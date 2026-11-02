@@ -114,6 +114,58 @@ def valid_material_host(host):
     return len(domain)<=253 and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label, re.I) for label in domain.split("."))
 
 
+def repository_parts(value, commit=False):
+    """Parse supported public-host URL shapes only; never contact the host."""
+    try:
+        url=urlsplit(value)
+        host=url.hostname
+        if (url.scheme!='https' or host not in {'github.com','gitee.com','gitlab.com'} or url.username is not None
+                or url.password is not None or url.netloc.lower()!=host or url.port is not None or url.query or url.fragment
+                or re.search(r'[\s\\%]',value) or len(value.encode('utf-8'))>1024):
+            return None
+        parts=url.path.rstrip('/').split('/')[1:]
+        sha=None
+        if commit:
+            tail=3 if host=='gitlab.com' else 2
+            if len(parts)<tail+2 or parts[-tail:-1]!=(['-','commit'] if host=='gitlab.com' else ['commit']):
+                return None
+            sha=parts[-1]
+            if not re.fullmatch(r'(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})',sha):
+                return None
+            parts=parts[:-tail]
+        if not parts or not parts[-1]:
+            return None
+        parts[-1]=re.sub(r'\.git$','',parts[-1])
+        # GitHub repository names may start with a dot; owners and other hosts keep their existing grammar.
+        if len(parts)<2 or (host!='gitlab.com' and len(parts)!=2) or any(not re.fullmatch(r'[A-Za-z0-9_.][A-Za-z0-9_.-]*' if host=='github.com' and index==len(parts)-1 else r'[A-Za-z0-9_][A-Za-z0-9_.-]*',part) or part in {'.','..'} for index,part in enumerate(parts)):
+            return None
+        # GitHub/Gitee names are case-insensitive; GitLab subgroup paths are kept exact.
+        path='/'.join(parts)
+        return host,path if host=='gitlab.com' else path.lower(),sha.lower() if sha else None
+    except (ValueError,TypeError):
+        return None
+
+
+def normalize_code_version(repository, version):
+    try:
+        url=urlsplit(repository)
+        valid=(url.scheme=='https' and valid_material_host(url.hostname) and url.username is None and url.password is None
+               and url.port!=0 and len(repository.encode('utf-8'))<=1024
+               and not re.search(r'[\s\\\x00-\x1f\x7f]',repository)
+               and not re.search(r'%(?:0[0-9a-f]|1[0-9a-f]|7f)',repository,re.I))
+    except (ValueError,TypeError):
+        valid=False
+    repo=repository_parts(repository)
+    if not valid or (url.hostname in {'github.com','gitee.com','gitlab.com'} and not repo):
+        raise APIError(400,'仓库请填写完整 HTTPS 仓库主页链接，不是本地路径或文件页面；GitHub、Gitee、GitLab 请使用仓库根地址')
+    if re.fullmatch(r'(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})',version):
+        return version.lower()
+    commit=repository_parts(version,commit=True)
+    if not repo or not commit or commit[:2]!=repo[:2]:
+        raise APIError(400,'commit 请填写同一 GitHub、Gitee 或 GitLab 仓库的完整提交页面链接，或40/64位完整哈希；其他平台请填完整哈希，不要填写分支、tag或前6位')
+    return commit[2]
+
+
 def scrypt_hash(code, salt):
     return hashlib.scrypt(code.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
 
@@ -544,7 +596,16 @@ class EventService:
 
     def team_submission_response(self, db, team):
         return {"team": {key: team[key] for key in ("id", "number", "name", "project", "track")},
-                "submission": self.submission(db, team["id"]), "window": self.submission_window(db)}
+                "submission": self.submission(db, team["id"]), "window": self.submission_window(db),
+                "judgingMaterials":self.judging_materials(db,team['id'])}
+
+    def judging_materials(self, db, team_id):
+        result={}
+        for row in db.execute('SELECT s.stage,s.run_id,r.frozen_at FROM judging_stages s JOIN judging_runs r ON r.id=s.run_id'):
+            roster=db.execute('SELECT snapshot_json FROM judging_roster WHERE run_id=? AND team_id=?',(row['run_id'],team_id)).fetchone()
+            snapshot=json.loads(roster['snapshot_json']).get('materialSnapshot') if roster else None
+            result[row['stage']]={'runId':row['run_id'],'inRoster':roster is not None,'frozenAt':row['frozen_at'],'materialSnapshot':snapshot}
+        return result
 
     def team_access(self, db, actor, body):
         if set(body)!={"teamId", "action"} or (not isinstance(body.get("action"), str) or body["action"] not in {"issue", "rotate", "revoke"}):
@@ -577,11 +638,13 @@ class EventService:
 
     def check_materials(self, materials, submitted):
         limits={"projectName": 140, "summary": 600, "license": 200, "demoInstructions": 2000,
-                "sourcesAndLimitations": 2000, "codeVersion": 120}
+                "sourcesAndLimitations": 2000, "codeVersion": 1024}
         urls=("codeUrl", "readmeUrl", "licenseUrl", "demoUrl", "slidesUrl", "videoUrl")
         if not isinstance(materials, dict) or not set(materials).issubset({*limits, *urls, "confirmed"}):
             raise APIError(400, "项目材料字段不正确")
         result={key: text_field(materials.get(key, ""), key, limit) for key,limit in limits.items()}
+        if len(result['codeVersion'].encode('utf-8'))>1024:
+            raise APIError(400,'代码版本最多1024字节')
         for key in urls:
             value=text_field(materials.get(key, ""), key, 1024)
             if value:
@@ -608,6 +671,7 @@ class EventService:
                 raise APIError(400, "请填写原型演示链接或本地演示说明")
             if not confirmed:
                 raise APIError(400, "正式提交前请完成材料自查确认")
+            result['codeVersion']=normalize_code_version(result['codeUrl'],result['codeVersion'])
         return result
 
     def save_submission(self, db, actor, team, body):
@@ -649,7 +713,8 @@ class EventService:
         rows=db.execute("""SELECT t.id AS team_id,a.id AS account_id,a.active FROM teams t
           LEFT JOIN team_accounts b ON b.team_id=t.id LEFT JOIN accounts a ON a.id=b.account_id ORDER BY t.number""")
         return [{"teamId": row["team_id"], "access": {"id": row["account_id"], "active": bool(row["active"])} if row["account_id"] else None,
-                 "submission": self.submission(db, row["team_id"])} for row in rows]
+                 "submission": self.submission(db, row["team_id"]),
+                 "judgingMaterials":self.judging_materials(db,row['team_id'])} for row in rows]
 
     def submission_csv(self, db):
         fields=("projectName", "summary", "codeUrl", "readmeUrl", "license", "licenseUrl", "demoUrl", "demoInstructions", "slidesUrl", "videoUrl", "sourcesAndLimitations", "codeVersion", "confirmed")

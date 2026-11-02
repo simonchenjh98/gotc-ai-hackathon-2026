@@ -72,8 +72,8 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 | 方法与路径 | 身份 | 请求及响应 |
 |---|---|---|
-| GET `/api/team` | 队伍 | `{team,submission,window}`，仅绑定队伍 |
-| POST `/api/submission` | 队伍 | `{expectedVersion,status:"draft"\|"submitted",materials}` → `{ok,team,submission,window}` |
+| GET `/api/team` | 队伍 | `{team,submission,window,judgingMaterials}`，仅绑定队伍 |
+| POST `/api/submission` | 队伍 | `{expectedVersion,status:"draft"\|"submitted",materials}` → `{ok,team,submission,window,judgingMaterials}` |
 | POST `/api/admin/team-access` | 管理员 | `{teamId,action:"issue"\|"rotate"\|"revoke"}` → `{ok,teamId,id,active,code?}`；仅发码与重发返回明文 |
 | GET `/api/admin/submissions/export` | 管理员 | UTF-8 BOM CSV，一队一行，正式与草稿列明确分开，含版本、时间和未提交修改状态，无凭据 |
 
@@ -90,7 +90,7 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 | `licenseUrl` | 1024 UTF-8 字节 | 选填 |
 | `demoUrl`, `demoInstructions` | 链接 1024 字节、说明 2000 字 | 至少一项 |
 | `sourcesAndLimitations` | 2000 字 | 必填 |
-| `codeVersion` | 120 字 | 选填 |
+| `codeVersion` | 输入最多1024 UTF-8字节 | 新正式提交必填：完整40/64位SHA或同仓库commit链接；正式保存为小写完整SHA，草稿可不完整 |
 | `confirmed` | 严格布尔值 | 必须 true，队伍自查声明 |
 
 只接受无凭据、无空白或控制字符的完整 HTTPS 链接；不抓取外部资源，不自动验证许可、可访问性、页数或视频长度。提交端点最多 32768 字节，其他 JSON 请求仍为 16384 字节；未知字段、错误类型、超长内容为 400，超请求上限为 413。请求不接受 `teamId`，身份与队伍由服务器绑定。
@@ -220,3 +220,13 @@ python3 -m py_compile server/app.py server/test_api.py
 ```
 
 测试启动真实本地 HTTP 服务，使用各自独立的临时数据库并清理，不写入生产。覆盖：空初始状态、管理码不落入数据库、身份隔离、Cookie、安全头、同源检查、登录限速、输入校验、16KB 上限、静态白名单与穿越保护、草稿/提交/回避、5 位门槛、算术均分、改分、提交不降为草稿、关闭评分、成绩发布开关、观众三票并发限制与幂等、票数独立、停用保留历史、同分排名、CSV 公式注入保护及审计。
+
+## 仓库与 commit 核对
+
+新正式提交的 `codeUrl` 应填写完整 HTTPS 仓库主页（不是代码包、文件页、个人页或本地路径）。GitHub、Gitee、GitLab 会检查仓库根地址形状；其他平台保持原 HTTPS 格式兼容，须直接填完整 SHA。例如 `https://github.com/your-team/your-project`。队伍应保证仓库公开、代码已 push；平台不联网检查存在性或可访问性。既有材料只读保留，旧草稿可继续保存，重新正式提交时按新规则补齐。
+
+`codeVersion` 输入40/64位十六进制完整SHA，或 GitHub/Gitee 的 `/owner/repo/commit/<完整SHA>`、GitLab 的 `/group/subgroup/repo/-/commit/<完整SHA>` 链接。仓库/commit链接主机和仓库路径必须一致，GitHub/Gitee路径忽略大小写，GitLab保持大小写并支持多级子组；允许仓库尾部 `.git` 和尾斜杠。拒绝凭据、显式端口、查询参数、片段、百分号编码及点路径。上述是三家已支持的 commit 链接解析范围；其他平台 commit 链接无法可靠解析时提示改填完整 SHA，不限制其原有 HTTPS 仓库输入。这里只做语法和路径比较；直接填SHA不能证明其属于该仓库，commit链接也不证明提交实际存在。正式保存小写完整SHA，草稿保留输入；摘要前6位不保证唯一，应使用完整值核对。
+
+本队响应及管理员各队记录新增 `judgingMaterials:{exhibition,roadshow}`。每阶段为 `{runId,inRoster,frozenAt,materialSnapshot}`，后者为空或既有 `{materials,submissionVersion,submittedAt,capturedAt}` 快照。区分未入名单、未冻结、冻结时无材料和已有冻结版；不会拿最新正式版补空。队伍只能得到本队材料，不带评委或评语。原专业入口仍读最新正式版，展示/路演同轮重开保持快照，新轮首次开放才重新截取。
+
+前端集中列缺项，预览原commit输入及规范化完整值后再次确认。成功回执取服务端返回的正式版号/时间；刷新只展示服务器最近记录。20秒超时、网络/5xx异常标记结果待确认，保留可复制输入、主动读取最新记录供核对，不自动重试或断言本次成功。409仍不覆盖、不自动合并；版本冲突与关闭/截止分别提示。回执只是字段与URL记录，不备份外部文件。

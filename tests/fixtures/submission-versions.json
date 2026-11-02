@@ -1,0 +1,267 @@
+[
+  {
+    "repository": "https://github.com/Team/Project",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": "a1b2c3dddddddddddddddddddddddddddddddddd"
+  },
+  {
+    "repository": "https://github.com/Team/Project",
+    "version": "https://github.com/team/project/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": "a1b2c3dddddddddddddddddddddddddddddddddd"
+  },
+  {
+    "repository": "https://github.com/Team/Project.git/",
+    "version": "https://github.com/TEAM/PROJECT/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": "a1b2c3dddddddddddddddddddddddddddddddddd"
+  },
+  {
+    "repository": "https://gitee.com/Team/Project",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": "a1b2c3dddddddddddddddddddddddddddddddddd"
+  },
+  {
+    "repository": "https://gitee.com/Team/Project",
+    "version": "https://gitee.com/team/project/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": "a1b2c3dddddddddddddddddddddddddddddddddd"
+  },
+  {
+    "repository": "https://gitee.com/Team/Project.git/",
+    "version": "https://gitee.com/TEAM/PROJECT/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": "a1b2c3dddddddddddddddddddddddddddddddddd"
+  },
+  {
+    "repository": "https://gitlab.com/Group/Sub/Project",
+    "version": "https://gitlab.com/Group/Sub/Project/-/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": "a1b2c3dddddddddddddddddddddddddddddddddd"
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "expected": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "a1b2c3",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "main",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "v1.0",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "https://github.com/other/project/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "https://gitee.com/team/project/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://gitlab.com/Group/Sub/Project",
+    "version": "https://gitlab.com/group/Sub/Project/-/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "https://github.com/team/project/commit/A1b2c3dddddddddddddddddddddddddddddddddd?x=1",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "https://github.com/team/project/commit/A1b2c3dddddddddddddddddddddddddddddddddd#diff",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "https://u:p@github.com/team/project/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "https://github.com:443/team/project/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "https://github.com/team/%70roject/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "https://github.com/team/other/../project/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "https:////github.com/team/project/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "http://github.com/team/project/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project",
+    "version": "https://github.com/team/project/commit/a1b2c3",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project/blob/main/file",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/project?tab=readme",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "/Users/me/project",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://other.test/team/project",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": "a1b2c3dddddddddddddddddddddddddddddddddd"
+  },
+  {
+    "repository": "https://gitlab.com/group/../project",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/team/%70roject",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com:/team/project",
+    "version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expected": null
+  },
+  {
+    "repository": "https://git.example.test/team/repo.git",
+    "version": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "expected": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  {
+    "repository": "https://git.example.test/team/repo.git",
+    "version": "https://git.example.test/team/repo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/github/.github",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": "a1b2c3dddddddddddddddddddddddddddddddddd"
+  },
+  {
+    "repository": "https://github.com/github/.github",
+    "version": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    "expected": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  {
+    "repository": "https://github.com/github/.github",
+    "version": "https://github.com/github/.github/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": "a1b2c3dddddddddddddddddddddddddddddddddd"
+  },
+  {
+    "repository": "https://github.com/github/.github.git/",
+    "version": "https://github.com/GitHub/.github/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": "a1b2c3dddddddddddddddddddddddddddddddddd"
+  },
+  {
+    "repository": "https://github.com/github/.github-private",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": "a1b2c3dddddddddddddddddddddddddddddddddd"
+  },
+  {
+    "repository": "https://github.com/github/.",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/github/..",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/github/..git",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/github/...git",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/github/%2egithub",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/github/%2e%2e/.github",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/github/.github/blob/main/README.md",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/github/.github",
+    "version": "https://github.com/github/.github-private/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/github/.github",
+    "version": "https://github.com/github/other/../.github/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/github/.github",
+    "version": "https://github.com/github/%2e%2e/.github/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://github.com/.owner/.github",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://gitee.com/team/.github",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://gitee.com/team/.github",
+    "version": "https://gitee.com/team/.github/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://gitlab.com/Group/.github",
+    "version": "A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  },
+  {
+    "repository": "https://gitlab.com/Group/.github",
+    "version": "https://gitlab.com/Group/.github/-/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
+    "expected": null
+  }
+]

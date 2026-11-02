@@ -144,7 +144,7 @@ class ExactParentReleaseTests(unittest.TestCase):
         self.assertEqual(response['role'], 'team')
         service.dispatch('POST', '/api/admin/settings', {'submissionsOpen': True}, cookie, '127.0.0.1')
         materials = {'projectName': 'NEW_FORMAL_PROJECT', 'summary': 'New synthetic material',
-            'codeUrl': 'https://example.invalid/code', 'readmeUrl': 'https://example.invalid/readme',
+            'codeUrl': 'https://github.com/synthetic/repository', 'codeVersion': 'a'*40, 'readmeUrl': 'https://example.invalid/readme',
             'license': 'MIT', 'demoInstructions': 'Synthetic local demo',
             'slidesUrl': 'https://example.invalid/slides', 'videoUrl': 'https://example.invalid/video',
             'sourcesAndLimitations': 'Synthetic only', 'confirmed': True}

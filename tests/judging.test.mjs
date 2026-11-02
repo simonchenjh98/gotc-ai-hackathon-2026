@@ -150,3 +150,11 @@ test('judge rendering excludes invalidated formal records from its count and kee
   assert.match(picker.innerHTML,/已作废/);
   assert.ok(!picker.innerHTML.includes('saved-status'));
 });
+
+test('review material view distinguishes unfrozen from frozen-empty and includes run/time',()=>{
+  const h=helpers();
+  const pending=h.reviewMaterialMarkup(null,{runId:'run-unfrozen',frozenAt:null});
+  assert.match(pending,/尚未生成材料快照/);assert.ok(!pending.includes('后续提交材料不会自动替换'));
+  const empty=h.reviewMaterialMarkup(null,{runId:'run-empty',frozenAt:1000});
+  assert.match(empty,/本轮冻结时无正式材料/);assert.match(empty,/run-empty/);assert.match(empty,/1970/);
+});

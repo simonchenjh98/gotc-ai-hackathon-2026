@@ -296,9 +296,10 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
                         def http_json(path, payload, cookie):
                             request = urllib.request.Request(f'http://127.0.0.1:{port}/gotc{path}', data=json.dumps(payload).encode(), headers={'Content-Type':'application/json','Origin':'https://example.invalid','Cookie':cookie})
                             with urllib.request.urlopen(request) as result: return json.load(result), result.headers
-                        materials = {'projectName':'Tar Synthetic','summary':'Tar test','codeUrl':'https://example.test/code','readmeUrl':'https://example.test/readme','license':'MIT','licenseUrl':'','demoUrl':'','demoInstructions':'Run','slidesUrl':'https://example.test/slides','videoUrl':'https://example.test/video','sourcesAndLimitations':'Synthetic','codeVersion':'tar','confirmed':True}
+                        materials = {'projectName':'Tar Synthetic','summary':'Tar test','codeUrl':'https://example.test/code','readmeUrl':'https://example.test/readme','license':'MIT','licenseUrl':'','demoUrl':'','demoInstructions':'Run','slidesUrl':'https://example.test/slides','videoUrl':'https://example.test/video','sourcesAndLimitations':'Synthetic','codeVersion':'a'*40,'confirmed':True}
                         saved, _ = http_json('/api/submission', {'expectedVersion':0,'status':'submitted','materials':materials}, cookie)
                         self.assertEqual(saved['submission']['submitted']['projectName'], 'Tar Synthetic')
+                        self.assertEqual(saved['submission']['submitted']['codeVersion'], 'a'*40)
                         team_req = urllib.request.Request(f'http://127.0.0.1:{port}/gotc/api/team', headers={'Cookie':cookie})
                         with urllib.request.urlopen(team_req) as team_response: self.assertEqual(json.load(team_response)['submission']['submittedVersion'], 1)
                         judge_cookie = urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{port}/gotc/api/login', data=json.dumps({'role':'judge','code':judge_code}).encode(), headers={'Content-Type':'application/json','Origin':'https://example.invalid'})).headers['Set-Cookie']

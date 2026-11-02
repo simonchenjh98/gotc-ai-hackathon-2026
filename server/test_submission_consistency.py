@@ -111,7 +111,7 @@ class SubmissionConsistencyTests(unittest.TestCase):
         client, _ = self.access(team_id)
         judge, _ = self.invitation()
         self.assertEqual(self.admin.post('/api/admin/settings', {'submissionsOpen': True})[0], 200)
-        materials = self.materials(codeUrl='https://example.invalid/archive.zip',
+        materials = self.materials(codeUrl='https://github.com/synthetic/repository',
                                    readmeUrl='https://example.invalid/README?version=1')
         original = copy.deepcopy(materials)
         with patch('socket.create_connection', side_effect=AssertionError('No outbound material fetch')) as connect, \

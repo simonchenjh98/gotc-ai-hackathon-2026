@@ -108,11 +108,11 @@ class SubmissionAPITests(unittest.TestCase):
         self.assertEqual(result[0],200,result[1])
 
     def materials(self, **changes):
-        return {'projectName':'Synthetic Project','summary':'A synthetic prototype', 'codeUrl':'https://example.test/repository',
+        return {'projectName':'Synthetic Project','summary':'A synthetic prototype', 'codeUrl':'https://github.com/synthetic/repository',
                 'readmeUrl':'https://example.test/README','license':'MIT','licenseUrl':'', 'demoUrl':'',
                 'demoInstructions':'Run locally following the README','slidesUrl':'https://example.test/slides',
                 'videoUrl':'https://example.test/video','sourcesAndLimitations':'No third-party assets. Synthetic demo only.',
-                'codeVersion':'v1','confirmed':True,**changes}
+                'codeVersion':'a'*40,'confirmed':True,**changes}
 
     def save(self, client, version=0, status='submitted', materials=None, **extra):
         return client.post('/api/submission',{'expectedVersion':version,'status':status,'materials':self.materials() if materials is None else materials,**extra})
@@ -215,7 +215,7 @@ class SubmissionAPITests(unittest.TestCase):
         client,_=self.access(self.team())
         self.open_submissions()
         invalid=[{'confirmed':'true'},{'summary':3},{'summary':'x'*601},{'projectName':'x'*141},
-                 {'unexpected':'field'},{'codeVersion':'x'*121},{'license':'x'*201},
+                 {'unexpected':'field'},{'codeVersion':'x'*1025},{'license':'x'*201},
                  *[{'codeUrl':url} for url in ['javascript:alert(1)','data:text/html,abc','http://example.test','//example.test','https://u:p@example.test','https://@example.test','https://exa<mple.test','https://exa|mple.test','https://%40example.test','https://under_score.test',
                                                 'https://example.test/a\\b','https://example.test/a b','https://example.test/%0aheader','https://[bad','https://example.test:bad',
                                                 'https://example.test/'+('中'*400)]]]
@@ -229,7 +229,7 @@ class SubmissionAPITests(unittest.TestCase):
             self.assertEqual(self.save(client,materials=self.materials(**changes))[0],400,changes)
         self.assertEqual(client.request('POST','/api/submission',{'expectedVersion':0,'status':'draft','materials':{}},origin='https://attacker.invalid')[0],403)
         large=self.materials(summary='中'*600,demoInstructions='中'*2000,sourcesAndLimitations='中'*2000,
-                             codeUrl='https://example.test/'+('a'*950),readmeUrl='https://example.test/'+('b'*950),slidesUrl='https://example.test/'+('c'*950))
+                             codeUrl='https://github.com/synthetic/'+('a'*920),readmeUrl='https://example.test/'+('b'*950),slidesUrl='https://example.test/'+('c'*950))
         encoded=json.dumps({'expectedVersion':0,'status':'submitted','materials':large},ensure_ascii=False).encode()
         self.assertGreater(len(encoded),16384)
         self.assertLess(len(encoded),32768)
