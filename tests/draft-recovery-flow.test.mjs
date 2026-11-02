@@ -145,3 +145,7 @@ test('confirmed old logout still cleans its bound copies after an intervening 40
 test('exit-and-switch uses the same confirmed team cleanup flow',async()=>{
   const f=fixture();f.context.establish({role:'team',loginId:'switch-login'});await f.context.render();f.edit('summary','SENSITIVE_SWITCH');vm.runInContext('renderWrongRole("judge");',f.context);await f.node('switch-role').onclick();assert.equal(f.slots().length,0);assert.equal(f.calls.filter(call=>call.path==='logout').length,1);
 });
+
+test('a storage notification during read failure keeps manual server saving available',async()=>{
+  const f=fixture();f.context.establish({role:'team',loginId:'temporarily-unavailable'});await f.context.render();f.storage.getItem=()=>{throw new Error('temporary read failure');};f.context.current().storageChanged();f.edit('summary','SERVER_ONLY');await f.node('save-submission-draft').onclick();assert.equal(f.node('fieldset').disabled,false);assert.equal(f.data.submission.draft.summary,'SERVER_ONLY');
+});
