@@ -13,11 +13,19 @@ let logoutInFlight=null;
 let session={role:null}, route='', pollTimer, routeVersion=0, lastBoard, judgeData, selectedTeam, toastTimer;
 const roleName = {team:'参赛队伍',judge:'专业评委',audience:'观众',admin:'组织方'};
 function toast(message) { const el = document.getElementById('platform-toast'); el.textContent = message; el.classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('visible'), 4500); }
+const loginOwnerKey=`gotc-login-owner:v1:${encodeURIComponent(base.pathname)}`;
+// A server-verified cookie may outlive a failed/quota-blocked owner publication.
+// Keep the request-time marker snapshot; a later login publication still invalidates it.
+let verifiedBrowserLogin=null;
+function browserLoginOwner(){try{return localStorage.getItem(loginOwnerKey);}catch{return undefined;}}
+function publishLogin(login){if(!login.loginId)return;try{localStorage.setItem(loginOwnerKey,login.loginId);}catch{/* Server saving remains available without storage. */}}
+function ownsBrowserLogin(login){const owner=browserLoginOwner();return !owner || !login.loginId || owner===login.loginId || (verifiedBrowserLogin?.loginId===login.loginId && verifiedBrowserLogin.owner===owner);}
 async function api(path, data, options={}) {
-  const recoveryAtStart=currentTeamRecovery,sessionAtStart=session;
-  const res = await fetch(new URL(`api/${path}`, base), {credentials:'same-origin',cache:'no-store',method:data === undefined ? 'GET' : 'POST',headers:data === undefined ? {} : {'Content-Type':'application/json'},body:data === undefined ? undefined : JSON.stringify(data),signal:options.signal});
+  const recoveryAtStart=currentTeamRecovery,sessionAtStart=session,ownerAtStart=path==='session'?browserLoginOwner():null;
+  const res = await fetch(new URL(`api/${path}`, base), {credentials:'same-origin',cache:'no-store',method:data === undefined ? 'GET' : 'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json'}),...((['team','submission','logout'].includes(path) || path.startsWith('submission/')) && (options.loginId ?? session.loginId)?{'X-GOTC-Login':options.loginId ?? session.loginId}:{})},body:data === undefined ? undefined : JSON.stringify(data),signal:options.signal});
   let body; try { body = await res.json(); } catch { throw new Error('服务暂时不可用，请稍后重试。'); }
   if (!res.ok) { if((res.status===401 || res.status===403) && recoveryAtStart && currentTeamRecovery===recoveryAtStart)recoveryAtStart.lock();if(res.status===401 && session===sessionAtStart && (!recoveryAtStart || currentTeamRecovery===recoveryAtStart))session={role:null}; const error = new Error(body.error || '操作未成功，请重试。'); error.status = res.status; throw error; }
+  if(path==='session')verifiedBrowserLogin={loginId:body.loginId,owner:ownerAtStart};
   return body;
 }
 function trackAdminForm(form){form.addEventListener('input',()=>{form.editRevision=(form.editRevision || 0)+1;dirtyAdminForms.add(form);});}
@@ -26,17 +34,18 @@ function clearStageUnsavedInputs(){for(const form of dirtyAdminForms)if(!form.is
 function confirmLeave(){return !(submissionDirty || reviewDirty || scoreDirty || dirtyAdminForms.size) || confirm(submissionDirty?'有尚未保存服务器的作品输入。离开不会自动提交；只有成功保存的本机副本可在重新登录本队后找回，未备份输入可能丢失。确认离开？':'有尚未保存的输入，确认离开并放弃这些输入？');}
 function account(){
   const el=document.getElementById('account');el.innerHTML=session.role?`<span>${esc(session.name || roleName[session.role])}</span><button id="logout">退出</button>`:'';
-  document.getElementById('logout')?.addEventListener('click',async event=>{
+  document.getElementById('logout')?.addEventListener('click',logoutAccount);
+}
+async function logoutAccount(event){
     if(logoutInFlight?.owner===session)return;
     const operation={owner:session,context:currentTeamRecovery},button=event?.currentTarget || document.getElementById('logout');logoutInFlight=operation;button.disabled=true;
     const owned=()=>session===operation.owner;
     try{let local=null,teamAtExit=null;
-      if(session.role==='team'){teamAtExit=await api('team');if(!owned())return;if(currentTeamRecovery && currentTeamRecovery.teamId!==teamAtExit.team.id)currentTeamRecovery.lock('当前登录队伍已变化，本地副本需重新授权后查看。');local=currentTeamRecovery?.teamId===teamAtExit.team.id?currentTeamRecovery:{purge:()=>teamDraftStore(teamAtExit)?.purge() ?? false};}
-      if(teamAtExit?!confirm(`退出当前登录的${teamAtExit.team.name}会清除本浏览器内本队的恢复副本，其他标签页的本队副本也会清理；服务器材料不受影响。确认退出？`):!confirmLeave())return;
-      await api('logout',{});if(!owned())return;let cleaned=true;if(local)cleaned=local.purge();submissionDirty=false;reviewDirty=false;scoreDirty=false;dirtyAdminForms.clear();currentTeamRecovery?.lock('已退出。');session={role:null};await renderRoute();if(!cleaned)toast('已退出，但无法确认本队本地副本已清理，请在共享设备上清除此站点的浏览器数据。');
+      if(session.role==='team'){teamAtExit=await api('team');if(!owned())return;if(currentTeamRecovery && currentTeamRecovery.teamId!==teamAtExit.team.id)currentTeamRecovery.lock('当前登录队伍已变化，本地副本需重新授权后查看。');const store=teamDraftStore(teamAtExit,undefined,teamAtExit.loginId ?? operation.owner.loginId ?? '');const captured=store?.capturePurge();local={purge:()=>store?.purge(captured) ?? false};}
+      if(teamAtExit?!confirm(`退出当前登录的${teamAtExit.team.name}会清除本浏览器内本队当前及历史恢复副本，并停止旧标签编辑；退出期间重新登录后新建的副本会保留；服务器材料不受影响。确认退出？`):!confirmLeave())return;
+      await api('logout',{}, {loginId:teamAtExit?.loginId ?? operation.owner.loginId});let cleaned=true;if(local && (owned() || operation.owner.loginId))cleaned=local.purge();if(!owned())return;submissionDirty=false;reviewDirty=false;scoreDirty=false;dirtyAdminForms.clear();currentTeamRecovery?.lock('已退出。');session={role:null};await renderRoute();if(!cleaned)toast('已退出，但无法确认本队本地副本已清理，请在共享设备上清除此站点的浏览器数据。');
     }catch(error){if(owned() || (logoutInFlight===operation && !session.role))toast('退出未确认，本地副本已保留。'+error.message);}
     finally{if(logoutInFlight===operation)logoutInFlight=null;if(button.isConnected)button.disabled=false;}
-  });
 }
 
 function heading(kicker,title,description,tools='') { return `<div class="page-heading"><div><p class="eyebrow">${kicker}</p><h1>${title}</h1><p>${description}</p></div>${tools ? `<div class="heading-tools">${tools}</div>` : ''}</div>`; }
@@ -118,11 +127,11 @@ function renderLogin(role) {
         formError(form,'登录码正确，请选择你自己的评委身份后继续。');
         return;
       }
-      session=await api('session');await renderRoute();
+      publishLogin(result);session=await api('session');await renderRoute();
     }catch(error){formError(form,error.message);}finally{if(button.isConnected)button.disabled=false;}
   };
 }
-function renderWrongRole(role) { root.innerHTML = heading('ACCESS / 登录身份','请使用对应的邀请码',`当前身份为${esc(roleName[session.role] || session.role)}，此入口需要${roleName[role]}身份。`) + empty('切换登录身份','退出当前账号后，使用此入口的专属邀请码登录。','<button class="btn" id="switch-role">退出并切换</button>');document.getElementById('switch-role').onclick=async()=>{await api('logout',{});session={role:null};await renderRoute();}; }
+function renderWrongRole(role) { root.innerHTML = heading('ACCESS / 登录身份','请使用对应的邀请码',`当前身份为${esc(roleName[session.role] || session.role)}，此入口需要${roleName[role]}身份。`) + empty('切换登录身份','退出当前账号后，使用此入口的专属邀请码登录。','<button class="btn" id="switch-role">退出并切换</button>');document.getElementById('switch-role').onclick=logoutAccount; }
 function reviewState(record){return record?.invalidated?'已作废':record?.recused?'已回避':record?.submitted?(record.hasUnsubmittedChanges?'已正式提交 · 有草稿修改':'已正式提交（未计分）'):record?.draft?'草稿已保存':'待评审';}
 function reviewMaterialMarkup(snapshot,stage=null){return `<section class="surface submitted-materials"><h2>本轮正式材料快照</h2>${stage?`<p class="small-note">轮次 ${esc(stage.runId)} · 冻结时间 ${esc(beijingTime(stage.frozenAt))}（北京时间）</p>`:''}${snapshot?`<p class="small-note">队伍提交版本 ${Number(snapshot.submissionVersion)} · 正式提交 ${esc(beijingTime(snapshot.submittedAt))}<br>本轮截取 ${esc(beijingTime(snapshot.capturedAt))}（北京时间）</p>${materialMarkup(snapshot.materials)}`:!stage?'<p class="small-note">本轮没有正式材料快照。</p>':stage.frozenAt===null?'<p class="small-note">尚未生成材料快照；首次开放时截取当时的正式材料。</p>':'<p class="small-note">本轮冻结时无正式材料；可根据现场演示记录观察。后续提交材料不会自动替换本轮快照。</p>'}</section>`;}
 async function renderExhibitionJudge(version,expectedForm=null,stage=stageForRoute()){
@@ -359,18 +368,18 @@ function requestReceiptMarkup(receipt,requestId,focusable=false){
 function rawTeamMaterials(form){return Object.fromEntries(materialFields.map(([key])=>[key,form.elements[key].value]));}
 function serverDraftMaterials(data){return Object.fromEntries(materialFields.map(([key])=>[key,String((data.submission.draft || {projectName:data.team.project || ''})[key] || '')]));}
 function localMaterialsText(materials){return materialFields.map(([key,label])=>`${label}：\n${materials[key] || ''}`).join('\n\n');}
-function teamRecoveryEpochs(){try{const target=globalThis.localStorage,prefix=`gotc-material-recovery:v1:${encodeURIComponent(base.pathname)}:`,epochs=new Map();for(let index=0;index<target.length;index++){const key=target.key(index);if(key?.startsWith(prefix) && key.endsWith(':epoch'))epochs.set(key,target.getItem(key) || '');}return teamId=>epochs.get(prefix+encodeURIComponent(teamId)+':epoch') || '';}catch{return ()=>'';}}
-function teamDraftStore(data,expectedEpoch){return globalThis.GotcDraftRecovery?.create({storage:()=>globalThis.localStorage,namespace:base.pathname,teamId:data.team.id,writerId:draftRecoveryWriter,baseVersion:data.submission.version,baseMaterials:serverDraftMaterials(data),fields:materialFields.map(([key,,limit])=>[key,limit]),expectedEpoch});}
+function teamRecoveryEpochs(){try{const target=globalThis.localStorage,prefix=`gotc-material-recovery:v1:${encodeURIComponent(base.pathname)}:`,epochs=new Map();for(let index=0;index<target.length;index++){const key=target.key(index);if(key?.startsWith(prefix) && key.endsWith(':epoch'))epochs.set(key,target.getItem(key) || '');}return (teamId,loginId)=>epochs.get(prefix+encodeURIComponent(teamId)+':'+(loginId?'auth:'+encodeURIComponent(loginId)+':':'')+'epoch') || '';}catch{return ()=>'';}}
+function teamDraftStore(data,expectedEpoch,loginId=session.loginId || ""){return globalThis.GotcDraftRecovery?.create({storage:()=>globalThis.localStorage,namespace:base.pathname,teamId:data.team.id,writerId:draftRecoveryWriter,baseVersion:data.submission.version,baseMaterials:serverDraftMaterials(data),fields:materialFields.map(([key,,limit])=>[key,limit]),expectedEpoch,loginId});}
 function installTeamRecovery(data,form,version,{restore,loadLatest,onWindow},expectedEpoch){
   const panel=document.getElementById('local-draft-recovery'),status=document.getElementById('local-draft-status'),candidates=document.getElementById('local-draft-candidates'),comparison=document.getElementById('local-draft-comparison');
   let active=true,edited=false,phase='editing',latest=data,loadedVersion=data.submission.version,inspectionRevision=0;
   const live=()=>active && form.isConnected && version===routeVersion && currentTeamRecovery===context;
   const store=teamDraftStore(data,expectedEpoch),sessionOwner=session;
-  function hasAuthorization(){if(!active || currentTeamRecovery!==context || session!==sessionOwner)return false;store?.checkEpoch();if(store?.revoked){context.lock(store.error);return false;}return true;}
+  function hasAuthorization(){if(!active || currentTeamRecovery!==context || session!==sessionOwner)return false;if(!ownsBrowserLogin(sessionOwner)){context.lock('登录身份已变化，请重新登录后编辑。');return false;}store?.checkEpoch();if(store?.revoked){context.lock(store.error);return false;}return true;}
   function authorized(){return hasAuthorization() && live();}
   function notice(text){if(live())status.textContent=text;}
-  function persist(state='editing',action=null,requestId=null){if(!live() || !store || (state==='editing' && ['pending','unknown'].includes(phase)))return null;const saved=store.write(rawTeamMaterials(form),state,action,requestId);notice(saved?'已保存本机副本（本机时间）：'+beijingTime(saved.record.updatedAt)+'；尚不能据此确认服务器提交结果。':store.error || '本地恢复不可用，请保存服务器草稿或复制当前输入。');return saved;}
-  function list(){if(!live())return;if(!store){notice('本地恢复不可用，请保存服务器草稿或复制当前输入。');return;}const result=store.candidates();if(store.revoked){context.lock(store.error);return;}if(store.error)notice(store.error);else if(!edited)notice(result.ignored?'部分本地记录格式无效，已跳过；其他副本可继续查看。':'以下为本队的本地副本；请选择查看核对，不会自动保存到服务器。');
+  function persist(state='editing',action=null,requestId=null){if(!authorized() || !store || (state==='editing' && ['pending','unknown'].includes(phase)))return null;const saved=store.write(rawTeamMaterials(form),state,action,requestId);notice(saved?'已保存本机副本（本机时间）：'+beijingTime(saved.record.updatedAt)+'；尚不能据此确认服务器提交结果。':store.error || '本地恢复不可用，请保存服务器草稿或复制当前输入。');return saved;}
+  function list(){if(!authorized())return;if(!store){notice('本地恢复不可用，请保存服务器草稿或复制当前输入。');return;}const result=store.candidates();if(store.revoked){context.lock(store.error);return;}if(store.error)notice(store.error);else if(!edited)notice(result.ignored?'部分本地记录格式无效，已跳过；其他副本可继续查看。':'以下为本队的本地副本；请选择查看核对，不会自动保存到服务器。');
     candidates.innerHTML=result.items.map((item,index)=>{const r=item.record,uncertain=['pending','unknown'].includes(r.state);return `<details class="local-candidate"><summary>本地副本 · ${esc(beijingTime(r.updatedAt))}（本机时间） · 来源编辑版 v${r.baseVersion}${uncertain?' · 上次发送结果待确认':''}</summary><p class="small-note">${uncertain?'须先核对服务器记录，此副本只供比较和复制，不直接恢复。':'恢复只填入当前表单，仍需主动保存草稿或正式提交。'}${r.request?.requestId?'<br>请求编号：<code>'+esc(r.request.requestId)+'</code>':''}</p><div class="form-actions"><button type="button" class="btn secondary small" data-local-view="${index}">查看并核对服务器</button><button type="button" class="btn secondary small" data-copy-value="${esc(localMaterialsText(r.materials))}">复制本地材料</button><button type="button" class="btn secondary small" data-local-discard="${index}">丢弃此副本</button></div></details>`;}).join('') || '<p class="small-note">暂无其他可恢复副本。当前表单发生编辑后才建立本机副本。</p>';
     candidates.querySelectorAll('[data-local-view]').forEach(button=>button.onclick=()=>withBusy(button,()=>inspect(result.items[Number(button.dataset.localView)])));
     candidates.querySelectorAll('[data-local-discard]').forEach(button=>button.onclick=()=>{const item=result.items[Number(button.dataset.localDiscard)];notice(store.discard(item)?'已丢弃所选本地副本，服务器材料不受影响。':store.error || '副本已更新，未删除；请重新查看。');list();});
@@ -387,14 +396,14 @@ function installTeamRecovery(data,form,version,{restore,loadLatest,onWindow},exp
       document.getElementById('confirm-local-restore').onclick=e=>withBusy(e.currentTarget,async()=>{const checked=await authorizedLatest(action);if(!checked)return;if(['pending','unknown'].includes(phase)){notice('当前发送结果尚未确认，本次未替换表单。');return;}if(checked.submission.version!==item.record.baseVersion || checked.submission.version!==loadedVersion || !checked.window.canEdit || !stillPresent(item)){await inspect(item);return;}
         if(submissionDirty && !persist()){notice('未替换当前输入：本地备份失败，请先复制或保存。');return;}store.fork();restore(item.record.materials,checked);edited=true;phase='editing';persist();comparison.innerHTML='';notice('已恢复到当前表单；尚未保存服务器，也未正式提交。请核对并重新勾选材料自查。');list();});
     }catch(error){if(live())notice(error.message);}}
-  const context={teamId:data.team.id,store,sessionOwner,hasAuthorization,isAuthorized:authorized,lock(message){active=false;panel.hidden=true;form.querySelector('fieldset').disabled=true;status.textContent=message;},input(){edited=true;if(['pending','unknown'].includes(phase))return;phase='editing';persist();},flush(){if(edited && phase==='editing')persist();},pending(action,requestId){phase='pending';edited=true;return persist('pending',action,requestId);},result(sent,state){phase=state;if(store)store.result(sent,state);if(live() && store?.error)notice(store.error);},acknowledge(sent){store?.acknowledge(sent);return store?.error || '';},rebase(next){loadedVersion=next.submission.version;store?.rebase(loadedVersion,serverDraftMaterials(next));phase='editing';edited=true;persist();},purge(){return store?.purge() ?? false;},storageChanged(){if(!live() || !store)return;if(!store.checkEpoch()){context.lock(store.error);return;}list();}};
+  const context={teamId:data.team.id,store,sessionOwner,hasAuthorization,isAuthorized:authorized,lock(message){active=false;panel.hidden=true;form.querySelector('fieldset').disabled=true;status.textContent=message;},input(){edited=true;if(['pending','unknown'].includes(phase))return;phase='editing';persist();},flush(){if(edited && phase==='editing')persist();},pending(action,requestId){phase='pending';edited=true;return persist('pending',action,requestId);},result(sent,state){phase=state;if(store)store.result(sent,state);if(live() && store?.error)notice(store.error);},acknowledge(sent){store?.acknowledge(sent);return store?.error || '';},rebase(next){loadedVersion=next.submission.version;store?.rebase(loadedVersion,serverDraftMaterials(next));phase='editing';edited=true;persist();},purge(){return store?.purge() ?? false;},storageChanged(){if(!authorized() || !store)return;list();}};
   currentTeamRecovery=context;document.getElementById('refresh-local-drafts').onclick=()=>{inspectionRevision++;comparison.innerHTML='';list();};list();return context;
 }
 
 async function renderTeam(version,provided=null,received=false,owner=null){
   const sessionAtStart=session,authorization=owner || (currentTeamRecovery?.sessionOwner===sessionAtStart?currentTeamRecovery:null),epochs=teamRecoveryEpochs();
   if(authorization && !authorization.hasAuthorization())return;
-  const data=provided || await api('team');if(version!==routeVersion || session!==sessionAtStart || (authorization && !authorization.hasAuthorization()))return;if(authorization && authorization.teamId!==data.team.id){authorization.lock('当前登录队伍已变化，请重新登录本队后编辑。');return;}const expectedEpoch=authorization?.store?.epoch ?? epochs(data.team.id),s=data.submission;
+  const data=provided || await api('team');if(version!==routeVersion || session!==sessionAtStart || !ownsBrowserLogin(sessionAtStart) || (authorization && !authorization.hasAuthorization()))return;if(authorization && authorization.teamId!==data.team.id){authorization.lock('当前登录队伍已变化，请重新登录本队后编辑。');return;}const expectedEpoch=authorization?.store?.epoch ?? epochs(data.team.id,sessionAtStart.loginId),s=data.submission;
   root.innerHTML=heading('TEAM / 作品提交',esc(teamLabel(data.team)),`${esc(data.team.track || '方向待完善')} · 队伍编号、名称及赛道由组织方维护。`)+windowMarkup(data.window)+`<section class="surface submission-overview"><h2 id="submission-status">${submissionState(s)}</h2><div>草稿编辑版 v${s.version} · 最新正式版 ${s.submittedVersion?'v'+s.submittedVersion:'尚未提交'}${s.submitted?.codeVersion?` · commit ${commitMarkup(s.submitted.codeVersion)}`:''}</div><p class="small-note" id="submission-edit-state">${s.hasUnsubmittedChanges?'草稿修改尚未正式提交；评审继续使用正式材料。':'更新时间（北京时间）：'+esc(beijingTime(s.updatedAt))}</p><a href="#submitted-summary" id="view-formal-materials">查看最近正式材料</a></section>`+(received && typeof received==='object'?requestReceiptMarkup(received,received.requestId,true):submissionReceiptMarkup(data,received))+judgingMaterialsMarkup(data.judgingMaterials,s.submittedVersion)+localRecoveryMarkup()+teamFormMarkup(data)+'<div id="submission-preview" aria-live="polite"></div><div id="submission-conflict" aria-live="polite"></div>'+`<section class="surface" id="submitted-summary"><h2>最近正式材料</h2>${s.submitted?`<p class="small-note">正式版本 ${s.submittedVersion} · 最近提交 ${esc(beijingTime(s.submittedAt))}（北京时间）</p>${materialMarkup(s.submitted)}`:'<p class="small-note">尚未正式提交；草稿不会发送给评委。</p>'}</section>`+submissionHistoryMarkup();
   document.getElementById('view-formal-materials').onclick=e=>{e.preventDefault();document.getElementById('submitted-summary').scrollIntoView({block:'start'});};
   const form=document.getElementById('submission-form'),preview=document.getElementById('submission-preview');let currentVersion=s.version,blocked=!data.window.canEdit,inputRevision=0;

@@ -358,6 +358,17 @@ class EventService:
             if len(self.login_attempts) > 5000:
                 self.login_attempts = defaultdict(deque, {k: v for k, v in self.login_attempts.items() if v and v[-1] >= current - 60})
 
+    @staticmethod
+    def login_id(cookie):
+        """Public, non-bearer identity; it cannot be used in place of the HttpOnly token."""
+        try:
+            token = SimpleCookie(cookie or "")[COOKIE_NAME].value
+            if re.fullmatch(r"[A-Za-z0-9_-]{40,100}", token):
+                return hashlib.sha256(b"gotc-public-login-id\0" + token.encode()).hexdigest()
+        except (KeyError, ValueError, CookieError):
+            pass
+        return None
+
     def account(self, db, cookie):
         try:
             cookies = SimpleCookie()
@@ -431,18 +442,20 @@ class EventService:
             db.execute("DELETE FROM sessions WHERE expires_at<=?", (now_ms(),))
             db.execute("INSERT INTO sessions VALUES (?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), current["id"], now_ms() + SESSION_SECONDS * 1000))
             self.audit(db, current, "login")
-            return {"ok": True, "role": role, "name": current["name"]}, token, "set"
+            return {"ok": True, "role": role, "name": current["name"], "loginId": self.login_id(f"{COOKIE_NAME}={token}")}, token, "set"
 
-    def dispatch(self, method, path, body, cookie, ip, query=None):
+    def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None):
         """Return (JSON object or CSV bytes, optional session token, cookie action)."""
         if method == "POST" and path == "/api/login":
             return self.login(body, ip)
-        if method=='POST' and path=='/api/submission':return self.dispatch_submission(body,cookie)
+        if method=='POST' and path=='/api/submission':return self.dispatch_submission(body,cookie,expected_login_id)
         with self.db() as db:
             # Resolve write identities only after the lock: revocation may have committed while queued.
             if method=="POST":
                 db.execute("BEGIN IMMEDIATE")
             actor = self.account(db, cookie)
+            if (path in {"/api/team", "/api/submission", "/api/logout"} or path.startswith("/api/submission/")) and expected_login_id is not None and (not actor or expected_login_id != self.login_id(cookie)):
+                raise APIError(401, "登录身份已变化，请重新登录后操作")
             if self.submission_records.supports(path):return self.submission_records.dispatch(db,actor,method,path,body,query or {}),None,None
             if path.startswith('/api/admin/data/'):
                 parsed_cookie=SimpleCookie()
@@ -454,7 +467,7 @@ class EventService:
             if path.startswith(("/api/judging/","/api/admin/judging/")):
                 return self.judging.dispatch(db,actor,method,path,body), None, None
             if method == "GET" and path == "/api/session":
-                return {"role": actor["role"] if actor else None, "name": actor["name"] if actor else ""}, None, None
+                return {"role": actor["role"] if actor else None, "name": actor["name"] if actor else "", "loginId": self.login_id(cookie) if actor else None}, None, None
             if method == "GET" and path == "/api/board":
                 config = self.config(db)
                 return {"teams": self.teams(db), "config": config, "updatedAt": config["updatedAt"], "serverTime": now_ms()}, None, None
@@ -466,7 +479,8 @@ class EventService:
                         db.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),))
                     except (KeyError, ValueError, CookieError):
                         pass
-                return {"ok": True}, None, "clear"
+                # Revocation is authoritative. A late expiry header would erase a newer login's cookie.
+                return {"ok": True}, None, None
             if method == "GET" and path == "/api/judge":
                 self.require(actor, "judge")
                 scores = [{"teamId": r["team_id"], "scores": json.loads(r["scores_json"]), "feedback": r["feedback"], "status": r["status"]}
@@ -519,7 +533,7 @@ class EventService:
                 if not bound:
                     raise APIError(403, "队伍身份未绑定")
                 if method=="GET" and path=="/api/team":
-                    return self.team_submission_response(db, bound), None, None
+                    return {**self.team_submission_response(db, bound), "loginId": self.login_id(cookie)}, None, None
                 if method=="POST" and path=="/api/submission":
                     return self.save_submission(db, actor, bound, body), None, None
             if path.startswith("/api/admin"):
@@ -588,10 +602,11 @@ class EventService:
         if not team:raise APIError(403,'本账号未绑定队伍，请联系组织方')
         return team
 
-    def dispatch_submission(self,body,cookie):
+    def dispatch_submission(self,body,cookie,expected_login_id=None):
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
             actor=self.account(db,cookie);self.require(actor,'team')
+            if expected_login_id is not None and expected_login_id!=self.login_id(cookie):raise APIError(401,'登录身份已变化，请重新登录后操作')
             team=self.bound_submission_team(db,actor)
             result=self.submission_records.save(db,actor,team,body)
         if isinstance(result,APIError):raise result
@@ -891,7 +906,7 @@ class EventHandler(BaseHTTPRequestHandler):
                         peer = str(ipaddress.ip_address(proxy_ip))
                     except ValueError:
                         pass
-                value, token, cookie_action = service.dispatch(self.command, path, body, self.headers.get("Cookie", ""), peer,query=query)
+                value, token, cookie_action = service.dispatch(self.command, path, body, self.headers.get("Cookie", ""), peer,query=query,expected_login_id=self.headers.get("X-GOTC-Login"))
                 cookie = None
                 if cookie_action:
                     cookie = f"{COOKIE_NAME}={token or ''}; Path={service.base_path or '/'}; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS if cookie_action == 'set' else 0}"
