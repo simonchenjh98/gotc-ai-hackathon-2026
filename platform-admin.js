@@ -147,10 +147,10 @@ function installAdminData(data,version){
   document.querySelectorAll('[data-admin-jump]').forEach(button=>button.onclick=()=>document.getElementById(button.dataset.adminJump)?.scrollIntoView({behavior:'smooth',block:'start'}));
 
   async function refreshDirectory(){
-    const id=next('directory'),table=document.querySelector('.admin-team-table');
+    const id=next('directory'),table=document.querySelector('.admin-team-table'),submissionStamp=typeof submissionOverviewStamp==='function'?submissionOverviewStamp():null;
     try{
       const result=await api('admin');if(!fresh('directory',id,table))return;
-      ctx.data=result;adminEventData=result;
+      ctx.data=result;adminEventData=result;if(typeof updateSubmissionOverview==='function')updateSubmissionOverview(result,submissionStamp);
       const teamTotal=document.getElementById('admin-total-teams');
       const activeAudience=document.getElementById('admin-active-audience');
       if(teamTotal)teamTotal.textContent=String(result.teams.length);
