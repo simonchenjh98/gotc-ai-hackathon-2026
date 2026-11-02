@@ -117,6 +117,29 @@ class SubmissionAPITests(unittest.TestCase):
     def save(self, client, version=0, status='submitted', materials=None, **extra):
         return client.post('/api/submission',{'expectedVersion':version,'status':status,'materials':self.materials() if materials is None else materials,**extra})
 
+    def test_stale_tab_identity_cannot_read_write_or_logout_the_new_shared_cookie(self):
+        team_id = self.team()
+        old, access = self.access(team_id)
+        old_id = old.get('/api/session')[1]['loginId']
+        fresh = api_helpers.Client(self.server)
+        self.assertEqual(fresh.post('/api/login', {'role': 'team', 'code': access['code']})[0], 200)
+        current = fresh.get('/api/session')[1]
+        self.open_submissions()
+        for method, path, body in [('GET', '/api/team', None), ('POST', '/api/submission', {
+                'expectedVersion': 0, 'status': 'draft', 'materials': self.materials()}), ('POST', '/api/logout', {})]:
+            status, _, headers = fresh.request(method, path, body, headers={'X-GOTC-Login': old_id})
+            self.assertEqual(status, 401)
+            self.assertNotIn('Set-Cookie', headers)
+        self.assertEqual(fresh.get('/api/team')[1]['submission']['version'], 0)
+        self.assertEqual(fresh.get('/api/session')[1]['loginId'], current['loginId'])
+        status, _, _ = fresh.request('POST', '/api/submission', {
+            'expectedVersion': 0, 'status': 'draft', 'materials': self.materials()},
+            headers={'X-GOTC-Login': current['loginId']})
+        self.assertEqual(status, 200)
+        forged = api_helpers.Client(self.server)
+        forged.cookie = 'gotc_session=' + current['loginId']
+        self.assertIsNone(forged.get('/api/session')[1]['role'], 'public login identity must never be a bearer credential')
+
     def test_team_access_isolated_rotated_and_revoked_without_losing_materials(self):
         first=self.team(1,'Synthetic One')
         second=self.team(2,'Synthetic Two')

@@ -12,8 +12,8 @@ function fixture(storage=new Storage()){
   const root=node('platform-main'),setRoot=Object.getOwnPropertyDescriptor(root,'innerHTML').set;
   Object.defineProperty(root,'innerHTML',{get:()=>root.html || '',set(value){for(const n of nodes.values())if(n!==root)n.isConnected=false;nodes.clear();nodes.set(root.id,root);root.html=value;setRoot(value);const form=node('submission-form');form.elements={};for(const key of ['projectName','summary','codeUrl','codeVersion','readmeUrl','license','licenseUrl','demoUrl','demoInstructions','slidesUrl','videoUrl','sourcesAndLimitations','confirmed']){const field=node('material-'+key);field.value=data.submission.draft?.[key] || '';field.checked=key==='confirmed'?!!data.submission.draft?.confirmed:false;field.type=key==='confirmed'?'checkbox':'text';form.elements[key]=field;}const fieldset=node('fieldset');form.querySelector=selector=>selector==='fieldset'?fieldset:selector==='.form-error'?node('form-error'):null;form.querySelectorAll=selector=>selector==='input,textarea'?Object.values(form.elements):selector==='button'?[node('save-submission-draft')]:[];node('submission-preview').querySelectorAll=selector=>selector==='button'?[node('confirm-submission'),node('cancel-submission-preview')]:[];}});
   const response=(body,status=200)=>({ok:status<400,status,json:async()=>structuredClone(body)});
-  const fetch=async(url,options={})=>{const path=new URL(url).pathname.split('/api/')[1],body=options.body?JSON.parse(options.body):undefined;calls.push({path,body,method:options.method});if(hooks[path])return hooks[path](body);if(path==='team')return response(data);if(path==='logout')return response({ok:true});if(path==='submission'){const nextVersion=data.submission.version+1;data={...data,submission:{...data.submission,version:nextVersion,draft:body.materials,submitted:body.status==='submitted'?body.materials:data.submission.submitted,submittedVersion:body.status==='submitted'?nextVersion:data.submission.submittedVersion,submittedAt:1234,updatedAt:1234}};return response({ok:true,...data});}throw new Error(path);};
-  const context=vm.createContext({document:{getElementById:node},location:{href:'https://example.test/gotc/platform.html#team'},URL,TextEncoder,Intl,Date,Math,setTimeout,clearTimeout,AbortController,localStorage:storage,fetch,confirm:()=>true});vm.runInContext(helper,context);vm.runInContext(source+'\nrouteVersion=1;route="team";session={role:"team"};globalThis.render=()=>renderTeam(1);globalThis.current=()=>currentTeamRecovery;globalThis.invokeApi=api;globalThis.dirty=()=>submissionDirty;globalThis.logout=()=>{account();return document.getElementById("logout").listeners.click();};globalThis.seed=(teamId,summary,baseVersion=0,state="editing",at=Date.now())=>{const fields=materialFields.map(([key,,limit])=>[key,limit]),materials=Object.fromEntries(fields.map(([key])=>[key,key==="summary"?summary:""]));return GotcDraftRecovery.create({storage:()=>localStorage,namespace:base.pathname,teamId,baseVersion,baseMaterials:Object.fromEntries(fields.map(([key])=>[key,""])),fields,now:()=>at}).write(materials,state,state==="editing"?null:"draft");};renderRoute=async()=>{};',context);
+  const fetch=async(url,options={})=>{const path=new URL(url).pathname.split('/api/')[1],body=options.body?JSON.parse(options.body):undefined;calls.push({path,body,method:options.method,headers:options.headers});if(hooks[path])return hooks[path](body);if(path==='team')return response(data);if(path==='logout')return response({ok:true});if(path==='submission'){const nextVersion=data.submission.version+1;data={...data,submission:{...data.submission,version:nextVersion,draft:body.materials,submitted:body.status==='submitted'?body.materials:data.submission.submitted,submittedVersion:body.status==='submitted'?nextVersion:data.submission.submittedVersion,submittedAt:1234,updatedAt:1234}};return response({ok:true,...data});}throw new Error(path);};
+  const context=vm.createContext({document:{getElementById:node},location:{href:'https://example.test/gotc/platform.html#team'},URL,TextEncoder,Intl,Date,Math,setTimeout,clearTimeout,AbortController,localStorage:storage,fetch,confirm:()=>true});vm.runInContext(helper,context);vm.runInContext(source+'\nrouteVersion=1;route="team";session={role:"team"};globalThis.render=()=>renderTeam(1);globalThis.current=()=>currentTeamRecovery;globalThis.establish=login=>{publishLogin(login);session=login;};globalThis.invokeApi=api;globalThis.dirty=()=>submissionDirty;globalThis.logout=()=>{account();return document.getElementById("logout").listeners.click();};globalThis.seed=(teamId,summary,baseVersion=0,state="editing",at=Date.now())=>{const fields=materialFields.map(([key,,limit])=>[key,limit]),materials=Object.fromEntries(fields.map(([key])=>[key,key==="summary"?summary:""]));return GotcDraftRecovery.create({storage:()=>localStorage,namespace:base.pathname,teamId,baseVersion,baseMaterials:Object.fromEntries(fields.map(([key])=>[key,""])),fields,now:()=>at}).write(materials,state,state==="editing"?null:"draft");};renderRoute=async()=>{};',context);
   return {context,storage,nodes,node,root,calls,hooks,response,get data(){return data;},set data(next){data=next;},edit(key,value,event='input'){node('submission-form').elements[key].value=value;node('submission-form').listeners[event]();},inspect(index=0){return node('local-draft-candidates').querySelectorAll('[data-local-view]')[index].onclick();},slots(){return [...storage.map.values()].filter(value=>value.startsWith('{')).map(value=>JSON.parse(value));}};
 }
 test('authorized same-version recovery preserves raw strings, clears confirmation and never sends a POST',async()=>{
@@ -96,4 +96,52 @@ test('the first team GET is bound to epochs captured before the response, even w
 });
 test('the revoked tab may establish a new context only after explicit same-team login',async()=>{
   const storage=new Storage(),a=fixture(storage),b=fixture(storage);await a.context.render();await b.context.render();const old=b.context.current();await a.context.logout();old.storageChanged();await b.context.render();assert.equal(b.context.current(),old);vm.runInContext('session={role:"team"};',b.context);await b.context.render();assert.notEqual(b.context.current(),old);assert.equal(b.node('fieldset').disabled,false);b.edit('summary','EXPLICIT_RELOGIN');assert.equal(b.slots()[0].materials.summary,'EXPLICIT_RELOGIN');
+});
+
+for(const delivered of [false,true])test(`late logout cannot revoke a new same-team login when storage event ${delivered?'arrived':'is delayed'}`,async()=>{
+  const storage=new Storage(),a=fixture(storage),b=fixture(storage);
+  a.context.establish({role:'team',loginId:'old-login'});
+  b.context.establish({role:'team',loginId:'old-login'});
+  await a.context.render();await b.context.render();a.edit('summary','OLD_LOGIN');
+  const waiting=deferred();a.hooks.logout=()=>waiting.promise;const leaving=a.context.logout();
+  await new Promise(resolve=>setImmediate(resolve));assert.equal(a.calls.filter(call=>call.path==='logout').length,1,'logout was dispatched before new login');
+  b.context.establish({role:'team',loginId:'new-login'});await b.context.render();b.edit('summary','NEW_LOGIN_DRAFT');const snapshot=b.slots().find(record=>record.materials.summary==='NEW_LOGIN_DRAFT');
+  waiting.resolve(a.response({ok:true}));await leaving;if(delivered)b.context.current().storageChanged();
+  assert.ok(b.slots().some(record=>JSON.stringify(record)===JSON.stringify(snapshot)),'new login slot survives late logout');
+  assert.equal(b.node('material-summary').value,'NEW_LOGIN_DRAFT');assert.equal(b.node('fieldset').disabled,false);
+  b.edit('summary','NEW_LOGIN_CONTINUES');await b.node('save-submission-draft').onclick();
+  assert.equal(b.data.submission.draft.summary,'NEW_LOGIN_CONTINUES');assert.equal(b.node('fieldset').disabled,false);
+});
+
+test('explicit login stops a previously independent empty old tab even with delayed storage events',async()=>{
+  const storage=new Storage(),c=fixture(storage),a=fixture(storage);c.context.establish({role:'team',loginId:'independent-old'});await c.context.render();
+  a.context.establish({role:'team',loginId:'current-login'});await a.context.render();a.edit('summary','CURRENT');await a.context.logout();
+  c.edit('summary','OLD_TAB_MUST_NOT_RECREATE');await c.context.render();assert.equal(c.slots().length,0);assert.equal(c.node('fieldset').disabled,true);await c.node('save-submission-draft').onclick();assert.equal(c.calls.filter(call=>call.path==='submission').length,0);
+});
+test('ordinary session reads do not publish a new explicit login boundary',async()=>{
+  const storage=new Storage(),a=fixture(storage),b=fixture(storage),waiting=deferred();b.hooks.session=()=>waiting.promise;const reading=b.context.invokeApi('session');a.context.establish({role:'team',loginId:'new-login'});waiting.resolve(b.response({role:'team',loginId:'stale-login'}));
+  const restored=await reading;vm.runInContext('session={role:"team",loginId:"stale-login"};',b.context);
+  assert.equal(restored.loginId,'stale-login');assert.equal([...storage.map.values()][0],'new-login');await b.context.render();assert.equal(b.context.current(),null);assert.equal([...storage.map.values()][0],'new-login');
+});
+test('normal login logout removes legacy and current drafts, retains other teams, and terminal old login cannot reopen',async()=>{
+  const f=fixture();f.context.seed('T1','LEGACY');f.context.seed('T2','OTHER_TEAM');f.context.establish({role:'team',loginId:'normal-login'});await f.context.render();f.edit('summary','CURRENT_LOGIN');await f.context.logout();
+  assert.deepEqual(f.slots().map(record=>record.teamId),['T2']);vm.runInContext('session={role:"team",loginId:"normal-login"};',f.context);await f.context.render();assert.equal(f.node('fieldset').disabled,true);f.edit('summary','NO_REOPEN');assert.deepEqual(f.slots().map(record=>record.teamId),['T2']);
+});
+test('private requests carry the expected public login identity and failed logout preserves copies',async()=>{
+  const f=fixture();f.context.establish({role:'team',loginId:'failed-login'});await f.context.render();f.edit('summary','KEEP');f.hooks.logout=()=>f.response({error:'failed'},500);await f.context.logout();
+  assert.equal(f.slots().length,1);assert.equal(f.calls.filter(call=>call.path==='logout')[0].headers['X-GOTC-Login'],'failed-login');assert.equal(f.node('fieldset').disabled,false);
+});
+
+test('quota blocks publishing the new owner but server-confirmed login can still edit and manually save',async()=>{
+  const storage=new Storage(),f=fixture(storage);f.context.establish({role:'team',loginId:'old-owner'});storage.setItem=()=>{throw new Error('quota exceeded');};
+  f.context.establish({role:'team',loginId:'new-quota-login'});f.hooks.session=()=>f.response({role:'team',loginId:'new-quota-login'});await f.context.invokeApi('session');await f.context.render();f.edit('summary','MANUAL_AFTER_QUOTA_LOGIN');await f.node('save-submission-draft').onclick();
+  assert.equal(f.node('fieldset').disabled,false);assert.equal(f.data.submission.draft.summary,'MANUAL_AFTER_QUOTA_LOGIN');assert.equal(f.slots().length,0);
+});
+
+test('confirmed old logout still cleans its bound copies after an intervening 401 changes the local session',async()=>{
+  const f=fixture();f.context.establish({role:'team',loginId:'exiting-login'});await f.context.render();f.edit('summary','SENSITIVE_OLD_COPY');const waiting=deferred();f.hooks.logout=()=>waiting.promise;const leaving=f.context.logout();await new Promise(resolve=>setImmediate(resolve));
+  f.hooks.team=()=>f.response({error:'revoked'},401);await assert.rejects(f.context.invokeApi('team'));waiting.resolve(f.response({ok:true}));await leaving;assert.equal(f.slots().length,0);
+});
+test('exit-and-switch uses the same confirmed team cleanup flow',async()=>{
+  const f=fixture();f.context.establish({role:'team',loginId:'switch-login'});await f.context.render();f.edit('summary','SENSITIVE_SWITCH');vm.runInContext('renderWrongRole("judge");',f.context);await f.node('switch-role').onclick();assert.equal(f.slots().length,0);assert.equal(f.calls.filter(call=>call.path==='logout').length,1);
 });

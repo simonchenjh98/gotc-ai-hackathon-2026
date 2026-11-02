@@ -131,6 +131,47 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.admin.post("/api/logout", {})[0], 200)
         self.assertIsNone(self.admin.get("/api/session")[1]["role"])
 
+    def test_late_logout_response_preserves_new_login_cookie_and_identity(self):
+        old, invitation = self.invitation()
+        old_identity = old.get('/api/session')[1].get('loginId')
+        entered, release = threading.Event(), threading.Event()
+        dispatch = self.service.dispatch
+        outcome = []
+
+        def paused(method, path, *args, **kwargs):
+            result = dispatch(method, path, *args, **kwargs)
+            if path == '/api/logout':
+                entered.set()
+                if not release.wait(10):
+                    raise RuntimeError('Synthetic logout was not released')
+            return result
+
+        self.service.dispatch = paused
+        thread = threading.Thread(target=lambda: outcome.append(old.post('/api/logout', {})))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            fresh = Client(self.server)
+            status, login, _ = fresh.post('/api/login', {'role': 'judge', 'code': invitation['code']})
+            self.assertEqual(status, 200)
+            current = fresh.get('/api/session')[1]
+            release.set()
+            thread.join(5)
+        finally:
+            release.set()
+            thread.join(5)
+            self.service.dispatch = dispatch
+        status, _, headers = outcome[0]
+        self.assertEqual(status, 200)
+        self.assertNotIn('Set-Cookie', headers, 'late logout must not expire the shared new login cookie')
+        self.assertIsInstance(old_identity, str)
+        self.assertTrue(old_identity)
+        self.assertEqual(login['loginId'], current['loginId'])
+        self.assertNotEqual(old_identity, current['loginId'])
+        self.assertEqual(fresh.get('/api/session')[1]['loginId'], current['loginId'])
+        self.assertIsNone(old.get('/api/session')[1]['role'])
+        self.assertEqual(fresh.get('/api/judge')[0], 200)
+
     def test_score_threshold_average_recusal_edits_and_publication(self):
         team_id = self.team()
         self.open()

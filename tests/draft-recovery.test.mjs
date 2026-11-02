@@ -54,3 +54,18 @@ test('unchanged input and leaving do not advance edit time/revision or renew exp
 test('a replacement store inherits the original epoch and cannot adopt a later logout generation',()=>{
   const storage=new Storage(),writer=make(storage),expectedEpoch=writer.epoch;writer.write(raw);writer.purge();const inherited=make(storage,{expectedEpoch});assert.equal(inherited.epoch,expectedEpoch);assert.equal(inherited.revoked,true);assert.equal(inherited.write(raw),null);const newlyAuthorized=make(storage);assert.notEqual(newlyAuthorized.epoch,expectedEpoch);assert.ok(newlyAuthorized.write({...raw,summary:'EXPLICIT_NEW_AUTH'}));assert.equal(inherited.acknowledge(null),false);
 });
+
+test('login-scoped cleanup revokes its own writers and only exact historical snapshots',()=>{
+  const storage=new Storage(),historical=make(storage,{loginId:'historical-login'}),old=make(storage,{loginId:'old-login'});
+  historical.write({...raw,summary:'HISTORICAL'});old.write(raw);const captured=old.capturePurge();
+  const newer=make(storage,{loginId:'new-login'}),fresh=newer.write({...raw,summary:'NEW_LOGIN'});
+  historical.write({...raw,summary:'CHANGED_AFTER_CAPTURE'});assert.equal(old.purge(captured),true);
+  assert.ok(storage.getItem(fresh.key));assert.ok(historical.candidates().items.some(item=>item.record.materials.summary==='NEW_LOGIN'));
+  assert.ok(make(storage,{loginId:'new-login'}).candidates().items.some(item=>item.record.materials.summary==='CHANGED_AFTER_CAPTURE'));
+  assert.equal(old.write(raw),null);const reconstructed=make(storage,{loginId:'old-login'});assert.equal(reconstructed.revoked,true);assert.equal(reconstructed.write(raw),null);
+});
+test('failed deletion leaves revoked login records hidden and does not remove unrelated corrupt records',()=>{
+  const storage=new Storage(),old=make(storage,{loginId:'old-login'});old.write(raw);const captured=old.capturePurge();storage.setItem(old.prefix+'slot:corrupt','{bad');const remove=storage.removeItem.bind(storage);
+  storage.removeItem=()=>{throw new Error('cannot remove');};assert.equal(old.purge(captured),false);storage.removeItem=remove;
+  assert.equal(make(storage,{loginId:'new-login'}).candidates().items.length,0);assert.equal(storage.getItem(old.prefix+'slot:corrupt'),'{bad');
+});
