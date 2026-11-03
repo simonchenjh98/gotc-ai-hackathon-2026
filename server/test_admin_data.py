@@ -455,25 +455,25 @@ class AdminDataTests(unittest.TestCase):
         for stage in ['exhibition','roadshow']:
             self.roster(stage,[team_id],[invitation['id']])
             self.window(stage)
-        self.assertEqual(self.admin.post('/api/admin/settings',{
+        self.assertEqual(self.admin.settings({
             'submissionsOpen':True,'votingOpen':True,'scoringOpen':False})[0],200)
         self.assertTrue(audience.get('/api/audience')[1]['votingOpen'])
-        self.assertEqual(judge.post('/api/score',{'teamId':team_id,'scores':[0]*6,'status':'submitted'})[0],409)
+        self.assertEqual(judge.score({'teamId':team_id,'scores':[0]*6,'status':'submitted'})[0],409)
         self.window('exhibition',False)
         self.assertFalse(self.judge(judge,'exhibition')['window']['canEdit'])
         self.assertTrue(self.judge(judge,'roadshow')['window']['canEdit'])
         self.assertTrue(team_client.get('/api/team')[1]['window']['canEdit'])
         self.assertTrue(audience.get('/api/audience')[1]['votingOpen'])
-        self.assertEqual(self.admin.post('/api/admin/settings',{'submissionsOpen':False})[0],200)
+        self.assertEqual(self.admin.settings({'submissionsOpen':False})[0],200)
         self.assertTrue(self.judge(judge,'roadshow')['window']['canEdit'])
         self.assertTrue(audience.get('/api/audience')[1]['votingOpen'])
-        self.assertEqual(self.admin.post('/api/admin/settings',{'votingOpen':False,'scoringOpen':True})[0],200)
+        self.assertEqual(self.admin.settings({'votingOpen':False,'scoringOpen':True})[0],200)
         self.assertFalse(audience.get('/api/audience')[1]['votingOpen'])
         self.assertEqual(audience.post('/api/vote',{'teamId':team_id})[0],409)
         deadline=app.now_ms()+100000
         for stage in ['exhibition','roadshow']:
             self.window(stage,True,deadline)
-        self.assertEqual(self.admin.post('/api/admin/settings',{
+        self.assertEqual(self.admin.settings({
             'submissionsOpen':True,'submissionDeadline':deadline,'votingOpen':True,'votingDeadline':deadline})[0],200)
         for now,can_edit in [(deadline-1,True),(deadline,False),(deadline+1,False)]:
             with patch('app.now_ms',return_value=now):
@@ -493,7 +493,7 @@ class AdminDataTests(unittest.TestCase):
     def test_a_queued_audience_vote_rechecks_its_own_window_after_the_write_lock(self):
         team_id=self.team(track='AI for Science')
         audience,_=self.invitation('audience','Queued audience')
-        self.assertEqual(self.admin.post('/api/admin/settings',{'votingOpen':True,'votingDeadline':None})[0],200)
+        self.assertEqual(self.admin.settings({'votingOpen':True,'votingDeadline':None})[0],200)
         original_db=self.service.db
         queued=threading.Event()
         @contextmanager
@@ -603,7 +603,7 @@ class AdminDataTests(unittest.TestCase):
         issued=self.admin.post('/api/admin/team-access',{'teamId':team_id,'action':'issue'})[1]
         client=fixtures.Client(self.server)
         self.assertEqual(client.post('/api/login',{'role':'team','code':issued['code']})[0],200)
-        self.assertEqual(self.admin.post('/api/admin/settings',{'submissionsOpen':True})[0],200)
+        self.assertEqual(self.admin.settings({'submissionsOpen':True})[0],200)
         self.assertEqual(client.post('/api/submission',{'expectedVersion':0,'status':'submitted',
             'materials':test_submissions.SubmissionAPITests.materials(self,projectName='BACKUP_FORMAL_MATERIAL')})[0],200)
         for stage in ['exhibition','roadshow']:

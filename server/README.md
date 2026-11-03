@@ -27,7 +27,7 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 ## API 合同
 
-下列路径前统一加 `/gotc`（或配置的 base path）。JSON 写入使用 `Content-Type: application/json`，携带同源 Origin 和 Cookie。成功返回 200；错误为 `{ "error": "可读错误说明" }`。错误码包括 400 输入错误、401 未登录、403 身份或来源不符、404 不存在、409 状态冲突、413 超过端点请求上限、415 内容类型错误、429 登录限速。
+下列路径前统一加 `/gotc`（或配置的 base path）。JSON 写入使用 `Content-Type: application/json`，携带同源 Origin 和 Cookie。成功返回 200；错误为 `{ "error": "可读错误说明" }`。错误码包括 400 输入错误、401 未登录、403 身份或来源不符、404 不存在、409 状态冲突、413 超过端点请求上限、415 内容类型错误、429 登录限速、428 缺少必须的编辑版本。版本冲突响应附具体 `code`；旧页面不能省略版本盲写。
 
 | 方法与路径 | 身份 | 请求及响应 |
 |---|---|---|
@@ -36,11 +36,11 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 | GET `/api/session` | 公开 | `{role: null\|"admin"\|"judge"\|"audience"\|"team",name}` |
 | POST `/api/logout` | 任意 | `{}` → `{ok}`，删除当前会话 |
 | GET `/api/judge` | 评委 | `{teams,myScores,dimensions,scoringOpen,name}` |
-| POST `/api/score` | 评委 | `{teamId,scores:[六项数字],feedback,status:"draft"\|"submitted"\|"recused"}` → `{ok,status}` |
+| POST `/api/score` | 评委 | `{teamId,scores:[六项数字],feedback,status:"draft"\|"submitted"\|"recused",expectedRevision}` → `{ok,status,score}` |
 | GET `/api/audience` | 观众 | `{teams,votedTeamIds,voteLimit:3,votingOpen,name}` |
 | POST `/api/vote` | 观众 | `{teamId}` → `{ok,alreadyVoted}` |
 | GET `/api/admin` | 管理员 | `{teams,judges,audience,config,stats}` |
-| POST `/api/admin/settings` | 管理员 | `scoringOpen`/`resultsPublished`/`submissionsOpen`/`votingOpen` 布尔值、`minJudges` 1–50 整数、`submissionDeadline`/`votingDeadline` Unix 毫秒整数或 null，均可单独更新 → `{ok,config}` |
+| POST `/api/admin/settings` | 管理员 | `scoringOpen`/`resultsPublished`/`submissionsOpen`/`votingOpen` 布尔值、`minJudges` 1–50 整数、`submissionDeadline`/`votingDeadline` Unix 毫秒整数或 null，均可单独更新，必带对应组 `expectedRevisions` → `{ok,config}` |
 | POST `/api/admin/teams` | 管理员 | `{id?,number,name,project?,track?,status?,statusReason?,booth?,roadshowOrder?,expectedRevision?}` → `{ok,team}` |
 | POST `/api/admin/invitations` | 管理员 | `{role:"judge"\|"audience",name}` → `{id,name,code}`，只有创建响应返回明文码 |
 | POST `/api/admin/revoke` | 管理员 | `{role:"judge"\|"audience",id}` → `{ok}` |
@@ -64,9 +64,33 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 }
 ```
 
-`config` 包含 `scoringOpen`（默认 false）、`resultsPublished`（默认 true）、`minJudges`（默认 5）、`dimensions`、`updatedAt`、`voteLimit:3`、`audienceIncludedInScore:false`、`maxScore:100`。所有时间戳为 Unix 毫秒。评委 `myScores` 仅返回本人记录：`{teamId,scores,feedback,status}`；回避状态 scores 为空数组。
+`config` 包含 `scoringOpen`（默认 false）、`resultsPublished`（默认 true）、`minJudges`（默认 5）、`dimensions`、`updatedAt`、`voteLimit:3`、`audienceIncludedInScore:false`、`maxScore:100`。所有时间戳为 Unix 毫秒。评委 `myScores` 仅返回本人记录：`{teamId,scores,feedback,status,revision,updatedAt}`；回避状态 scores 为空数组。
 
 `judges` 每项为 `{id,name,submittedCount,active}`；`audience` 每项为 `{id,name,active}`；`stats` 包含 `teamCount`、`submittedScores`、`audienceVotes`。后台不返回邀请码哈希或明文。
+
+## 原专业评分与后台设置的编辑版本
+
+原六维权重、均分、回避、评分开关与已正式评分不能降为草稿的规则保持。`GET /api/judge` 返回每个本人评分的 `revision` 与 `updatedAt`；无记录时提交基线为 0，已有旧评分升级后从 1 开始。`POST /api/score` 必须带该评委对该队自己读到的 `expectedRevision`，草稿、正式提交、改分和回避共用同一版本。成功返回本次保存的完整 `score` 实体并加一，不能用另一次 GET 冒充本次结果。旧版本返回 `409/score_revision_conflict`，不写评分、版本或审计。
+
+仅管理接口的 `config.writeRevisions` 包含三个独立组：
+
+| 组 | 保护字段 |
+|---|---|
+| `scoring` | `scoringOpen,resultsPublished,minJudges` |
+| `submissions` | `submissionsOpen,submissionDeadline` |
+| `voting` | `votingOpen,votingDeadline` |
+
+例如关闭提交为 `{submissionsOpen:false,expectedRevisions:{submissions:2}}`。原平铺设置允许部分字段更新，但 `expectedRevisions` 必须恰好覆盖本次字段所属组；任一组过期返回 `409/settings_revision_conflict`，整批设置、版本与审计均不变。成功每个涉及组只加一，同值保存也加一，未涉及组不变。修改提交窗口不会使观众窗口的编辑基线过期。成功配置含各组最新版本，但前端仅推进本次提交组的基线，不替换其他正在编辑的表单。
+
+评分及设置的版本为非布尔 JSON 整数，范围 `0..9007199254740991`；缺版本返回 `428/revision_required`，类型、范围或多余设置组错误返回 400。当前版本已达上限时返回 `409/revision_exhausted`。请求鉴权、版本核对、字段校验、写入、版本推进与审计均在同一写事务内执行。评分审计只记录修订号、状态、总分及评语是否变动，不保存评语正文历史。
+
+`judge`、`score`、`admin`、`admin/settings` 支持已有 `X-GOTC-Login` 登录归属检查；提供的归属与实际 Cookie 会话不同返回 401。该公开标识不能作登录凭据。省略归属的 API 调用仍按 Cookie 身份鉴权，仍必须提供编辑版本。
+
+页面遇到冲突保留输入，先只读查看服务器最新值；只有明确确认载入后，才替换对应队伍或设置组的表单并采用新基线。查看、冲突或网络失败都不自动重发。更新前已打开的旧页面会收到 428，应先复制未保存输入，再刷新重新读取。
+
+首次升级独立创建私有 `before-write-conflicts-*.sqlite3` 整库备份，即使已有后台、提交历史迁移标记也不会跳过。备份失败停止启动；三个新 revision/meta 表、旧评分基线与三组初始版本在单事务中建立，失败回滚，重复及并发启动在写锁内核对完成标记。原 scores 七列和值保持不变。
+
+旧代码不维护这些版本，禁止新旧服务混跑写入；切回旧代码不代表并发保护仍有效。回退前须停止写入并核对数据。代码回退不会自动还原数据库；恢复旧备份会丢失备份后写入，仍须按现有恢复说明单独处理。
 
 ## 队伍提交 API
 

@@ -44,6 +44,23 @@ class Client:
     def post(self, path, body):
         return self.request("POST", path, body)
 
+    def settings(self,body):
+        """Explicit fresh-read helper for pre-existing non-conflict scenarios."""
+        response=self.get('/api/admin')
+        if response[0]!=200:return self.post('/api/admin/settings',body)
+        groups={'scoring':{'scoringOpen','resultsPublished','minJudges'},
+                'submissions':{'submissionsOpen','submissionDeadline'},'voting':{'votingOpen','votingDeadline'}}
+        revisions=response[1]['config']['writeRevisions']
+        expected={group:revisions[group] for group,keys in groups.items() if set(body) & keys}
+        return self.post('/api/admin/settings',{**body,'expectedRevisions':expected})
+
+    def score(self,body):
+        """Read a base explicitly; conflict tests use raw post with captured revisions."""
+        response=self.get('/api/judge')
+        if response[0]!=200:return self.post('/api/score',body)
+        record=next((row for row in response[1]['myScores'] if row['teamId']==body.get('teamId')),None)
+        return self.post('/api/score',{**body,'expectedRevision':record['revision'] if record else 0})
+
 
 class APITests(unittest.TestCase):
     def setUp(self):
@@ -87,7 +104,7 @@ class APITests(unittest.TestCase):
         return client, invitation
 
     def open(self):
-        self.assertEqual(self.admin.post("/api/admin/settings", {"scoringOpen": True})[0], 200)
+        self.assertEqual(self.admin.settings({"scoringOpen": True})[0], 200)
 
     def test_empty_start_and_bootstrap_secrets(self):
         status, board, _ = self.public.get("/api/board")
@@ -115,7 +132,7 @@ class APITests(unittest.TestCase):
             self.assertEqual(self.public.get(path)[0], 401)
         self.assertEqual(judge.get("/api/admin")[0], 403)
         self.assertEqual(judge.get("/api/audience")[0], 403)
-        self.assertEqual(judge.post("/api/admin/settings", {"scoringOpen": True})[0], 403)
+        self.assertEqual(judge.settings({"scoringOpen": True})[0], 403)
         self.assertEqual(self.admin.request("POST", "/api/admin/settings", {"scoringOpen": True}, origin=False)[0], 403)
         self.assertEqual(self.admin.request("POST", "/api/admin/settings", {"scoringOpen": True}, origin="https://attacker.invalid")[0], 403)
         self.assertEqual(self.admin.request("POST", "/api/admin/settings", {"scoringOpen": True}, headers={"Sec-Fetch-Site": "cross-site"})[0], 403)
@@ -180,7 +197,7 @@ class APITests(unittest.TestCase):
         eighty = [16, 16, 16, 12, 12, 8]
         sixty = [12, 12, 12, 9, 9, 6]
         def save(client, values, status="submitted"):
-            return client.post("/api/score", {"teamId": team_id, "scores": values, "feedback": "PRIVATE_FEEDBACK", "status": status})
+            return client.score({"teamId": team_id, "scores": values, "feedback": "PRIVATE_FEEDBACK", "status": status})
         self.assertEqual(save(judges[0], eighty, "draft")[0], 200)
         self.assertEqual(self.public.get("/api/board")[1]["teams"][0]["judgeCount"], 0)
         self.assertEqual(save(judges[0], eighty)[0], 200)
@@ -196,7 +213,7 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.public.get("/api/board")[1]["teams"][0]["score"], 92)
         self.assertEqual(save(judges[0], full, "draft")[0], 409)
         self.assertEqual(self.public.get("/api/board")[1]["teams"][0]["score"], 92)
-        self.assertEqual(judges[4].post("/api/score", {"teamId": team_id, "status": "recused"})[0], 200)
+        self.assertEqual(judges[4].score({"teamId": team_id, "status": "recused"})[0], 200)
         self.assertIsNone(self.public.get("/api/board")[1]["teams"][0]["score"])
         self.assertEqual(save(judges[4], full, "draft")[0], 200)
         self.assertIsNone(self.public.get("/api/board")[1]["teams"][0]["score"])
@@ -207,10 +224,10 @@ class APITests(unittest.TestCase):
         self.assertNotIn("PRIVATE_", public_serialized)
         self.assertNotIn("feedback", public_serialized)
         self.assertNotIn("scores_json", public_serialized)
-        self.assertEqual(self.admin.post("/api/admin/settings", {"resultsPublished": False})[0], 200)
+        self.assertEqual(self.admin.settings({"resultsPublished": False})[0], 200)
         self.assertIsNone(self.public.get("/api/board")[1]["teams"][0]["score"])
         self.assertEqual(self.admin.get("/api/admin")[1]["teams"][0]["score"], 92)
-        self.assertEqual(self.admin.post("/api/admin/settings", {"resultsPublished": True, "scoringOpen": False})[0], 200)
+        self.assertEqual(self.admin.settings({"resultsPublished": True, "scoringOpen": False})[0], 200)
         for state in ["submitted", "draft", "recused"]:
             self.assertEqual(save(judges[0], full, state)[0], 409)
         self.assertEqual(self.public.get("/api/board")[1]["teams"][0]["score"], 92)
@@ -222,14 +239,14 @@ class APITests(unittest.TestCase):
         bad_scores = [[0] * 5, [21, 0, 0, 0, 0, 0], [-0.1, 0, 0, 0, 0, 0], [0.01, 0, 0, 0, 0, 0], [True, 0, 0, 0, 0, 0], ["1", 0, 0, 0, 0, 0], [float("nan"), 0, 0, 0, 0, 0]]
         for values in bad_scores:
             with self.subTest(values=values):
-                self.assertEqual(judge.post("/api/score", {"teamId": team_id, "scores": values, "status": "submitted"})[0], 400)
-        self.assertEqual(judge.post("/api/score", {"teamId": team_id, "scores": [0.1, 0, 0, 0, 0, 0], "status": "submitted"})[0], 200)
-        self.assertEqual(judge.post("/api/score", {"teamId": "missing", "scores": [0] * 6, "status": "submitted"})[0], 404)
+                self.assertEqual(judge.score({"teamId": team_id, "scores": values, "status": "submitted"})[0], 400)
+        self.assertEqual(judge.score({"teamId": team_id, "scores": [0.1, 0, 0, 0, 0, 0], "status": "submitted"})[0], 200)
+        self.assertEqual(judge.score({"teamId": "missing", "scores": [0] * 6, "status": "submitted"})[0], 404)
         self.assertEqual(self.admin.post("/api/admin/teams", {"number": True, "name": "bad"})[0], 400)
         self.assertEqual(self.admin.post("/api/admin/teams", {"number": 1, "name": "duplicate"})[0], 409)
         for value in [0, 51, 101, True, 1.5, "5"]:
-            self.assertEqual(self.admin.post("/api/admin/settings", {"minJudges": value})[0], 400)
-        self.assertEqual(self.admin.post("/api/admin/settings", {"scoringOpen": "true"})[0], 400)
+            self.assertEqual(self.admin.settings({"minJudges": value})[0], 400)
+        self.assertEqual(self.admin.settings({"scoringOpen": "true"})[0], 400)
         self.assertEqual(self.admin.request("POST", "/api/login", raw=b"{")[0], 400)
         self.assertEqual(self.admin.request("POST", "/api/login", raw=b"[]")[0], 400)
         self.assertEqual(self.admin.request("POST", "/api/login", raw=b"{}", headers={"Content-Type": "text/plain"})[0], 415)
@@ -239,7 +256,7 @@ class APITests(unittest.TestCase):
         teams = [self.team(i + 1, f"队伍{i + 1}") for i in range(4)]
         audience, invitation = self.invitation("audience", "PRIVATE_AUDIENCE")
         self.assertEqual(audience.post("/api/vote", {"teamId": teams[0]})[0], 409)
-        self.assertEqual(self.admin.post("/api/admin/settings", {"votingOpen": True})[0], 200)
+        self.assertEqual(self.admin.settings({"votingOpen": True})[0], 200)
         with ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(lambda team: audience.post("/api/vote", {"teamId": team})[0], teams))
         self.assertEqual(results.count(200), 3)
@@ -253,7 +270,7 @@ class APITests(unittest.TestCase):
         self.assertEqual(sum(t["audienceVotes"] for t in board["teams"]), 3)
         self.assertTrue(all(t["score"] is None and t["judgeCount"] == 0 for t in board["teams"]))
         self.assertFalse(board["config"]["audienceIncludedInScore"])
-        self.assertEqual(audience.post("/api/score", {"teamId": selected, "scores": [0] * 6, "status": "submitted"})[0], 403)
+        self.assertEqual(audience.score({"teamId": selected, "scores": [0] * 6, "status": "submitted"})[0], 403)
         self.assertEqual(self.admin.post("/api/admin/revoke", {"role": "audience", "id": invitation["id"]})[0], 200)
         self.assertEqual(audience.get("/api/audience")[0], 401)
         self.assertEqual(sum(t["audienceVotes"] for t in self.public.get("/api/board")[1]["teams"]), 3)
@@ -262,10 +279,10 @@ class APITests(unittest.TestCase):
         ids = [self.team(i + 1, "=FORMULA" if i == 0 else f"Team{i}") for i in range(3)]
         judge, invitation = self.invitation(name="+JUDGE_FORMULA")
         self.open()
-        self.assertEqual(self.admin.post("/api/admin/settings", {"minJudges": 1})[0], 200)
+        self.assertEqual(self.admin.settings({"minJudges": 1})[0], 200)
         for i, team_id in enumerate(ids):
             scores = [20, 20, 20, 15, 15, 10 if i < 2 else 0]
-            self.assertEqual(judge.post("/api/score", {"teamId": team_id, "scores": scores, "status": "submitted", "feedback": "@FORMULA"})[0], 200)
+            self.assertEqual(judge.score({"teamId": team_id, "scores": scores, "status": "submitted", "feedback": "@FORMULA"})[0], 200)
         self.assertEqual([t["rank"] for t in self.public.get("/api/board")[1]["teams"]], [1, 1, 3])
         status, body, _ = self.admin.post("/api/admin/teams", {"id": ids[1], "number": 2, "name": "Updated", "project": "Real", "track": "城市与社区问题"})
         self.assertEqual(status, 200)

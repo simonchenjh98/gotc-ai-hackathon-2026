@@ -142,7 +142,7 @@ class ExactParentReleaseTests(unittest.TestCase):
         response, token, _ = service.dispatch('POST', '/api/login', {
             'role': 'team', 'code': access['code']}, '', '127.0.0.1')
         self.assertEqual(response['role'], 'team')
-        service.dispatch('POST', '/api/admin/settings', {'submissionsOpen': True}, cookie, '127.0.0.1')
+        service.dispatch('POST', '/api/admin/settings', {'submissionsOpen': True,'expectedRevisions':{'submissions':service.dispatch('GET','/api/admin',{},cookie,'127.0.0.1')[0]['config']['writeRevisions']['submissions']}}, cookie, '127.0.0.1')
         materials = {'projectName': 'NEW_FORMAL_PROJECT', 'summary': 'New synthetic material',
             'codeUrl': 'https://github.com/synthetic/repository', 'codeVersion': 'a'*40, 'readmeUrl': 'https://example.invalid/readme',
             'license': 'MIT', 'demoInstructions': 'Synthetic local demo',

@@ -87,10 +87,10 @@ class SharedLoginTests(unittest.TestCase):
             self.assertEqual(client.get("/api/session")[1]["role"], "judge")
         team_id = self.team()
         self.open()
-        self.assertEqual(self.admin.post("/api/admin/settings", {"minJudges": 2})[0], 200)
+        self.assertEqual(self.admin.settings({"minJudges": 2})[0], 200)
         scores_first, scores_second = [16, 16, 16, 12, 12, 8], [20, 20, 20, 15, 15, 10]
         for client, scores, feedback in [(first, scores_first, "First judge only"), (second, scores_second, "Second judge only")]:
-            self.assertEqual(client.post("/api/score", {"teamId": team_id, "scores": scores, "feedback": feedback, "status": "submitted"})[0], 200)
+            self.assertEqual(client.score({"teamId": team_id, "scores": scores, "feedback": feedback, "status": "submitted"})[0], 200)
         first_scores = first.get("/api/judge")[1]["myScores"]
         second_scores = second.get("/api/judge")[1]["myScores"]
         self.assertEqual(len(first_scores), 1)
@@ -107,9 +107,9 @@ class SharedLoginTests(unittest.TestCase):
         team_id = self.team()
         judge, invitation = self.invitation("judge", "Existing scored judge")
         self.open()
-        self.assertEqual(self.admin.post("/api/admin/settings", {"minJudges": 1})[0], 200)
+        self.assertEqual(self.admin.settings({"minJudges": 1})[0], 200)
         values = [16, 16, 16, 12, 12, 8]
-        self.assertEqual(judge.post("/api/score", {"teamId": team_id, "scores": values, "feedback": "Keep this real score", "status": "submitted"})[0], 200)
+        self.assertEqual(judge.score({"teamId": team_id, "scores": values, "feedback": "Keep this real score", "status": "submitted"})[0], 200)
         self.configure_shared_codes()
         self.login_admin()
         self.assertEqual(self.public.get("/api/board")[1]["teams"][0]["score"], 80)

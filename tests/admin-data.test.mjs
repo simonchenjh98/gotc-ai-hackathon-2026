@@ -235,7 +235,7 @@ function teamHarness(fetch,directoryOverrides={}){
     'new-code':{innerHTML:'',insertAdjacentHTML(_position,html){this.innerHTML+=html;},querySelectorAll:()=>[]}};
   const root={isConnected:true,insertAdjacentHTML(){},querySelectorAll:()=>[]};elements['platform-main']=root;
   entry.querySelector=selector=>selector==='.form-grid'?{insertAdjacentHTML(){}}:selector==='.form-error'?entry.error:entry.button;
-  const eventData={config:{votingOpen:false,votingDeadline:null},teams:[
+  const eventData={config:{votingOpen:false,votingDeadline:null,writeRevisions:{scoring:0,submissions:0,voting:0}},teams:[
     {id:'T1',number:1,name:'Stored A',track:'AI for Science',revision:7},
     {id:'T2',number:2,name:'Stored B',track:'AI for Science',revision:10}],judges:[],audience:[],trackOptions:['AI for Science'],...directoryOverrides};
   elements['settings-form'].elements.scoringOpen={checked:true};elements['settings-form'].elements.resultsPublished={checked:true};elements['settings-form'].onsubmit=()=>{elements['settings-form'].originalHandlerCalled=true;};
@@ -363,12 +363,12 @@ test('directory refresh updates team and active-audience summaries while preserv
 
 test('admin tools retain professional settings and use an independent audience settings form',async()=>{
   const requests=[];
-  const h=teamHarness(async(url,options)=>{requests.push({path:url.pathname,body:options.body?JSON.parse(options.body):null});return ok({ok:true});});
+  const h=teamHarness(async(url,options)=>{requests.push({path:url.pathname,body:options.body?JSON.parse(options.body):null});return ok({ok:true,config:{writeRevisions:{scoring:0,submissions:0,voting:1}}});});
   const professional=h.elements['settings-form'],audience=h.elements['audience-settings'];
   assert.equal(professional.elements.minJudges.value,'5');assert.equal(professional.elements.scoringOpen.checked,true);assert.equal(professional.elements.resultsPublished.checked,true);
   professional.onsubmit();assert.equal(professional.originalHandlerCalled,true,'The existing professional submit handler must survive admin extensions');
   audience.elements.votingOpen.checked=true;audience.onsubmit({preventDefault(){}});await wait();
-  assert.deepEqual(requests,[{path:'/api/admin/settings',body:{votingOpen:true,votingDeadline:null}}]);
+  assert.deepEqual(requests,[{path:'/api/admin/settings',body:{votingOpen:true,votingDeadline:null,expectedRevisions:{voting:0}}}]);
   assert.equal(professional.elements.minJudges.value,'5');assert.equal(professional.elements.scoringOpen.checked,true);
   assert.match(audience.innerHTML,/name="votingOpen"/);assert.match(audience.innerHTML,/name="votingDeadline"/);assert(!audience.innerHTML.includes('name="scoringOpen"'));
 });

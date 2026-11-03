@@ -104,7 +104,7 @@ class SubmissionAPITests(unittest.TestCase):
         return client,access
 
     def open_submissions(self, **settings):
-        result=self.admin.post('/api/admin/settings',{'submissionsOpen':True,**settings})
+        result=self.admin.settings({'submissionsOpen':True,**settings})
         self.assertEqual(result[0],200,result[1])
 
     def materials(self, **changes):
@@ -228,14 +228,14 @@ class SubmissionAPITests(unittest.TestCase):
             with patch('app.now_ms',return_value=current):
                 self.assertFalse(client.get('/api/team')[1]['window']['canEdit'])
                 self.assertEqual(self.save(client,1)[0],409)
-        self.assertEqual(self.admin.post('/api/admin/settings',{'scoringOpen':True})[0],200)
-        self.assertEqual(self.admin.post('/api/admin/settings',{'submissionsOpen':False})[0],200)
+        self.assertEqual(self.admin.settings({'scoringOpen':True})[0],200)
+        self.assertEqual(self.admin.settings({'submissionsOpen':False})[0],200)
         self.assertEqual(self.save(client,1)[0],409)
         self.open_submissions(submissionDeadline=deadline+200000)
         self.assertEqual(self.save(client,1)[0],200)
         before=self.admin.get('/api/admin')[1]['config']
         for value in [True,'tomorrow',-1,1.5,253402300800000]:
-            self.assertEqual(self.admin.post('/api/admin/settings',{'scoringOpen':False,'submissionDeadline':value})[0],400)
+            self.assertEqual(self.admin.settings({'scoringOpen':False,'submissionDeadline':value})[0],400)
             self.assertEqual(self.admin.get('/api/admin')[1]['config'],before)
 
     def test_material_validation_origin_and_body_limit(self):

@@ -56,6 +56,10 @@ class SubmissionRecordsReleaseTests(unittest.TestCase):
         return app.EventService(data_dir=data,origin='http://127.0.0.1',static_root=self.public)
 
     def call(self,service,method,path,body=None,cookie='',query=None):
+        if method=='POST' and path=='/api/admin/settings':
+            revisions=service.dispatch('GET','/api/admin',{},cookie,'127.0.0.1')[0]['config']['writeRevisions']
+            groups={'scoring':{'scoringOpen','resultsPublished','minJudges'},'submissions':{'submissionsOpen','submissionDeadline'},'voting':{'votingOpen','votingDeadline'}}
+            body={**body,'expectedRevisions':{group:revisions[group] for group,keys in groups.items() if set(body) & keys}}
         return service.dispatch(method,path,body or {},cookie,'127.0.0.1',query=query)[0]
 
     def materials(self,**changes):
