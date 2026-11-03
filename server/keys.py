@@ -749,6 +749,9 @@ class KeyService:
                 not isinstance(t, dict) or ("type" in t and not str(t["type"]).startswith(CLIENT_TOOL_TYPES)) for t in tools):
             # Server-side tools are billed by the upstream outside token usage, so they would escape team budgets.
             raise APIError(400, "本活动不开放上游服务端工具（网页搜索、代码执行、MCP 等），请在客户端实现工具")
+        if body.get("n", 1) != 1 or "best_of" in body:
+            # Several completions per call multiply output cost beyond the reservation; one reply per request.
+            raise APIError(400, "本活动每次请求只生成一条回复（n 必须为 1，不支持 best_of）")
         for field in PRICING_FIELDS:
             body.pop(field, None)
         call["stream"] = stream = body.get("stream") is True

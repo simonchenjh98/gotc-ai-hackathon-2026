@@ -505,6 +505,11 @@ class GatewayTests(unittest.TestCase):
         self.call("/v1/chat/completions", {"model": "cheap", "max_completion_tokens": "lots"}, key)
         self.assertEqual(FakeUpstream.calls[-1][2]["max_completion_tokens"], keys.RESERVE_OUTPUT_CAP)  # non-integer
         self.assertNotIn("max_tokens", FakeUpstream.calls[-1][2])  # existing field used, none added
+        before = len(FakeUpstream.calls)
+        for body in [{"model": "cheap", "n": 4}, {"model": "cheap", "n": "2"}, {"model": "cheap", "best_of": 3}]:
+            self.assertEqual(self.call("/v1/chat/completions", body, key)[0], 400, body)
+        self.assertEqual(len(FakeUpstream.calls), before)  # multi-completion requests never reach the upstream
+        self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap", "n": 1}, key)[0], 200)
         self.assertEqual(self.admin.post("/api/admin/keys/settings", {"dailyBudget": 0.05})[0], 200)
         service = self.service.keys
         service.reserved[team_id] = 49_000  # $0.049 already held by another request in flight
