@@ -244,3 +244,17 @@ python3 -m py_compile server/app.py server/test_api.py
 只有授权读取本队后才列候选。恢复前再次读取服务器；同版且窗口开放时可主动填回，仍需核对和手动保存。服务器变版、窗口关闭或发送结果不明时只比较／复制；来源副本保留，不能把相同内容当成功回执。新输入或另一标签的副本不随旧请求成功一起删除。读取／配额／清理失败会提示，手动服务器保存仍可进行；离页提醒保持。
 
 成功退出前重新确认当前队伍，退出成功后切换本队本地清理代次并清理旧副本，旧标签停止写入；会话到期、关页、刷新不等同退出，不自动删除。共享设备请显式退出；如浏览器阻止本地清理，按提示清除此站点数据。此功能不改服务器数据库、正式材料或评审快照。
+
+## 精确请求回执、正式历史与人工访问记录
+
+`POST /api/submission` 新增可选 `requestId`（16–128位 ASCII 字母、数字、下划线或连字符）。新操作生成新编号，不自动重发。原始 `{expectedVersion,status,materials}` 以排序JSON指纹绑定编号；同队同ID同指纹回放原结果，不增版、不追加审计或历史；同ID不同内容为409 `request_id_conflict`。旧客户端省略编号时服务端生成，保留原保存流程，但丢响应后不知道编号。
+
+成功响应在原投影外增加 `receipt` 与 `replayed`。精确回执为 `{requestId,status:"succeeded",action,baseVersion,version,savedAt,materials,historyVersion}`；材料、版号、时间是那一次的不可变结果，外层队伍投影仍可能已推进。草稿 historyVersion 为 null，正式提交等于此次编辑版。
+
+队伍 `GET /api/submission/requests/{id}` 仅查询本队，返回成功回执，或 `{requestId,status:"rejected",action,baseVersion,error:{status,code,message},decidedAt}`，或 `{requestId,status:"not_found"}`，查询本身为200。未找到不证明失败，可能仍在途，不自动重发。材料、窗口、版号拒绝分别记录 `materials_invalid/submission_closed/version_conflict` 终态后返回原400/409；修正后用新编号。401/403、非法ID或顶层信封不占编号。写锁后才鉴权；停用或轮换前的旧会话不能借编号读取或重放。
+
+历史列表 `GET /api/submission/history?beforeVersion=N&limit=20` 返回 `{items,nextBeforeVersion}`，版号倒序且不含边界，默认20、最多50。列表项为 `{version,submittedAt,requestId,origin,codeVersion,projectName}`，不含全文；详情 `/api/submission/history/{version}` 返回版本元数据和完整 `materials`。管理员同形路径 `/api/admin/submissions/{teamId}/history[/version]`；不扩大评委或公开权限。只记录成功正式提交；旧库每队只补当前真实一份为 `legacy_current/requestId=null`，不推造早期版本。历史保存字段和URL，不归档外部文件。
+
+管理员 `GET /api/admin/submissions/{teamId}/checks?version=N` 返回 `{teamId,version,latestVersion,items}`；每项 `{field,url,status,revision,checkedAt,actor,note}`。仅生成非空代码/README/许可证/演示/幻灯片/视频链接，地址来自不可变历史。POST同一路径接收 `{version,field,expectedRevision,status,note}`；备注最多500字，状态 `unchecked/accessible/permission_required/unavailable`。仅当前正式版可写，每项独立并发修订；版号推进或修订冲突均409。操作者与记录时间由服务器产生。新正式版默认未检查，旧版只读，即使地址相同也不复制。人工记录仅反映当时观察，不证明作品合格或永久可访问，不自动抓取或通知。
+
+新增请求账本、正式历史、人工检查和迁移元数据表。非空升级先创建私有 `before-submission-records-*.sqlite3` SQLite整库备份；备份失败停止启动。DDL、真实当前正式回填与标记独立原子提交，失败全部回滚，重复启动幂等。旧代码回退期间不维护新记录，再升级只补当时仍保有的当前正式一份并保留缺口，不虚构请求回执、不覆盖已有历史。代码回退不恢复数据库，不自动覆盖现库；整库SQLite备份恢复包含新表。私有临时库演练不代表生产迁移或部署。

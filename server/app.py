@@ -22,6 +22,7 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 from errors import APIError
+from submission_records import SubmissionRecords, query_path
 from judging import JudgingService
 from admin_data import AdminDataService, TRACK_OPTIONS
 
@@ -199,6 +200,7 @@ class EventService:
             if not isinstance(value, str) or not 6 <= len(value) <= 160 or value != value.strip():
                 raise ValueError("Shared login codes must contain 6 to 160 characters")
         self.db_path = self.data_dir / "event.sqlite3"
+        database_existed=self.db_path.exists()
         self.rate_lock = threading.Lock()
         self.login_attempts = defaultdict(deque)
         self.login_kdf_slots = threading.BoundedSemaphore(LOGIN_KDF_CONCURRENCY)
@@ -206,6 +208,7 @@ class EventService:
             history=lambda *args,**kwargs:self.admin_data.record_review_change(*args,**kwargs),
             enrich_team=lambda db,team:self.admin_data.enrich_team(db,team))
         self.admin_data=AdminDataService(self)
+        self.submission_records=SubmissionRecords(self)
         self.admin_data.backup_before_upgrade()
         self.migrate_accounts()
         with self.db() as db:
@@ -245,6 +248,7 @@ class EventService:
             os.replace(temporary, access_file)
             os.chmod(access_file, 0o600)
         os.chmod(self.db_path, 0o600)
+        self.submission_records.initialize(backup=database_existed)
 
     def migrate_accounts(self):
         """Rebuild only the legacy role CHECK; preserve IDs and referencing tables."""
@@ -444,13 +448,15 @@ class EventService:
         """Return (JSON object or CSV bytes, optional session token, cookie action)."""
         if method == "POST" and path == "/api/login":
             return self.login(body, ip)
+        if method=='POST' and path=='/api/submission':return self.dispatch_submission(body,cookie,expected_login_id)
         with self.db() as db:
             # Resolve write identities only after the lock: revocation may have committed while queued.
             if method=="POST":
                 db.execute("BEGIN IMMEDIATE")
             actor = self.account(db, cookie)
-            if path in {"/api/team", "/api/submission", "/api/logout"} and expected_login_id is not None and (not actor or expected_login_id != self.login_id(cookie)):
+            if (path in {"/api/team", "/api/submission", "/api/logout"} or path.startswith("/api/submission/")) and expected_login_id is not None and (not actor or expected_login_id != self.login_id(cookie)):
                 raise APIError(401, "登录身份已变化，请重新登录后操作")
+            if self.submission_records.supports(path):return self.submission_records.dispatch(db,actor,method,path,body,query or {}),None,None
             if path.startswith('/api/admin/data/'):
                 parsed_cookie=SimpleCookie()
                 try:parsed_cookie.load(cookie)
@@ -591,6 +597,21 @@ class EventService:
                     return ("\ufeff" + output.getvalue()).encode("utf-8"), None, None
             raise APIError(404, "接口不存在")
 
+    def bound_submission_team(self,db,actor):
+        team=db.execute('SELECT t.* FROM teams t JOIN team_accounts b ON b.team_id=t.id WHERE b.account_id=?',(actor['id'],)).fetchone()
+        if not team:raise APIError(403,'本账号未绑定队伍，请联系组织方')
+        return team
+
+    def dispatch_submission(self,body,cookie,expected_login_id=None):
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            actor=self.account(db,cookie);self.require(actor,'team')
+            if expected_login_id is not None and expected_login_id!=self.login_id(cookie):raise APIError(401,'登录身份已变化，请重新登录后操作')
+            team=self.bound_submission_team(db,actor)
+            result=self.submission_records.save(db,actor,team,body)
+        if isinstance(result,APIError):raise result
+        return result,None,None
+
     def submission_window(self, db, current=None):
         config=self.config(db)
         current=now_ms() if current is None else current
@@ -697,10 +718,10 @@ class EventService:
         materials=self.check_materials(body["materials"], submitted)
         current=now_ms()
         if not self.submission_window(db, current)["canEdit"]:
-            raise APIError(409, "作品提交尚未开放或已截止，当前材料只读")
+            raise APIError(409, "作品提交尚未开放或已截止，当前材料只读", "submission_closed")
         previous=self.submission(db, team["id"])
         if body["expectedVersion"]!=previous["version"]:
-            raise APIError(409, "材料已被其他页面更新。当前输入已保留，请重新读取并合并后再保存")
+            raise APIError(409, "材料已被其他页面更新。当前输入已保留，请重新读取并合并后再保存", "version_conflict")
         encoded=json.dumps(materials, ensure_ascii=False, sort_keys=True)
         version=previous["version"]+1
         db.execute("""INSERT INTO submissions VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(team_id) DO UPDATE SET
@@ -845,7 +866,7 @@ class EventHandler(BaseHTTPRequestHandler):
             path = path[len(service.base_path):] if service.base_path else path
             query={}
             if parsed.query:
-                if self.command!='GET' or not path.startswith('/api/admin/data/'):
+                if self.command!='GET' or not (path.startswith('/api/admin/data/') or query_path(path)):
                     raise APIError(400,'此接口不接受查询参数')
                 try:
                     params=parse_qs(parsed.query,keep_blank_values=True,strict_parsing=True,max_num_fields=20,encoding='utf-8',errors='strict')
@@ -917,7 +938,7 @@ class EventHandler(BaseHTTPRequestHandler):
                 raise APIError(405, "请求方法不支持")
         except APIError as error:
             self.close_connection = True
-            self.respond(error.status, {"error": error.message})
+            self.respond(error.status, {"error":error.message,**({"code":error.code} if error.code else {}),**({"requestId":error.request_id} if hasattr(error,'request_id') else {})})
         except sqlite3.IntegrityError:
             self.respond(409, {"error": "队号或记录已存在，请刷新后核对"})
         except (BrokenPipeError, ConnectionResetError, TimeoutError):

@@ -125,12 +125,16 @@ class SubmissionAPITests(unittest.TestCase):
         self.assertEqual(fresh.post('/api/login', {'role': 'team', 'code': access['code']})[0], 200)
         current = fresh.get('/api/session')[1]
         self.open_submissions()
-        for method, path, body in [('GET', '/api/team', None), ('POST', '/api/submission', {
+        for method, path, body in [('GET', '/api/team', None), ('GET', '/api/submission/requests/unknown-request-0001', None),
+                ('GET', '/api/submission/history', None), ('GET', '/api/submission/history/1', None), ('POST', '/api/submission', {
                 'expectedVersion': 0, 'status': 'draft', 'materials': self.materials()}), ('POST', '/api/logout', {})]:
             status, _, headers = fresh.request(method, path, body, headers={'X-GOTC-Login': old_id})
             self.assertEqual(status, 401)
             self.assertNotIn('Set-Cookie', headers)
         self.assertEqual(fresh.get('/api/team')[1]['submission']['version'], 0)
+        with self.service.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM submission_requests').fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM submission_history').fetchone()[0], 0)
         self.assertEqual(fresh.get('/api/session')[1]['loginId'], current['loginId'])
         status, _, _ = fresh.request('POST', '/api/submission', {
             'expectedVersion': 0, 'status': 'draft', 'materials': self.materials()},

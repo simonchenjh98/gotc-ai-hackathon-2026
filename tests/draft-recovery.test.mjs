@@ -51,6 +51,10 @@ test('disabled storage and quota failures never claim persistence and do not thr
 test('unchanged input and leaving do not advance edit time/revision or renew expiry',()=>{
   const storage=new Storage();let tick=1000;const writer=make(storage,{now:()=>tick});const first=writer.write(raw);tick=2000;const unchanged=writer.write({...raw});assert.equal(unchanged.record.updatedAt,1000);assert.equal(unchanged.record.localRevision,first.record.localRevision);const pending=writer.write(raw,'pending','draft');assert.equal(pending.record.updatedAt,1000);assert.ok(pending.record.localRevision>first.record.localRevision);
 });
+test('request id stays bound through unknown and exact acknowledgement rejects a changed request identity',()=>{
+  const storage=new Storage(),writer=make(storage),requestId='request-1234567890',sent=writer.write(raw,'pending','submitted',requestId);assert.equal(sent.record.request.requestId,requestId);writer.result(sent,'unknown');assert.equal(make(storage).candidates().items[0].record.request.requestId,requestId);const changed=JSON.parse(storage.getItem(sent.key));changed.request.requestId='another-request-123456';storage.setItem(sent.key,JSON.stringify(changed));assert.equal(writer.acknowledge(sent),false);assert.ok(storage.getItem(sent.key));
+  changed.request.requestId=1234567890123456;storage.setItem(sent.key,JSON.stringify(changed));assert.equal(make(storage).candidates().items.length,0);
+});
 test('a replacement store inherits the original epoch and cannot adopt a later logout generation',()=>{
   const storage=new Storage(),writer=make(storage),expectedEpoch=writer.epoch;writer.write(raw);writer.purge();const inherited=make(storage,{expectedEpoch});assert.equal(inherited.epoch,expectedEpoch);assert.equal(inherited.revoked,true);assert.equal(inherited.write(raw),null);const newlyAuthorized=make(storage);assert.notEqual(newlyAuthorized.epoch,expectedEpoch);assert.ok(newlyAuthorized.write({...raw,summary:'EXPLICIT_NEW_AUTH'}));assert.equal(inherited.acknowledge(null),false);
 });

@@ -18,6 +18,7 @@
           || typeof value.writerId!=='string' || !Number.isSafeInteger(value.localRevision) || value.localRevision<1 || !Number.isSafeInteger(value.baseVersion) || value.baseVersion<0
           || !Number.isSafeInteger(value.updatedAt) || value.updatedAt<0 || typeof value.epoch!=='string' || (value.loginId!==undefined && typeof value.loginId!=='string') || !['editing','pending','unknown','conflict'].includes(value.state)
           || !validMaterials(value.materials) || !validMaterials(value.baseMaterials))return null;
+      if(value.request?.requestId!==undefined && (typeof value.request.requestId!=='string' || !/^[A-Za-z0-9_-]{16,128}$/.test(value.request.requestId)))return null;
       if(value.state!=='editing' && (!object(value.request) || !['draft','submitted'].includes(value.request.action) || value.request.revision!==value.localRevision || value.request.baseVersion!==value.baseVersion))return null;
       return {key,raw,record:value};
     }
@@ -36,14 +37,14 @@
       if(!read(key,raw))return fail();
       try{const target=access();target.setItem(key,raw);if((target.getItem(epochKey) || '')!==epoch){if(target.getItem(key)===raw)target.removeItem(key);checkEpoch();return null;}error='';return {key,raw,record};}catch{return fail();}
     }
-    function write(materials,state='editing',action=null){
+    function write(materials,state='editing',action=null,requestId=null){
       if(!validMaterials(materials))return fail();
       if(!checkEpoch())return null;
       let previous=null;try{previous=read(prefix+'slot:'+activeId,access().getItem(prefix+'slot:'+activeId));}catch{return fail();}
       const same=previous && previous.record.baseVersion===baseVersion && fields.every(([key])=>previous.record.materials[key]===materials[key]);
       if(state==='editing' && same && previous.record.state==='editing'){error='';return previous;}
       const nextRevision=++revision,record={schema:1,id:activeId,writerId,teamId,loginId,epoch,localRevision:nextRevision,baseVersion,baseMaterials:{...baseMaterials},materials:{...materials},updatedAt:same?previous.record.updatedAt:now(),state};
-      if(state!=='editing')record.request={action,revision:nextRevision,baseVersion};return put(record);
+      if(state!=='editing')record.request={action,revision:nextRevision,baseVersion,...(requestId?{requestId}:{})};return put(record);
     }
     function result(sent,state){
       if(!sent || !checkEpoch())return false;
@@ -52,7 +53,7 @@
     }
     function acknowledge(sent){
       if(!sent || !checkEpoch())return false;
-      try{const target=access(),current=read(sent.key,target.getItem(sent.key));if(!current || (current.record.loginId || '')!==loginId || current.record.epoch!==epoch || current.record.localRevision!==sent.record.localRevision || current.record.writerId!==writerId || JSON.stringify(current.record.materials)!==JSON.stringify(sent.record.materials))return false;
+      try{const target=access(),current=read(sent.key,target.getItem(sent.key));if(!current || (current.record.loginId || '')!==loginId || current.record.epoch!==epoch || current.record.localRevision!==sent.record.localRevision || current.record.writerId!==writerId || current.record.request?.requestId!==sent.record.request?.requestId || JSON.stringify(current.record.materials)!==JSON.stringify(sent.record.materials))return false;
         if(target.getItem(sent.key)!==current.raw)return false;target.removeItem(sent.key);error='';return true;}catch{fail();return false;}
     }
     function discard(snapshot){if(!checkEpoch())return false;try{const target=access();if(!snapshot || !snapshot.key.startsWith(prefix+'slot:') || target.getItem(snapshot.key)!==snapshot.raw)return false;target.removeItem(snapshot.key);error='';return true;}catch{fail();return false;}}
