@@ -379,6 +379,43 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(len(FakeUpstream.calls), before)
         self.assertEqual(self.call("/v1/messages", {"model": "claude-x", "tools": [{"name": "Read", "input_schema": {}}]}, key)[0], 200)
 
+    def test_review_hardening(self):
+        team_id, client, key = self.enabled_key()
+        ok = lambda body, **kw: self.call("/v1/messages", {"model": "claude-x", **body}, key, **kw)[0]
+        # Only client-run tools pass; upstream-billed extras are refused.
+        self.assertEqual(ok({"tools": [{"type": "bash_20250124", "name": "bash"}, {"name": "Read", "input_schema": {}}]}), 200)
+        for body in [{"tools": [{"type": "tool_search_tool_regex_20251119", "name": "s"}]}, {"tools": ["x"]},
+                     {"web_search_options": {}}, {"container": "c"}]:
+            self.assertEqual(ok(body), 400, body)
+        # Billed betas are stripped, others forwarded.
+        ok({}, headers={"anthropic-beta": "claude-code-20250219, context-1m-2025-08-07,files-api-2025-04-14"})
+        self.assertEqual(FakeUpstream.calls[-1][1]["Anthropic-Beta"], "claude-code-20250219")
+        # Blocklist covers every field, e.g. tool descriptions.
+        self.admin.post("/api/admin/keys/settings", {"blockedWords": ["越狱"]})
+        self.assertEqual(ok({"tools": [{"name": "t", "description": "越狱工具"}]}), 403)
+        self.admin.post("/api/admin/keys/settings", {"blockedWords": []})
+        # 500 may already be billed upstream: not retried. 529 is retried.
+        FakeUpstream.status = 500
+        before = len(FakeUpstream.calls)
+        self.assertEqual(ok({}), 502)
+        self.assertEqual(len(FakeUpstream.calls) - before, 1)
+        FakeUpstream.status = 200
+        # Saved upstream key is not reused for a different host.
+        moved = {"openai": {"url": "https://evil.example/v1", "key": "", "models": {"cheap": [1, 2]}}}
+        self.assertEqual(self.admin.post("/api/admin/keys/upstreams", {"upstreams": moved})[0], 400)
+        same_host = {"openai": {**self.upstreams["openai"], "key": ""}, "anthropic": {**self.upstreams["anthropic"], "key": ""}}
+        self.assertEqual(self.admin.post("/api/admin/keys/upstreams", {"upstreams": same_host})[0], 200)
+        # Keys stop with the team: withdrawn status, then revoked team login.
+        with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
+            db.execute("UPDATE team_details SET status='withdrawn', status_reason='退赛' WHERE team_id=?", (team_id,))
+            db.commit()
+            self.assertEqual(ok({}), 401)
+            db.execute("UPDATE team_details SET status='active' WHERE team_id=?", (team_id,))
+            db.commit()
+        self.assertEqual(ok({}), 200)
+        self.assertEqual(self.admin.post("/api/admin/team-access", {"teamId": team_id, "action": "revoke"})[0], 200)
+        self.assertEqual(ok({}), 401)
+
     def test_stream_is_billed_when_the_client_disconnects(self):
         _, client, key = self.enabled_key()
         import socket

@@ -13,6 +13,7 @@ import ipaddress
 import json
 import re
 import secrets
+import socket
 import threading
 import time
 import urllib.error
@@ -55,8 +56,13 @@ ROUTES = {"/v1/chat/completions": ("openai", "/chat/completions"), "/v1/messages
 BODY_LIMIT = 4 * 1024 * 1024
 UPSTREAM_TIMEOUT = 300
 QUEUE_WAIT = 30  # seconds a request waits for a free team slot before 429 (agent tools send bursts)
-RETRY_STATUSES = {429, 500, 502, 503, 504, 529}
-SERVER_TOOLS = ("web_search", "web_fetch", "code_execution", "mcp")  # Anthropic tools run and billed upstream
+RETRY_STATUSES = {429, 503, 529}  # explicit "not processed" answers; 5xx/timeouts may already be billed upstream
+# Tools must run on the client. Anthropic "client tools" (bash, text editor, computer, memory) are allowed;
+# anything else typed (web search, code execution, MCP, tool search, …) runs and is billed upstream.
+CLIENT_TOOL_TYPES = ("custom", "function", "bash_", "text_editor_", "computer_", "memory_")
+BILLED_FIELDS = {"mcp_servers", "web_search_options", "container"}  # upstream-billed extras outside token usage
+# ponytail: denylist of beta prefixes that add upstream charges; extend when providers add more.
+BILLED_BETAS = ("mcp-client", "code-execution", "files-api", "context-1m", "skills", "web-fetch", "web-search")
 RETRY_DELAYS = (1, 2)  # seconds; retried only before any byte reaches the client
 TEAM_CONCURRENCY = 4
 DAY_MS = 86_400_000
@@ -162,6 +168,12 @@ def read_usage(upstream, data, usage):
         pass
 
 
+def allowed_betas(value):
+    """Forward client anthropic-beta flags except those that add upstream charges outside token prices."""
+    flags = [f.strip() for f in (value or "").split(",") if f.strip() and not f.strip().startswith(BILLED_BETAS)]
+    return ",".join(flags)
+
+
 def unpack(blob):
     return zlib.decompress(blob).decode("utf-8", "replace")
 
@@ -230,6 +242,9 @@ class KeyService:
             if not item.get("key"):
                 if name not in old:
                     raise APIError(400, f"{name} 上游需要填写 API Key")
+                # Never send the saved key to a different server: changing the host requires re-entering it.
+                if not isinstance(item.get("url"), str) or urlsplit(item["url"]).netloc.lower() != urlsplit(old[name]["url"]).netloc.lower():
+                    raise APIError(400, f"{name} 上游地址已更改，请重新填写 API Key")
                 item["key"] = old[name]["key"]
             if not item.get("aliases"):
                 item.pop("aliases", None)
@@ -535,8 +550,11 @@ class KeyService:
         if not token:
             raise APIError(401, "缺少 API 密钥")
         with self.service.db() as db:
+            # Keys stop with the team: API access disabled, team login revoked, or team withdrawn/disqualified.
             row = db.execute("""SELECT k.id, k.team_id FROM api_keys k JOIN team_api t ON t.team_id=k.team_id
-              WHERE k.key_hash=? AND k.active=1 AND t.active=1""", (digest(token),)).fetchone()
+              JOIN team_accounts ta ON ta.team_id=k.team_id JOIN accounts a ON a.id=ta.account_id AND a.active=1
+              LEFT JOIN team_details d ON d.team_id=k.team_id
+              WHERE k.key_hash=? AND k.active=1 AND t.active=1 AND COALESCE(d.status,'active')='active'""", (digest(token),)).fetchone()
             if not row:
                 raise APIError(401, "API 密钥无效或已停用")
             settings = self.settings(db)
@@ -606,14 +624,16 @@ class KeyService:
         call["price"] = upstream["models"][model]
         settings = call["settings"]
         if settings["blockedWords"]:
-            # ponytail: substring scan of the raw JSON (escapes included); fine for a short keyword list.
-            text = json.dumps(body.get("messages"), ensure_ascii=False).lower() + json.dumps(body.get("system"), ensure_ascii=False).lower()
+            # Whole decoded request (ensure_ascii=False undoes \u escapes); ponytail: substring scan, fine for a short list.
+            text = json.dumps(body, ensure_ascii=False).lower()
             hit = next((w for w in settings["blockedWords"] if w.lower() in text), None)
             if hit:
                 raise APIError(403, "请求内容包含本活动禁止的词语，已拦截")
         if "stream" in body and type(body["stream"]) is not bool:
             raise APIError(400, "stream 必须是布尔值")
-        if "mcp_servers" in body or any(isinstance(t, dict) and str(t.get("type", "")).startswith(SERVER_TOOLS) for t in body.get("tools") or []):
+        tools = body.get("tools") or []
+        if BILLED_FIELDS & set(body) or not isinstance(tools, list) or any(
+                not isinstance(t, dict) or ("type" in t and not str(t["type"]).startswith(CLIENT_TOOL_TYPES)) for t in tools):
             # Server-side tools are billed by the upstream outside token usage, so they would escape team budgets.
             raise APIError(400, "本活动不开放上游服务端工具（网页搜索、代码执行、MCP 等），请在客户端实现工具")
         call["stream"] = stream = body.get("stream") is True
@@ -636,8 +656,9 @@ class KeyService:
                 if delay is None or error.code not in RETRY_STATUSES:
                     raise
                 error.close()
-            except OSError:
-                if delay is None:
+            except OSError as error:
+                # Only connection failures are safe: a timeout may mean the upstream is still generating (and billing).
+                if delay is None or not isinstance(getattr(error, "reason", error), (ConnectionRefusedError, socket.gaierror)):
                     raise
             time.sleep(delay)
 
@@ -652,8 +673,9 @@ class KeyService:
         body["model"] = model
         headers = {"Content-Type": "application/json", "x-api-key": upstream["key"],
                    "anthropic-version": handler.headers.get("anthropic-version", "2023-06-01")}
-        if handler.headers.get("anthropic-beta"):
-            headers["anthropic-beta"] = handler.headers["anthropic-beta"]
+        beta = allowed_betas(handler.headers.get("anthropic-beta"))
+        if beta:
+            headers["anthropic-beta"] = beta
         request = urllib.request.Request(upstream["url"] + "/messages/count_tokens", data=json.dumps(body).encode(), headers=headers, method="POST")
         try:
             with self.open_with_retry(request) as response:
@@ -676,8 +698,9 @@ class KeyService:
         else:
             headers["x-api-key"] = upstream["key"]
             headers["anthropic-version"] = handler.headers.get("anthropic-version", "2023-06-01")
-            if handler.headers.get("anthropic-beta"):
-                headers["anthropic-beta"] = handler.headers["anthropic-beta"]
+            beta = allowed_betas(handler.headers.get("anthropic-beta"))
+            if beta:
+                headers["anthropic-beta"] = beta
         request = urllib.request.Request(upstream["url"] + suffix, data=json.dumps(body).encode(), headers=headers, method="POST")
         handler.connection.settimeout(UPSTREAM_TIMEOUT)
         try:
