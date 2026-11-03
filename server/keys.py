@@ -61,6 +61,7 @@ RETRY_STATUSES = {429, 503, 529}  # explicit "not processed" answers; 5xx/timeou
 # anything else typed (web search, code execution, MCP, tool search, …) runs and is billed upstream.
 CLIENT_TOOL_TYPES = ("custom", "function", "bash_", "text_editor_", "computer_", "memory_")
 BILLED_FIELDS = {"mcp_servers", "web_search_options", "container"}  # upstream-billed extras outside token usage
+PRICING_FIELDS = ("service_tier", "speed", "inference_geo")  # dropped so requests run at the configured (standard) price
 # ponytail: denylist of beta prefixes that add upstream charges; extend when providers add more.
 BILLED_BETAS = ("mcp-client", "code-execution", "files-api", "context-1m", "skills", "web-fetch", "web-search")
 RETRY_DELAYS = (1, 2)  # seconds; retried only before any byte reaches the client
@@ -170,7 +171,7 @@ def read_usage(upstream, data, usage):
 
 def allowed_betas(value):
     """Forward client anthropic-beta flags except those that add upstream charges outside token prices."""
-    flags = [f.strip() for f in (value or "").split(",") if f.strip() and not f.strip().startswith(BILLED_BETAS)]
+    flags = [f.strip() for f in (value or "").split(",") if f.strip() and not f.strip().lower().startswith(BILLED_BETAS)]
     return ",".join(flags)
 
 
@@ -636,6 +637,8 @@ class KeyService:
                 not isinstance(t, dict) or ("type" in t and not str(t["type"]).startswith(CLIENT_TOOL_TYPES)) for t in tools):
             # Server-side tools are billed by the upstream outside token usage, so they would escape team budgets.
             raise APIError(400, "本活动不开放上游服务端工具（网页搜索、代码执行、MCP 等），请在客户端实现工具")
+        for field in PRICING_FIELDS:
+            body.pop(field, None)
         call["stream"] = stream = body.get("stream") is True
         if stream and name == "openai":
             options = body.get("stream_options")

@@ -390,6 +390,9 @@ class GatewayTests(unittest.TestCase):
         # Billed betas are stripped, others forwarded.
         ok({}, headers={"anthropic-beta": "claude-code-20250219, context-1m-2025-08-07,files-api-2025-04-14"})
         self.assertEqual(FakeUpstream.calls[-1][1]["Anthropic-Beta"], "claude-code-20250219")
+        ok({"service_tier": "priority", "speed": "fast"}, headers={"anthropic-beta": "Context-1M-2025-08-07"})
+        self.assertNotIn("Anthropic-Beta", FakeUpstream.calls[-1][1])  # case-insensitive
+        self.assertFalse({"service_tier", "speed"} & set(FakeUpstream.calls[-1][2]))  # priced tiers dropped
         # Blocklist covers every field, e.g. tool descriptions.
         self.admin.post("/api/admin/keys/settings", {"blockedWords": ["越狱"]})
         self.assertEqual(ok({"tools": [{"name": "t", "description": "越狱工具"}]}), 403)
