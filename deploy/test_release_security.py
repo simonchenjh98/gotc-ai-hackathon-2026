@@ -252,6 +252,7 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
             self.assertFalse(any('test_fixture' in name or '/test_' in name for name in names))
             package.extractall(extract)
         self.assertTrue((extract / 'index.html').is_file())
+        self.assertTrue((extract / 'platform-draft-recovery.js').is_file())
         with urllib.request.urlopen('file://' + str(extract / 'index.html')) as page:
             self.assertIn(b'<!doctype html', page.read(200).lower())
         env = os.environ | {'GOTC_DATA_DIR': str(self.root / 'data'), 'GOTC_HOST': '127.0.0.1', 'GOTC_PORT': '55991', 'GOTC_BASE_PATH': '/gotc', 'GOTC_PUBLIC_ORIGIN': 'https://example.invalid'}
@@ -270,6 +271,8 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
                         self.assertIn('teams', payload); self.assertIn('config', payload)
                         with urllib.request.urlopen(f'http://127.0.0.1:{port}/gotc/index.html') as static:
                             self.assertEqual(static.status, 200); self.assertIn(b'<!doctype html', static.read(200).lower())
+                        with urllib.request.urlopen(f'http://127.0.0.1:{port}/gotc/platform-draft-recovery.js') as helper:
+                            self.assertEqual(helper.status, 200); self.assertIn(b'GotcDraftRecovery', helper.read())
                         try: urllib.request.urlopen(f'http://127.0.0.1:{port}/gotc/api/team')
                         except urllib.error.HTTPError as denied: self.assertEqual(denied.code, 401)
                         else: self.fail('unauthenticated team API unexpectedly succeeded')

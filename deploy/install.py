@@ -77,7 +77,7 @@ MemoryMax=512M
 [Install]
 WantedBy=multi-user.target
 '''
-FILES = {'index.html', 'styles.css', 'app.js', 'platform.html', 'platform.css', 'platform.js', 'platform-admin.js', 'favicon.svg'}
+FILES = {'index.html', 'styles.css', 'app.js', 'platform.html', 'platform.css', 'platform.js', 'platform-admin.js', 'platform-draft-recovery.js', 'favicon.svg'}
 ASSETS = {'.webp', '.png', '.jpg', '.jpeg', '.svg', '.ico', '.woff', '.woff2'}
 
 
