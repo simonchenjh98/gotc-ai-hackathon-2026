@@ -17,6 +17,7 @@ class FakeUpstream(BaseHTTPRequestHandler):
     calls = []
     status = 200
     fail_first = 0  # answer 529 this many times before succeeding
+    hang = None  # "before": no reply at all; "body": headers, then the body stalls
     usage = None  # overrides the non-streaming usage object
 
     def log_message(self, *_):
@@ -25,6 +26,16 @@ class FakeUpstream(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         FakeUpstream.calls.append((self.path, dict(self.headers), body))
+        if FakeUpstream.hang:
+            if FakeUpstream.hang == "body":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "1000")
+                self.end_headers()
+                self.wfile.write(b'{"id":')
+                self.wfile.flush()
+            threading.Event().wait(2)  # longer than the shortened upstream timeout in the test
+            return
         if FakeUpstream.fail_first:
             FakeUpstream.fail_first -= 1
             self.send_response(529)
@@ -79,7 +90,7 @@ class GatewayTests(unittest.TestCase):
     team = test_api.APITests.team  # reuse helpers without re-running APITests
 
     def setUp(self):
-        FakeUpstream.calls, FakeUpstream.status, FakeUpstream.fail_first, FakeUpstream.usage = [], 200, 0, None
+        FakeUpstream.calls, FakeUpstream.status, FakeUpstream.fail_first, FakeUpstream.usage, FakeUpstream.hang = [], 200, 0, None, None
         self.delays, keys.RETRY_DELAYS = keys.RETRY_DELAYS, (0, 0)
         self.fake = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
         threading.Thread(target=self.fake.serve_forever, daemon=True).start()
@@ -526,6 +537,38 @@ class GatewayTests(unittest.TestCase):
             columns = {r[1] for r in db.execute("PRAGMA table_info(api_usage)")}
         self.assertTrue({"incomplete", "estimated"} <= columns)
         self.assertIsNotNone(restarted)
+
+    def test_upstream_failures_record_their_final_status(self):
+        team_id, _, key = self.enabled_key()
+        errors = lambda: self.admin.get("/api/admin/keys")[1]["overview"]["errors"]
+        for count, code in enumerate((401, 403, 500, 503), 1):
+            FakeUpstream.status = code
+            self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, key)[0], 502)
+            item = self.latest()
+            self.assertEqual((item["status"], item["cost"]), (502, 0), code)  # was recorded as status 0
+            self.assertEqual(errors(), count)
+            detail = self.admin.post("/api/admin/keys/log", {"id": item["id"]})[1]
+            self.assertIn(f"上游返回 HTTP {code}", detail["response"])  # the admin can see why
+        self.assertEqual(self.service.keys.reserved[team_id], 0)
+
+    def test_upstream_timeouts_are_charged_the_reservation(self):
+        team_id, _, key = self.enabled_key()
+        timeout, keys.UPSTREAM_TIMEOUT = keys.UPSTREAM_TIMEOUT, 0.5
+        try:
+            for hang in ("before", "body"):
+                FakeUpstream.hang = hang
+                body = {"model": "claude-x", "max_tokens": 1000, "messages": [{"role": "user", "content": "x" * 400}]}
+                self.assertEqual(self.call("/v1/messages", body, key)[0], 504, hang)
+                item = self.latest()
+                self.assertEqual((item["status"], item["incomplete"], item["estimated"]), (504, 1, 1), hang)
+                self.assertEqual(item["output"], 1000)  # the reserved output, not zero
+                self.assertGreater(item["cost"], 0.015)  # 1000 output tokens at $15 / 1M
+                detail = self.admin.post("/api/admin/keys/log", {"id": item["id"]})[1]
+                self.assertIn("上游响应超时", detail["response"])
+            self.assertEqual(self.admin.get("/api/admin/keys")[1]["overview"]["errors"], 2)
+            self.assertEqual(self.service.keys.reserved[team_id], 0)  # released after the charge landed
+        finally:
+            keys.UPSTREAM_TIMEOUT, FakeUpstream.hang = timeout, None
 
     def test_stream_is_billed_when_the_client_disconnects(self):
         _, client, key = self.enabled_key()

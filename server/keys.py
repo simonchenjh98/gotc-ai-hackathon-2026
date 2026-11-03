@@ -628,6 +628,8 @@ class KeyService:
         # A forwarded call the upstream answered without finishing (no terminal event) is incomplete, never a plain success.
         incomplete = call["forwarded"] and call["status"] < 400 and not call["done"]
         estimated = False
+        if call.get("charge_reserved"):
+            usage, incomplete, estimated = [call["request_bytes"] // 4, call.get("reserve_out", 0), 0, 0], True, True
         if call["forwarded"] and call["status"] < 400:
             # sub2api bills only what it observed; a call with no usage would then be free and escape the budget.
             # Fill gaps with its reservation estimate instead: input ~ request bytes / 4, output ~ reply text bytes / 4.
@@ -760,12 +762,18 @@ class KeyService:
             body["stream_options"] = {**(options if isinstance(options, dict) else {}), "include_usage": True}
         team = key["team_id"]
         price = call["price"]
-        estimate = round(call["request_bytes"] // 4 * price[0] + bound_output(body) * price[1])
+        call["reserve_out"] = bound_output(body)
+        estimate = round(call["request_bytes"] // 4 * price[0] + call["reserve_out"] * price[1])
         self.admit(team, settings["teamRpm"])
         try:
             self.reserve(handler, call, estimate)
             try:
                 self.forward(handler, name, upstream, suffix, body, stream, call)
+            except APIError as error:
+                # record() writes once, so the final status and reason must be set before the finally below runs.
+                call["status"] = error.status
+                self.keep(call, error.message.encode())
+                raise
             finally:
                 self.record(handler, call)  # the real cost lands before the reservation is dropped
                 self.unreserve(team, estimate)
@@ -816,6 +824,18 @@ class KeyService:
         handler.headers_out(status, content_type, len(payload))
         handler.wfile.write(payload)
 
+    def upstream_failed(self, call, error):
+        """Turn a network failure into the team's error response, charging the reservation when the upstream may have run."""
+        reason = getattr(error, "reason", error)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            # The request reached the upstream, which may still be generating and billing: charge the reserved estimate
+            # rather than nothing, so timeouts cannot be used to run requests for free.
+            call["charge_reserved"] = True
+            self.keep(call, f"上游响应超时（{UPSTREAM_TIMEOUT} 秒）\n".encode())
+            raise APIError(504, "上游模型服务响应超时，本次按预留额度计费") from None
+        self.keep(call, f"上游连接失败：{type(reason).__name__}\n".encode())
+        raise APIError(502, "上游模型服务暂时不可用，请稍后重试") from None
+
     def forward(self, handler, name, upstream, suffix, body, stream, call):
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream" if stream else "application/json"}
         if name == "openai":
@@ -832,6 +852,8 @@ class KeyService:
             response = self.open_with_retry(request)
         except urllib.error.HTTPError as error:
             if error.code in {401, 403} or error.code >= 500:  # our credentials or an upstream outage
+                # Hidden from the team, kept for admins; the upstream does not bill a request it rejected or failed.
+                self.keep(call, f"上游返回 HTTP {error.code}\n".encode())
                 raise APIError(502, "上游模型服务暂时不可用，请稍后重试") from None
             payload = error.read(1_000_000)  # client errors (bad params, 429) pass through for debugging
             call["status"] = error.code
@@ -841,8 +863,8 @@ class KeyService:
             handler.headers_out(error.code, error.headers.get("Content-Type", "application/json"), len(payload))
             handler.wfile.write(payload)
             return
-        except OSError:
-            raise APIError(502, "上游模型服务暂时不可用，请稍后重试") from None
+        except OSError as error:
+            self.upstream_failed(call, error)
         call["status"], call["forwarded"] = response.status, True
         usage = call["usage"]
         with response:
@@ -873,7 +895,10 @@ class KeyService:
                 except OSError:
                     pass  # upstream went away; bill what was produced
             else:
-                payload = response.read(50_000_000)
+                try:
+                    payload = response.read(50_000_000)
+                except OSError as error:  # nothing sent to the client yet, so this can still become a clean error
+                    self.upstream_failed(call, error)
                 call["reply_bytes"] = len(payload)
                 try:
                     read_usage(name, json.loads(payload), usage)
