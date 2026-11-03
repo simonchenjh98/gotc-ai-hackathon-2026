@@ -143,6 +143,14 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(listing["models"], {"openai": ["cheap"], "anthropic": ["claude-x", "claude-small"]})
         with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
             self.assertFalse(any(key in str(row) for row in db.execute("SELECT * FROM api_keys")))
+            stored = db.execute("SELECT key_hash FROM api_keys").fetchone()[0]
+        import hashlib, os, stat
+        self.assertNotEqual(stored, hashlib.sha256(key.encode()).hexdigest())  # peppered, not a bare hash
+        pepper = self.root / "private" / "api-key-pepper"
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(pepper.stat().st_mode), 0o600)
+        restarted = test_api.EventService(data_dir=self.root / "private", origin=self.service.origin, static_root=self.root / "public")
+        self.assertEqual(restarted.keys.digest(key), stored)  # same secret after restart: keys keep working
 
         self.assertEqual(client.post("/api/team/keys", {"name": "bob"})[0], 200)
         self.assertEqual(client.post("/api/team/keys", {"name": "carol"})[0], 409)  # cap of 2

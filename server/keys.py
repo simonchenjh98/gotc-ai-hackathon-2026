@@ -10,6 +10,7 @@ import csv
 import hashlib
 import io
 import ipaddress
+import os
 import json
 import re
 import secrets
@@ -75,8 +76,20 @@ def now_ms():
     return int(time.time() * 1000)
 
 
-def digest(token):
-    return hashlib.sha256(token.encode()).hexdigest()
+KEY_HASH_ITERATIONS = 1000  # keys are 256-bit random, so the server-side pepper, not iterations, carries the strength
+
+
+def load_pepper(data_dir):
+    """Private random secret mixed into key hashes, so a leaked database alone cannot be used to check keys."""
+    path = data_dir / "api-key-pepper"
+    if not path.exists():
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)  # never overwrite: that would void every key
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(secrets.token_hex(32))
+        except FileExistsError:
+            pass
+    return bytes.fromhex(path.read_text(encoding="utf-8").strip())
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -204,6 +217,7 @@ def blocked_by(rules, headers):
 class KeyService:
     def __init__(self, service, config, text):
         self.service, self.text = service, text
+        self.pepper = load_pepper(service.data_dir)
         self.seed = config  # raw gateway.json content, copied into the database once
         self.config = parse_config(config)
         self.lock = threading.Lock()
@@ -212,6 +226,9 @@ class KeyService:
         self.inflight = defaultdict(int)
         self.recent = defaultdict(deque)  # team -> monotonic times of requests in the last minute
         self.opener = urllib.request.build_opener(_NoRedirect)  # honours HTTPS_PROXY for reaching upstreams
+
+    def digest(self, token):
+        return hashlib.pbkdf2_hmac("sha256", token.encode(), self.pepper, KEY_HASH_ITERATIONS).hex()
 
     def initialize(self, db):
         db.executescript(SCHEMA)
@@ -318,7 +335,7 @@ class KeyService:
             key_id = "K" + secrets.token_hex(8)
             masked = key[:7] + "…" + key[-4:]
             db.execute("INSERT INTO api_keys(id,team_id,name,key_hash,masked,created_at) VALUES (?,?,?,?,?,?)",
-                       (key_id, team_id, name, digest(key), masked, now_ms()))
+                       (key_id, team_id, name, self.digest(key), masked, now_ms()))
             self.service.audit(db, actor, "api-key.create", team_id, {"keyId": key_id})
             # The only response that ever carries the full key; only its hash is stored.
             return {"ok": True, "key": key, "item": {"id": key_id, "name": name, "masked": masked}}
@@ -555,7 +572,7 @@ class KeyService:
             row = db.execute("""SELECT k.id, k.team_id FROM api_keys k JOIN team_api t ON t.team_id=k.team_id
               JOIN team_accounts ta ON ta.team_id=k.team_id JOIN accounts a ON a.id=ta.account_id AND a.active=1
               LEFT JOIN team_details d ON d.team_id=k.team_id
-              WHERE k.key_hash=? AND k.active=1 AND t.active=1 AND COALESCE(d.status,'active')='active'""", (digest(token),)).fetchone()
+              WHERE k.key_hash=? AND k.active=1 AND t.active=1 AND COALESCE(d.status,'active')='active'""", (self.digest(token),)).fetchone()
             if not row:
                 raise APIError(401, "API 密钥无效或已停用")
             settings = self.settings(db)
