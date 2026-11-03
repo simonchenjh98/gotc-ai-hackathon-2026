@@ -427,6 +427,90 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.admin.post("/api/admin/team-access", {"teamId": team_id, "action": "revoke"})[0], 200)
         self.assertEqual(ok({}), 401)
 
+    def latest(self):
+        return self.admin.post("/api/admin/keys/logs", {})[1]["items"][0]
+
+    def test_missing_usage_is_estimated_not_free(self):
+        _, _, key = self.enabled_key()
+        FakeUpstream.usage = {"note": "no token counts"}
+        body = {"model": "cheap", "messages": [{"role": "user", "content": "x" * 4000}]}
+        self.assertEqual(self.call("/v1/chat/completions", body, key)[0], 200)
+        item = self.latest()
+        self.assertTrue(item["estimated"])
+        self.assertFalse(item["incomplete"])
+        self.assertGreaterEqual(item["input"], 1000)  # ~ request bytes / 4
+        self.assertGreater(item["cost"], 0)
+
+    def test_cut_stream_is_flagged_incomplete_and_billed(self):
+        _, client, key = self.enabled_key()
+        original = FakeUpstream.do_POST
+        reply = "回答" * 200
+
+        def cut(handler):  # input usage and some text, then the upstream dies before message_delta / message_stop
+            handler.rfile.read(int(handler.headers["Content-Length"]))
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.end_headers()
+            for event in [{"type": "message_start", "message": {"usage": {"input_tokens": 300, "output_tokens": 1}}},
+                          {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": reply}}]:
+                handler.wfile.write(b"data: " + json.dumps(event).encode() + b"\n\n")
+            handler.wfile.flush()
+            handler.connection.close()
+        FakeUpstream.do_POST = cut
+        try:
+            self.call("/v1/messages", {"model": "claude-x", "stream": True}, key)
+        finally:
+            FakeUpstream.do_POST = original
+        item = self.latest()
+        self.assertEqual((item["status"], item["incomplete"], item["estimated"]), (200, 1, 1))
+        self.assertEqual(item["input"], 300)  # observed usage kept
+        self.assertGreaterEqual(item["output"], len(reply.encode()) // 4)  # output estimated from streamed text
+        self.assertEqual(self.admin.get("/api/admin/keys")[1]["overview"]["errors"], 1)  # counted as a failure
+        self.assertEqual(len(self.admin.post("/api/admin/keys/logs", {"errorsOnly": True})[1]["items"]), 1)
+        self.assertTrue(client.get("/api/team/keys/logs")[1]["items"][0]["incomplete"])
+
+    def test_queued_request_is_rechecked_after_the_wait(self):
+        team_id, _, key = self.enabled_key()
+        service = self.service.keys
+        service.inflight[team_id] = keys.TEAM_CONCURRENCY  # team busy: the next request queues
+        result = {}
+        waiter = threading.Thread(target=lambda: result.update(status=self.call("/v1/chat/completions", {"model": "cheap"}, key)[0]))
+        waiter.start()
+        for _ in range(100):
+            if service.slot_free._waiters:  # the request is now waiting for a slot
+                break
+            threading.Event().wait(0.02)
+        self.assertEqual(self.admin.post("/api/admin/keys/revoke", {"teamId": team_id})[0], 200)
+        before = len(FakeUpstream.calls)
+        service.release(team_id)
+        waiter.join(10)
+        self.assertEqual(result["status"], 401)
+        self.assertEqual(len(FakeUpstream.calls), before)  # never reached the upstream
+        self.assertEqual(service.inflight[team_id], keys.TEAM_CONCURRENCY - 1)  # its slot was given back
+        self.assertEqual(service.reserved[team_id], 0)
+
+    def test_budget_reserves_in_flight_cost(self):
+        team_id, _, key = self.enabled_key()
+        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"dailyBudget": 0.05})[0], 200)
+        # claude-x output costs $15 / 1M tokens: 8192 default output tokens alone reserve ~$0.12 > $0.05.
+        self.assertEqual(self.call("/v1/messages", {"model": "claude-x"}, key)[0], 429)
+        self.assertEqual(self.call("/v1/messages", {"model": "claude-x", "max_tokens": 100}, key)[0], 200)
+        service = self.service.keys
+        service.reserved[team_id] = 49_000  # $0.049 already held by another request in flight
+        self.assertEqual(self.call("/v1/messages", {"model": "claude-x", "max_tokens": 100}, key)[0], 429)
+        service.reserved[team_id] = 0
+
+    def test_old_usage_table_gains_flag_columns(self):
+        with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
+            db.execute("ALTER TABLE api_usage DROP COLUMN incomplete")
+            db.execute("ALTER TABLE api_usage DROP COLUMN estimated")
+            db.commit()
+        restarted = test_api.EventService(data_dir=self.root / "private", origin=self.service.origin, static_root=self.root / "public")
+        with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
+            columns = {r[1] for r in db.execute("PRAGMA table_info(api_usage)")}
+        self.assertTrue({"incomplete", "estimated"} <= columns)
+        self.assertIsNotNone(restarted)
+
     def test_stream_is_billed_when_the_client_disconnects(self):
         _, client, key = self.enabled_key()
         import socket

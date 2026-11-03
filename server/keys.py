@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS api_usage (
  at INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
  cache_write_tokens INTEGER NOT NULL, cache_read_tokens INTEGER NOT NULL,
  cost_micro INTEGER NOT NULL, status INTEGER NOT NULL, path TEXT NOT NULL, stream INTEGER NOT NULL,
- duration_ms INTEGER NOT NULL, user_agent TEXT NOT NULL
+ duration_ms INTEGER NOT NULL, user_agent TEXT NOT NULL,
+ incomplete INTEGER NOT NULL DEFAULT 0, estimated INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS api_usage_team ON api_usage(team_id, at);
 CREATE INDEX IF NOT EXISTS api_usage_key ON api_usage(key_id, at);
@@ -57,6 +58,8 @@ ROUTES = {"/v1/chat/completions": ("openai", "/chat/completions"), "/v1/messages
 BODY_LIMIT = 4 * 1024 * 1024
 UPSTREAM_TIMEOUT = 300
 QUEUE_WAIT = 30  # seconds a request waits for a free team slot before 429 (agent tools send bursts)
+RESERVE_OUTPUT_DEFAULT = 8192  # output tokens reserved when the request sets no max_tokens (as sub2api)
+RESERVE_OUTPUT_CAP = 64000
 RETRY_STATUSES = {429, 503, 529}  # explicit "not processed" answers; 5xx/timeouts may already be billed upstream
 # Tools must run on the client. Anthropic "client tools" (bash, text editor, computer, memory) are allowed;
 # anything else typed (web search, code execution, MCP, tool search, …) runs and is billed upstream.
@@ -182,6 +185,36 @@ def read_usage(upstream, data, usage):
         pass
 
 
+def stream_progress(upstream, data, call):
+    """Track whether the stream reached its terminal event and how much reply text it carried (for estimates)."""
+    if not isinstance(data, dict):
+        return
+    if upstream == "anthropic":
+        if data.get("type") == "message_stop":
+            call["done"] = True
+        delta = data.get("delta") if isinstance(data.get("delta"), dict) else {}
+        texts = [delta.get("text"), delta.get("thinking"), delta.get("partial_json")]
+    else:
+        choices = data.get("choices") if isinstance(data.get("choices"), list) else []
+        if isinstance(data.get("usage"), dict) or any(isinstance(c, dict) and c.get("finish_reason") for c in choices):
+            call["done"] = True
+        texts = []
+        for choice in choices:
+            delta = choice.get("delta") if isinstance(choice, dict) and isinstance(choice.get("delta"), dict) else {}
+            texts += [delta.get("content"), delta.get("reasoning_content")]
+            calls = delta.get("tool_calls") if isinstance(delta.get("tool_calls"), list) else []
+            texts += [c.get("function", {}).get("arguments") for c in calls if isinstance(c, dict) and isinstance(c.get("function"), dict)]
+    call["reply_bytes"] += sum(len(t.encode()) for t in texts if isinstance(t, str))
+
+
+def requested_output(body):
+    for field in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        value = body.get(field)
+        if type(value) is int and value > 0:
+            return min(value, RESERVE_OUTPUT_CAP)
+    return RESERVE_OUTPUT_DEFAULT
+
+
 def allowed_betas(value):
     """Forward client anthropic-beta flags except those that add upstream charges outside token prices."""
     flags = [f.strip() for f in (value or "").split(",") if f.strip() and not f.strip().lower().startswith(BILLED_BETAS)]
@@ -225,6 +258,7 @@ class KeyService:
         # ponytail: in-memory per-team concurrency; correct because the service is a single process.
         self.inflight = defaultdict(int)
         self.recent = defaultdict(deque)  # team -> monotonic times of requests in the last minute
+        self.reserved = defaultdict(int)  # team -> micro-USD held by requests in flight
         self.opener = urllib.request.build_opener(_NoRedirect)  # honours HTTPS_PROXY for reaching upstreams
 
     def digest(self, token):
@@ -232,6 +266,10 @@ class KeyService:
 
     def initialize(self, db):
         db.executescript(SCHEMA)
+        columns = {r["name"] for r in db.execute("PRAGMA table_info(api_usage)")}
+        for column in ("incomplete", "estimated"):  # databases created before these flags existed
+            if column not in columns:
+                db.execute(f"ALTER TABLE api_usage ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
         for key, value in DEFAULTS.items():
             db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, json.dumps(value)))
         if self.seed:
@@ -355,7 +393,7 @@ class KeyService:
               (SELECT COUNT(*) FROM api_keys k WHERE k.team_id=t.team_id AND k.active=1) AS key_count FROM team_api t""").fetchall()
             today = (now_ms() + 8 * 3600_000) // DAY_MS * DAY_MS - 8 * 3600_000  # Beijing midnight
             overview = dict(db.execute("""SELECT COUNT(*) AS requests, COALESCE(SUM(cost_micro),0)/1e6 AS cost,
-              COALESCE(SUM(input_tokens),0) AS input, COALESCE(SUM(output_tokens),0) AS output, COALESCE(SUM(status>=400),0) AS errors,
+              COALESCE(SUM(input_tokens),0) AS input, COALESCE(SUM(output_tokens),0) AS output, COALESCE(SUM(status>=400 OR incomplete=1),0) AS errors,
               COUNT(DISTINCT team_id) AS teams, CAST(AVG(CASE WHEN status<400 THEN duration_ms END) AS INTEGER) AS avgMs
               FROM api_usage WHERE at>=?""", (today,)).fetchone())
             changes = [{"at": r["at"], "action": r["action"], "target": r["target"], "metadata": json.loads(r["metadata"])}
@@ -460,7 +498,7 @@ class KeyService:
         rows = lambda sql: [dict(r) for r in db.execute(sql, params)]
         return {
             "days": days,
-            "totals": rows(f"SELECT {sums}, SUM(u.status>=400) AS errors, CAST(AVG(u.duration_ms) AS INTEGER) AS avgMs FROM api_usage u WHERE {clause}")[0],
+            "totals": rows(f"SELECT {sums}, SUM(u.status>=400 OR u.incomplete=1) AS errors, CAST(AVG(u.duration_ms) AS INTEGER) AS avgMs FROM api_usage u WHERE {clause}")[0],
             "byKey": rows(f"""SELECT u.key_id AS keyId, k.name, k.masked, k.active, t.number AS teamNumber, t.name AS teamName, {sums},
               MAX(u.at) AS lastAt FROM api_usage u JOIN api_keys k ON k.id=u.key_id JOIN teams t ON t.id=u.team_id
               WHERE {clause} GROUP BY u.key_id ORDER BY cost DESC"""),
@@ -478,12 +516,12 @@ class KeyService:
             where.append("u.id<?")
             params.append(body["beforeId"])
         if body.get("errorsOnly") is True:
-            where.append("u.status>=400")
+            where.append("(u.status>=400 OR u.incomplete=1)")
         clause = ("WHERE " + " AND ".join(where)) if where else ""
         items = [dict(r) for r in db.execute(f"""SELECT u.id, u.at, u.key_id AS keyId, k.name AS keyName, t.number AS teamNumber, t.name AS teamName,
           u.model, u.path, u.stream, u.status, u.input_tokens AS input, u.output_tokens AS output, u.cache_write_tokens AS cacheWrite,
           u.cache_read_tokens AS cacheRead, u.cost_micro/1e6 AS cost,
-          u.duration_ms AS durationMs, u.user_agent AS userAgent, EXISTS(SELECT 1 FROM api_logs l WHERE l.usage_id=u.id) AS hasContent,
+          u.duration_ms AS durationMs, u.user_agent AS userAgent, u.incomplete, u.estimated, EXISTS(SELECT 1 FROM api_logs l WHERE l.usage_id=u.id) AS hasContent,
           (SELECT l.request_bytes FROM api_logs l WHERE l.usage_id=u.id) AS requestBytes
           FROM api_usage u JOIN api_keys k ON k.id=u.key_id JOIN teams t ON t.id=u.team_id {clause} ORDER BY u.id DESC LIMIT 50""", params)]
         return {"items": items, "more": len(items) == 50}
@@ -492,11 +530,11 @@ class KeyService:
         """Usage CSV without request content; formula-like cells are neutralised."""
         out = io.StringIO(newline="")
         writer = csv.writer(out)
-        writer.writerow(["时间(UTC毫秒)", "队号", "队名", "密钥", "模型", "接口", "流式", "状态", "输入tokens", "输出tokens", "缓存写入tokens", "缓存读取tokens", "费用USD", "耗时ms", "User-Agent"])
+        writer.writerow(["时间(UTC毫秒)", "队号", "队名", "密钥", "模型", "接口", "流式", "状态", "输入tokens", "输出tokens", "缓存写入tokens", "缓存读取tokens", "费用USD", "耗时ms", "User-Agent", "中断", "估算计费"])
         for r in db.execute("""SELECT u.*, t.number, t.name AS team_name, k.name AS key_name FROM api_usage u
           JOIN teams t ON t.id=u.team_id JOIN api_keys k ON k.id=u.key_id ORDER BY u.id"""):
             writer.writerow([self.service.csv_safe(v) for v in (r["at"], r["number"], r["team_name"], r["key_name"], r["model"], r["path"],
-                             r["stream"], r["status"], r["input_tokens"], r["output_tokens"], r["cache_write_tokens"], r["cache_read_tokens"], r["cost_micro"] / 1e6, r["duration_ms"], r["user_agent"])])
+                             r["stream"], r["status"], r["input_tokens"], r["output_tokens"], r["cache_write_tokens"], r["cache_read_tokens"], r["cost_micro"] / 1e6, r["duration_ms"], r["user_agent"], r["incomplete"], r["estimated"])])
         return ("\ufeff" + out.getvalue()).encode("utf-8")
 
     def admit(self, team, rpm):
@@ -514,6 +552,32 @@ class KeyService:
                 raise APIError(429, f"本队同时进行的请求最多 {TEAM_CONCURRENCY} 个，排队超时")
             self.inflight[team] += 1
 
+    def reserve(self, handler, call, estimate):
+        """After the queue wait: re-check the key, team and access, then atomically reserve the estimated cost.
+
+        sub2api re-checks billing after the slot wait and reserves in-flight budget; this also re-checks the key and team,
+        so a revoke or withdrawal during the wait stops the request before it reaches the upstream.
+        """
+        team = call["key"]["team_id"]
+        with self.service.db() as db, self.lock:
+            row = self.lookup(db, handler)
+            if not row or row["id"] != call["key"]["id"]:
+                raise APIError(401, "API 密钥在排队期间已被停用")
+            settings = self.settings(db)
+            current = now_ms()
+            if settings["expiresAt"] is not None and current >= settings["expiresAt"]:
+                raise APIError(403, "本活动 API 额度已到期")
+            held = (self.reserved[team] + estimate) / 1e6
+            if self.spend(db, team, current - DAY_MS) + held > settings["dailyBudget"]:
+                raise APIError(429, "本队近24小时额度不足以完成本次请求")
+            if self.spend(db, team) + held > settings["totalBudget"]:
+                raise APIError(429, "本队总额度不足以完成本次请求")
+            self.reserved[team] += estimate
+
+    def unreserve(self, team, estimate):
+        with self.lock:
+            self.reserved[team] -= estimate
+
     def release(self, team):
         with self.lock:
             self.inflight[team] -= 1
@@ -522,7 +586,8 @@ class KeyService:
     # Gateway (API keys from SDKs, no cookies or Origin).
     def gateway(self, handler, path):
         call = {"key": None, "path": path, "model": "", "stream": False, "price": None, "usage": [0, 0, 0, 0], "status": 0,
-                "request": b"", "response": [], "size": 0, "started": time.monotonic(), "log": False}
+                "request": b"", "response": [], "size": 0, "started": time.monotonic(), "log": False,
+                "request_bytes": 0, "reply_bytes": 0, "done": False, "forwarded": False}
         try:
             self.serve(handler, path, call)
         except APIError as error:
@@ -545,15 +610,26 @@ class KeyService:
         if not call["key"] or call.get("recorded"):
             return
         call["recorded"] = True
-        usage, price = call["usage"], call["price"] or (0, 0, 0, 0)
+        usage, price = list(call["usage"]), call["price"] or (0, 0, 0, 0)
+        # A forwarded call the upstream answered without finishing (no terminal event) is incomplete, never a plain success.
+        incomplete = call["forwarded"] and call["status"] < 400 and not call["done"]
+        estimated = False
+        if call["forwarded"] and call["status"] < 400:
+            # sub2api bills only what it observed; a call with no usage would then be free and escape the budget.
+            # Fill gaps with its reservation estimate instead: input ~ request bytes / 4, output ~ reply text bytes / 4.
+            est_in, est_out = call["request_bytes"] // 4, call["reply_bytes"] // 4
+            if not any(usage):
+                usage[0], usage[1], estimated = est_in, est_out, True
+            elif incomplete and usage[1] < est_out:
+                usage[1], estimated = est_out, True
         cost = round(sum(t * p for t, p in zip(usage, price)))  # USD per 1M tokens == micro-USD per token
         at = now_ms()
         with self.service.db() as db:
             usage_id = db.execute("""INSERT INTO api_usage(key_id,team_id,at,model,input_tokens,output_tokens,cache_write_tokens,cache_read_tokens,
-              cost_micro,status,path,stream,duration_ms,user_agent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              cost_micro,status,path,stream,duration_ms,user_agent,incomplete,estimated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                   (call["key"]["id"], call["key"]["team_id"], at, call["model"], usage[0], usage[1], usage[2], usage[3], cost,
                                                      call["status"], call["path"], int(call["stream"]), int((time.monotonic() - call["started"]) * 1000),
-                                                     (handler.headers.get("User-Agent") or "")[:300])).lastrowid
+                                                     (handler.headers.get("User-Agent") or "")[:300], int(incomplete), int(estimated))).lastrowid
             db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (at, call["key"]["id"]))
             if call["log"]:
                 headers = {k: v[:500] for k, v in handler.headers.items() if k.lower() not in SECRET_HEADERS}
@@ -562,17 +638,20 @@ class KeyService:
                 db.execute("INSERT INTO api_logs VALUES (?,?,?,?,?,?)", (usage_id, json.dumps(headers, ensure_ascii=False),
                            zlib.compress(call["request"], 6), zlib.compress(response, 6), len(call["request"]), call["size"]))
 
-    def authenticate(self, handler, call=None):
+    def lookup(self, db, handler):
         header = handler.headers.get("Authorization", "")
         token = header[7:].strip() if header.startswith("Bearer ") else handler.headers.get("x-api-key", "").strip()
         if not token:
             raise APIError(401, "缺少 API 密钥")
+        # Keys stop with the team: API access disabled, team login revoked, or team withdrawn/disqualified.
+        return db.execute("""SELECT k.id, k.team_id FROM api_keys k JOIN team_api t ON t.team_id=k.team_id
+          JOIN team_accounts ta ON ta.team_id=k.team_id JOIN accounts a ON a.id=ta.account_id AND a.active=1
+          LEFT JOIN team_details d ON d.team_id=k.team_id
+          WHERE k.key_hash=? AND k.active=1 AND t.active=1 AND COALESCE(d.status,'active')='active'""", (self.digest(token),)).fetchone()
+
+    def authenticate(self, handler, call=None):
         with self.service.db() as db:
-            # Keys stop with the team: API access disabled, team login revoked, or team withdrawn/disqualified.
-            row = db.execute("""SELECT k.id, k.team_id FROM api_keys k JOIN team_api t ON t.team_id=k.team_id
-              JOIN team_accounts ta ON ta.team_id=k.team_id JOIN accounts a ON a.id=ta.account_id AND a.active=1
-              LEFT JOIN team_details d ON d.team_id=k.team_id
-              WHERE k.key_hash=? AND k.active=1 AND t.active=1 AND COALESCE(d.status,'active')='active'""", (self.digest(token),)).fetchone()
+            row = self.lookup(db, handler)
             if not row:
                 raise APIError(401, "API 密钥无效或已停用")
             settings = self.settings(db)
@@ -585,7 +664,7 @@ class KeyService:
                 current = now_ms()
                 if settings["expiresAt"] is not None and current >= settings["expiresAt"]:
                     raise APIError(403, "本活动 API 额度已到期")
-                # ponytail: checked before each request, so a team can overshoot by its in-flight requests.
+                # Cheap early reject; the binding check is reserve() after the queue wait.
                 if self.spend(db, row["team_id"], current - DAY_MS) >= settings["dailyBudget"]:
                     raise APIError(429, "本队近24小时额度已用完")
                 if self.spend(db, row["team_id"]) >= settings["totalBudget"]:
@@ -624,6 +703,7 @@ class KeyService:
             call["log"] = False  # metadata row only, zero cost
             self.admit(key["team_id"], call["settings"]["teamRpm"])
             try:
+                self.reserve(handler, call, 0)  # free call, but a revoke during the wait still stops it
                 return self.count_tokens(handler, call)
             finally:
                 self.release(key["team_id"])
@@ -634,6 +714,7 @@ class KeyService:
         key = self.authenticate(handler, call)
         body = self.read_body(handler)
         call["request"] = handler.raw_body if call["log"] else b""  # exactly what the client sent
+        call["request_bytes"] = len(handler.raw_body)
         model = resolve(upstream, body.get("model"))
         call["model"] = model or (body["model"][:100] if isinstance(body.get("model"), str) else "")
         if model is None:
@@ -661,9 +742,16 @@ class KeyService:
             options = body.get("stream_options")
             body["stream_options"] = {**(options if isinstance(options, dict) else {}), "include_usage": True}
         team = key["team_id"]
+        price = call["price"]
+        estimate = round(call["request_bytes"] // 4 * price[0] + requested_output(body) * price[1])
         self.admit(team, settings["teamRpm"])
         try:
-            self.forward(handler, name, upstream, suffix, body, stream, call)
+            self.reserve(handler, call, estimate)
+            try:
+                self.forward(handler, name, upstream, suffix, body, stream, call)
+            finally:
+                self.record(handler, call)  # the real cost lands before the reservation is dropped
+                self.unreserve(team, estimate)
         finally:
             self.release(team)
 
@@ -738,7 +826,7 @@ class KeyService:
             return
         except OSError:
             raise APIError(502, "上游模型服务暂时不可用，请稍后重试") from None
-        call["status"] = response.status
+        call["status"], call["forwarded"] = response.status, True
         usage = call["usage"]
         with response:
             content_type = response.headers.get("Content-Type", "application/json")
@@ -749,10 +837,15 @@ class KeyService:
                 try:
                     for line in response:
                         if line.startswith(b"data:"):
-                            try:
-                                read_usage(name, json.loads(line[5:]), usage)
-                            except ValueError:
-                                pass
+                            if line[5:].strip() == b"[DONE]":
+                                call["done"] = True
+                            else:
+                                try:
+                                    event = json.loads(line[5:])
+                                except ValueError:
+                                    event = None
+                                read_usage(name, event, usage)
+                                stream_progress(name, event, call)
                         self.keep(call, line)
                         if client_open:
                             try:
@@ -764,8 +857,10 @@ class KeyService:
                     pass  # upstream went away; bill what was produced
             else:
                 payload = response.read(50_000_000)
+                call["reply_bytes"] = len(payload)
                 try:
                     read_usage(name, json.loads(payload), usage)
+                    call["done"] = True  # a complete JSON body is a finished reply
                 except ValueError:
                     pass
                 self.keep(call, payload)
