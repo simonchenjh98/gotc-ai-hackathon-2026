@@ -34,6 +34,15 @@ class FakeUpstream(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'{"id":')
                 self.wfile.flush()
+            if FakeUpstream.hang == "reset":  # answer starts, then the connection drops mid-body
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "1000")
+                self.end_headers()
+                self.wfile.write(b'{"id":')
+                self.wfile.flush()
+                self.connection.shutdown(2)
+                return
             threading.Event().wait(2)  # longer than the shortened upstream timeout in the test
             return
         if FakeUpstream.fail_first:
@@ -569,6 +578,21 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(self.service.keys.reserved[team_id], 0)  # released after the charge landed
         finally:
             keys.UPSTREAM_TIMEOUT, FakeUpstream.hang = timeout, None
+
+    def test_reply_cut_mid_body_is_charged_and_refused_connection_is_free(self):
+        _, _, key = self.enabled_key()
+        FakeUpstream.hang = "reset"
+        body = {"model": "claude-x", "max_tokens": 1000, "messages": [{"role": "user", "content": "hi"}]}
+        self.assertEqual(self.call("/v1/messages", body, key)[0], 502)
+        item = self.latest()
+        self.assertEqual((item["status"], item["incomplete"], item["estimated"], item["output"]), (502, 1, 1, 1000))
+        self.assertGreater(item["cost"], 0)  # upstream had started answering: not free
+        FakeUpstream.hang = None
+        self.fake.shutdown()
+        self.fake.server_close()  # nothing listening: connection refused, the request never left
+        self.assertEqual(self.call("/v1/messages", body, key)[0], 502)
+        item = self.latest()
+        self.assertEqual((item["status"], item["cost"], item["estimated"]), (502, 0, 0))
 
     def test_stream_is_billed_when_the_client_disconnects(self):
         _, client, key = self.enabled_key()

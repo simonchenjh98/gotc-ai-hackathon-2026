@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import http.client
 import io
 import ipaddress
 import os
@@ -827,14 +828,18 @@ class KeyService:
     def upstream_failed(self, call, error):
         """Turn a network failure into the team's error response, charging the reservation when the upstream may have run."""
         reason = getattr(error, "reason", error)
+        if not call["forwarded"] and isinstance(reason, (ConnectionRefusedError, socket.gaierror)):
+            # The request never left: nothing can have been generated or billed upstream.
+            self.keep(call, f"上游连接失败：{type(reason).__name__}\n".encode())
+            raise APIError(502, "上游模型服务暂时不可用，请稍后重试") from None
+        # Anything else happened after the request was sent (timeout, reset, a reply cut off mid-body): the upstream
+        # may be generating and billing, so charge the reserved estimate rather than nothing.
+        call["charge_reserved"] = True
         if isinstance(reason, (TimeoutError, socket.timeout)):
-            # The request reached the upstream, which may still be generating and billing: charge the reserved estimate
-            # rather than nothing, so timeouts cannot be used to run requests for free.
-            call["charge_reserved"] = True
             self.keep(call, f"上游响应超时（{UPSTREAM_TIMEOUT} 秒）\n".encode())
             raise APIError(504, "上游模型服务响应超时，本次按预留额度计费") from None
-        self.keep(call, f"上游连接失败：{type(reason).__name__}\n".encode())
-        raise APIError(502, "上游模型服务暂时不可用，请稍后重试") from None
+        self.keep(call, f"上游连接中断：{type(reason).__name__}\n".encode())
+        raise APIError(502, "上游模型服务连接中断，本次按预留额度计费") from None
 
     def forward(self, handler, name, upstream, suffix, body, stream, call):
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream" if stream else "application/json"}
@@ -892,13 +897,17 @@ class KeyService:
                             except OSError:
                                 # Keep draining so the usage event at the end is still billed (upstream timeout bounds this).
                                 client_open = False
-                except OSError:
-                    pass  # upstream went away; bill what was produced
+                except (OSError, http.client.HTTPException):
+                    pass  # upstream went away (incl. a cut chunked body); flagged incomplete and billed in record()
             else:
                 try:
                     payload = response.read(50_000_000)
-                except OSError as error:  # nothing sent to the client yet, so this can still become a clean error
+                except (OSError, http.client.HTTPException) as error:  # nothing sent to the client yet: a clean error
                     self.upstream_failed(call, error)
+                declared = response.headers.get("Content-Length")
+                if declared and declared.isdigit() and len(payload) < int(declared):
+                    # read(n) returns a short body instead of raising when the upstream drops mid-reply.
+                    self.upstream_failed(call, ConnectionResetError("reply cut short"))
                 call["reply_bytes"] = len(payload)
                 try:
                     read_usage(name, json.loads(payload), usage)
