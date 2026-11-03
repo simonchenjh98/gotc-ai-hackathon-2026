@@ -1,0 +1,49 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+
+const source=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8').split("window.addEventListener('hashchange'")[0];
+const ctx=vm.createContext({document:{getElementById:()=>({})},location:{href:'https://example.test/platform.html#admin'},URL});
+vm.runInContext(source,ctx);
+const sse=events=>events.map(e=>`event: ${e.type || 'x'}\ndata: ${JSON.stringify(e)}\n`).join('\n');
+
+test('Anthropic stream rebuilds text, thinking and tool calls in block order',()=>{
+  const raw=sse([{type:'message_start',message:{content:[]}},
+    {type:'content_block_start',index:0,content_block:{type:'thinking',thinking:''}},{type:'content_block_delta',index:0,delta:{type:'thinking_delta',thinking:'先读文件'}},
+    {type:'content_block_start',index:1,content_block:{type:'text',text:''}},{type:'content_block_delta',index:1,delta:{type:'text_delta',text:'好的，'}},{type:'content_block_delta',index:1,delta:{type:'text_delta',text:'我来看看。'}},
+    {type:'content_block_start',index:2,content_block:{type:'tool_use',name:'Read'}},{type:'content_block_delta',index:2,delta:{type:'input_json_delta',partial_json:'{"file_path":'}},{type:'content_block_delta',index:2,delta:{type:'input_json_delta',partial_json:'"a.py"}'}},
+    {type:'message_delta',delta:{stop_reason:'tool_use'}}]);
+  assert.equal(ctx.replyOf(raw),'【思考】\n先读文件\n\n好的，我来看看。\n\n【调用工具 Read】\n{"file_path":"a.py"}\n\n— 结束原因：tool_use');
+});
+
+test('OpenAI stream joins content, reasoning and split tool-call arguments',()=>{
+  const raw=['{"choices":[{"delta":{"reasoning_content":"想一想"}}]}','{"choices":[{"delta":{"content":"你好"}}]}',
+    '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"search","arguments":"{\\"q\\":"}}]}}]}',
+    '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"x\\"}"}}]},"finish_reason":"tool_calls"}]}','[DONE]'].map(l=>`data: ${l}\n\n`).join('');
+  assert.equal(ctx.replyOf(raw),'【思考】\n想一想\n\n你好\n\n【调用工具 search】\n{"q":"x"}\n\n— 结束原因：tool_calls');
+});
+
+test('request context lists system, every turn, tool results and tools',()=>{
+  const conv=ctx.conversationOf(JSON.stringify({model:'m',system:[{type:'text',text:'规则'}],tools:[{name:'Read',description:'读文件\n详细'}],
+    messages:[{role:'user',content:'问题'},{role:'assistant',content:[{type:'tool_use',name:'Read',input:{p:1}}]},{role:'user',content:[{type:'tool_result',content:[{type:'text',text:'文件内容'}]},{type:'image'}]}]}));
+  assert.deepEqual(JSON.parse(JSON.stringify(conv.turns)),[['system','规则'],['user','问题'],['assistant','【调用工具 Read】\n{\n  "p": 1\n}'],['user','【工具结果】\n文件内容\n\n【图片】']]);
+  assert.equal(conv.tools[0].name,'Read');
+  assert.equal(ctx.conversationOf('not json'),null);
+  assert.equal(ctx.replyOf('{"choices":[{"message":{"content":"完成"}}]}'),'完成');
+});
+
+test('client rule templates parse into valid rules',()=>{
+  const rules=JSON.parse(JSON.stringify(ctx.parseClientRules(vm.runInContext("clientRuleTemplates['仅允许 WorkBuddy（官方客户端）']",ctx))));
+  assert.deepEqual(rules,[{action:'allow',header:'User-Agent',contains:'workbuddy'}]);
+  for(const text of vm.runInContext('Object.values(clientRuleTemplates)',ctx))ctx.parseClientRules(text);
+});
+
+test('upstream model and alias text round-trips and rejects bad lines',()=>{
+  const models=vm.runInContext("parseModels('DeepSeek-V3 0.3 1.2\\n\\n  Qwen3-8B 0.1 0.2 0.125 0.01  ','openai')",ctx);
+  assert.deepEqual(JSON.parse(JSON.stringify(models)),{'DeepSeek-V3':[0.3,1.2],'Qwen3-8B':[0.1,0.2,0.125,0.01]});
+  assert.equal(vm.runInContext('modelsText',ctx)(models),'DeepSeek-V3 0.3 1.2\nQwen3-8B 0.1 0.2 0.125 0.01');
+  assert.deepEqual(JSON.parse(JSON.stringify(vm.runInContext("parseAliases('claude-* => claude-x\\ngpt-4o=>DeepSeek-V3','anthropic')",ctx))),{'claude-*':'claude-x','gpt-4o':'DeepSeek-V3'});
+  for(const bad of ["parseModels('m 1','openai')","parseModels('m 1 x','openai')","parseModels('m 1 2 3','openai')","parseModels('m -1 2','openai')","parseAliases('a -> b','openai')"])
+    assert.throws(()=>vm.runInContext(bad,ctx));
+});

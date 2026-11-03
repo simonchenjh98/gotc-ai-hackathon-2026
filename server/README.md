@@ -129,6 +129,59 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 完整的保存/冲突处理、URL 字段快照边界、部署检查及三类回退步骤见 [作品提交上线与回退说明](../docs/submission-release.md)。作品提交模块保留最新草稿与最近正式字段，不归档外链内容；独立评审轮次的冻结能力见下文。保存是否成功以服务端锁后校验与成功响应为准，不能以点击时间判断；409 需要读取最新版本并由用户明确合并，不自动重试。
 
+## 队伍 AI API 网关
+
+服务内置 AI API 网关（标准库实现，不需要单独部署 sub2api）：组织方在后台“AI API 额度”为每队开通一次额度，队伍在作品提交页自行创建 / 删除密钥，所有密钥共用本队额度。完整密钥只在创建响应中返回一次，数据库只保存 SHA-256 哈希。网关用组织方的上游密钥转发请求，按返回的 token 用量计费，队伍看不到上游密钥。
+
+模型上游在后台“AI API 额度 → 模型上游”中配置（类似 sub2api 的渠道）：每类上游（OpenAI 兼容、Anthropic）填写接口地址、API Key、开放模型和别名，保存后立即生效，无需重启。内置 Gitee AI（模力方舟，`https://ai.gitee.com/v1`）、DeepSeek、Anthropic 官方地址模板。上游 API Key 保存在私有数据库，不会返回给浏览器，留空保存表示沿用原密钥；修改记录写入 API 管理操作记录（不含密钥）。
+
+开放模型每行写“模型名 输入价 输出价”或再加“缓存写入价 缓存读取价”，单价为每百万 token 的美元价（人民币价格请按汇率换算，与队伍额度同一单位）；短格式按输入价的 1.25 倍 / 0.1 倍计缓存。每类上游的第一个模型是队伍页接入示例的默认模型。别名每行写“别名 => 模型名”，以 `*` 结尾表示前缀匹配。
+
+也可以在私有数据目录放置 `gateway.json`，仅在首次启动时导入后台（之后以后台为准，修改文件不再生效）：
+
+```json
+{
+  "openai":    {"url": "https://ai.gitee.com/v1", "key": "…", "models": {"DeepSeek-V3": [0.3, 1.2]}},
+  "anthropic": {"url": "https://api.anthropic.com/v1", "key": "sk-ant-…",
+                "models": {"claude-sonnet-5-5": [3, 15, 3.75, 0.3], "claude-haiku-5-5": [1, 5]},
+                "aliases": {"claude-*": "claude-sonnet-5-5", "claude-haiku-*": "claude-haiku-5-5"}}
+}
+```
+
+Claude Code 会按自己的默认模型名请求（如 `claude-opus-…`、`claude-haiku-…`），使用 Claude Code 的活动必须配置 `claude-*` 等前缀别名，否则请求会因模型不在白名单而被拒绝。
+
+- 队伍使用：OpenAI 兼容 SDK `base_url=https://<域名>/gotc/v1`；Anthropic SDK `base_url=https://<域名>/gotc`。支持 `Authorization: Bearer` 或 `x-api-key`，支持流式输出。
+- 后台设置每队近24小时额度、累计额度（美元）、每队密钥上限、统一到期时间、每队每分钟请求上限（默认60，0为不限）、屏蔽词和队伍公告；额度在每次请求前检查，进行中的请求可能略超。每队最多 4 个并发请求，超出时排队最多 30 秒再返回 429。
+- 上游返回 429/5xx/529 或连接失败时，在向客户端发送任何内容之前最多重试 2 次（间隔 1 秒、2 秒）。
+- 屏蔽词对 `messages` 与 `system` 做不区分大小写的包含匹配，命中返回 403 且不转发上游。
+- 支持 Claude Code：网关路径接受查询参数（如 `?beta=true`，忽略不转发），并转发 `/v1/messages/count_tokens`（不计费、不记录）。
+- 后台“AI API 额度”包含今日概况、近24小时消耗排行（含进行中请求数）、用量 CSV 导出（不含请求内容）和 API 管理操作记录；队伍页显示公告、接入示例（Claude Code、Anthropic / OpenAI Python、curl）和本队最近调用。
+- 缓存读写 token 按输入单价计，偏保守。上游返回 401/403/5xx 时统一返回 502，不暴露上游信息；参数错误、限流等 4xx 原样返回便于调试。
+- 服务器访问不到上游时，在 systemd 单元设置 `HTTPS_PROXY`。Nginx 需为 `/gotc/v1/` 关闭缓冲、放宽超时与请求体（`deploy/install.py` 已包含）。
+- 网关不可用或额度用完只影响 API 调用，提交与评分不受影响。
+- 调用记录：每次通过密钥认证的调用（包括被规则、额度或模型白名单拒绝的）都会记录时间、队伍、密钥、模型、状态、token、费用、耗时和 User-Agent。开启“记录请求与回复内容”（默认开启）时，另存请求头（去除 Authorization、x-api-key、Cookie）、客户端原样发送的完整请求体（即完整上下文，最大 4MB）和回复（最多 16MB），以 zlib 压缩保存；队伍页会提示正在记录。后台“查看上下文”提供对话视图（system、每条消息、工具调用与结果、由流式事件还原的回复）、原始内容、请求头和 JSON 下载；查看单条内容会写入审计日志。Agent 每次请求都会重发整段对话，存储增长较快，记录没有自动清理，活动结束后按需删除 `api_logs`。
+- 客户端规则：按请求头限制队伍使用的应用或 Agent，如 `allow User-Agent: claude-cli`、`deny x-stainless-lang: python`。不区分大小写的“包含”匹配；命中任一 deny 即拒绝，设置了 allow 时必须命中其中一条；规则对全体队伍生效，`/v1/models` 同样受限。请求头可被客户端伪造，只能约束常规使用，不是安全边界。调用记录中的请求头可用于确定各客户端的特征。
+
+| 方法与路径 | 身份 | 请求及响应 |
+|---|---|---|
+| POST `/v1/chat/completions` | API 密钥 | OpenAI 兼容请求，转发到 `openai` 上游 |
+| POST `/v1/messages` | API 密钥 | Anthropic 请求，转发到 `anthropic` 上游 |
+| POST `/v1/messages/count_tokens` | API 密钥 | 转发到 `anthropic` 上游，不计费 |
+| GET `/v1/models` | API 密钥 | 开放模型列表 |
+| GET `/api/team/keys` | 队伍 | `{enabled,baseUrl,models,maxKeys,keys:[{id,name,masked,used24h,usedTotal,requests,lastUsedAt,createdAt}],budget}` |
+| POST `/api/team/keys` | 队伍 | `{name}` → `{ok,key,item}`，`key` 仅此一次 |
+| POST `/api/team/keys/delete` | 队伍 | `{id}` → `{ok}`，密钥立即失效，用量记录保留 |
+| GET `/api/team/keys/logs` | 队伍 | 本队最近50次调用（不含内容） |
+| GET `/api/admin/keys/export` | 管理员 | 用量 CSV（不含请求内容，防公式注入） |
+| GET `/api/admin/keys` | 管理员 | `{enabled,settings,models,overview,changes,teams:[{teamId,active,keyCount,inflight,used24h,usedTotal}]}` |
+| POST `/api/admin/keys/settings` | 管理员 | `dailyBudget`/`totalBudget` 美元、`maxKeys` 1–20、`expiresAt` 毫秒或 null、`logContent` 布尔、`clientRules` `[{action:"allow"\|"deny",header,contains}]`（最多30条）、`teamRpm` 0–10000、`announcement` ≤500字、`blockedWords` ≤200个，可单独更新 |
+| POST `/api/admin/keys/upstreams` | 管理员 | `{upstreams:{openai?,anthropic?:{url,key,models,aliases?}}}`，整体替换；`key` 留空沿用原值；`{}` 关闭网关 |
+| POST `/api/admin/keys/stats` | 管理员 | `{teamId?,keyId?,days:1–90}` → `{totals,byKey,byModel,byClient,daily}`，按北京时间分日 |
+| POST `/api/admin/keys/logs` | 管理员 | `{teamId?,keyId?,errorsOnly?,beforeId?}` → `{items,more}`，每页50条，按时间倒序 |
+| POST `/api/admin/keys/log` | 管理员 | `{id}` → `{headers,request,response,requestBytes,responseBytes,responseTruncated}`，记录查看操作 |
+| POST `/api/admin/keys/provision` | 管理员 | `{teamId}` → `{ok}`；重新开通后原密钥恢复可用 |
+| POST `/api/admin/keys/revoke` | 管理员 | `{teamId}` → `{ok}`，该队全部密钥立即停止调用 |
+
 ## 展示与路演评审框架
 
 新记录入口 `#judge-exhibition`、`#judge-roadshow` 使用 `/api/judging/{stage}`，stage 允许 `exhibition`（展示）或 `roadshow`（路演），未知阶段返回 404；相应进度页为 `#board-exhibition`、`#board-roadshow`。它保存定性评审记录，**仅这些新阶段的数值评分、满分、有效评委门槛、汇总公式、排名、晋级名额和成绩发布尚未实现**：相应字段为 `null`，能力标记为 false，不生成成绩或晋级结果。六个维度名称仅作为后续量表的占位，`max` 全为 null。
