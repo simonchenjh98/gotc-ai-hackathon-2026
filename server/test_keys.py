@@ -495,6 +495,17 @@ class GatewayTests(unittest.TestCase):
         # claude-x output costs $15 / 1M tokens: 8192 default output tokens alone reserve ~$0.12 > $0.05.
         self.assertEqual(self.call("/v1/messages", {"model": "claude-x"}, key)[0], 429)
         self.assertEqual(self.call("/v1/messages", {"model": "claude-x", "max_tokens": 100}, key)[0], 200)
+        self.assertEqual(FakeUpstream.calls[-1][2]["max_tokens"], 100)
+        # The forwarded output limit never exceeds what was reserved.
+        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"dailyBudget": 50})[0], 200)
+        self.call("/v1/messages", {"model": "claude-x"}, key)
+        self.assertEqual(FakeUpstream.calls[-1][2]["max_tokens"], keys.RESERVE_OUTPUT_DEFAULT)  # injected when absent
+        self.call("/v1/messages", {"model": "claude-x", "max_tokens": 10**9}, key)
+        self.assertEqual(FakeUpstream.calls[-1][2]["max_tokens"], keys.RESERVE_OUTPUT_CAP)  # clamped
+        self.call("/v1/chat/completions", {"model": "cheap", "max_completion_tokens": "lots"}, key)
+        self.assertEqual(FakeUpstream.calls[-1][2]["max_completion_tokens"], keys.RESERVE_OUTPUT_CAP)  # non-integer
+        self.assertNotIn("max_tokens", FakeUpstream.calls[-1][2])  # existing field used, none added
+        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"dailyBudget": 0.05})[0], 200)
         service = self.service.keys
         service.reserved[team_id] = 49_000  # $0.049 already held by another request in flight
         self.assertEqual(self.call("/v1/messages", {"model": "claude-x", "max_tokens": 100}, key)[0], 429)

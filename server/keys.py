@@ -207,12 +207,26 @@ def stream_progress(upstream, data, call):
     call["reply_bytes"] += sum(len(t.encode()) for t in texts if isinstance(t, str))
 
 
-def requested_output(body):
-    for field in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
-        value = body.get(field)
-        if type(value) is int and value > 0:
-            return min(value, RESERVE_OUTPUT_CAP)
-    return RESERVE_OUTPUT_DEFAULT
+OUTPUT_LIMIT_FIELDS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
+
+
+def bound_output(body):
+    """Clamp the output limit the upstream will honour to what gets reserved, so the reservation is a true ceiling.
+
+    Any limit above the cap (or a non-integer one) is lowered to the cap; with no limit at all, max_tokens is set to
+    the default. Returns the number of output tokens reserved.
+    """
+    present = [f for f in OUTPUT_LIMIT_FIELDS if f in body]
+    limit = RESERVE_OUTPUT_DEFAULT
+    for field in present:
+        value = body[field]
+        value = value if type(value) is int and value > 0 else RESERVE_OUTPUT_CAP
+        body[field] = min(value, RESERVE_OUTPUT_CAP)
+    if present:
+        limit = max(body[f] for f in present)
+    else:
+        body["max_tokens"] = limit
+    return limit
 
 
 def allowed_betas(value):
@@ -743,7 +757,7 @@ class KeyService:
             body["stream_options"] = {**(options if isinstance(options, dict) else {}), "include_usage": True}
         team = key["team_id"]
         price = call["price"]
-        estimate = round(call["request_bytes"] // 4 * price[0] + requested_output(body) * price[1])
+        estimate = round(call["request_bytes"] // 4 * price[0] + bound_output(body) * price[1])
         self.admit(team, settings["teamRpm"])
         try:
             self.reserve(handler, call, estimate)
