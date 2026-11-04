@@ -86,7 +86,13 @@ class Provider:
         body = {'name': row['slug'], 'description': 'GOTC provisioning ' + row['operation_id'],
                 'auto_init': True, 'private': False, 'has_wiki': False}
         if self.name == 'gitee':
-            body['path'] = row['slug']
+            # The GOTC Gitee namespace is an enterprise, not an ordinary organization.
+            # This endpoint's private field is an integer enum: 1 means externally open.
+            body.update(path=row['slug'], private=1, outsourced=False)
+            status, data = self.request('POST', '/enterprises/' + quote(row['organization'], safe='') + '/repos', body)
+            if status != 201:
+                raise UpstreamError()
+            return data
         return self.request('POST', '/orgs/' + quote(row['organization'], safe='') + '/repos', body)[1]
 
     def head(self, row, branch=None):
@@ -127,8 +133,24 @@ class Provider:
             return 'unverified'
 
     def invite(self, row, username):
-        status, _ = self.request('PUT', self.path(row) + '/collaborators/' + quote(username, safe=''), {'permission': 'push'})
-        return 'invited' if self.name == 'github' and status == 201 else 'ready'
+        path = self.path(row) + '/collaborators/' + quote(username, safe='')
+        status, member = self.request('PUT', path, {'permission': 'push'})
+        if self.name == 'github':
+            return 'invited' if status == 201 else 'ready'
+        # Ordinary Gitee v5 documents 200 + ProjectMember. An enterprise/pending/empty
+        # response must not be presented as a confirmed grant. Verify the same user's
+        # effective write access independently rather than inferring it from HTTP success.
+        if (status != 200 or not isinstance(member, dict) or type(member.get('id')) is not int
+                or member['id'] <= 0 or not isinstance(member.get('login'), str)
+                or member['login'].lower() != username.lower()):
+            raise UpstreamError()
+        status, permission = self.request('GET', path + '/permission')
+        if (status != 200 or not isinstance(permission, dict) or type(permission.get('id')) is not int
+                or permission['id'] != member['id'] or not isinstance(permission.get('login'), str)
+                or permission['login'].lower() != username.lower()
+                or permission.get('permission') not in ('push', 'admin')):
+            raise UpstreamError()
+        return 'ready'
 
 
 class Repositories:
@@ -204,6 +226,9 @@ class Repositories:
 
     def verify_repository(self, row, data):
         expected = row['organization'] + '/' + row['slug']
+        if row['provider'] == 'gitee' and (not isinstance(data, dict) or not isinstance(data.get('namespace'), dict)
+                or data['namespace'].get('type') != 'enterprise'):
+            raise APIError(409, '远端仓库不属于预期 Gitee 企业命名空间，请管理员人工核对', 'repository_identity')
         if (not isinstance(data, dict) or str(data.get('full_name', '')).lower() != expected.lower()
                 or type(data.get('id')) is not int or data['id'] <= 0
                 or (row['external_id'] and str(data['id']) != row['external_id'])

@@ -12,7 +12,7 @@ function fixture(){
   const nodes=new Map(),calls=[];
   function node(id){
     if(nodes.has(id))return nodes.get(id);
-    const item={id,isConnected:true,disabled:false,value:'',checked:false,dataset:{},listeners:{},classList:{add(){},remove(){}},addEventListener(kind,fn){this.listeners[kind]=fn;},focus(){},scrollIntoView(){},querySelectorAll(){return [];},querySelector(){return null;}};
+    const item={id,isConnected:true,disabled:false,readOnly:false,value:'',checked:false,dataset:{},listeners:{},classList:{add(){},remove(){}},addEventListener(kind,fn){this.listeners[kind]=fn;},focus(){},scrollIntoView(){},querySelectorAll(){return [];},querySelector(){return null;}};
     let html='';Object.defineProperty(item,'innerHTML',{configurable:true,get:()=>html,set(value){html=value;for(const match of value.matchAll(/id="([^"]+)"/g))node(match[1]);}});nodes.set(id,item);return item;
   }
   const root=node('platform-main');let latest={team:{id:'T1',number:1,name:'Synthetic'},window:{canEdit:true,submissionDeadline:null},submission:{version:0,draft:null,submitted:null},repository,repositoryProviders:providers};
@@ -24,14 +24,16 @@ function fixture(){
     if(path==='team')return structuredClone(latest);
     if(path==='team/repository/preview')return context.previewResponse?await context.previewResponse():{previewId,sha,branch:'main',codeUrl:repository.codeUrl,archived:false};
     if(path==='submission'){
+      if(context.submissionResponse)await context.submissionResponse(body);
       const receipt={requestId:body.requestId,status:'succeeded',action:body.status,baseVersion:0,version:1,historyVersion:1,savedAt:123,materials:body.materials};
       latest={...latest,submission:{version:1,draft:body.materials,submitted:body.materials,submittedVersion:1,submittedAt:123}};
       return {...latest,receipt};
     }
     throw new Error(path);
   };
+  context.recoveryStates=[];
   vm.runInContext(source+`\napi=transport;session={role:'team',loginId:'synthetic-login'};routeVersion=1;route='team';
-    installTeamRecovery=()=>({isAuthorized:()=>true,hasAuthorization:()=>true,sessionOwner:session,teamId:'T1',input(){},pending(){},acknowledge(){},result(){}});
+    installTeamRecovery=()=>({isAuthorized:()=>true,hasAuthorization:()=>true,sessionOwner:session,teamId:'T1',input(){},pending(){},acknowledge(){},result(sent,state){globalThis.recoveryStates.push(state);}});
     installTeamRepository=()=>{};installSubmissionHistory=()=>{};loadTeamKeys=()=>{};
     globalThis.h={teamFormMarkup,teamRepositoryMarkup,repositoryAdminMarkup,repositoryStatusMarkup};globalThis.render=()=>renderTeam(1);`,context);
   return {context,calls,node,root,h:context.h};
@@ -94,4 +96,48 @@ test('upstream SHA failure preserves input and does not fabricate a preview or r
   await f.node('submission-form').onsubmit({preventDefault(){}});
   assert.match(f.node('form-error').textContent,/仓库服务暂不可用/);assert.equal(f.node('material-summary').value,'Summary');
   assert.equal(f.node('submission-preview').innerHTML,'');assert.equal(f.calls.filter(c=>c.path==='submission').length,0);
+});
+
+for(const code of ['repository_head_changed','repository_preview_expired','repository_preview_required']){
+  test(`${code} preserves editable unsaved materials and permits a fresh preview and confirmation`,async()=>{
+    const f=fixture();let previews=0,attempts=0;
+    f.context.previewResponse=async()=>({previewId:++previews===1?previewId:'c'.repeat(48),sha:previews===1?sha:'d'.repeat(40),branch:'main',codeUrl:repository.codeUrl});
+    f.context.submissionResponse=async()=>{if(++attempts===1){const error=new Error('请重新预览 SHA');error.status=409;error.code=code;throw error;}};
+    await f.context.render();
+    f.node('material-summary').value='UNSAVED MATERIALS';f.node('submission-form').listeners.input();
+    await f.node('submission-form').onsubmit({preventDefault(){}});await f.node('confirm-submission').onclick();
+    assert.equal(f.node('material-summary').value,'UNSAVED MATERIALS');
+    assert.equal(f.node('material-summary').readOnly,false);assert.equal(f.node('material-confirmed').disabled,false);assert.equal(f.node('fieldset').disabled,false);
+    assert.equal(f.node('submission-preview').innerHTML,'');assert.equal(f.node('submission-conflict').innerHTML,'');
+    assert.match(f.node('form-error').textContent,/当前材料已保留/);assert.equal(f.context.recoveryStates.at(-1),'editing');
+    f.node('material-demoInstructions').value='Further unsaved edits';f.node('submission-form').listeners.input();
+    await f.node('submission-form').onsubmit({preventDefault(){}});await f.node('confirm-submission').onclick();
+    const posts=f.calls.filter(c=>c.path==='submission');
+    assert.equal(previews,2);assert.equal(posts.length,2);assert.notEqual(posts[0].body.requestId,posts[1].body.requestId);
+    assert.equal(posts[1].body.repoPreviewId,'c'.repeat(48));assert.equal(posts[1].body.materials.codeVersion,'d'.repeat(40));
+    assert.equal(posts[1].body.materials.summary,'UNSAVED MATERIALS');assert.equal(posts[1].body.materials.demoInstructions,'Further unsaved edits');
+    assert.match(f.root.innerHTML,/正式版 v1 已收到/);
+  });
+}
+
+test('genuine material version conflicts still lock current inputs for manual reconciliation',async()=>{
+  const f=fixture();f.context.submissionResponse=async()=>{const error=new Error('材料已被其他页面更新');error.status=409;error.code='version_conflict';throw error;};
+  await f.context.render();f.node('material-summary').value='UNSAVED VERSION CONFLICT';
+  await f.node('submission-form').onsubmit({preventDefault(){}});await f.node('confirm-submission').onclick();
+  assert.equal(f.node('material-summary').value,'UNSAVED VERSION CONFLICT');assert.equal(f.node('material-summary').readOnly,true);
+  assert.equal(f.context.recoveryStates.at(-1),'conflict');assert.match(f.node('submission-conflict').innerHTML,/材料版本已变化/);
+  await f.node('submission-form').onsubmit({preventDefault(){}});
+  assert.equal(f.calls.filter(c=>c.path==='submission').length,1);
+});
+
+test('ambiguous admin approval directs a status refresh and reconciliation before retrying',async()=>{
+  const f=fixture(),box=f.node('repository-admin'),form=f.node('repository-review-form'),button=f.node('approve-button'),error=f.node('approve-error');
+  form.dataset.repositoryTeam=repository.teamId;form.elements={verified:{checked:true}};
+  form.querySelector=selector=>selector==='button'?button:error;
+  box.querySelectorAll=selector=>selector==='[data-repository-team]'?[form]:[];
+  const calls=[];f.context.adminTransport=async(path,body)=>{calls.push({path,body});if(body)throw new Error('Gateway timeout');return {providers,items:[{...repository,state:'requested'}]};};
+  vm.runInContext(`api=adminTransport;route='admin';globalThis.startAdmin=()=>installRepositoryAdmin(document.getElementById('repository-admin'));`,f.context);
+  await f.context.startAdmin();await form.onsubmit({preventDefault(){}});
+  assert.match(error.textContent,/后台可能仍在处理/);assert.match(error.textContent,/刷新申请列表核对状态/);assert.match(error.textContent,/勿重复批准/);
+  assert.equal(calls.filter(c=>c.body).length,1);
 });

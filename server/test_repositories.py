@@ -21,6 +21,9 @@ class Remote:
         self.timeout_create = False
         self.timeout_invite = False
         self.timeout_read = False
+        self.gitee_member_response = None
+        self.gitee_permission = 'push'
+        self.namespace_type = None
 
     def __call__(self, method, path, body=None):
         # Every mocked upstream call also proves the writer lock is free.
@@ -29,9 +32,10 @@ class Remote:
         self.calls.append((method, path, body))
         if self.timeout_read and method == 'GET':
             raise UpstreamError()
-        if method == 'POST' and path.startswith('/orgs/'):
+        if method == 'POST' and path.startswith(('/orgs/', '/enterprises/')):
             org = path.split('/')[2]
-            self.repo = {'id': 123, 'full_name': org + '/' + body['name'], 'description': body['description'], 'default_branch': 'main'}
+            self.repo = {'id': 123, 'full_name': org + '/' + body['name'], 'description': body['description'], 'default_branch': 'main',
+                         'namespace': {'type': self.namespace_type or ('enterprise' if path.startswith('/enterprises/') else 'group')}}
             if self.timeout_create:
                 raise UpstreamError()
             return 201, self.repo
@@ -39,7 +43,9 @@ class Remote:
             if self.timeout_invite:
                 raise UpstreamError()
             if path.endswith('/permission'):
-                return 200, {'permission': 'push'}
+                return 200, {'id': 456, 'login': path.split('/')[-2], 'permission': self.gitee_permission}
+            if self.provider == 'gitee':
+                return self.gitee_member_response or (200, {'id': 456, 'login': path.split('/')[-1], 'permissions': 'push'})
             return (204 if self.accepted else 201), {}
         if path.endswith('/protection'):
             return 200, {}
@@ -208,6 +214,7 @@ class RepositoryTests(unittest.TestCase):
 
     def test_gitee_complete_application_approval_sha_receipt_and_history(self):
         self.enable('gitee')
+        self.remote.provider = 'gitee'
         self.repos.providers['gitee'].request = self.remote
         self.remote.accepted = True
         status, application, _ = self.apply('gitee', ['Gitee_Developer'])
@@ -227,6 +234,67 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(result['receipt']['materials']['codeVersion'], self.remote.sha)
         self.assertEqual(self.request(self.client, '/api/submission/history/1')[1]['materials']['codeVersion'], self.remote.sha)
         self.assertEqual(next(c[2] for c in self.remote.calls if '/collaborators/' in c[1]), {'permission': 'push'})
+        self.assertTrue(any(c[0] == 'GET' and c[1].endswith('/collaborators/Gitee_Developer/permission') for c in self.remote.calls))
+        create = next(c for c in self.remote.calls if c[0] == 'POST')
+        self.assertEqual(create[1], '/enterprises/gotc-ai-hackathon/repos')
+        self.assertIs(type(create[2]['private']), int)
+        self.assertEqual(create[2]['private'], 1)
+        self.assertIs(create[2]['outsourced'], False)
+        self.assertFalse(any(c[1].startswith('/orgs/') for c in self.remote.calls))
+
+    def test_gitee_nonenterprise_namespace_never_binds_or_grants(self):
+        self.enable('gitee')
+        self.remote.provider = 'gitee'
+        self.remote.namespace_type = 'group'
+        self.repos.providers['gitee'].request = self.remote
+        application = self.apply('gitee', ['Gitee_Developer'])[1]['repository']
+        status, result, _ = self.admin_action(application)
+        self.assertEqual(status, 200, result)
+        row = result['repository']
+        self.assertEqual(row['state'], 'reconcile')
+        self.assertIsNone(row['externalId'])
+        self.assertFalse(any('/collaborators/' in c[1] for c in self.remote.calls))
+        row = self.admin_action(row, 'reconcile')[1]['repository']
+        self.assertEqual(row['state'], 'reconcile')
+        self.assertEqual(len([c for c in self.remote.calls if c[0] == 'POST']), 1)
+
+    def test_gitee_ambiguous_enterprise_create_recovers_without_org_fallback(self):
+        self.enable('gitee')
+        self.remote.provider = 'gitee'
+        self.remote.timeout_create = True
+        self.repos.providers['gitee'].request = self.remote
+        application = self.apply('gitee', ['Gitee_Developer'])[1]['repository']
+        row = self.admin_action(application)[1]['repository']
+        self.assertEqual(row['state'], 'reconcile')
+        self.assertIsNone(row['externalId'])
+        self.remote.timeout_create = False
+        row = self.admin_action(row, 'reconcile')[1]['repository']
+        self.assertEqual(row['state'], 'ready')
+        self.assertEqual(row['externalId'], '123')
+        self.assertEqual([c[1] for c in self.remote.calls if c[0] == 'POST'], ['/enterprises/gotc-ai-hackathon/repos'])
+
+    def test_gitee_inconclusive_grant_remains_reconcilable_until_readback_confirms_push(self):
+        self.enable('gitee')
+        self.remote.provider = 'gitee'
+        self.repos.providers['gitee'].request = self.remote
+        self.remote.gitee_member_response = (204, {})
+        application = self.apply('gitee', ['Gitee_Developer'])[1]['repository']
+        status, result, _ = self.admin_action(application)
+        self.assertEqual(status, 200, result)
+        row = result['repository']
+        self.assertEqual(row['state'], 'reconcile')
+        self.assertEqual(row['externalId'], '123')
+        self.assertNotEqual(row['message'], '仓库写权限已确认')
+        self.open_submissions()
+        self.assertEqual(self.preview()[0], 409)
+        self.remote.gitee_member_response = None
+        self.remote.gitee_permission = 'pull'
+        row = self.admin_action(row, 'reconcile')[1]['repository']
+        self.assertEqual(row['state'], 'reconcile')
+        self.remote.gitee_permission = 'push'
+        row = self.admin_action(row, 'reconcile')[1]['repository']
+        self.assertEqual(row['state'], 'ready')
+        self.assertEqual(len([c for c in self.remote.calls if c[0] == 'POST' and c[1].startswith('/enterprises/')]), 1)
 
     def test_missing_preview_and_manual_code_override_are_denied(self):
         self.provision()
@@ -336,6 +404,24 @@ class RepositoryTests(unittest.TestCase):
 
 
 class ProviderTransportTests(unittest.TestCase):
+    def test_gitee_enterprise_create_uses_integer_external_open_and_never_falls_back(self):
+        provider = Provider('gitee', 'gotc-ai-hackathon', 'never-used', 'main', True)
+        row = {'organization': 'gotc-ai-hackathon', 'slug': 'generated-team-repo', 'operation_id': 'operation-marker'}
+        data = {'id': 123, 'namespace': {'type': 'enterprise'}}
+        with patch.object(provider, 'request', return_value=(201, data)) as request:
+            self.assertEqual(provider.create(row), data)
+            method, path, body = request.call_args.args
+            self.assertEqual((method, path), ('POST', '/enterprises/gotc-ai-hackathon/repos'))
+            self.assertIs(type(body['private']), int)
+            self.assertEqual(body['private'], 1)
+            self.assertEqual(body['path'], row['slug'])
+            self.assertIs(body['outsourced'], False)
+        for response in [(202, data), (200, data)]:
+            with self.subTest(response=response), patch.object(provider, 'request', return_value=response) as request:
+                with self.assertRaises(UpstreamError):
+                    provider.create(row)
+                self.assertEqual(request.call_count, 1)
+
     def test_fixed_hosts_push_permission_no_redirect_and_redacted_errors(self):
         for name, origin in [('github', 'https://api.github.com/'), ('gitee', 'https://gitee.com/api/v5/')]:
             provider = Provider(name, 'org', 'synthetic-secret', 'main', True)
@@ -355,9 +441,28 @@ class ProviderTransportTests(unittest.TestCase):
 
     def test_gitee_collaborator_write_permission_uses_push_not_admin(self):
         provider = Provider('gitee', 'org', 'never-used', 'main', True)
-        with patch.object(provider, 'request', return_value=(200, {})) as request:
+        responses = [(200, {'id': 123, 'login': 'developer', 'permissions': 'push'}),
+                     (200, {'id': 123, 'login': 'developer', 'permission': 'push'})]
+        with patch.object(provider, 'request', side_effect=responses) as request:
             self.assertEqual(provider.invite({'organization': 'org', 'slug': 'repo'}, 'developer'), 'ready')
-            request.assert_called_once_with('PUT', '/repos/org/repo/collaborators/developer', {'permission': 'push'})
+            self.assertEqual(request.call_args_list[0].args, ('PUT', '/repos/org/repo/collaborators/developer', {'permission': 'push'}))
+            self.assertEqual(request.call_args_list[1].args, ('GET', '/repos/org/repo/collaborators/developer/permission'))
+
+    def test_gitee_grant_rejects_empty_pending_mismatched_and_read_only_responses(self):
+        provider = Provider('gitee', 'org', 'never-used', 'main', True)
+        row = {'organization': 'org', 'slug': 'repo'}
+        valid = {'id': 123, 'login': 'developer', 'permissions': 'push'}
+        for response in [(202, valid), (204, {}), (200, {}), (200, {'id': 123, 'login': 'other'})]:
+            with self.subTest(member=response), patch.object(provider, 'request', return_value=response) as request:
+                with self.assertRaises(UpstreamError):
+                    provider.invite(row, 'developer')
+                self.assertEqual(request.call_count, 1)
+        for permission in [{}, {'id': 123, 'login': 'developer', 'permission': 'pull'},
+                           {'id': 456, 'login': 'developer', 'permission': 'push'},
+                           {'id': 123, 'login': 'other', 'permission': 'push'}]:
+            with self.subTest(permission=permission), patch.object(provider, 'request', side_effect=[(200, valid), (200, permission)]):
+                with self.assertRaises(UpstreamError):
+                    provider.invite(row, 'developer')
 
 
 if __name__ == '__main__':
