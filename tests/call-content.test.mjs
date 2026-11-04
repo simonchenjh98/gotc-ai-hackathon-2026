@@ -75,3 +75,12 @@ test('malformed stored records still open, with raw content intact',()=>{
   assert.doesNotMatch(ctx.replyOf('data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'),/流未正常结束/);
   assert.equal(ctx.replyOf('模型不在本活动开放列表中'),'模型不在本活动开放列表中');  // plain-text errors shown as-is
 });
+
+test('failure notes show whose fault it was and escape upstream text',()=>{
+  const note=ctx.failureNote({errorType:'api_error',errorOwner:'provider',errorPhase:'upstream',upstreamStatus:401,errorMessage:'<img src=x onerror=alert(1)> key ***'});
+  assert.match(note,/上游 · api_error · 上游 401/);
+  assert.ok(!note.includes('<img'));assert.match(note,/&lt;img/);
+  assert.equal(ctx.failureNote({errorType:''}),'');
+  const team=ctx.failureNote({errorType:'rate_limit_error',errorOwner:'client'});  // team view: no upstream detail
+  assert.match(team,/学生请求 · rate_limit_error/);assert.doesNotMatch(team,/上游 \d/);
+});

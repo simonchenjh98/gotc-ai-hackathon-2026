@@ -15,6 +15,8 @@ import threading
 import unittest
 
 import test_api
+from app import EventHandler
+test_api.EventHandler = EventHandler
 from test_api import Client
 import keys
 from keys import load_config
@@ -26,6 +28,7 @@ class FakeUpstream(BaseHTTPRequestHandler):
     fail_first = 0  # answer 529 this many times before succeeding
     hang = None  # "before": no reply at all; "body": headers, then the body stalls
     usage = None  # overrides the non-streaming usage object
+    reply = None  # (status, content type, raw bytes): answer exactly this
 
     def log_message(self, *_):
         pass
@@ -55,6 +58,15 @@ class FakeUpstream(BaseHTTPRequestHandler):
                 self.connection.shutdown(2)
                 return
             threading.Event().wait(2)  # longer than the shortened upstream timeout in the test
+            return
+        if FakeUpstream.reply:
+            status, content_type, payload = FakeUpstream.reply
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            if content_type != "text/event-stream":
+                self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
             return
         if FakeUpstream.fail_first:
             FakeUpstream.fail_first -= 1
@@ -111,6 +123,7 @@ class GatewayTests(unittest.TestCase):
 
     def setUp(self):
         FakeUpstream.calls, FakeUpstream.status, FakeUpstream.fail_first, FakeUpstream.usage, FakeUpstream.hang = [], 200, 0, None, None
+        FakeUpstream.reply = None
         self.delays, keys.RETRY_DELAYS = keys.RETRY_DELAYS, (0, 0)
         self.fake = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
         threading.Thread(target=self.fake.serve_forever, daemon=True).start()
@@ -212,7 +225,7 @@ class GatewayTests(unittest.TestCase):
         status, content = self.call("/v1/messages", {"model": "claude-x", "stream": True}, headers={"x-api-key": key})
         self.assertEqual(status, 200)
         self.assertEqual(FakeUpstream.calls[-1][1]["X-Api-Key"], "sk-upstream-anthropic")
-        self.assertEqual(self.call("/v1/messages", {"model": "cheap"}, key)[0], 400)  # model of the other upstream
+        self.assertEqual(self.call("/v1/messages", {"model": "cheap"}, key)[0], 404)  # model of the other upstream
 
         # 2000*1 + 1000*2 = 4000 micro-USD; 1000*1 + 500*2 = 2000; 1000*3 + 500*15 = 10500
         budget = client.get("/api/team/keys")[1]["budget"]
@@ -233,7 +246,7 @@ class GatewayTests(unittest.TestCase):
         _, _, key = self.enabled_key()
         self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"})[0], 401)
         self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, "gk-wrong")[0], 401)
-        self.assertEqual(self.call("/v1/chat/completions", {"model": "unknown"}, key)[0], 400)
+        self.assertEqual(self.call("/v1/chat/completions", {"model": "unknown"}, key)[0], 404)
         FakeUpstream.status = 401  # our upstream credential is wrong: hide it
         status, content = self.call("/v1/chat/completions", {"model": "cheap"}, key)
         self.assertEqual(status, 502)
@@ -255,7 +268,7 @@ class GatewayTests(unittest.TestCase):
         self.call("/v1/chat/completions", {"model": "unknown"}, key)
         status, logs, _ = self.admin.post("/api/admin/keys/logs", {"teamId": team_id})
         self.assertEqual(status, 200, logs)
-        self.assertEqual([i["status"] for i in logs["items"]], [400, 200, 200])
+        self.assertEqual([i["status"] for i in logs["items"]], [404, 200, 200])
         first = logs["items"][2]
         self.assertEqual((first["userAgent"], first["input"], first["keyName"]), ("my-agent/1.0", 2000, "alice"))
         self.assertEqual(len(self.admin.post("/api/admin/keys/logs", {"errorsOnly": True})[1]["items"]), 1)
@@ -344,7 +357,7 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap", "messages": []}, key)[0], 200)
         self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap", "messages": []}, key)[0], 429)  # 3rd in a minute
         self.assertEqual(self.admin.post("/api/admin/keys/settings", {"teamRpm": 0})[0], 200)  # 0 = unlimited
-        self.assertEqual(self.call("/v1/chat/completions", {"model": "=1+1", "messages": []}, key)[0], 400)
+        self.assertEqual(self.call("/v1/chat/completions", {"model": "=1+1", "messages": []}, key)[0], 404)
 
         status, data, _ = self.admin.get("/api/admin/keys")
         self.assertEqual(status, 200)
@@ -393,8 +406,8 @@ class GatewayTests(unittest.TestCase):
         before = len(FakeUpstream.calls)
         self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, key)[0], 200)
         self.assertEqual(len(FakeUpstream.calls) - before, 3)
-        FakeUpstream.fail_first = 3
-        self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, key)[0], 502)
+        FakeUpstream.fail_first = 3  # still overloaded after the retries: 503 overloaded_error, as sub2api maps 529
+        self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, key)[0], 503)
 
         # Teams see their own call history, without content.
         status, own, _ = client.get("/api/team/keys/logs")
@@ -495,7 +508,7 @@ class GatewayTests(unittest.TestCase):
         finally:
             FakeUpstream.do_POST = original
         item = self.latest()
-        self.assertEqual((item["status"], item["incomplete"], item["estimated"]), (200, 1, 1))
+        self.assertEqual((item["status"], item["incomplete"], item["estimated"]), (502, 1, 1))  # inferred, as sub2api
         self.assertEqual(item["input"], 300)  # observed usage kept
         self.assertGreaterEqual(item["output"], len(reply.encode()) // 4)  # output estimated from streamed text
         self.assertEqual(self.admin.get("/api/admin/keys")[1]["overview"]["errors"], 1)  # counted as a failure
@@ -570,7 +583,7 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual((item["status"], item["cost"]), (502, 0), code)  # was recorded as status 0
             self.assertEqual(errors(), count)
             detail = self.admin.post("/api/admin/keys/log", {"id": item["id"]})[1]
-            self.assertIn(f"上游返回 HTTP {code}", detail["response"])  # the admin can see why
+            self.assertIn(f"上游 HTTP {code}", detail["response"])  # the admin can see why
         self.assertEqual(self.service.keys.reserved[team_id], 0)
 
     def test_upstream_timeouts_are_charged_the_reservation(self):
@@ -639,8 +652,8 @@ class GatewayTests(unittest.TestCase):
             ("HTTPS to a plain HTTP port", f"https://localhost:{plain_port}/v1", None, 502, False, False, "TLS 握手失败"),
             ("TLS handshake timeout", f"https://localhost:{silent_listener()}/v1", None, 502, False, False, "上游超时"),
             ("HTTPS_PROXY cannot reach upstream", "https://api.example.com/v1", "proxy", 502, False, False, "Tunnel connection failed"),
-            ("upstream 401", f"http://127.0.0.1:{plain_port}/v1", 401, 502, False, True, "上游返回 HTTP 401"),
-            ("upstream 500", f"http://127.0.0.1:{plain_port}/v1", 500, 502, False, True, "上游返回 HTTP 500"),
+            ("upstream 401", f"http://127.0.0.1:{plain_port}/v1", 401, 502, False, True, "上游 HTTP 401"),
+            ("upstream 500", f"http://127.0.0.1:{plain_port}/v1", 500, 502, False, True, "上游 HTTP 500"),
             ("timeout after sending", f"http://127.0.0.1:{plain_port}/v1", "before", 504, True, True, "请求已发出"),
             ("closed after receiving", f"http://127.0.0.1:{plain_port}/v1", "drop", 502, True, True, "请求已发出"),
             ("reply cut mid-body", f"http://127.0.0.1:{plain_port}/v1", "reset", 502, True, True, "请求已发出"),
@@ -691,6 +704,164 @@ class GatewayTests(unittest.TestCase):
             for server in servers:
                 (server.close if isinstance(server, socket.socket) else server.shutdown)()
 
+    def test_unexpected_gateway_error_never_records_status_zero(self):
+        team_id, _, key = self.enabled_key()
+        with mock.patch.object(keys, "read_usage", side_effect=RuntimeError("bug")):
+            status, _ = self.call("/v1/messages", {"model": "claude-x", "max_tokens": 1000}, key)
+        self.assertEqual(status, 500)
+        item = self.latest()
+        self.assertEqual((item["status"], item["estimated"]), (500, 1))  # the upstream had answered: charged, not free
+        self.assertGreater(item["cost"], 0)
+        self.assertEqual(self.admin.get("/api/admin/keys")[1]["overview"]["errors"], 1)
+        self.assertEqual(self.service.keys.reserved[team_id], 0)
+        self.assertEqual(self.call("/v1/messages", {"model": "claude-x", "max_tokens": 10}, key)[0], 200)  # gateway still healthy
+
+    def test_reservation_is_released_even_if_recording_fails(self):
+        team_id, _, key = self.enabled_key()
+        with mock.patch.object(self.service.keys, "record", side_effect=lambda *a: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked"))):
+            status, _ = self.call("/v1/messages", {"model": "claude-x", "max_tokens": 1000}, key)
+        self.assertEqual(status, 200)  # the team still got its reply
+        self.assertEqual(self.service.keys.reserved[team_id], 0)  # and its budget is not blocked forever
+
+    def test_stream_is_drained_and_billed_when_the_client_left_before_headers(self):
+        _, client, key = self.enabled_key()
+        real_headers_out = test_api.EventHandler.headers_out
+
+        def broken(handler, status, content_type, *args, **kwargs):
+            if content_type.startswith("text/event-stream"):
+                raise BrokenPipeError()
+            return real_headers_out(handler, status, content_type, *args, **kwargs)
+        with mock.patch.object(test_api.EventHandler, "headers_out", broken):
+            with self.assertRaises(http.client.RemoteDisconnected):  # the client is "gone": nothing is sent back
+                self.call("/v1/messages", {"model": "claude-x", "stream": True, "max_tokens": 1000}, key)
+        item = self.latest()
+        self.assertEqual((item["status"], item["input"], item["output"], item["incomplete"]), (200, 1000, 500, 0))  # usage read to the end
+        self.assertGreater(item["cost"], 0)
+
+    def sse(self, *events, anthropic=True):
+        out = b""
+        for event in events:
+            if anthropic and isinstance(event, dict) and "type" in event:
+                out += b"event: " + event["type"].encode() + b"\n"
+            out += b"data: " + (event if isinstance(event, bytes) else json.dumps(event).encode()) + b"\n\n"
+        return out
+
+    def test_abnormal_requests_follow_sub2api_records_and_billing(self):
+        """Every abnormal case: what the team receives, what is recorded (sub2api classification) and what is charged."""
+        team_id, client, key = self.enabled_key()
+        secret = self.upstreams["anthropic"]["key"]
+        start = {"type": "message_start", "message": {"usage": {"input_tokens": 300, "output_tokens": 1}}}
+        delta = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "回答" * 100}}
+        overloaded = {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
+        A, O = "/v1/messages", "/v1/chat/completions"
+        cases = [
+            # name, path, request, fake upstream reply, status, error type, phase, owner, upstream status, charged
+            ("model not allowed", A, {"model": "nope"}, None, 404, "not_found_error", "request", "client", None, False),
+            ("upstream 400 passed through", A, {"model": "claude-x"}, (400, "application/json", b'{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: too big"}}'),
+             400, "invalid_request_error", "upstream", "provider", 400, False),
+            ("upstream 401 hidden", A, {"model": "claude-x"}, (401, "application/json", f'{{"error":{{"message":"invalid x-api-key {secret}"}}}}'.encode()),
+             502, "api_error", "upstream", "provider", 401, False),
+            ("upstream 404 on messages", A, {"model": "claude-x"}, (404, "application/json", b'{"error":{"message":"no such model"}}'),
+             502, "api_error", "upstream", "provider", 404, False),
+            ("upstream 404 on chat", O, {"model": "cheap"}, (404, "application/json", b'{"error":{"message":"no such model"}}'),
+             404, "invalid_request_error", "upstream", "provider", 404, False),
+            ("upstream 429", A, {"model": "claude-x"}, (429, "application/json", b'{"error":{"message":"slow down"}}'),
+             429, "rate_limit_error", "upstream", "provider", 429, False),
+            ("upstream 529", A, {"model": "claude-x"}, (529, "application/json", b'{"error":{"message":"Overloaded"}}'),
+             503, "overloaded_error", "upstream", "provider", 529, False),
+            ("200 that is not JSON", A, {"model": "claude-x"}, (200, "text/html", b"<html>gateway page</html>"),
+             502, "api_error", "upstream", "provider", 200, False),
+            ("200 carrying an error", O, {"model": "cheap"}, (200, "application/json", b'{"error":{"message":"server overloaded"}}'),
+             503, "overloaded_error", "upstream", "provider", 200, False),
+            ("stream error before output", A, {"model": "claude-x", "stream": True}, (200, "text/event-stream", self.sse(overloaded)),
+             503, "overloaded_error", "upstream", "provider", 200, False),
+            ("stream error after output", A, {"model": "claude-x", "stream": True}, (200, "text/event-stream", self.sse(start, delta, overloaded)),
+             200, "overloaded_error", "upstream", "provider", 200, True),
+            ("stream ends without terminal event", A, {"model": "claude-x", "stream": True}, (200, "text/event-stream", self.sse(start, delta)),
+             200, "api_error", "network", "provider", None, True),
+            ("chat stream ends without terminal event", O, {"model": "cheap", "stream": True},
+             (200, "text/event-stream", self.sse({"choices": [{"delta": {"content": "hi" * 100}}]}, anthropic=False)),
+             200, "api_error", "network", "provider", None, True),
+        ]
+        for name, path, request, reply, status, etype, phase, owner, ustatus, charged in cases:
+            with self.subTest(name):
+                FakeUpstream.reply = reply
+                got, content = self.call(path, request, key)
+                item = self.latest()
+                self.assertEqual(got, status)
+                recorded = 502 if got == 200 else got  # a stream that failed after the 200 is recorded as a failure
+                self.assertEqual((item["status"], item["errorType"], item["errorPhase"], item["errorOwner"], item["upstreamStatus"]),
+                                 (recorded, etype, phase, owner, ustatus))
+                self.assertEqual(item["cost"] > 0, charged, f"cost={item['cost']}")
+                self.assertNotIn(secret, json.dumps(item))  # our upstream key never reaches records
+                self.assertNotIn(secret.encode(), content)
+                if got != 200:  # native error shape of each API
+                    body = json.loads(content)
+                    if path == A and got != 400:
+                        self.assertEqual((body["type"], body["error"]["type"]), ("error", etype))
+                    elif path == O:  # OpenAI shape and type names in the response; the record keeps one canonical type
+                        self.assertEqual(set(body), {"error"})
+                        self.assertEqual(set(body["error"]), {"message", "type", "code"})
+                if name == "upstream 400 passed through":
+                    self.assertIn(b"max_tokens: too big", content)
+                if name == "stream ends without terminal event":
+                    self.assertIn(b"event: error", content)  # the client is told, not just cut off
+                if name == "chat stream ends without terminal event":
+                    self.assertIn(b'data: {"error"', content)
+                if name == "stream error after output":
+                    self.assertEqual(content.count(b"event: error"), 1)  # the upstream's frame, not a second one
+        FakeUpstream.reply = None
+        errors = self.admin.get("/api/admin/keys")[1]["overview"]["errors"]
+        self.assertEqual(errors, len(cases))
+        self.assertEqual(self.service.keys.reserved[team_id], 0)
+        own = client.get("/api/team/keys/logs")[1]["items"]
+        self.assertEqual(own[0]["errorOwner"], "provider")  # teams can see whose fault a failure was
+
+    def test_client_that_left_while_queued_is_not_forwarded(self):
+        team_id, _, key = self.enabled_key()
+        service = self.service.keys
+        service.inflight[team_id] = keys.TEAM_CONCURRENCY
+        body = json.dumps({"model": "cheap"}).encode()
+        sock = socket.create_connection(("127.0.0.1", self.server.server_port))
+        sock.sendall(b"POST " + self.service.base_path.encode() + b"/v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                     b"Authorization: Bearer " + key.encode() + b"\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        for _ in range(100):
+            if service.slot_free._waiters:
+                break
+            threading.Event().wait(0.02)
+        sock.close()  # the student gives up while queued
+        before = len(FakeUpstream.calls)
+        service.release(team_id)
+        for _ in range(100):
+            items = self.admin.post("/api/admin/keys/logs", {})[1]["items"]
+            if items:
+                break
+            threading.Event().wait(0.05)
+        self.assertEqual((items[0]["status"], items[0]["errorType"], items[0]["cost"]), (499, "api_error", 0))
+        self.assertEqual(len(FakeUpstream.calls), before)  # never forwarded
+        self.assertEqual(service.reserved[team_id], 0)
+
+    def test_count_tokens_mirrors_upstream_errors_and_is_never_charged(self):
+        _, _, key = self.enabled_key()
+        for reply, status in [((529, "application/json", b'{"error":{"message":"Overloaded"}}'), 503),
+                              ((429, "application/json", b'{"error":{"message":"slow"}}'), 429),
+                              ((400, "application/json", b'{"error":{"message":"bad"}}'), 400)]:
+            FakeUpstream.reply = reply
+            self.assertEqual(self.call("/v1/messages/count_tokens", {"model": "claude-x"}, key)[0], status)
+            item = self.latest()
+            self.assertEqual((item["status"], item["cost"], item["upstreamStatus"]), (status, 0, reply[0]))
+        FakeUpstream.reply = None
+
+    def test_old_usage_table_gains_error_columns(self):
+        with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
+            for column in ("error_type", "error_phase", "error_owner", "upstream_status", "error_message"):
+                db.execute(f"ALTER TABLE api_usage DROP COLUMN {column}")
+            db.commit()
+        test_api.EventService(data_dir=self.root / "private", origin=self.service.origin, static_root=self.root / "public")
+        with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
+            columns = {r[1] for r in db.execute("PRAGMA table_info(api_usage)")}
+        self.assertTrue({"error_type", "error_phase", "error_owner", "upstream_status", "error_message"} <= columns)
+
     def test_stream_is_billed_when_the_client_disconnects(self):
         _, client, key = self.enabled_key()
         import socket
@@ -734,7 +905,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(saved["models"], {"openai": ["DeepSeek-V3"]})  # anthropic removed
         self.assertEqual(self.call("/v1/chat/completions", {"model": "DeepSeek-V3"}, key)[0], 200)
         self.assertEqual(FakeUpstream.calls[-1][1]["Authorization"], "Bearer sk-upstream-openai")
-        self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, key)[0], 400)
+        self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, key)[0], 404)
         self.assertEqual(self.call("/v1/messages", {"model": "claude-x"}, key)[0], 404)
 
         # Survives a restart: a new service reads the database, not gateway.json.

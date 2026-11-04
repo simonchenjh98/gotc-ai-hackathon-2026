@@ -15,10 +15,12 @@ import os
 import json
 import re
 import secrets
+import select
 import socket
 import ssl
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 import zlib
@@ -41,7 +43,9 @@ CREATE TABLE IF NOT EXISTS api_usage (
  cache_write_tokens INTEGER NOT NULL, cache_read_tokens INTEGER NOT NULL,
  cost_micro INTEGER NOT NULL, status INTEGER NOT NULL, path TEXT NOT NULL, stream INTEGER NOT NULL,
  duration_ms INTEGER NOT NULL, user_agent TEXT NOT NULL,
- incomplete INTEGER NOT NULL DEFAULT 0, estimated INTEGER NOT NULL DEFAULT 0
+ incomplete INTEGER NOT NULL DEFAULT 0, estimated INTEGER NOT NULL DEFAULT 0,
+ error_type TEXT NOT NULL DEFAULT '', error_phase TEXT NOT NULL DEFAULT '', error_owner TEXT NOT NULL DEFAULT '',
+ upstream_status INTEGER, error_message TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS api_usage_team ON api_usage(team_id, at);
 CREATE INDEX IF NOT EXISTS api_usage_key ON api_usage(key_id, at);
@@ -58,6 +62,29 @@ DEFAULTS = {"keys.dailyBudget": 5, "keys.totalBudget": 50, "keys.maxKeys": 5, "k
 # Public path -> (upstream name, path appended to that upstream's base URL)
 ROUTES = {"/v1/chat/completions": ("openai", "/chat/completions"), "/v1/messages": ("anthropic", "/messages")}
 BODY_LIMIT = 4 * 1024 * 1024
+# Error classification copied from sub2api (handler/ops_error_logger.go classifyOpsPhase + owner mapping):
+# kind -> (default status, Anthropic error type, OpenAI error type, OpenAI code, phase, owner).
+# phase: request|auth|upstream|network|internal; owner: client (the team's request), provider (upstream), platform (gateway).
+ERROR_KINDS = {
+    "invalid": (400, "invalid_request_error", "invalid_request_error", "invalid_request", "request", "client"),
+    "auth": (401, "authentication_error", "invalid_request_error", "invalid_api_key", "auth", "client"),
+    "forbidden": (403, "permission_error", "invalid_request_error", "permission_denied", "request", "client"),
+    "billing": (403, "billing_error", "insufficient_quota", "insufficient_quota", "request", "client"),
+    "not_found": (404, "not_found_error", "invalid_request_error", "model_not_found", "request", "client"),
+    "too_large": (413, "request_too_large", "invalid_request_error", "request_too_large", "request", "client"),
+    "rate_limit": (429, "rate_limit_error", "rate_limit_error", "rate_limit_exceeded", "request", "client"),
+    "usage_limit": (429, "rate_limit_error", "insufficient_quota", "usage_limit_exceeded", "request", "client"),
+    "client_closed": (499, "api_error", "api_error", "client_closed_request", "internal", "platform"),
+    "internal": (500, "api_error", "api_error", "internal_error", "internal", "platform"),
+    "upstream": (502, "api_error", "upstream_error", "upstream_error", "upstream", "provider"),
+    "upstream_invalid": (400, "invalid_request_error", "invalid_request_error", "invalid_request", "upstream", "provider"),
+    "upstream_rate_limit": (429, "rate_limit_error", "rate_limit_error", "rate_limit_exceeded", "upstream", "provider"),
+    "overloaded": (503, "overloaded_error", "server_error", "overloaded", "upstream", "provider"),
+    "network": (502, "api_error", "upstream_error", "upstream_unreachable", "network", "provider"),
+    "timeout": (504, "api_error", "upstream_error", "upstream_timeout", "network", "provider"),
+}
+STATUS_KINDS = {400: "invalid", 401: "auth", 403: "forbidden", 404: "not_found", 411: "invalid", 413: "too_large",
+                415: "invalid", 429: "rate_limit", 499: "client_closed"}
 UPSTREAM_TIMEOUT = 300
 QUEUE_WAIT = 30  # seconds a request waits for a free team slot before 429 (agent tools send bursts)
 RESERVE_OUTPUT_DEFAULT = 8192  # output tokens reserved when the request sets no max_tokens (as sub2api)
@@ -95,6 +122,75 @@ def load_pepper(data_dir):
         except FileExistsError:
             pass
     return bytes.fromhex(path.read_text(encoding="utf-8").strip())
+
+
+class GatewayError(APIError):
+    """An error with a sub2api-style classification; plain APIError statuses are classified by STATUS_KINDS."""
+
+    def __init__(self, kind, message, status=None, upstream_status=None, upstream_message=""):
+        super().__init__(status or ERROR_KINDS[kind][0], message)
+        self.kind, self.upstream_status, self.upstream_message = kind, upstream_status, upstream_message
+
+
+def error_info(error):
+    """The record and response fields of an error, whichever exception type carried it."""
+    kind = getattr(error, "kind", None) or STATUS_KINDS.get(error.status) or ("internal" if error.status >= 500 else "invalid")
+    _, a_type, o_type, o_code, phase, owner = ERROR_KINDS[kind]
+    return {"kind": kind, "type": a_type, "openai_type": o_type, "code": o_code, "phase": phase, "owner": owner,
+            "message": error.message, "upstream_status": getattr(error, "upstream_status", None),
+            "upstream_message": getattr(error, "upstream_message", "")}
+
+
+def error_body(path, info):
+    """Error JSON in the native format of the endpoint, as sub2api answers each API in its own shape."""
+    if path.startswith("/v1/messages"):
+        return {"type": "error", "error": {"type": info["type"], "message": info["message"]}}
+    return {"error": {"message": info["message"], "type": info["openai_type"], "code": info["code"]}}
+
+
+def sse_error(path, info):
+    """Terminal error frame appended to a stream that cannot finish (sub2api appends one instead of just closing)."""
+    data = json.dumps(error_body(path, info), ensure_ascii=False)
+    return (f"event: error\ndata: {data}\n\n" if path.startswith("/v1/messages") else f"data: {data}\n\n").encode()
+
+
+def upstream_message(payload, secret=""):
+    """The upstream's own error message, cut down and with our upstream key and key-like strings removed."""
+    text = payload.decode("utf-8", "replace") if isinstance(payload, bytes) else str(payload)
+    try:
+        data = json.loads(text)
+        found = data.get("error") if isinstance(data, dict) else None
+        text = found.get("message") if isinstance(found, dict) and isinstance(found.get("message"), str) else \
+            found if isinstance(found, str) else data.get("message") if isinstance(data, dict) and isinstance(data.get("message"), str) else text
+    except ValueError:
+        pass
+    if secret:
+        text = text.replace(secret, "***")
+    text = re.sub(r"(sk-|gk-|Bearer\s+)[A-Za-z0-9._\-]{6,}", r"\1***", text)
+    text = re.sub(r"(?i)((?:api_?key|key|access_token|refresh_token|client_secret)=)[^&\s]+", r"\1***", text)
+    return " ".join(text.split())[:500]
+
+
+def upstream_http_error(path, status, message):
+    """Map an upstream HTTP error the way sub2api does (gateway_upstream_response.go / openai_gateway_upstream_errors.go)."""
+    if status == 400:
+        return None  # passed through as-is, so the team can see what was wrong with its request
+    if status in (401, 403):
+        return GatewayError("upstream", "上游鉴权失败，请联系组织方检查上游配置", upstream_status=status, upstream_message=message)
+    if status == 429:
+        return GatewayError("upstream_rate_limit", "上游请求过多，请稍后重试", upstream_status=status, upstream_message=message)
+    if status == 529:
+        return GatewayError("overloaded", "上游模型服务繁忙，请稍后重试", upstream_status=status, upstream_message=message)
+    if status >= 500:
+        return GatewayError("upstream", "上游模型服务暂时不可用，请稍后重试", upstream_status=status, upstream_message=message)
+    if path.startswith("/v1/messages"):  # Anthropic: other 4xx become 502 without upstream text
+        return GatewayError("upstream", "上游请求失败", upstream_status=status, upstream_message=message)
+    # OpenAI-compatible: keep the upstream status with its sanitized message
+    return GatewayError("upstream_invalid", message or "上游请求失败", status=status, upstream_status=status, upstream_message=message)
+
+
+class ClientGone(Exception):
+    """The team's client closed its connection; nothing more can be sent to it."""
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -309,9 +405,12 @@ class KeyService:
     def initialize(self, db):
         db.executescript(SCHEMA)
         columns = {r["name"] for r in db.execute("PRAGMA table_info(api_usage)")}
-        for column in ("incomplete", "estimated"):  # databases created before these flags existed
+        added = {"incomplete": "INTEGER NOT NULL DEFAULT 0", "estimated": "INTEGER NOT NULL DEFAULT 0",
+                 "error_type": "TEXT NOT NULL DEFAULT ''", "error_phase": "TEXT NOT NULL DEFAULT ''",
+                 "error_owner": "TEXT NOT NULL DEFAULT ''", "upstream_status": "INTEGER", "error_message": "TEXT NOT NULL DEFAULT ''"}
+        for column, kind in added.items():  # databases created before these columns existed
             if column not in columns:
-                db.execute(f"ALTER TABLE api_usage ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+                db.execute(f"ALTER TABLE api_usage ADD COLUMN {column} {kind}")
         for key, value in DEFAULTS.items():
             db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, json.dumps(value)))
         if self.seed:
@@ -404,7 +503,10 @@ class KeyService:
         if not enabled:
             raise APIError(409, "本队 API 额度尚未开通或已停用")
         if method == "GET" and path == "/api/team/keys/logs":
-            return self.logs(db, {"teamId": team_id})  # metadata only; content stays admin-only
+            items = self.logs(db, {"teamId": team_id})  # metadata only; content stays admin-only
+            for item in items["items"]:  # teams see what failed and whose fault it was, not upstream internals
+                item.pop("errorMessage"), item.pop("upstreamStatus")
+            return items
         if method == "POST" and path == "/api/team/keys":
             if set(body) != {"name"}:
                 raise APIError(400, "密钥字段不正确")
@@ -545,6 +647,9 @@ class KeyService:
               MAX(u.at) AS lastAt FROM api_usage u JOIN api_keys k ON k.id=u.key_id JOIN teams t ON t.id=u.team_id
               WHERE {clause} GROUP BY u.key_id ORDER BY cost DESC"""),
             "byModel": rows(f"SELECT u.model, {sums} FROM api_usage u WHERE {clause} GROUP BY u.model ORDER BY cost DESC"),
+            "byFailure": rows(f"""SELECT u.error_owner AS owner, u.error_phase AS phase, u.error_type AS type, u.upstream_status AS upstreamStatus,
+              {sums} FROM api_usage u WHERE {clause} AND (u.status>=400 OR u.incomplete=1) GROUP BY owner, phase, type, upstreamStatus
+              ORDER BY requests DESC"""),
             "byClient": rows(f"SELECT u.user_agent AS userAgent, {sums} FROM api_usage u WHERE {clause} GROUP BY u.user_agent ORDER BY requests DESC LIMIT 20"),
             # Calendar days in Beijing time.
             "daily": rows(f"SELECT date(u.at/1000+28800,'unixepoch') AS day, {sums} FROM api_usage u WHERE {clause} GROUP BY day ORDER BY day"),
@@ -563,7 +668,8 @@ class KeyService:
         items = [dict(r) for r in db.execute(f"""SELECT u.id, u.at, u.key_id AS keyId, k.name AS keyName, t.number AS teamNumber, t.name AS teamName,
           u.model, u.path, u.stream, u.status, u.input_tokens AS input, u.output_tokens AS output, u.cache_write_tokens AS cacheWrite,
           u.cache_read_tokens AS cacheRead, u.cost_micro/1e6 AS cost,
-          u.duration_ms AS durationMs, u.user_agent AS userAgent, u.incomplete, u.estimated, EXISTS(SELECT 1 FROM api_logs l WHERE l.usage_id=u.id) AS hasContent,
+          u.duration_ms AS durationMs, u.user_agent AS userAgent, u.incomplete, u.estimated, u.error_type AS errorType,
+          u.error_phase AS errorPhase, u.error_owner AS errorOwner, u.upstream_status AS upstreamStatus, u.error_message AS errorMessage, EXISTS(SELECT 1 FROM api_logs l WHERE l.usage_id=u.id) AS hasContent,
           (SELECT l.request_bytes FROM api_logs l WHERE l.usage_id=u.id) AS requestBytes
           FROM api_usage u JOIN api_keys k ON k.id=u.key_id JOIN teams t ON t.id=u.team_id {clause} ORDER BY u.id DESC LIMIT 50""", params)]
         return {"items": items, "more": len(items) == 50}
@@ -572,11 +678,13 @@ class KeyService:
         """Usage CSV without request content; formula-like cells are neutralised."""
         out = io.StringIO(newline="")
         writer = csv.writer(out)
-        writer.writerow(["时间(UTC毫秒)", "队号", "队名", "密钥", "模型", "接口", "流式", "状态", "输入tokens", "输出tokens", "缓存写入tokens", "缓存读取tokens", "费用USD", "耗时ms", "User-Agent", "中断", "估算计费"])
+        writer.writerow(["时间(UTC毫秒)", "队号", "队名", "密钥", "模型", "接口", "流式", "状态", "输入tokens", "输出tokens", "缓存写入tokens", "缓存读取tokens", "费用USD", "耗时ms", "User-Agent", "中断", "估算计费",
+                         "错误类型", "错误阶段", "责任方", "上游状态", "错误信息"])
         for r in db.execute("""SELECT u.*, t.number, t.name AS team_name, k.name AS key_name FROM api_usage u
           JOIN teams t ON t.id=u.team_id JOIN api_keys k ON k.id=u.key_id ORDER BY u.id"""):
             writer.writerow([self.service.csv_safe(v) for v in (r["at"], r["number"], r["team_name"], r["key_name"], r["model"], r["path"],
-                             r["stream"], r["status"], r["input_tokens"], r["output_tokens"], r["cache_write_tokens"], r["cache_read_tokens"], r["cost_micro"] / 1e6, r["duration_ms"], r["user_agent"], r["incomplete"], r["estimated"])])
+                             r["stream"], r["status"], r["input_tokens"], r["output_tokens"], r["cache_write_tokens"], r["cache_read_tokens"], r["cost_micro"] / 1e6, r["duration_ms"], r["user_agent"], r["incomplete"], r["estimated"],
+                             r["error_type"], r["error_phase"], r["error_owner"], r["upstream_status"], r["error_message"])])
         return ("\ufeff" + out.getvalue()).encode("utf-8")
 
     def admit(self, team, rpm):
@@ -608,12 +716,12 @@ class KeyService:
             settings = self.settings(db)
             current = now_ms()
             if settings["expiresAt"] is not None and current >= settings["expiresAt"]:
-                raise APIError(403, "本活动 API 额度已到期")
+                raise GatewayError("billing", "本活动 API 额度已到期")
             held = (self.reserved[team] + estimate) / 1e6
             if self.spend(db, team, current - DAY_MS) + held > settings["dailyBudget"]:
-                raise APIError(429, "本队近24小时额度不足以完成本次请求")
+                raise GatewayError("usage_limit", "本队近24小时额度不足以完成本次请求")
             if self.spend(db, team) + held > settings["totalBudget"]:
-                raise APIError(429, "本队总额度不足以完成本次请求")
+                raise GatewayError("billing", "本队总额度不足以完成本次请求")
             self.reserved[team] += estimate
 
     def unreserve(self, team, estimate):
@@ -632,14 +740,60 @@ class KeyService:
                 "request_bytes": 0, "reply_bytes": 0, "done": False, "forwarded": False}
         try:
             self.serve(handler, path, call)
-        except APIError as error:
-            call["status"] = error.status
-            self.keep(call, error.message.encode())
-            self.record(handler, call)
+        except ClientGone:
+            handler.close_connection = True  # the team's client went away; the call was already recorded
+        except Exception as error:
+            if not isinstance(error, APIError):
+                # A gateway bug or unexpected failure: never leave a row with status 0, and tell the team something.
+                traceback.print_exc()
+                error = GatewayError("internal", "网关内部错误，请联系组织方")
+            info = self.note_error(call, error)
+            self.safe_record(handler, call)
             handler.close_connection = True
-            handler.respond(error.status, {"type": "error", "error": {"type": "gateway_error", "message": error.message}})
+            if not call.get("headers_sent"):
+                try:
+                    handler.respond(error.status, error_body(path, info))
+                except OSError:
+                    pass
         finally:
-            self.record(handler, call)  # no-op when already recorded or unauthenticated
+            self.safe_record(handler, call)  # no-op when already recorded or unauthenticated
+
+    def note_error(self, call, error):
+        """Attach the final status and classification to a call that has not been written yet."""
+        info = error_info(error)
+        if not call.get("recorded"):
+            call["status"], call["error"] = error.status, info
+            detail = (f"上游 HTTP {info['upstream_status']}：" if info["upstream_status"] else "") + info["upstream_message"]
+            detail = detail + "\n" if detail else ""
+            self.keep(call, (detail + error.message).encode())
+        return info
+
+    def client_gone(self, handler):
+        """Whether the team's client has closed its connection (its request body was already read in full)."""
+        try:
+            readable, _, _ = select.select([handler.connection], [], [], 0)
+            return bool(readable) and handler.connection.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
+
+    def safe_record(self, handler, call):
+        """record(), but a storage failure must not hide the original error or leave the client without a reply."""
+        try:
+            self.record(handler, call)
+        except Exception:
+            traceback.print_exc()
+
+    def send(self, handler, call, status, content_type, payload=None, length=None):
+        """Write to the team's client; a closed connection becomes ClientGone so it is never mistaken for an upstream error."""
+        try:
+            if not call.get("headers_sent"):
+                handler.headers_out(status, content_type, len(payload) if length is None and payload is not None else length,
+                                    extra={"X-Accel-Buffering": "no"} if payload is None else None)
+                call["headers_sent"] = True
+            if payload:
+                handler.wfile.write(payload)
+        except OSError:
+            raise ClientGone() from None
 
     def keep(self, call, data):
         if call["log"]:
@@ -652,13 +806,16 @@ class KeyService:
         if not call["key"] or call.get("recorded"):
             return
         call["recorded"] = True
+        if not call["status"]:
+            call["status"] = 500  # defensive: every stored call has a real outcome
         usage, price = list(call["usage"]), call["price"] or (0, 0, 0, 0)
-        # A forwarded call the upstream answered without finishing (no terminal event) is incomplete, never a plain success.
-        incomplete = call["forwarded"] and call["status"] < 400 and not call["done"]
+        # Billing follows whether the upstream generated output ("forwarded"), never the recorded status: a stream that
+        # failed after output started is a 502 for the record but its tokens were still produced.
+        incomplete = call["forwarded"] and not call["done"]
         estimated = False
         if call.get("charge_reserved"):
             usage, incomplete, estimated = [call["request_bytes"] // 4, call.get("reserve_out", 0), 0, 0], True, True
-        if call["forwarded"] and call["status"] < 400:
+        elif call["forwarded"]:
             # sub2api bills only what it observed; a call with no usage would then be free and escape the budget.
             # Fill gaps with its reservation estimate instead: input ~ request bytes / 4, output ~ reply text bytes / 4.
             est_in, est_out = call["request_bytes"] // 4, call["reply_bytes"] // 4
@@ -667,13 +824,17 @@ class KeyService:
             elif incomplete and usage[1] < est_out:
                 usage[1], estimated = est_out, True
         cost = round(sum(t * p for t, p in zip(usage, price)))  # USD per 1M tokens == micro-USD per token
+        error = call.get("error") or {"type": "", "phase": "", "owner": "", "upstream_status": None, "upstream_message": "", "message": ""}
         at = now_ms()
         with self.service.db() as db:
             usage_id = db.execute("""INSERT INTO api_usage(key_id,team_id,at,model,input_tokens,output_tokens,cache_write_tokens,cache_read_tokens,
-              cost_micro,status,path,stream,duration_ms,user_agent,incomplete,estimated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              cost_micro,status,path,stream,duration_ms,user_agent,incomplete,estimated,error_type,error_phase,error_owner,
+              upstream_status,error_message) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                   (call["key"]["id"], call["key"]["team_id"], at, call["model"], usage[0], usage[1], usage[2], usage[3], cost,
                                                      call["status"], call["path"], int(call["stream"]), int((time.monotonic() - call["started"]) * 1000),
-                                                     (handler.headers.get("User-Agent") or "")[:300], int(incomplete), int(estimated))).lastrowid
+                                                     (handler.headers.get("User-Agent") or "")[:300], int(incomplete), int(estimated),
+                                                     error["type"], error["phase"], error["owner"], error["upstream_status"],
+                                                     (error["upstream_message"] or error["message"])[:500])).lastrowid
             db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (at, call["key"]["id"]))
             if call["log"]:
                 headers = {k: v[:500] for k, v in handler.headers.items() if k.lower() not in SECRET_HEADERS}
@@ -707,12 +868,12 @@ class KeyService:
             if call is not None:
                 current = now_ms()
                 if settings["expiresAt"] is not None and current >= settings["expiresAt"]:
-                    raise APIError(403, "本活动 API 额度已到期")
+                    raise GatewayError("billing", "本活动 API 额度已到期")
                 # Cheap early reject; the binding check is reserve() after the queue wait.
                 if self.spend(db, row["team_id"], current - DAY_MS) >= settings["dailyBudget"]:
-                    raise APIError(429, "本队近24小时额度已用完")
+                    raise GatewayError("usage_limit", "本队近24小时额度已用完")
                 if self.spend(db, row["team_id"]) >= settings["totalBudget"]:
-                    raise APIError(429, "本队总额度已用完")
+                    raise GatewayError("billing", "本队总额度已用完")
         return row
 
     def read_body(self, handler):
@@ -762,7 +923,7 @@ class KeyService:
         model = resolve(upstream, body.get("model"))
         call["model"] = model or (body["model"][:100] if isinstance(body.get("model"), str) else "")
         if model is None:
-            raise APIError(400, "模型不在本活动开放列表中，可用模型见 /v1/models")
+            raise GatewayError("not_found", "模型不在本活动开放列表中，可用模型见 /v1/models")
         body["model"] = model
         call["price"] = upstream["models"][model]
         settings = call["settings"]
@@ -796,15 +957,29 @@ class KeyService:
         try:
             self.reserve(handler, call, estimate)
             try:
+                if self.client_gone(handler):
+                    # Left while queued: forwarding now would bill a reply nobody receives (sub2api: 499, nothing sent).
+                    raise GatewayError("client_closed", "客户端已断开，请求未发出，不计费")
                 self.forward(handler, name, upstream, suffix, body, stream, call)
             except APIError as error:
                 # record() writes once, so the final status and reason must be set before the finally below runs.
-                call["status"] = error.status
-                self.keep(call, error.message.encode())
+                self.note_error(call, error)
                 raise
+            except ClientGone:
+                raise
+            except Exception as error:
+                # Unexpected failure: the upstream may already have run if the reply had started, so charge as post-send.
+                traceback.print_exc()
+                internal = GatewayError("internal", f"网关内部错误，请联系组织方（{type(error).__name__}）")
+                if not call.get("recorded"):
+                    call["charge_reserved"] = call["forwarded"]
+                self.note_error(call, internal)
+                raise internal from None
             finally:
-                self.record(handler, call)  # the real cost lands before the reservation is dropped
-                self.unreserve(team, estimate)
+                try:
+                    self.safe_record(handler, call)  # the real cost lands before the reservation is dropped
+                finally:
+                    self.unreserve(team, estimate)  # released even if recording failed, or the team budget stays blocked
         finally:
             self.release(team)
 
@@ -832,7 +1007,7 @@ class KeyService:
         model = resolve(upstream, body.get("model"))
         call["model"] = model or ""
         if model is None:
-            raise APIError(400, "模型不在本活动开放列表中，可用模型见 /v1/models")
+            raise GatewayError("not_found", "模型不在本活动开放列表中，可用模型见 /v1/models")
         body["model"] = model
         headers = {"Content-Type": "application/json", "x-api-key": upstream["key"],
                    "anthropic-version": handler.headers.get("anthropic-version", "2023-06-01")}
@@ -843,16 +1018,22 @@ class KeyService:
         try:
             with self.open_with_retry(request) as response:
                 status, payload, content_type = response.status, response.read(1_000_000), response.headers.get("Content-Type", "application/json")
-        except urllib.error.HTTPError as error:
-            if error.code in {401, 403} or error.code >= 500:
-                raise APIError(502, "上游模型服务暂时不可用，请稍后重试") from None
-            status, payload, content_type = error.code, error.read(1_000_000), error.headers.get("Content-Type", "application/json")
-        except OSError:
-            raise APIError(502, "上游模型服务暂时不可用，请稍后重试") from None
+        except urllib.error.HTTPError as error:  # mapped like /v1/messages; count_tokens is never charged
+            try:
+                payload = error.read(1_000_000)
+            except (OSError, http.client.HTTPException):
+                payload = b"{}"
+            message = upstream_message(payload, upstream["key"])
+            mapped = upstream_http_error(call["path"], error.code, message)
+            if mapped:
+                raise mapped from None
+            status, content_type = error.code, error.headers.get("Content-Type", "application/json")
+            self.note_error(call, GatewayError("upstream_invalid", message, status=status, upstream_status=status, upstream_message=message))
+        except (OSError, http.client.HTTPException) as error:  # count_tokens is free, so any failure is just a 502
+            raise GatewayError("network", "上游模型服务暂时不可用，请稍后重试", upstream_message=failure_reason(error)) from None
         call["status"] = status
-        self.record(handler, call)
-        handler.headers_out(status, content_type, len(payload))
-        handler.wfile.write(payload)
+        self.safe_record(handler, call)
+        self.send(handler, call, status, content_type, payload)
 
     def upstream_failed(self, call, error):
         """Turn a network failure into the team's error response, charging the reservation when the upstream may have run."""
@@ -861,15 +1042,15 @@ class KeyService:
         if not call["forwarded"] and not request_was_sent(error):
             # Failed while connecting, in the TLS handshake or while sending: the upstream never had the whole request,
             # so nothing can have been generated or billed. Decided by where the failure happened, not by its type.
-            self.keep(call, f"{failure_reason(error)}（请求未发出，不计费）\n".encode())
-            raise APIError(502, "上游模型服务暂时不可用，请稍后重试（本次不计费）") from None
+            raise GatewayError("network", "上游模型服务暂时不可用，请稍后重试（本次不计费）",
+                               upstream_message=f"{failure_reason(error)}（请求未发出，不计费）") from None
         # The request was sent (or the reply had started): the upstream may be generating and billing,
         # so charge the reserved estimate rather than nothing.
         call["charge_reserved"] = True
-        self.keep(call, f"{failure_reason(error)}（请求已发出，按预留额度计费）\n".encode())
+        reason = f"{failure_reason(error)}（请求已发出，按预留额度计费）"
         if timed_out:
-            raise APIError(504, "上游模型服务响应超时，本次按预留额度计费") from None
-        raise APIError(502, "上游模型服务连接中断，本次按预留额度计费") from None
+            raise GatewayError("timeout", "上游模型服务响应超时，本次按预留额度计费", upstream_message=reason) from None
+        raise GatewayError("network", "上游模型服务连接中断，本次按预留额度计费", upstream_message=reason) from None
 
     def forward(self, handler, name, upstream, suffix, body, stream, call):
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream" if stream else "application/json"}
@@ -886,17 +1067,22 @@ class KeyService:
         try:
             response = self.open_with_retry(request)
         except urllib.error.HTTPError as error:
-            if error.code in {401, 403} or error.code >= 500:  # our credentials or an upstream outage
-                # Hidden from the team, kept for admins; the upstream does not bill a request it rejected or failed.
-                self.keep(call, f"上游返回 HTTP {error.code}\n".encode())
-                raise APIError(502, "上游模型服务暂时不可用，请稍后重试") from None
-            payload = error.read(1_000_000)  # client errors (bad params, 429) pass through for debugging
-            call["status"] = error.code
+            # The upstream answered with an error: nothing was generated, so it is never charged.
+            try:
+                payload = error.read(1_000_000)
+            except (OSError, http.client.HTTPException):
+                payload = b""
+            message = upstream_message(payload, upstream["key"]) or f"HTTP {error.code}"
+            mapped = upstream_http_error(call["path"], error.code, message)
+            if mapped:
+                raise mapped from None
+            # 400: the team's request was wrong; pass the upstream body through so it can fix it (as sub2api does).
+            self.note_error(call, GatewayError("upstream_invalid", message, status=400, upstream_status=400, upstream_message=message))
+            call["response"], call["size"] = [], 0
             self.keep(call, payload)
-            self.record(handler, call)
+            self.safe_record(handler, call)
             handler.close_connection = True
-            handler.headers_out(error.code, error.headers.get("Content-Type", "application/json"), len(payload))
-            handler.wfile.write(payload)
+            self.send(handler, call, 400, error.headers.get("Content-Type", "application/json"), payload)
             return
         except OSError as error:
             self.upstream_failed(call, error)
@@ -905,46 +1091,124 @@ class KeyService:
         with response:
             content_type = response.headers.get("Content-Type", "application/json")
             if content_type.startswith("text/event-stream"):
-                handler.close_connection = True  # HTTP/1.0: the stream ends when the connection closes
-                handler.headers_out(response.status, content_type, None, extra={"X-Accel-Buffering": "no"})
-                client_open = True
+                self.relay_stream(handler, name, response, content_type, call)
+                return
+            try:
+                payload = response.read(50_000_000)
+            except (OSError, http.client.HTTPException) as error:  # nothing sent to the client yet: a clean error
+                self.upstream_failed(call, error)
+            declared = response.headers.get("Content-Length")
+            if declared and declared.isdigit() and len(payload) < int(declared):
+                # read(n) returns a short body instead of raising when the upstream drops mid-reply.
+                self.upstream_failed(call, ConnectionResetError("reply cut short"))
+            call["reply_bytes"] = len(payload)
+            try:
+                data = json.loads(payload)
+            except ValueError:
+                # A 200 the gateway cannot parse is not a reply (sub2api: 502, not billed); keep it for admins.
+                call["forwarded"] = False
+                self.keep(call, payload[:2000])
+                preview = upstream_message(payload[:300], upstream["key"])
+                raise GatewayError("upstream", "上游返回了无法解析的内容，请稍后重试（本次不计费）", upstream_status=response.status,
+                                   upstream_message=f"上游返回 HTTP {response.status} 但内容不是 JSON：{preview}") from None
+            if isinstance(data, dict) and isinstance(data.get("error"), (dict, str)):
+                # Some providers answer errors with HTTP 200 and an error object.
+                call["forwarded"] = False
+                message = upstream_message(payload, upstream["key"])
+                kind = "overloaded" if "overload" in json.dumps(data.get("error")).lower() else "upstream"
+                raise GatewayError(kind, "上游模型服务返回错误，请稍后重试（本次不计费）", upstream_status=response.status,
+                                   upstream_message=message) from None
+            read_usage(name, data, usage)
+            call["done"] = True  # a complete JSON body is a finished reply
+            self.keep(call, payload)
+            self.safe_record(handler, call)
+            self.send(handler, call, response.status, content_type, payload)
+
+    def relay_stream(self, handler, name, response, content_type, call):
+        """Relay an SSE stream, billing what the upstream produced however the stream or the client ends.
+
+        As in sub2api, the first event is read before anything is sent: an upstream error there becomes a proper HTTP
+        error (not billed). After output has started, a failure is reported to the client with a terminal error frame
+        and recorded as a failed call (inferred 502/504), billed for what was observed or estimated.
+        """
+        usage, path = call["usage"], call["path"]
+        handler.close_connection = True  # HTTP/1.0: the stream ends when the connection closes
+        held = []
+        try:
+            for line in response:
+                held.append(line)
+                if line.startswith(b"data:") and line[5:].strip():
+                    break
+        except (OSError, http.client.HTTPException) as error:
+            self.upstream_failed(call, error)  # nothing sent to the client yet: a clean error response
+        first = b"".join(held)
+        event = None
+        for line in held:
+            if line.startswith(b"data:") and line[5:].strip() != b"[DONE]":
                 try:
-                    for line in response:
-                        if line.startswith(b"data:"):
-                            if line[5:].strip() == b"[DONE]":
-                                call["done"] = True
-                            else:
-                                try:
-                                    event = json.loads(line[5:])
-                                except ValueError:
-                                    event = None
-                                read_usage(name, event, usage)
-                                stream_progress(name, event, call)
-                        self.keep(call, line)
-                        if client_open:
-                            try:
-                                handler.wfile.write(line)
-                            except OSError:
-                                # Keep draining so the usage event at the end is still billed (upstream timeout bounds this).
-                                client_open = False
-                except (OSError, http.client.HTTPException):
-                    pass  # upstream went away (incl. a cut chunked body); flagged incomplete and billed in record()
-            else:
-                try:
-                    payload = response.read(50_000_000)
-                except (OSError, http.client.HTTPException) as error:  # nothing sent to the client yet: a clean error
-                    self.upstream_failed(call, error)
-                declared = response.headers.get("Content-Length")
-                if declared and declared.isdigit() and len(payload) < int(declared):
-                    # read(n) returns a short body instead of raising when the upstream drops mid-reply.
-                    self.upstream_failed(call, ConnectionResetError("reply cut short"))
-                call["reply_bytes"] = len(payload)
-                try:
-                    read_usage(name, json.loads(payload), usage)
-                    call["done"] = True  # a complete JSON body is a finished reply
+                    event = json.loads(line[5:])
                 except ValueError:
-                    pass
-                self.keep(call, payload)
-                self.record(handler, call)
-                handler.headers_out(response.status, content_type, len(payload))
-                handler.wfile.write(payload)
+                    event = None
+        if isinstance(event, dict) and (event.get("type") == "error" or isinstance(event.get("error"), (dict, str))):
+            call["forwarded"] = False  # the upstream refused before generating anything: not billed
+            message = upstream_message(json.dumps(event).encode())
+            raw = json.dumps(event.get("error"))
+            kind = "overloaded" if "overload" in raw.lower() else "upstream_rate_limit" if "rate_limit" in raw.lower() else "upstream"
+            raise GatewayError(kind, "上游模型服务返回错误，请稍后重试（本次不计费）", upstream_status=200, upstream_message=message)
+        try:
+            self.send(handler, call, 200, content_type)
+            client_open = True
+        except ClientGone:
+            client_open = False  # still drain below: the upstream is generating and billing regardless
+        failure = None
+
+        def relay(line):
+            nonlocal client_open
+            if line.startswith(b"data:"):
+                if line[5:].strip() == b"[DONE]":
+                    call["done"] = True
+                else:
+                    try:
+                        parsed = json.loads(line[5:])
+                    except ValueError:
+                        parsed = None
+                    read_usage(name, parsed, usage)
+                    stream_progress(name, parsed, call)
+                    if isinstance(parsed, dict) and (parsed.get("type") == "error" or isinstance(parsed.get("error"), (dict, str))):
+                        call["stream_error"] = parsed  # the upstream gave up mid-stream; the client gets its frame as-is
+            self.keep(call, line)
+            if client_open:
+                try:
+                    self.send(handler, call, 200, content_type, line)
+                except ClientGone:
+                    client_open = False  # keep draining so the final usage is still billed (bounded by the upstream timeout)
+
+        for line in held:
+            relay(line)
+        try:
+            for line in response:
+                relay(line)
+        except (OSError, http.client.HTTPException) as error:
+            failure = error
+        if call["done"] and not call.get("stream_error"):
+            return  # finished (if the client left mid-way, the full drained usage is billed, as in sub2api)
+        # The stream did not finish: classify, tell the client (if it is still there) and record a failed call.
+        if call.get("stream_error"):
+            raw = json.dumps(call["stream_error"].get("error", call["stream_error"]))
+            kind = "overloaded" if "overload" in raw.lower() else "upstream"
+            info = error_info(GatewayError(kind, "上游模型服务在输出过程中返回错误", status=502, upstream_status=200,
+                                           upstream_message=upstream_message(raw.encode())))
+            frame = None  # the upstream's own error frame was already relayed
+        else:
+            timed_out = failure is not None and isinstance(getattr(failure, "reason", failure), (TimeoutError, socket.timeout))
+            reason = failure_reason(failure) if failure is not None else "上游未发送结束事件就关闭了连接"
+            info = error_info(GatewayError("timeout" if timed_out else "network",
+                                           "上游输出中断，本次按已产生的用量计费", upstream_message=reason))
+            frame = sse_error(path, info)
+        call["status"], call["error"] = info["kind"] == "timeout" and 504 or 502, info
+        self.keep(call, f"{info['upstream_message']}\n".encode())
+        if frame and client_open:
+            try:
+                self.send(handler, call, 200, content_type, frame)
+            except ClientGone:
+                pass
