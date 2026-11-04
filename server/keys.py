@@ -1552,6 +1552,11 @@ class KeyService:
             except (OSError, http.client.HTTPException):
                 payload = b"{}"
             message = upstream_message(payload, upstream["key"])
+            if error.code in (404, 405, 501):
+                # The upstream has no count_tokens (Gitee AI, many compatible providers). Mirror the status, as sub2api
+                # does for count_tokens, so clients such as Claude Code fall back to their own estimate.
+                raise GatewayError("upstream_invalid", "上游不支持 count_tokens 接口", status=404, upstream_status=error.code,
+                                   upstream_message=message) from None
             mapped = upstream_http_error(call["path"], error.code, message)
             if mapped:
                 raise mapped from None

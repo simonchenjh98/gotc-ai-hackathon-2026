@@ -885,7 +885,8 @@ class GatewayTests(unittest.TestCase):
 
     def test_count_tokens_mirrors_upstream_errors_and_is_never_charged(self):
         _, _, key = self.enabled_key()
-        for reply, status in [((529, "application/json", b'{"error":{"message":"Overloaded"}}'), 503),
+        for reply, status in [((404, "text/html", b"<html><body><h1>Resource not found</h1></body></html>"), 404),  # Gitee AI
+                              ((529, "application/json", b'{"error":{"message":"Overloaded"}}'), 503),
                               ((429, "application/json", b'{"error":{"message":"slow"}}'), 429),
                               ((400, "application/json", b'{"error":{"message":"bad"}}'), 400)]:
             FakeUpstream.reply = reply

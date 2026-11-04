@@ -684,7 +684,7 @@ function setupSnippets(info,key){if(!info)return '';const base=info.baseUrl,clau
   return `<div class="setup-snippets"><h3>接入示例</h3>${tabs.map(([name,code])=>`<details><summary>${esc(name)}</summary><pre class="log-content">${esc(code)}</pre></details>`).join('')}<p class="small-note">密钥请放在环境变量或 .env 文件中，并把 .env 加入 .gitignore。</p></div>`;}
 // Model upstreams (like sub2api channels): base URL, API key, model whitelist with prices, aliases.
 const upstreamKinds={openai:'OpenAI 兼容（/v1/chat/completions）',anthropic:'Anthropic（/v1/messages）'};
-const upstreamPresets={'Gitee AI（模力方舟）':['openai','https://ai.gitee.com/v1'],'DeepSeek':['openai','https://api.deepseek.com/v1'],'Anthropic 官方':['anthropic','https://api.anthropic.com/v1']};
+const upstreamPresets={'Gitee AI（模力方舟）':['openai','https://ai.gitee.com/v1'],'Gitee AI（Anthropic 格式，供 Claude Code）':['anthropic','https://ai.gitee.com/v1'],'DeepSeek':['openai','https://api.deepseek.com/v1'],'Anthropic 官方':['anthropic','https://api.anthropic.com/v1']};
 const modelsText=models=>Object.entries(models || {}).map(([m,p])=>[m,...p].join(' ')).join('\n');
 const aliasesText=aliases=>Object.entries(aliases || {}).map(([a,m])=>`${a} => ${m}`).join('\n');
 function parseModels(text,kind){const models={};for(const line of text.split('\n').map(l=>l.trim()).filter(Boolean)){const [name,...nums]=line.split(/\s+/);const prices=nums.map(Number);if(!(prices.length===2 || prices.length===4 || prices.length===5) || prices.some(n=>!Number.isFinite(n) || n<0))throw new Error(`${upstreamKinds[kind]} 模型行格式不正确：${line}（应为“模型名 输入价 输出价”，可再加“5分钟缓存写入价 缓存读取价 [1小时缓存写入价]”）`);models[name]=prices;}return models;}

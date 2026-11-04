@@ -148,6 +148,14 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 }
 ```
 
+已用真实 Gitee AI（模力方舟）密钥验证（2026-11-04）：
+- 接口地址 `https://ai.gitee.com/v1`，同一密钥同时支持 OpenAI 兼容 `/chat/completions`、Anthropic 格式 `/messages`（接受 `x-api-key`）与 `/responses`，因此两类上游都可填写此地址与同一密钥；后台“模型上游”提供两个 Gitee 模板。
+- 模型名区分大小写，以后台“获取上游模型列表”为准（如 `DeepSeek-V4-Flash`、`qwen3.8-flash`、`GLM-5.3`、`kimi-k3`）；单价需按 Gitee 控制台的人民币价格换算为美元填写。
+- 用量字段与网关解析一致：推理 token 计入 `completion_tokens`；Anthropic 格式流式回复在 `message_start` 中输入数为 0、在 `message_delta` 中给出实际值，网关按后者计费；缓存命中通过 `cache_read_input_tokens` 返回并按缓存读取价计费。
+- 不支持 `/messages/count_tokens`（返回 404），网关原样返回 404，Claude Code 会改用本地估算。
+- DeepSeek V4 等为推理模型，输出上限过小（如 20）时 token 可能全部用于推理、正文为空，接入示例中请使用较大的 `max_tokens`。
+- 实测 OpenAI Python SDK（普通、流式、Responses API）、Anthropic Python SDK（普通、流式，经 `claude-*` 别名）与 Claude Code CLI（含读取文件的工具调用）均可正常使用，调用记录、计费与首字耗时正确。Claude Code 使用非 Claude 模型时会提示无法识别模型、按 200k 上下文处理，不影响使用。
+
 Claude Code 会按自己的默认模型名请求（如 `claude-opus-…`、`claude-haiku-…`），使用 Claude Code 的活动必须配置 `claude-*` 等前缀别名，否则请求会因模型不在白名单而被拒绝。
 
 - 队伍使用：OpenAI 兼容 SDK `base_url=https://<域名>/gotc/v1`；Anthropic SDK `base_url=https://<域名>/gotc`。支持 `Authorization: Bearer` 或 `x-api-key`，支持流式输出。
