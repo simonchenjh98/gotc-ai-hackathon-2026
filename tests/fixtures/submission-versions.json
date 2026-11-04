@@ -263,5 +263,65 @@
     "repository": "https://gitlab.com/Group/.github",
     "version": "https://gitlab.com/Group/.github/-/commit/A1b2c3dddddddddddddddddddddddddddddddddd",
     "expected": null
+  },
+  {
+    "repository": "https://gitcode.com/Team/Project",
+    "version": "https://gitcode.com/Team/Project/commit/AbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb",
+    "expected": "abababababababababababababababababababab"
+  },
+  {
+    "repository": "https://gitcode.com/Team/Project.git/",
+    "version": "https://gitcode.com/Team/Project/commits/detail/CDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCD",
+    "expected": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+  },
+  {
+    "repository": "https://gitcode.com/Team/Project",
+    "version": "https://gitcode.com/Other/Project/commit/AbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb",
+    "expected": null
+  },
+  {
+    "repository": "https://gitcode.com/Team/Project",
+    "version": "https://gitcode.com/Team/Other/commits/detail/AbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb",
+    "expected": null
+  },
+  {
+    "repository": "https://gitcode.com/Team/Project",
+    "version": "https://gitcode.com/team/Project/commit/AbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb",
+    "expected": null
+  },
+  {
+    "repository": "https://gitcode.com/Team/Project",
+    "version": "https://gitcode.com/Team/Project/commit/AbAbAb",
+    "expected": null
+  },
+  {
+    "repository": "https://gitcode.com/Team/Project",
+    "version": "https://gitcode.com/Team/Project/commits/detail/main",
+    "expected": null
+  },
+  {
+    "repository": "https://gitcode.com/Team/Project",
+    "version": "https://gitcode.com/Team/Project/commits/detail/AbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb?view=1",
+    "expected": null
+  },
+  {
+    "repository": "https://gitcode.com/Team/Project",
+    "version": "https://gitee.com/Team/Project/commit/AbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb",
+    "expected": null
+  },
+  {
+    "repository": "https://gitcode.com/Team/Project",
+    "version": "https://gitcode.com/Team/Project/-/commit/AbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb",
+    "expected": null
+  },
+  {
+    "repository": "https://gitcode.com/Team/Project/blob/main/readme",
+    "version": "AbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb",
+    "expected": null
+  },
+  {
+    "repository": "https://gitee.com/Team/Project",
+    "version": "https://gitee.com/Team/Project/commits/detail/AbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb",
+    "expected": null
   }
 ]
