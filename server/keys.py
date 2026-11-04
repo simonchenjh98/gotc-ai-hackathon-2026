@@ -16,6 +16,7 @@ import json
 import re
 import secrets
 import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -234,6 +235,32 @@ def allowed_betas(value):
     """Forward client anthropic-beta flags except those that add upstream charges outside token prices."""
     flags = [f.strip() for f in (value or "").split(",") if f.strip() and not f.strip().lower().startswith(BILLED_BETAS)]
     return ",".join(flags)
+
+
+def request_was_sent(error):
+    """Whether the upstream can have received the whole request when this error occurred.
+
+    urllib wraps every failure that happens while connecting, during the TLS handshake (certificate checks included)
+    or while sending the request in URLError; failures after the request was sent (waiting for or reading the reply)
+    are raised unwrapped. HTTPError is a URLError but means the upstream answered.
+    """
+    return isinstance(error, urllib.error.HTTPError) or not isinstance(error, urllib.error.URLError)
+
+
+def failure_reason(error):
+    """Admin-facing explanation of an upstream network failure."""
+    reason = getattr(error, "reason", error)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return f"上游 TLS 证书校验失败（请检查上游地址与证书）：{reason.verify_message or reason}"
+    if isinstance(reason, ssl.SSLError):
+        return f"上游 TLS 握手失败（请检查上游地址是否为 HTTPS）：{reason.reason or reason}"
+    if isinstance(reason, socket.gaierror):
+        return "上游域名无法解析"
+    if isinstance(reason, ConnectionRefusedError):
+        return "上游拒绝连接"
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return f"上游超时（{UPSTREAM_TIMEOUT} 秒）"
+    return f"上游连接失败：{type(reason).__name__}：{reason}"[:300]
 
 
 def unpack(blob):
@@ -791,8 +818,10 @@ class KeyService:
                     raise
                 error.close()
             except OSError as error:
-                # Only connection failures are safe: a timeout may mean the upstream is still generating (and billing).
-                if delay is None or not isinstance(getattr(error, "reason", error), (ConnectionRefusedError, socket.gaierror)):
+                # Retry only when the request certainly never reached the upstream and the failure can be transient.
+                # TLS errors are configuration problems and timeouts would each wait the full upstream timeout again.
+                reason = getattr(error, "reason", error)
+                if delay is None or request_was_sent(error) or not isinstance(reason, (ConnectionError, socket.gaierror)):
                     raise
             time.sleep(delay)
 
@@ -828,17 +857,18 @@ class KeyService:
     def upstream_failed(self, call, error):
         """Turn a network failure into the team's error response, charging the reservation when the upstream may have run."""
         reason = getattr(error, "reason", error)
-        if not call["forwarded"] and isinstance(reason, (ConnectionRefusedError, socket.gaierror)):
-            # The request never left: nothing can have been generated or billed upstream.
-            self.keep(call, f"上游连接失败：{type(reason).__name__}\n".encode())
-            raise APIError(502, "上游模型服务暂时不可用，请稍后重试") from None
-        # Anything else happened after the request was sent (timeout, reset, a reply cut off mid-body): the upstream
-        # may be generating and billing, so charge the reserved estimate rather than nothing.
+        timed_out = isinstance(reason, (TimeoutError, socket.timeout))
+        if not call["forwarded"] and not request_was_sent(error):
+            # Failed while connecting, in the TLS handshake or while sending: the upstream never had the whole request,
+            # so nothing can have been generated or billed. Decided by where the failure happened, not by its type.
+            self.keep(call, f"{failure_reason(error)}（请求未发出，不计费）\n".encode())
+            raise APIError(502, "上游模型服务暂时不可用，请稍后重试（本次不计费）") from None
+        # The request was sent (or the reply had started): the upstream may be generating and billing,
+        # so charge the reserved estimate rather than nothing.
         call["charge_reserved"] = True
-        if isinstance(reason, (TimeoutError, socket.timeout)):
-            self.keep(call, f"上游响应超时（{UPSTREAM_TIMEOUT} 秒）\n".encode())
+        self.keep(call, f"{failure_reason(error)}（请求已发出，按预留额度计费）\n".encode())
+        if timed_out:
             raise APIError(504, "上游模型服务响应超时，本次按预留额度计费") from None
-        self.keep(call, f"上游连接中断：{type(reason).__name__}\n".encode())
         raise APIError(502, "上游模型服务连接中断，本次按预留额度计费") from None
 
     def forward(self, handler, name, upstream, suffix, body, stream, call):

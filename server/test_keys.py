@@ -3,6 +3,13 @@ from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import http.client
 import json
+import shutil
+import socket
+import ssl
+import subprocess
+import tempfile
+import urllib.request
+from unittest import mock
 import sqlite3
 import threading
 import unittest
@@ -34,6 +41,10 @@ class FakeUpstream(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'{"id":')
                 self.wfile.flush()
+            if FakeUpstream.hang == "drop":  # request fully received, connection closed without any reply
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+                return
             if FakeUpstream.hang == "reset":  # answer starts, then the connection drops mid-body
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -104,6 +115,8 @@ class GatewayTests(unittest.TestCase):
         self.fake = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
         threading.Thread(target=self.fake.serve_forever, daemon=True).start()
         test_api.APITests.setUp(self)
+        self.direct = urllib.request.build_opener(urllib.request.ProxyHandler({}), keys._NoRedirect)
+        self.service.keys.opener = self.direct  # ignore this machine's proxy settings
         url = f"http://127.0.0.1:{self.fake.server_port}/v1"
         # Prices are USD per million tokens: [input, output(, cacheWrite, cacheRead)]. Configured through the admin panel API.
         self.upstreams = {"openai": {"url": url, "key": "sk-upstream-openai", "models": {"cheap": [1, 2]}},
@@ -573,7 +586,7 @@ class GatewayTests(unittest.TestCase):
                 self.assertEqual(item["output"], 1000)  # the reserved output, not zero
                 self.assertGreater(item["cost"], 0.015)  # 1000 output tokens at $15 / 1M
                 detail = self.admin.post("/api/admin/keys/log", {"id": item["id"]})[1]
-                self.assertIn("上游响应超时", detail["response"])
+                self.assertIn("请求已发出，按预留额度计费", detail["response"])
             self.assertEqual(self.admin.get("/api/admin/keys")[1]["overview"]["errors"], 2)
             self.assertEqual(self.service.keys.reserved[team_id], 0)  # released after the charge landed
         finally:
@@ -593,6 +606,89 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.call("/v1/messages", body, key)[0], 502)
         item = self.latest()
         self.assertEqual((item["status"], item["cost"], item["estimated"]), (502, 0, 0))
+
+    def test_every_upstream_failure_is_billed_by_whether_the_request_was_sent(self):
+        """Free when the upstream never received the whole request; charged the reservation once it was sent."""
+        team_id, _, key = self.enabled_key()
+        servers = []
+
+        def serve(server):
+            servers.append(server)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            return server.server_port
+
+        def silent_listener():  # accepts TCP, never answers: a TLS handshake against it times out before sending
+            sock = socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(8)
+            servers.append(sock)
+            return sock.getsockname()[1]
+
+        class RefusingProxy(BaseHTTPRequestHandler):  # what an HTTPS_PROXY does when it cannot reach the upstream
+            def log_message(self, *_):
+                pass
+
+            def do_CONNECT(self):
+                self.send_response(502)
+                self.end_headers()
+        proxy = f"http://127.0.0.1:{serve(ThreadingHTTPServer(('127.0.0.1', 0), RefusingProxy))}"
+        plain_port = self.fake.server_port
+        cases = [  # name, upstream URL, fake mode, student status, charged, upstream saw the request, admin reason
+            ("connection refused", "http://127.0.0.1:1/v1", None, 502, False, False, "上游拒绝连接"),
+            ("unknown host", "https://gotc-gateway-test.invalid/v1", None, 502, False, False, "上游域名无法解析"),
+            ("HTTPS to a plain HTTP port", f"https://localhost:{plain_port}/v1", None, 502, False, False, "TLS 握手失败"),
+            ("TLS handshake timeout", f"https://localhost:{silent_listener()}/v1", None, 502, False, False, "上游超时"),
+            ("HTTPS_PROXY cannot reach upstream", "https://api.example.com/v1", "proxy", 502, False, False, "Tunnel connection failed"),
+            ("upstream 401", f"http://127.0.0.1:{plain_port}/v1", 401, 502, False, True, "上游返回 HTTP 401"),
+            ("upstream 500", f"http://127.0.0.1:{plain_port}/v1", 500, 502, False, True, "上游返回 HTTP 500"),
+            ("timeout after sending", f"http://127.0.0.1:{plain_port}/v1", "before", 504, True, True, "请求已发出"),
+            ("closed after receiving", f"http://127.0.0.1:{plain_port}/v1", "drop", 502, True, True, "请求已发出"),
+            ("reply cut mid-body", f"http://127.0.0.1:{plain_port}/v1", "reset", 502, True, True, "请求已发出"),
+            ("reply body stalls", f"http://127.0.0.1:{plain_port}/v1", "body", 504, True, True, "请求已发出"),
+        ]
+        if shutil.which("openssl"):
+            certs = tempfile.mkdtemp()
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", f"{certs}/key.pem",
+                            "-out", f"{certs}/cert.pem", "-days", "1", "-subj", "/CN=localhost"], check=True, capture_output=True)
+            tls = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(f"{certs}/cert.pem", f"{certs}/key.pem")
+            tls.socket = context.wrap_socket(tls.socket, server_side=True)
+            cases.insert(2, ("untrusted certificate", f"https://localhost:{serve(tls)}/v1", None, 502, False, False, "TLS 证书校验失败"))
+        timeout, keys.UPSTREAM_TIMEOUT = keys.UPSTREAM_TIMEOUT, 0.5
+        try:
+            for name, url, mode, student, charged, reached, reason in cases:
+                with self.subTest(name):
+                    upstream = {"anthropic": {"url": url, "key": "sk-upstream-anthropic", "models": {"claude-x": [3, 15]}}}
+                    self.assertEqual(self.admin.post("/api/admin/keys/upstreams", {"upstreams": upstream})[0], 200)
+                    self.service.keys.opener = (urllib.request.build_opener(urllib.request.ProxyHandler({"https": proxy}), keys._NoRedirect)
+                                                if mode == "proxy" else self.direct)
+                    FakeUpstream.hang, FakeUpstream.status = (None, 200) if mode in (None, "proxy") else (mode, 200) if isinstance(mode, str) else (None, mode)
+                    before = len(FakeUpstream.calls)
+                    real_lookup = socket.getaddrinfo
+
+                    def lookup(host, *args, **kwargs):  # deterministic DNS failure, whatever resolver this machine uses
+                        if host.endswith(".invalid"):
+                            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+                        return real_lookup(host, *args, **kwargs)
+                    with mock.patch("socket.getaddrinfo", lookup):
+                        status, _ = self.call("/v1/messages", {"model": "claude-x", "max_tokens": 1000}, key)
+                    item = self.latest()
+                    detail = self.admin.post("/api/admin/keys/log", {"id": item["id"]})[1]["response"]
+                    self.assertEqual((status, item["status"]), (student, student))
+                    self.assertEqual(item["cost"] > 0, charged, f"cost={item['cost']}")
+                    self.assertEqual(bool(item["estimated"]), charged)
+                    self.assertEqual(len(FakeUpstream.calls) > before, reached)
+                    self.assertIn(reason, detail)
+                    if charged:
+                        self.assertIn("请求已发出，按预留额度计费", detail)
+                    elif not reached:
+                        self.assertIn("请求未发出，不计费", detail)
+                    self.assertEqual(self.service.keys.reserved[team_id], 0)
+        finally:
+            keys.UPSTREAM_TIMEOUT, FakeUpstream.hang, FakeUpstream.status = timeout, None, 200
+            for server in servers:
+                (server.close if isinstance(server, socket.socket) else server.shutdown)()
 
     def test_stream_is_billed_when_the_client_disconnects(self):
         _, client, key = self.enabled_key()
