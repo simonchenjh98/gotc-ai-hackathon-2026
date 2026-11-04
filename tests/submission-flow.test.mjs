@@ -21,7 +21,7 @@ test('real team controller preflights, previews, then sends canonical SHA and re
   assert.match(f.node('submission-errors').innerHTML,/请检查以下/);assert.equal(f.calls.filter(c=>c.body).length,0);
   f.fill();await f.preview();assert.match(f.node('submission-preview').innerHTML,new RegExp(sha));assert.equal(f.calls.filter(c=>c.body).length,0);
   await f.node('confirm-submission').onclick();
-  assert.equal(f.calls.filter(c=>c.body).length,1);assert.equal(f.calls.at(-1).body.materials.codeVersion,sha);assert.match(f.root.innerHTML,/正式版 v1 已收到/);
+  assert.equal(f.calls.filter(c=>c.body).length,1);assert.equal(f.calls.filter(c=>c.body).at(-1).body.materials.codeVersion,sha);assert.match(f.root.innerHTML,/正式版 v1 已收到/);
 });
 test('lost response preserves input, blocks repeat writes and reads latest only for comparison',async()=>{
   const f=fixture('lost');await f.context.render();f.fill();await f.preview();await f.node('confirm-submission').onclick();

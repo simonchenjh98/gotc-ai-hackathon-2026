@@ -34,6 +34,16 @@ LOCATIONS = BEGIN + '''    location = /gotc { return 308 /gotc/; }
         proxy_send_timeout 30s;
         client_max_body_size 2m;
     }
+    location ^~ /gotc/v1/ {
+        proxy_pass http://127.0.0.1:5274;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_buffering off;
+        proxy_read_timeout 330s;
+        proxy_send_timeout 330s;
+        client_max_body_size 32m;
+    }
     location ^~ /gotc/ {
         proxy_pass http://127.0.0.1:5274;
         proxy_http_version 1.1;

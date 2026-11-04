@@ -26,6 +26,7 @@ from submission_records import SubmissionRecords, query_path
 from write_conflicts import WriteConflicts
 from judging import JudgingService
 from admin_data import AdminDataService, TRACK_OPTIONS
+from keys import KeyService, load_config
 
 DIMENSIONS = [
     {"id": "problem", "name": "问题价值与理解", "max": 20},
@@ -213,11 +214,14 @@ class EventService:
         self.write_conflicts=WriteConflicts(self)
         self.write_conflicts.backup_before_upgrade()
         self.admin_data.backup_before_upgrade()
+        self.keys=KeyService(self, load_config(self.data_dir / "gateway.json"), text_field)
+        self.csv_safe=csv_safe
         self.migrate_accounts()
         with self.db() as db:
             db.executescript(SCHEMA)
             self.judging.initialize(db)
             self.admin_data.initialize(db)
+            self.keys.initialize(db)
             for key, value in {"scoringOpen": False, "resultsPublished": True, "minJudges": 5, "submissionsOpen": False, "submissionDeadline": None, "updatedAt": now_ms()}.items():
                 db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, json.dumps(value)))
             # Preserve an upgraded event's current audience window once; later changes are independent.
@@ -302,7 +306,7 @@ class EventService:
             db.close()
 
     def config(self, db):
-        result = {r["key"]: json.loads(r["value"]) for r in db.execute("SELECT * FROM settings")}
+        result = {r["key"]: json.loads(r["value"]) for r in db.execute("SELECT * FROM settings") if not r["key"].startswith("keys.")}
         result.update(dimensions=DIMENSIONS, voteLimit=VOTE_LIMIT, audienceIncludedInScore=False, maxScore=100)
         return result
 
@@ -461,7 +465,14 @@ class EventService:
                 # Keep form values and their revision tokens in one read snapshot.
                 db.execute("BEGIN")
             actor = self.account(db, cookie)
-            if (path in {"/api/team", "/api/submission", "/api/logout", "/api/judge", "/api/score", "/api/admin", "/api/admin/settings"} or path.startswith("/api/submission/")) and expected_login_id is not None and (not actor or expected_login_id != self.login_id(cookie)):
+            team_keys_route = path == "/api/team/keys" or path.startswith("/api/team/keys/")
+            if team_keys_route:
+                self.require(actor, "team")
+                # An old tab shares the new login's cookie. Require its own page marker,
+                # including for reads, before any key data or mutation is dispatched.
+                if not expected_login_id:
+                    raise APIError(428, "缺少页面登录信息，请刷新页面并核对登录身份后重试", "login_required")
+            if (team_keys_route or path in {"/api/team", "/api/submission", "/api/logout", "/api/judge", "/api/score", "/api/admin", "/api/admin/settings"} or path.startswith("/api/submission/")) and expected_login_id is not None and (not actor or expected_login_id != self.login_id(cookie)):
                 raise APIError(401, "登录身份已变化，请重新登录后操作")
             if self.submission_records.supports(path):return self.submission_records.dispatch(db,actor,method,path,body,query or {}),None,None
             if path.startswith('/api/admin/data/'):
@@ -473,6 +484,8 @@ class EventService:
                 return self.admin_data.dispatch(db,actor,method,path,body,query or {},session_hash),None,None
             if path.startswith(("/api/judging/","/api/admin/judging/")):
                 return self.judging.dispatch(db,actor,method,path,body), None, None
+            if path.startswith(("/api/team/keys", "/api/admin/keys")):
+                return self.keys.dispatch(db, actor, method, path, body), None, None
             if method == "GET" and path == "/api/session":
                 return {"role": actor["role"] if actor else None, "name": actor["name"] if actor else "", "loginId": self.login_id(cookie) if actor else None}, None, None
             if method == "GET" and path == "/api/board":
@@ -818,7 +831,8 @@ class EventHandler(BaseHTTPRequestHandler):
     def headers_out(self, status, content_type, length, cookie=None, extra=None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(length))
+        if length is not None:  # None: streamed until the connection closes
+            self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
@@ -867,6 +881,10 @@ class EventHandler(BaseHTTPRequestHandler):
             if service.base_path and not path.startswith(service.base_path + "/"):
                 raise APIError(404, "页面不存在")
             path = path[len(service.base_path):] if service.base_path else path
+            if path.startswith("/v1/"):
+                # AI gateway: authenticated by API key, called by SDKs without cookies or Origin.
+                service.keys.gateway(self, path)
+                return
             query={}
             if parsed.query:
                 if self.command!='GET' or not (path.startswith('/api/admin/data/') or query_path(path)):
@@ -916,7 +934,7 @@ class EventHandler(BaseHTTPRequestHandler):
                     if service.secure:
                         cookie += "; Secure"
                 if isinstance(value, bytes):
-                    filename='gotc-submissions.csv' if path=='/api/admin/submissions/export' else 'gotc-data.csv' if path.startswith('/api/admin/data/') else 'gotc-scores.csv'
+                    filename='gotc-submissions.csv' if path=='/api/admin/submissions/export' else 'gotc-data.csv' if path.startswith('/api/admin/data/') else 'gotc-api-usage.csv' if path=='/api/admin/keys/export' else 'gotc-scores.csv'
                     self.headers_out(200, "text/csv; charset=utf-8", len(value), extra={"Content-Disposition": f'attachment; filename="{filename}"'})
                     self.wfile.write(value)
                 else:
