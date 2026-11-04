@@ -11,7 +11,7 @@ function node(){return {isConnected:true,innerHTML:'',textContent:'',disabled:fa
 function scoreHarness(fetch,record={teamId:'T1',scores:[10,10,10,10,10,5],feedback:'原评语',status:'draft',revision:4}){
   const inputs=Array.from({length:6},(_,i)=>({...node(),value:String(record?.scores[i] ?? 0),dataset:{score:String(i)}}));
   const sliders=inputs.map((input,i)=>({...node(),value:input.value,dataset:{slider:String(i)}}));
-  const elements={'platform-main':node(),'judge-editor':node(),'team-picker':node(),'score-total':node(),'platform-toast':node(),'save-draft':node(),recuse:node(),'score-conflict':node(),'preview-score':node(),'load-score':node(),'score-status':node()};
+  const elements={'platform-main':node(),'judge-editor':node(),'team-picker':node(),'score-total':node(),'platform-toast':node(),'save-draft':node(),recuse:node(),'score-conflict':node(),'preview-score':node(),'load-score':node(),'score-status':node(),'judge-score-count':node(),'judge-score-window':node()};
   const submit=node(),feedback={...node(),value:record?.feedback ?? ''},error=node(),listeners=[];
   const form={...node(),elements:{feedback,...Object.fromEntries(inputs.map((input,i)=>[`score${i}`,input]))},
     addEventListener(type,fn){if(type==='input')listeners.push(fn);},input(){listeners.forEach(fn=>fn());},reportValidity:()=>true,
@@ -40,7 +40,7 @@ test('numeric POST owns its revision and keeps later input editable and dirty wi
 
 test('numeric conflict keeps the entire form and blocks retries until latest is explicitly loaded',async()=>{
   const requests=[];const latest={teamId:'T1',scores:[20,20,20,15,15,10],feedback:'另一页已保存',status:'submitted',revision:5};
-  let h;h=scoreHarness(async(url,options)=>{requests.push({path:url.pathname,method:options.method});return options.method==='POST'?response({error:'冲突',code:'score_revision_conflict'},409):response({...h.data,myScores:[latest]});});
+  let h;h=scoreHarness(async(url,options)=>{requests.push({path:url.pathname,method:options.method});return options.method==='POST'?response({error:'冲突',code:'score_revision_conflict'},409):response({...h.data,scoringOpen:false,myScores:[latest]});});
   h.feedback.value='本页未保存评语';h.form.input();await h.elements['save-draft'].onclick({currentTarget:h.elements['save-draft']});
   assert.equal(h.feedback.value,'本页未保存评语');assert.equal(h.inputs[0].value,'10');assert.equal(vm.runInContext('scoreDirty',h.ctx),true);
   assert.match(h.elements['score-conflict'].innerHTML,/当前输入已保留/);
@@ -49,6 +49,8 @@ test('numeric conflict keeps the entire form and blocks retries until latest is 
   assert.match(h.elements['score-conflict'].innerHTML,/另一页已保存/);
   await h.elements['load-score'].onclick();
   assert.equal(vm.runInContext('judgeData.myScores[0].revision',h.ctx),5);
+  assert.equal(h.elements['judge-score-count'].textContent,'1');
+  assert.match(h.elements['judge-score-window'].textContent,/已截止/);
   assert.equal(vm.runInContext('scoreDirty',h.ctx),false);
 });
 
@@ -189,4 +191,49 @@ test('unchanged successful score uses server-normalized fields and recusal clear
   status='recused';await h.elements.recuse.onclick();
   assert.deepEqual(h.inputs.map(input=>input.value),['0','0','0','0','0','0']);
   assert.match(h.elements['score-total'].innerHTML,/0\.0/);assert.equal(vm.runInContext('scoreDirty',h.ctx),false);
+});
+
+for(const kind of ['score','settings']){
+  const save=h=>kind==='score'?h.elements['save-draft'].onclick():h.form.onsubmit({preventDefault(){}});
+  const harness=fetch=>kind==='score'?scoreHarness(fetch):settingsHarness(fetch);
+
+  test(kind+' keeps unsaved input and gives recovery instructions when its session expires',async()=>{
+    let requests=0;
+    const h=harness(async()=>{requests++;return response({error:'需要登录'},401);});
+    const input=kind==='score'?h.feedback:h.form.elements.submissionDeadline;
+    input.value=kind==='score'?'本页评语':'2030-01-02T08:15';h.form.input();
+    const original=input.value;
+    await save(h);
+    assert.equal(input.value,original);assert.match(h.error.textContent,/复制.*刷新.*登录/);
+    await save(h);assert.equal(requests,1);
+  });
+
+  test(kind+' ignores a late 401 after a new login takes over the view',async()=>{
+    const gate=deferred(),h=harness(()=>gate.promise);
+    const saving=save(h);await wait();
+    vm.runInContext("session={role:'admin',loginId:'replacement'}",h.ctx);
+    gate.resolve(response({error:'expired'},401));await saving;
+    assert.equal(vm.runInContext('session.loginId',h.ctx),'replacement');
+    assert.equal(h.error.textContent,'');
+  });
+}
+
+test('a manual admin refresh cannot replace a pending or already committed settings save with its old snapshot',async()=>{
+  for(const finishSaveFirst of [false,true]){
+    const read=deferred(),write=deferred();
+    const h=settingsHarness(async(url,options)=>{
+      if(options.method==='POST')return write.promise;
+      if(url.pathname.endsWith('/admin'))return read.promise;
+      return response({roster:{judgeIds:[]},reviews:[]});
+    });
+    const main=h.elements['platform-main'];
+    main.querySelectorAll=()=>[h.form];
+    Object.defineProperty(main,'innerHTML',{set(){assert.fail('A stale settings snapshot replaced the active admin forms');}});
+    const refresh=vm.runInContext('renderAdmin(1,form)',h.ctx);
+    const saving=h.form.onsubmit({preventDefault(){}});
+    const reply=()=>write.resolve(response({ok:true,config:{writeRevisions:{submissions:9}}}));
+    if(finishSaveFirst){reply();await saving;}
+    read.resolve(response({teams:[],judges:[],audience:[],config:{writeRevisions:{submissions:8}}}));
+    try{await refresh;}finally{reply();await saving;}
+  }
 });
