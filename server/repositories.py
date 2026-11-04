@@ -147,8 +147,11 @@ class Provider:
         status, permission = self.request('GET', path + '/permission')
         if (status != 200 or not isinstance(permission, dict) or type(permission.get('id')) is not int
                 or permission['id'] != member['id'] or not isinstance(permission.get('login'), str)
-                or permission['login'].lower() != username.lower()
-                or permission.get('permission') not in ('push', 'admin')):
+                or permission['login'].lower() != username.lower()):
+            raise UpstreamError()
+        if permission.get('permission') == 'admin':
+            raise APIError(409, '开发者账号仍有仓库管理权限，请主办方人工核对多余权限后恢复；平台不会自动修改组织或企业继承权限', 'repository_excess_permission')
+        if permission.get('permission') != 'push':
             raise UpstreamError()
         return 'ready'
 

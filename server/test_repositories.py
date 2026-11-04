@@ -296,6 +296,30 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(row['state'], 'ready')
         self.assertEqual(len([c for c in self.remote.calls if c[0] == 'POST' and c[1].startswith('/enterprises/')]), 1)
 
+    def test_gitee_effective_admin_stays_reconcilable_for_organizer_review(self):
+        self.enable('gitee')
+        self.remote.provider = 'gitee'
+        self.remote.gitee_permission = 'admin'
+        self.repos.providers['gitee'].request = self.remote
+        application = self.apply('gitee', ['Gitee_Developer'])[1]['repository']
+        status, result, _ = self.admin_action(application)
+        self.assertEqual(status, 200, result)
+        row = result['repository']
+        self.assertEqual(row['state'], 'reconcile')
+        self.assertIn('仓库管理权限', row['message'])
+        self.assertIn('主办方人工核对', row['message'])
+        self.assertIn('不会自动修改', row['message'])
+        self.assertEqual(row['externalId'], '123')
+        self.open_submissions()
+        self.assertEqual(self.preview()[0], 409)
+        grants = [c for c in self.remote.calls if '/collaborators/' in c[1] and c[0] == 'PUT']
+        self.assertEqual(len(grants), 1)
+        self.assertEqual(grants[0][2], {'permission': 'push'})
+        self.assertFalse(any(c[0] in {'DELETE', 'PATCH'} or '/members/' in c[1] for c in self.remote.calls))
+        # The organizer resolves inherited privileges outside the service; only then can recovery finish.
+        self.remote.gitee_permission = 'push'
+        self.assertEqual(self.admin_action(row, 'reconcile')[1]['repository']['state'], 'ready')
+
     def test_missing_preview_and_manual_code_override_are_denied(self):
         self.provision()
         self.open_submissions()
