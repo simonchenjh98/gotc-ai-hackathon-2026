@@ -652,6 +652,7 @@ class GatewayTests(unittest.TestCase):
                             "-out", f"{certs}/cert.pem", "-days", "1", "-subj", "/CN=localhost"], check=True, capture_output=True)
             tls = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(f"{certs}/cert.pem", f"{certs}/key.pem")
             tls.socket = context.wrap_socket(tls.socket, server_side=True)
             cases.insert(2, ("untrusted certificate", f"https://localhost:{serve(tls)}/v1", None, 502, False, False, "TLS 证书校验失败"))
