@@ -465,7 +465,14 @@ class EventService:
                 # Keep form values and their revision tokens in one read snapshot.
                 db.execute("BEGIN")
             actor = self.account(db, cookie)
-            if (path in {"/api/team", "/api/submission", "/api/logout", "/api/judge", "/api/score", "/api/admin", "/api/admin/settings"} or path.startswith("/api/submission/")) and expected_login_id is not None and (not actor or expected_login_id != self.login_id(cookie)):
+            team_keys_route = path == "/api/team/keys" or path.startswith("/api/team/keys/")
+            if team_keys_route:
+                self.require(actor, "team")
+                # An old tab shares the new login's cookie. Require its own page marker,
+                # including for reads, before any key data or mutation is dispatched.
+                if not expected_login_id:
+                    raise APIError(428, "缺少页面登录信息，请刷新页面并核对登录身份后重试", "login_required")
+            if (team_keys_route or path in {"/api/team", "/api/submission", "/api/logout", "/api/judge", "/api/score", "/api/admin", "/api/admin/settings"} or path.startswith("/api/submission/")) and expected_login_id is not None and (not actor or expected_login_id != self.login_id(cookie)):
                 raise APIError(401, "登录身份已变化，请重新登录后操作")
             if self.submission_records.supports(path):return self.submission_records.dispatch(db,actor,method,path,body,query or {}),None,None
             if path.startswith('/api/admin/data/'):

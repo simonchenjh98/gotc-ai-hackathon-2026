@@ -127,6 +127,22 @@ class FakeUpstream(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
+class TeamKeyClient(Client):
+    """Model a key page retaining its login marker, independently of shared cookies."""
+    login_id = None
+
+    def request(self, method, path, payload=None, raw=None, origin=True, headers=None):
+        headers = dict(headers or {})
+        if (path == '/api/team/keys' or path.startswith('/api/team/keys/')) and self.login_id:
+            headers.setdefault('X-GOTC-Login', self.login_id)
+        result = super().request(method, path, payload, raw, origin, headers)
+        if method == 'POST' and path == '/api/login' and result[0] == 200:
+            self.login_id = result[1]['loginId']
+        if method == 'POST' and path == '/api/logout' and result[0] == 200:
+            self.login_id = None
+        return result
+
+
 class GatewayTests(unittest.TestCase):
     team = test_api.APITests.team  # reuse helpers without re-running APITests
 
@@ -156,7 +172,7 @@ class GatewayTests(unittest.TestCase):
     def team_client(self, team_id):
         status, access, _ = self.admin.post("/api/admin/team-access", {"teamId": team_id, "action": "issue"})
         self.assertEqual(status, 200)
-        client = Client(self.server)
+        client = TeamKeyClient(self.server)
         self.assertEqual(client.post("/api/login", {"role": "team", "code": access["code"]})[0], 200)
         return client
 
@@ -312,7 +328,7 @@ class GatewayTests(unittest.TestCase):
 
     def team_client_for(self, team_id):
         status, access, _ = self.admin.post("/api/admin/team-access", {"teamId": team_id, "action": "rotate"})
-        client = Client(self.server)
+        client = TeamKeyClient(self.server)
         client.post("/api/login", {"role": "team", "code": access["code"]})
         return access, client
 

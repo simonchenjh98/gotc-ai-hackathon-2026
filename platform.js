@@ -9,7 +9,7 @@ const selectedTeams={},dirtyAdminForms=new Set();
 const stageForRoute=()=>route.endsWith('-roadshow')?'roadshow':'exhibition';
 const stageName=stage=>stage==='roadshow'?'路演评审':'展示评审';
 const stageNotice=stage=>stage==='roadshow'?'<div class="info-banner warning"><strong>组织方人工工作名单</strong><br>晋级算法尚未实现，本页名单不代表正式晋级。展示与路演的名单、材料和评语分别保存。</div>':'';
-let logoutInFlight=null;
+let logoutInFlight=null,currentTeamKeys=null;
 let session={role:null}, route='', pollTimer, routeVersion=0, lastBoard, judgeData, selectedTeam, toastTimer;
 const roleName = {team:'参赛队伍',judge:'专业评委',audience:'观众',admin:'组织方'};
 function toast(message) { const el = document.getElementById('platform-toast'); el.textContent = message; el.classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('visible'), 4500); }
@@ -22,7 +22,7 @@ function publishLogin(login){if(!login.loginId)return;try{localStorage.setItem(l
 function ownsBrowserLogin(login){const owner=browserLoginOwner();return !owner || !login.loginId || owner===login.loginId || (verifiedBrowserLogin?.loginId===login.loginId && verifiedBrowserLogin.owner===owner);}
 async function api(path, data, options={}) {
   const recoveryAtStart=currentTeamRecovery,sessionAtStart=session,ownerAtStart=path==='session'?browserLoginOwner():null;
-  const res = await fetch(new URL(`api/${path}`, base), {credentials:'same-origin',cache:'no-store',method:data === undefined ? 'GET' : 'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json'}),...((['team','submission','logout','judge','score','admin','admin/settings'].includes(path) || path.startsWith('submission/')) && (options.loginId ?? session.loginId)?{'X-GOTC-Login':options.loginId ?? session.loginId}:{})},body:data === undefined ? undefined : JSON.stringify(data),signal:options.signal});
+  const res = await fetch(new URL(`api/${path}`, base), {credentials:'same-origin',cache:'no-store',method:data === undefined ? 'GET' : 'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json'}),...((['team','submission','logout','judge','score','admin','admin/settings'].includes(path) || path.startsWith('submission/') || path==='team/keys' || path.startsWith('team/keys/')) && (options.loginId ?? session.loginId)?{'X-GOTC-Login':options.loginId ?? session.loginId}:{})},body:data === undefined ? undefined : JSON.stringify(data),signal:options.signal});
   let body; try { body = await res.json(); } catch { throw new Error('服务暂时不可用，请稍后重试。'); }
   if (!res.ok) { if((res.status===401 || res.status===403) && recoveryAtStart && currentTeamRecovery===recoveryAtStart)recoveryAtStart.lock();if(res.status===401 && session===sessionAtStart && (!recoveryAtStart || currentTeamRecovery===recoveryAtStart))session={role:null}; const error = new Error(body.error || '操作未成功，请重试。'); error.status = res.status; error.code=body.code; throw error; }
   if(path==='session')verifiedBrowserLogin={loginId:body.loginId,owner:ownerAtStart};
@@ -629,6 +629,7 @@ function installSubmissionAdmin(data){const cfg=data.config || {};root.insertAdj
 }
 
 async function renderRoute(){
+  currentTeamKeys?.dispose();
   if(typeof disposeAdminReviewSync==='function')disposeAdminReviewSync();adminReadOnlyView=null;adminLoadPending=null;
   clearTimeout(pollTimer);const version=++routeVersion;
   route=['team','judge','judge-exhibition','board-exhibition','judge-roadshow','board-roadshow','audience','admin'].includes(location.hash.slice(1))?location.hash.slice(1):'board';
@@ -642,13 +643,87 @@ async function renderRoute(){
 }
 // Cheap models cost fractions of a cent per call, so small amounts keep 4 decimals.
 const usd=v=>v===null || v===undefined?'—':`$${Number(v).toFixed(Number(v)!==0 && Math.abs(v)<1?4:2)}`;
-async function loadTeamKeys(version){const box=document.getElementById('team-keys');let data;try{data=await api('team/keys');}catch(e){if(version===routeVersion && box?.isConnected)box.innerHTML=`<h2>AI API 密钥</h2><p class="small-note">${esc(e.message)}</p>`;return;}if(version!==routeVersion || !box?.isConnected)return;
-  if(!data.enabled){box.innerHTML='<h2>AI API 密钥</h2><p class="small-note">本队 API 额度尚未开通或已停用，请联系组织方。</p>';return;}
-  teamKeyInfo=data;const b=data.budget,keys=data.keys,full=keys.length>=data.maxKeys,models=Object.entries(data.models).map(([kind,list])=>`${kind==='openai'?'OpenAI 兼容':'Anthropic'}：${list.map(esc).join('、')}`).join('<br>');
+const teamKeyLoginNotice='当前登录已失效或已切换，密钥已隐藏。请刷新页面并核对登录队伍后操作。';
+function createTeamKeyContext(version){
+  currentTeamKeys?.dispose();
+  const owner=session,loginId=owner.loginId,box=document.getElementById('team-keys'),out=document.getElementById('new-api-key');
+  const authorization=currentTeamRecovery?.sessionOwner===owner?currentTeamRecovery:null;
+  const context={owner,loginId,box,out,active:true,busy:false,copying:false,key:'',data:null,generation:0,
+    dispose(){this.active=false;this.key='';if(out)out.innerHTML='';},
+    lock(){this.dispose();if(box?.isConnected && document.getElementById('team-keys')===box)box.innerHTML=`<h2>AI API 密钥</h2><p class="small-note" role="alert">${teamKeyLoginNotice}</p>`;},
+    valid(){
+      if(!this.active)return false;
+      if(currentTeamKeys!==this || version!==routeVersion || route!=='team' || !box?.isConnected || document.getElementById('team-keys')!==box || !out?.isConnected || document.getElementById('new-api-key')!==out){this.dispose();return false;}
+      if(session!==owner || owner.role!=='team' || !loginId || owner.loginId!==loginId || !ownsBrowserLogin(owner)){this.lock();return false;}
+      // Logout can revoke the captured login epoch without changing the browser's owner marker.
+      if(authorization && !authorization.hasAuthorization()){this.lock();return false;}
+      return true;
+    },
+    async request(path,body){
+      if(!this.valid())throw new Error(teamKeyLoginNotice);
+      try{return await api(path,body,{loginId});}
+      catch(error){if([401,403,428].includes(error.status) && currentTeamKeys===this)this.lock();throw error;}
+    }
+  };
+  currentTeamKeys=context;return context;
+}
+async function loadTeamKeys(version,context=null){
+  const view=context || createTeamKeyContext(version),box=view.box;
+  if(!view.valid())return false;
+  const generation=++view.generation;
+  const alive=()=>view.valid() && generation===view.generation;
+  let data;
+  try{data=await view.request('team/keys');}
+  catch(error){if(alive())box.innerHTML=`<h2>AI API 密钥</h2><p class="small-note">${esc(error.message)}</p>`;return false;}
+  if(!alive())return false;
+  if(!data.enabled){view.key='';view.out.innerHTML='';box.innerHTML='<h2>AI API 密钥</h2><p class="small-note">本队 API 额度尚未开通或已停用，请联系组织方。</p>';return false;}
+  view.data=data;
+  const b=data.budget,keys=data.keys,full=keys.length>=data.maxKeys,models=Object.entries(data.models).map(([kind,list])=>`${kind==='openai'?'OpenAI 兼容':'Anthropic'}：${list.map(esc).join('、')}`).join('<br>');
   box.innerHTML=`<h2>AI API 密钥</h2>${data.announcement?`<div class="info-banner warning"><strong>组织方公告</strong><br>${esc(data.announcement)}</div>`:''}<p class="small-note">OpenAI 兼容 SDK 的 base_url：<code>${esc(data.baseUrl)}/v1</code><br>Anthropic SDK 的 base_url：<code>${esc(data.baseUrl)}</code><br>${models}</p>${metrics([[usd(b.used24h),`近24小时全队已用 · 上限 ${usd(b.dailyLimit)}${b.dailyResetAt?` · ${beijingTime(b.dailyResetAt)} 起逐步恢复`:''}`],[usd(b.usedTotal),`累计全队已用 · 上限 ${usd(b.totalLimit)}`],[`${keys.length} / ${data.maxKeys}`,'有效密钥'],[b.expiresAt===null?'未设置':beijingTime(b.expiresAt),'额度到期（北京时间）']])}${data.logContent?'<div class="info-banner">组织方会记录每次 API 调用的请求与回复内容（不含密钥），用于额度核对与安全审查，请勿发送个人隐私或敏感信息。</div>':''}${data.clientRules.length?`<p class="small-note">客户端限制（按请求头判断）：${data.clientRules.map(r=>`${r.action==='allow'?'允许':'禁止'} ${esc(r.header)} 含“${esc(r.contains)}”`).join('；')}</p>`:''}<div class="info-banner warning">全队所有密钥共用一份额度。密钥只在创建时显示一次，请放入环境变量，切勿提交到代码仓库；疑似泄露请立即删除并重新创建。</div><div class="invite-list">${keys.map(k=>`<div class="invite-row"><span>${esc(k.name)}<small><code>${esc(k.masked)}</code> · 近24小时 ${usd(k.used24h)} · 累计 ${usd(k.usedTotal)} · ${Number(k.requests)} 次请求 · 最近使用 ${esc(beijingTime(k.lastUsedAt))}</small></span><button type="button" class="btn danger small" data-key-delete="${esc(k.id)}">删除</button></div>`).join('') || '<p class="small-note">尚未创建密钥。</p>'}</div>${setupSnippets(data,'<你的密钥>')}<h3>本队最近调用</h3><div id="team-calls"><p class="small-note">读取中…</p></div><form id="key-form"><div class="settings-row"><label class="field">新密钥名称<input name="name" required maxlength="40" placeholder="例如：alice-laptop" ${full?'disabled':''}></label><button class="btn small" type="submit" ${full?'disabled':''}>创建密钥 ↗</button></div><p class="form-error" role="alert"></p></form>`;
-  const form=document.getElementById('key-form');form.onsubmit=e=>{e.preventDefault();withBusy(form.querySelector('button'),async()=>{formError(form,'');try{const result=await api('team/keys',{name:form.elements.name.value.trim()});if(version!==routeVersion)return;const out=document.getElementById('new-api-key');out.innerHTML=`<div class="code-output"><strong>新密钥 · ${esc(result.item.name)}</strong><code>${esc(result.key)}</code><p>仅显示这一次，离开或刷新页面后无法再查看。请立即复制保存。</p><button type="button" class="btn secondary small" id="copy-api-key">复制密钥</button>${setupSnippets(teamKeyInfo,result.key)}</div>`;document.getElementById('copy-api-key').onclick=async()=>{try{await navigator.clipboard.writeText(result.key);toast('密钥已复制。');}catch{toast('请选中密钥手动复制。');}};out.scrollIntoView({block:'center'});await loadTeamKeys(version);}catch(error){formError(form,error.message);}});};
-  box.querySelectorAll('[data-key-delete]').forEach(button=>button.onclick=()=>withBusy(button,async()=>{if(!confirm('删除后使用该密钥的程序立即无法调用，确认删除？'))return;await api('team/keys/delete',{id:button.dataset.keyDelete});toast('密钥已删除。');await loadTeamKeys(version);}));
-  api('team/keys/logs').then(logs=>{const el=document.getElementById('team-calls');if(el?.isConnected)el.innerHTML=callTable(logs.items,false);}).catch(e=>{const el=document.getElementById('team-calls');if(el)el.innerHTML=`<p class="small-note">${esc(e.message)}</p>`;});
+  const form=document.getElementById('key-form'),submit=form.querySelector('button'),deletes=[...box.querySelectorAll('[data-key-delete]')];
+  view.updateButtons=()=>{if(alive()){submit.disabled=full || view.busy;deletes.forEach(button=>button.disabled=view.busy);}};
+  view.updateButtons();
+  form.onsubmit=async event=>{
+    event.preventDefault();if(!alive() || view.busy || full || !form.isConnected || document.getElementById('key-form')!==form)return;
+    view.busy=true;view.updateButtons();formError(form,'');
+    try{
+      const result=await view.request('team/keys',{name:form.elements.name.value.trim()});
+      if(!alive())return;
+      // Revalidate with the captured identity before revealing the result, including when localStorage is unavailable.
+      if(!await loadTeamKeys(version,view) || !view.valid())return;
+      view.key=result.key;
+      const out=view.out;
+      out.innerHTML=`<div class="code-output"><strong>新密钥 · ${esc(result.item.name)}</strong><code>${esc(view.key)}</code><p>仅显示这一次，离开或刷新页面后无法再查看。请立即复制保存。</p><button type="button" class="btn secondary small" id="copy-api-key">复制密钥</button>${setupSnippets(view.data,view.key)}</div>`;
+      const copy=document.getElementById('copy-api-key');
+      copy.onclick=async()=>{
+        if(!view.valid() || view.copying || !view.key || !copy.isConnected || document.getElementById('copy-api-key')!==copy)return;
+        const value=view.key;view.copying=true;copy.disabled=true;
+        try{
+          await view.request('team/keys');
+          if(!view.valid() || view.key!==value || !copy.isConnected || document.getElementById('copy-api-key')!==copy)return;
+          await navigator.clipboard.writeText(value);
+          if(view.valid() && view.key===value)toast('密钥已复制。');
+        }catch(error){if(view.valid())toast('复制未完成，请核对登录身份后重试。'+error.message);}
+        finally{view.copying=false;if(view.valid() && copy.isConnected)copy.disabled=false;}
+      };
+      out.scrollIntoView({block:'center'});
+    }catch(error){if(alive() && form.isConnected)formError(form,error.message);}
+    finally{view.busy=false;if(view.valid())view.updateButtons?.();}
+  };
+  deletes.forEach(button=>button.onclick=async()=>{
+    if(!alive() || view.busy || !button.isConnected || !confirm('删除后使用该密钥的程序立即无法调用，确认删除？') || !alive())return;
+    view.busy=true;view.updateButtons();
+    try{
+      await view.request('team/keys/delete',{id:button.dataset.keyDelete});
+      if(!alive())return;
+      view.key='';view.out.innerHTML='';toast('密钥已删除。');await loadTeamKeys(version,view);
+    }catch(error){if(alive())formError(form,error.message);}
+    finally{view.busy=false;if(view.valid())view.updateButtons?.();}
+  });
+  const calls=document.getElementById('team-calls');
+  view.request('team/keys/logs').then(logs=>{if(alive() && calls.isConnected && document.getElementById('team-calls')===calls)calls.innerHTML=callTable(logs.items,false);})
+    .catch(error=>{if(alive() && calls.isConnected && document.getElementById('team-calls')===calls)calls.innerHTML=`<p class="small-note">${esc(error.message)}</p>`;});
+  return true;
 }
 async function loadKeyAdmin(teams,version){const box=document.getElementById('key-admin');let data;try{data=await api('admin/keys');}catch(e){if(version===routeVersion && box?.isConnected)box.innerHTML=`<p class="small-note">${esc(e.message)}</p>`;return;}if(version!==routeVersion || !box?.isConnected)return;
   const reload=()=>loadKeyAdmin(teams,version);data.upstreams ||= {};
@@ -668,7 +743,6 @@ async function loadKeyAdmin(teams,version){const box=document.getElementById('ke
     form.onsubmit=e=>{e.preventDefault();withBusy(form.querySelector('[type=submit]'),async()=>{formError(form,'');try{await api('admin/keys/team',{teamId:b.dataset.teamLimits,dailyBudget:num(form.elements.dailyBudget.value),totalBudget:num(form.elements.totalBudget.value),note:form.elements.note.value.trim()});toast('该队单独额度已保存。');await loadKeyAdmin(teams,version);}catch(error){formError(form,error.message);}});};});
   box.querySelectorAll('[data-key-provision],[data-key-revoke]').forEach(button=>button.onclick=()=>withBusy(button,async()=>{const revoke='keyRevoke' in button.dataset;if(revoke && !confirm('停用后该队全部密钥立即无法调用，确认停用？'))return;await api(revoke?'admin/keys/revoke':'admin/keys/provision',{teamId:button.dataset.keyRevoke || button.dataset.keyProvision});toast(revoke?'该队 API 额度已停用。':'该队 API 额度已开通，队伍可自行创建密钥。');await loadKeyAdmin(teams,version);}));
 }
-let teamKeyInfo=null;
 const changeName={'api-key.create':'创建密钥','api-key.delete':'删除密钥','api-key.provision':'开通额度','api-key.revoke':'停用额度','api-key.settings':'修改 API 设置','api-log.view':'查看调用内容','api-usage.export':'导出用量'};
 // Failure classification copied from sub2api's ops error log: owner = whose fault, phase = where it failed.
 const ownerName={client:'学生请求',provider:'上游',platform:'平台'};
@@ -774,7 +848,7 @@ async function showKeyLogs(filter,title,errorsOnly=false,search={}){const box=do
   await load();if(!box.isConnected)return;render();box.scrollIntoView({block:'start'});}
 window.addEventListener('hashchange',()=>{if(restoreSubmissionRoute){restoreSubmissionRoute=false;return;}if(!confirmLeave()){restoreSubmissionRoute=true;location.hash=route;return;}submissionDirty=false;reviewDirty=false;scoreDirty=false;dirtyAdminForms.clear();renderRoute();});
 window.addEventListener('click',async event=>{const button=event.target.closest?.('[data-copy-value]');if(!button)return;try{await navigator.clipboard.writeText(button.dataset.copyValue);toast('已复制。');}catch{toast('复制不可用，请展开完整记录或哈希并手动复制。');}});
-window.addEventListener('storage',()=>currentTeamRecovery?.storageChanged());
+window.addEventListener('storage',()=>{currentTeamKeys?.valid();currentTeamRecovery?.storageChanged();});
 window.addEventListener('pagehide',()=>currentTeamRecovery?.flush());
 window.addEventListener('beforeunload',event=>{currentTeamRecovery?.flush();if(submissionDirty || reviewDirty || scoreDirty || dirtyAdminForms.size){event.preventDefault();event.returnValue='';}});
 (async()=>{try{session=await api('session');}catch{session={role:null};}await renderRoute();})();

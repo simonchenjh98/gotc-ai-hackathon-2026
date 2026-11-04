@@ -34,7 +34,7 @@ jobs:
           node --check app.js
           node --check platform.js
       - name: Run browser-side tests
-        run: node --test tests/platform.test.mjs
+        run: node --test tests/*.test.mjs
       - name: Validate public site references
         run: python -B scripts/check_site.py
 
