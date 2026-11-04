@@ -473,6 +473,14 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.admin.post("/api/admin/team-access", {"teamId": team_id, "action": "revoke"})[0], 200)
         self.assertEqual(ok({}), 401)
 
+    def assertReleased(self, team_id):
+        """The reservation is dropped just after a successful reply is sent, so allow the server thread to finish."""
+        for _ in range(100):
+            if self.service.keys.reserved[team_id] == 0:
+                return
+            threading.Event().wait(0.02)
+        self.assertEqual(self.service.keys.reserved[team_id], 0)
+
     def latest(self):
         return self.admin.post("/api/admin/keys/logs", {})[1]["items"][0]
 
@@ -533,7 +541,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(result["status"], 401)
         self.assertEqual(len(FakeUpstream.calls), before)  # never reached the upstream
         self.assertEqual(service.inflight[team_id], keys.TEAM_CONCURRENCY - 1)  # its slot was given back
-        self.assertEqual(service.reserved[team_id], 0)
+        self.assertReleased(team_id)
 
     def test_budget_reserves_in_flight_cost(self):
         team_id, _, key = self.enabled_key()
@@ -584,7 +592,7 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(errors(), count)
             detail = self.admin.post("/api/admin/keys/log", {"id": item["id"]})[1]
             self.assertIn(f"上游 HTTP {code}", detail["response"])  # the admin can see why
-        self.assertEqual(self.service.keys.reserved[team_id], 0)
+        self.assertReleased(team_id)
 
     def test_upstream_timeouts_are_charged_the_reservation(self):
         team_id, _, key = self.enabled_key()
@@ -601,7 +609,7 @@ class GatewayTests(unittest.TestCase):
                 detail = self.admin.post("/api/admin/keys/log", {"id": item["id"]})[1]
                 self.assertIn("请求已发出，按预留额度计费", detail["response"])
             self.assertEqual(self.admin.get("/api/admin/keys")[1]["overview"]["errors"], 2)
-            self.assertEqual(self.service.keys.reserved[team_id], 0)  # released after the charge landed
+            self.assertReleased(team_id)  # released after the charge landed
         finally:
             keys.UPSTREAM_TIMEOUT, FakeUpstream.hang = timeout, None
 
@@ -698,7 +706,7 @@ class GatewayTests(unittest.TestCase):
                         self.assertIn("请求已发出，按预留额度计费", detail)
                     elif not reached:
                         self.assertIn("请求未发出，不计费", detail)
-                    self.assertEqual(self.service.keys.reserved[team_id], 0)
+                    self.assertReleased(team_id)
         finally:
             keys.UPSTREAM_TIMEOUT, FakeUpstream.hang, FakeUpstream.status = timeout, None, 200
             for server in servers:
@@ -713,7 +721,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual((item["status"], item["estimated"]), (500, 1))  # the upstream had answered: charged, not free
         self.assertGreater(item["cost"], 0)
         self.assertEqual(self.admin.get("/api/admin/keys")[1]["overview"]["errors"], 1)
-        self.assertEqual(self.service.keys.reserved[team_id], 0)
+        self.assertReleased(team_id)
         self.assertEqual(self.call("/v1/messages", {"model": "claude-x", "max_tokens": 10}, key)[0], 200)  # gateway still healthy
 
     def test_reservation_is_released_even_if_recording_fails(self):
@@ -721,7 +729,7 @@ class GatewayTests(unittest.TestCase):
         with mock.patch.object(self.service.keys, "record", side_effect=lambda *a: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked"))):
             status, _ = self.call("/v1/messages", {"model": "claude-x", "max_tokens": 1000}, key)
         self.assertEqual(status, 200)  # the team still got its reply
-        self.assertEqual(self.service.keys.reserved[team_id], 0)  # and its budget is not blocked forever
+        self.assertReleased(team_id)  # and its budget is not blocked forever
 
     def test_stream_is_drained_and_billed_when_the_client_left_before_headers(self):
         _, client, key = self.enabled_key()
@@ -813,7 +821,7 @@ class GatewayTests(unittest.TestCase):
         FakeUpstream.reply = None
         errors = self.admin.get("/api/admin/keys")[1]["overview"]["errors"]
         self.assertEqual(errors, len(cases))
-        self.assertEqual(self.service.keys.reserved[team_id], 0)
+        self.assertReleased(team_id)
         own = client.get("/api/team/keys/logs")[1]["items"]
         self.assertEqual(own[0]["errorOwner"], "provider")  # teams can see whose fault a failure was
 
@@ -839,7 +847,7 @@ class GatewayTests(unittest.TestCase):
             threading.Event().wait(0.05)
         self.assertEqual((items[0]["status"], items[0]["errorType"], items[0]["cost"]), (499, "api_error", 0))
         self.assertEqual(len(FakeUpstream.calls), before)  # never forwarded
-        self.assertEqual(service.reserved[team_id], 0)
+        self.assertReleased(team_id)
 
     def test_count_tokens_mirrors_upstream_errors_and_is_never_charged(self):
         _, _, key = self.enabled_key()
