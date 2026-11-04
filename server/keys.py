@@ -479,6 +479,38 @@ def request_was_sent(error):
     return isinstance(error, urllib.error.HTTPError) or not isinstance(error, urllib.error.URLError)
 
 
+def reject_stored_file_references(body):
+    """Teams share upstream credentials, but have no ownership map for files stored there.
+
+    Only inspect API content structures: file_id in tool arguments, schemas or ordinary text is client data.
+    Inline files and media URLs do not reference the shared account's stored files and remain supported.
+    """
+    def visit(node):
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if not isinstance(node, dict):
+            return
+        kind = node.get("type")
+        source = node.get("source")
+        file = node.get("file")
+        stored = kind in ("input_file", "input_image", "computer_screenshot", "container_upload") and node.get("file_id") is not None
+        stored = stored or (kind == "file" and isinstance(file, dict) and file.get("file_id") is not None)
+        stored = stored or (kind in ("image", "document") and isinstance(source, dict) and source.get("type") == "file")
+        if stored:
+            raise GatewayError("invalid", "本活动不支持引用上游已存储的文件，请直接提供文件内容或图片/文件 URL")
+        if kind in (None, "message", "tool_result"):
+            visit(node.get("content"))
+        elif kind in ("function_call_output", "computer_call_output"):
+            visit(node.get("output"))
+        elif kind == "document" and isinstance(source, dict) and source.get("type") == "content":
+            visit(source.get("content"))
+
+    for field in ("messages", "input", "system"):
+        visit(body.get(field))
+
+
 def failure_reason(error):
     """Admin-facing explanation of an upstream network failure."""
     reason = getattr(error, "reason", error)
@@ -1431,6 +1463,7 @@ class KeyService:
             raise GatewayError("not_found", "模型不在本活动开放列表中，可用模型见 /v1/models")
         body["model"] = model
         call["price"] = upstream["models"][model]
+        reject_stored_file_references(body)
         settings = call["settings"]
         if settings["blockedWords"]:
             # Normalised like sub2api, but every message and the system prompt are scanned (sub2api reads only the last
@@ -1536,6 +1569,7 @@ class KeyService:
         if model is None:
             raise GatewayError("not_found", "模型不在本活动开放列表中，可用模型见 /v1/models")
         body["model"] = model
+        reject_stored_file_references(body)
         headers = {"Content-Type": "application/json", "x-api-key": upstream["key"],
                    "anthropic-version": handler.headers.get("anthropic-version", "2023-06-01")}
         beta = allowed_betas(handler.headers.get("anthropic-beta"))
@@ -1625,7 +1659,8 @@ class KeyService:
             handler.close_connection = True
             self.send(handler, call, 400, error.headers.get("Content-Type", "application/json"), payload)
             return
-        except OSError as error:
+        except (OSError, http.client.BadStatusLine, http.client.LineTooLong) as error:
+            # Response parsing failed after sending. Other HTTPExceptions (e.g. InvalidURL) can occur before sending.
             self.upstream_failed(call, error)
         call["status"], call["forwarded"] = response.status, True
         call["upstream_request_id"] = response.headers.get("request-id") or response.headers.get("x-request-id") or ""
