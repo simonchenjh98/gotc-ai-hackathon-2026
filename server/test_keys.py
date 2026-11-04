@@ -477,7 +477,12 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(ok({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x",
                                                                          "content": [{"type": "text", "text": "越狱"}]}]}]}), 403)
         self.assertEqual(ok({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64",
-                                         "media_type": "image/png", "data": "越狱"}}]}]}), 200)  # media payloads are not text
+                                         "media_type": "image/png", "data": "越狱"}}]}]}), 200)  # real media payloads are not text
+        # Text is never skipped because of a key name or prefix outside real media structures.
+        self.assertEqual(ok({"messages": [{"role": "user", "content": [{"type": "text", "text": "data:越狱"}]}]}), 403)
+        self.assertEqual(ok({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t",
+                                                                         "content": [{"type": "text", "text": "x", "data": "越狱"}]}]}]}), 403)
+        self.assertEqual(ok({"messages": [{"role": "user", "content": [{"type": "text", "text": "hi", "url": "越狱"}]}]}), 403)
         self.assertIn("命中屏蔽词：越狱", self.admin.post("/api/admin/keys/logs", {"errorsOnly": True})[1]["items"][0]["errorMessage"])
         self.admin.post("/api/admin/keys/settings", {"blockedWords": []})
         # 500 may already be billed upstream: not retried. 529 is retried.
@@ -1088,13 +1093,14 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.admin.post("/api/admin/keys/provision", {"teamId": other})[0], 200)
         other_key = other_client.post("/api/team/keys", {"name": "o"})[1]["key"]
         FakeUpstream.reply = (200, "application/json", b'{"id":"resp_team1","status":"completed","usage":{"input_tokens":5,"output_tokens":1}}')
-        self.assertEqual(self.call("/v1/responses", {"model": "cheap", "input": "hi"}, key)[0], 200)
+        self.assertEqual(self.call("/v1/responses", {"model": "cheap", "input": "hi", "store": True}, key)[0], 200)
+        self.assertIs(FakeUpstream.calls[-1][2]["store"], False)  # nothing is stored on the shared upstream account
         FakeUpstream.reply = None
-        # A response id continues only for the team that created it (one shared upstream account).
-        self.assertEqual(self.call("/v1/responses", {"model": "cheap", "input": "hi", "previous_response_id": "resp_team1"}, key)[0], 200)
-        self.assertEqual(self.call("/v1/responses", {"model": "cheap", "input": "hi", "previous_response_id": "resp_team1"}, other_key)[0], 403)
-        for extra in ({"background": True}, {"conversation": "conv_1"}, {"prompt": {"id": "pmpt_1"}}):
-            self.assertEqual(self.call("/v1/responses", {"model": "cheap", "input": "hi", **extra}, key)[0], 400, extra)
+        # So no stored state can be referenced, by any team.
+        for extra in ({"previous_response_id": "resp_team1"}, {"input": [{"type": "item_reference", "id": "msg_x"}]},
+                      {"background": True}, {"conversation": "conv_1"}, {"prompt": {"id": "pmpt_1"}}):
+            for team_key in (key, other_key):
+                self.assertEqual(self.call("/v1/responses", {"model": "cheap", "input": "hi", **extra}, team_key)[0], 400, extra)
         # Without a client limit, OpenAI-compatible routes reserve the full output cap (nothing injected upstream).
         service = self.service.keys
         seen = []

@@ -53,9 +53,6 @@ CREATE TABLE IF NOT EXISTS api_usage (
  client_ip TEXT NOT NULL DEFAULT '', upstream_request_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS api_usage_at ON api_usage(at);
-CREATE TABLE IF NOT EXISTS api_responses (
- response_id TEXT PRIMARY KEY, team_id TEXT NOT NULL REFERENCES teams(id), at INTEGER NOT NULL
-);
 CREATE INDEX IF NOT EXISTS api_usage_team ON api_usage(team_id, at);
 CREATE INDEX IF NOT EXISTS api_usage_key ON api_usage(key_id, at);
 CREATE TABLE IF NOT EXISTS gateway_config (
@@ -577,20 +574,30 @@ def request_text(body):
     or base64 payloads are skipped."""
     texts = []
 
-    def walk(node, key=""):
+    def media_keys(node):
+        """Payload fields of real media structures: Anthropic image/document sources, OpenAI image and file parts."""
+        kind = node.get("type")
+        if kind in ("image", "document") and isinstance(node.get("source"), dict) and node["source"].get("type") in ("base64", "url"):
+            return {"source"}
+        if kind in ("image_url", "input_image"):
+            return {"image_url", "file_id"}
+        if kind in ("input_file", "file"):
+            return {"file_data", "file_url", "file_id", "file"}
+        return set()
+
+    def walk(node):
         if isinstance(node, str):
-            if key in ("data", "url", "image_url", "file_data") or node.startswith("data:"):
-                return  # media payloads
             texts.append(node)
         elif isinstance(node, list):
             for item in node:
-                walk(item, key)
+                walk(item)
         elif isinstance(node, dict):
+            skip = media_keys(node) | {"type", "role", "id", "cache_control", "tool_use_id", "call_id"}
             for k, v in node.items():
-                if k not in ("type", "role", "id", "model", "cache_control", "media_type", "tool_use_id", "call_id"):
-                    walk(v, k)
+                if k not in skip:
+                    walk(v)
     for field in ("system", "messages", "input", "instructions", "prompt", "tools"):
-        walk(body.get(field), field)
+        walk(body.get(field))
     text = " ".join(texts)
     return " ".join(unicodedata.normalize("NFKC", text).translate(ZERO_WIDTH).split()).lower()
 
@@ -1252,8 +1259,6 @@ class KeyService:
                                                      call.get("stream_first_ms") if call["stream"] else call.get("first_token_ms"),
                                                      client_ip(handler), call.get("upstream_request_id", "")[:100], call["request_id"])).lastrowid
             db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (at, call["key"]["id"]))
-            if call.get("response_id"):
-                db.execute("INSERT OR IGNORE INTO api_responses VALUES (?,?,?)", (call["response_id"], call["key"]["team_id"], at))
             if call["log"] and time.monotonic() - self.last_prune > 600:  # amortised: at most every 10 minutes
                 self.last_prune = time.monotonic()
                 self.prune_logs(db, call.get("settings") or self.settings(db))
@@ -1449,15 +1454,17 @@ class KeyService:
         if path == "/v1/responses":
             # All teams share one upstream account: stored conversations must not cross teams, and background runs would
             # finish after the call, outside billing.
-            if body.get("background") or body.get("conversation") is not None or isinstance(body.get("prompt"), dict):
-                raise GatewayError("invalid", "本活动不支持 background、conversation 与预存 prompt，请在请求中直接提供输入")
-            previous = body.get("previous_response_id")
-            if previous is not None:
-                with self.service.db() as db:
-                    owned = isinstance(previous, str) and db.execute("SELECT 1 FROM api_responses WHERE response_id=? AND team_id=?",
-                                                                     (previous, key["team_id"])).fetchone()
-                if not owned:
-                    raise GatewayError("forbidden", "previous_response_id 不属于本队", detail=f"previous_response_id={str(previous)[:80]}")
+            # All teams share one upstream account, so nothing is stored there and nothing stored can be referenced:
+            # store is forced off; previous_response_id, item_reference, conversation and stored prompts are refused; and
+            # background runs (which finish after the call, outside billing) are refused. Clients send the full input,
+            # as Codex does with an API key.
+            items = body.get("input") if isinstance(body.get("input"), list) else []
+            if body.get("background") or body.get("conversation") is not None or isinstance(body.get("prompt"), dict) \
+                    or body.get("previous_response_id") is not None \
+                    or any(isinstance(i, dict) and i.get("type") == "item_reference" for i in items):
+                raise GatewayError("invalid", "本活动的 Responses API 不保存上游状态：不支持 previous_response_id、item_reference、"
+                                              "conversation、预存 prompt 与 background，请在 input 中提供完整上下文")
+            body["store"] = False
         for field in PRICING_FIELDS:
             body.pop(field, None)
         call["stream"] = stream = body.get("stream") is True
@@ -1653,8 +1660,6 @@ class KeyService:
                                    upstream_message=message) from None
             read_usage(name, data, usage)
             call["done"] = True  # a complete JSON body is a finished reply
-            if call["path"] == "/v1/responses" and isinstance(data, dict) and data.get("id"):
-                call["response_id"] = str(data["id"])[:100]
             self.keep(call, payload)
             self.safe_record(handler, call)
             self.send(handler, call, response.status, content_type, payload)
@@ -1710,8 +1715,6 @@ class KeyService:
                         parsed = None
                     read_usage(name, parsed, usage)
                     stream_progress(name, parsed, call)
-                    if isinstance(parsed, dict) and isinstance(parsed.get("response"), dict) and parsed["response"].get("id"):
-                        call["response_id"] = str(parsed["response"]["id"])[:100]
                     if call["reply_bytes"] and call.get("stream_first_ms") is None:
                         call["stream_first_ms"] = int((time.monotonic() - call["started"]) * 1000)
                     if isinstance(parsed, dict) and (parsed.get("type") in ("error", "response.failed") or isinstance(parsed.get("error"), (dict, str))):
