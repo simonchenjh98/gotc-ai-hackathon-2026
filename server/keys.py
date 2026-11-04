@@ -21,11 +21,12 @@ import ssl
 import threading
 import time
 import traceback
+import unicodedata
 import urllib.error
 import urllib.request
 import zlib
 from collections import defaultdict, deque
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from errors import APIError
 
@@ -89,10 +90,13 @@ ERROR_KINDS = {
 STATUS_KINDS = {400: "invalid", 401: "auth", 403: "forbidden", 404: "not_found", 411: "invalid", 413: "too_large",
                 415: "invalid", 429: "rate_limit", 499: "client_closed"}
 UPSTREAM_TIMEOUT = 300
+QUEUE_CAP = 20  # waiting requests per team beyond its running ones (sub2api defaultExtraWaitSlots)
+AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW, AUTH_BLOCK = 120, 60, 60  # per client IP, as sub2api's invalid-auth limiter
+KEY_CREATE_PER_HOUR = 60  # as sub2api; deleting a key does not give the quota back
 QUEUE_WAIT = 30  # seconds a request waits for a free team slot before 429 (agent tools send bursts)
 RESERVE_OUTPUT_DEFAULT = 8192  # output tokens reserved when the request sets no max_tokens (as sub2api)
 RESERVE_OUTPUT_CAP = 128000
-RESERVE_INPUT_CAP = 200000  # sub2api caps the input estimate: base64 images make bytes/4 far larger than real tokens
+IMAGE_TOKENS = 1600  # ceiling for one image (Anthropic: width*height/750, images resized to ~1.15 MP)
 RETRY_STATUSES = {429, 503, 529}  # explicit "not processed" answers; 5xx/timeouts may already be billed upstream
 # Tools must run on the client. Anthropic "client tools" (bash, text editor, computer, memory) are allowed;
 # anything else typed (web search, code execution, MCP, tool search, …) runs and is billed upstream.
@@ -131,9 +135,10 @@ def load_pepper(data_dir):
 class GatewayError(APIError):
     """An error with a sub2api-style classification; plain APIError statuses are classified by STATUS_KINDS."""
 
-    def __init__(self, kind, message, status=None, upstream_status=None, upstream_message=""):
+    def __init__(self, kind, message, status=None, upstream_status=None, upstream_message="", retry_after=None, detail=""):
         super().__init__(status or ERROR_KINDS[kind][0], message)
         self.kind, self.upstream_status, self.upstream_message = kind, upstream_status, upstream_message
+        self.retry_after, self.detail = retry_after, detail  # detail: recorded for admins, never sent to the team
 
 
 def error_info(error):
@@ -142,7 +147,8 @@ def error_info(error):
     _, a_type, o_type, o_code, phase, owner = ERROR_KINDS[kind]
     return {"kind": kind, "type": a_type, "openai_type": o_type, "code": o_code, "phase": phase, "owner": owner,
             "message": error.message, "upstream_status": getattr(error, "upstream_status", None),
-            "upstream_message": getattr(error, "upstream_message", "")}
+            "upstream_message": getattr(error, "upstream_message", ""), "retry_after": getattr(error, "retry_after", None),
+            "detail": getattr(error, "detail", "")}
 
 
 def error_body(path, info):
@@ -412,6 +418,32 @@ def beijing_midnight():
     return (now_ms() + 8 * 3600_000) // DAY_MS * DAY_MS - 8 * 3600_000
 
 
+def estimate_input(body):
+    """Input tokens for reservations and fallbacks: text at bytes/4 with no cap (so large prompts are never under-reserved),
+    each base64 image at most IMAGE_TOKENS instead of its byte size; other base64 data (PDFs...) stays at bytes/4."""
+    images = 0
+
+    def is_image(node):
+        source = node.get("source") if isinstance(node.get("source"), dict) else {}
+        url = node.get("image_url") if isinstance(node.get("image_url"), (dict, str)) else None
+        url = url.get("url") if isinstance(url, dict) else url
+        return (source.get("type") == "base64" and str(source.get("media_type", "")).startswith("image/")) or \
+            (isinstance(url, str) and url.startswith("data:image/"))
+
+    def strip(node):
+        nonlocal images
+        if isinstance(node, dict):
+            if is_image(node):
+                images += 1
+                return {}
+            return {k: strip(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [strip(v) for v in node]
+        return node
+    text = json.dumps(strip(body), ensure_ascii=False).encode()
+    return len(text) // 4 + images * IMAGE_TOKENS
+
+
 def client_ip(handler):
     """The team's address: Nginx's X-Real-IP is trusted only from a loopback peer, as in app.py."""
     peer = handler.client_address[0]
@@ -438,15 +470,32 @@ def check_rules(rules):
 
 
 def blocked_by(rules, headers):
-    """Return a reason when request headers break the rules: any deny match blocks; allow rules, if any, must match one."""
+    """Return an admin-facing detail when request headers break the rules: any deny match blocks; allow rules must match."""
     hit = lambda r: r["contains"].lower() in (headers.get(r["header"]) or "").lower()
     for rule in rules:
         if rule["action"] == "deny" and hit(rule):
-            return f"请求被组织方的客户端规则拦截（{rule['header']}）"
+            return f"命中禁止规则：{rule['header']} 含 {rule['contains']}（实际：{(headers.get(rule['header']) or '')[:200]}）"
     allows = [r for r in rules if r["action"] == "allow"]
     if allows and not any(hit(r) for r in allows):
-        return "当前应用或客户端不在本活动允许范围内：" + "；".join(f"{r['header']} 含 {r['contains']}" for r in allows)
+        return "未命中任何允许规则：" + "；".join(f"{r['header']}={(headers.get(r['header']) or '（无）')[:200]}" for r in allows[:5])
     return None
+
+
+ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))
+
+
+def last_user_text(body):
+    """Text of the last user turn, normalised like sub2api's moderation input (NFKC, no zero-width, collapsed spaces)."""
+    turns = body.get("messages") if isinstance(body.get("messages"), list) else body.get("input")
+    if isinstance(turns, str):
+        texts = [turns]
+    else:
+        user = next((m for m in reversed(turns) if isinstance(m, dict) and m.get("role") == "user"), None) if isinstance(turns, list) else None
+        content = user.get("content") if user else None
+        blocks = content if isinstance(content, list) else [content]
+        texts = [b if isinstance(b, str) else b.get("text") for b in blocks if isinstance(b, (str, dict))]
+    text = " ".join(t for t in texts if isinstance(t, str))
+    return " ".join(unicodedata.normalize("NFKC", text).translate(ZERO_WIDTH).split()).lower()
 
 
 class KeyService:
@@ -461,6 +510,10 @@ class KeyService:
         self.inflight = defaultdict(int)
         self.recent = defaultdict(deque)  # team -> monotonic times of requests in the last minute
         self.reserved = defaultdict(int)  # team -> micro-USD held by requests in flight
+        self.waiting = defaultdict(int)  # team -> requests queued for a slot
+        self.team_locks = defaultdict(threading.Lock)  # per team, so one team's budget check never blocks the others
+        self.auth_failures, self.auth_blocked = defaultdict(deque), {}
+        self.auth_failures_seen = deque(maxlen=100000)  # failed key attempts, for the admin overview
         self.opener = urllib.request.build_opener(_NoRedirect)  # honours HTTPS_PROXY for reaching upstreams
 
     def digest(self, token):
@@ -580,6 +633,9 @@ class KeyService:
             name = self.text(body["name"], "密钥名称", 40, True)
             if db.execute("SELECT COUNT(*) FROM api_keys WHERE team_id=? AND active=1", (team_id,)).fetchone()[0] >= settings["maxKeys"]:
                 raise APIError(409, f"每队最多 {settings['maxKeys']} 个密钥，请先删除不用的密钥")
+            if db.execute("SELECT COUNT(*) FROM api_keys WHERE team_id=? AND created_at>?", (team_id, now_ms() - 3600_000)).fetchone()[0] >= KEY_CREATE_PER_HOUR:
+                # As sub2api: deleting does not give the hourly creations back, so delete-and-recreate cannot loop.
+                raise APIError(429, f"每队每小时最多创建 {KEY_CREATE_PER_HOUR} 个密钥，请稍后再试")
             key = "gk-" + secrets.token_urlsafe(32)
             key_id = "K" + secrets.token_hex(8)
             masked = key[:7] + "…" + key[-4:]
@@ -613,10 +669,15 @@ class KeyService:
                        for r in db.execute("SELECT at,action,target,metadata FROM audit WHERE action LIKE 'api-%' ORDER BY id DESC LIMIT 50")]
             with self.lock:
                 inflight = {k: v for k, v in self.inflight.items() if v}
+                waiting = {k: v for k, v in self.waiting.items() if v}
+                hour_ago = time.monotonic() - 3600
+                overview_auth = {"authFailuresHour": sum(1 for t in self.auth_failures_seen if t > hour_ago),
+                                 "blockedClients": sum(1 for t in self.auth_blocked.values() if t > time.monotonic())}
+            overview.update(overview_auth)
             return {"enabled": self.config is not None, "settings": settings, "models": self.models(), "overview": overview,
                     "upstreams": self.public_config(db),
                     "changes": changes,
-                    "teams": [{"teamId": r["team_id"], "active": bool(r["active"]), "keyCount": r["key_count"], "inflight": inflight.get(r["team_id"], 0),
+                    "teams": [{"teamId": r["team_id"], "active": bool(r["active"]), "keyCount": r["key_count"], "inflight": inflight.get(r["team_id"], 0), "waiting": waiting.get(r["team_id"], 0),
                                "used24h": self.spend(db, r["team_id"], since), "usedTotal": self.spend(db, r["team_id"])} for r in rows]}
         if method == "GET" and path == "/api/admin/keys/export":
             self.service.audit(db, actor, "api-usage.export")
@@ -624,6 +685,7 @@ class KeyService:
         if method == "POST" and path == "/api/admin/keys/settings":
             if not body or not set(body).issubset({"dailyBudget", "totalBudget", "maxKeys", "expiresAt", "logContent", "clientRules", "teamRpm", "announcement", "blockedWords"}):
                 raise APIError(400, "API 设置字段不正确")
+            before = dict(settings)
             for key, value in body.items():
                 if key == "clientRules":
                     check_rules(value)
@@ -648,7 +710,8 @@ class KeyService:
                                                "teamRpm": "每分钟请求上限应为0至10000的整数（0为不限）", "announcement": "公告最多500字",
                                                "blockedWords": "屏蔽词最多200个，每个1至100字"}.get(key, "额度应为0至100000美元"))
                 db.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(value), "keys." + key))
-            self.service.audit(db, actor, "api-key.settings", metadata=body)
+            changed = {k: [before.get(k), v] for k, v in self.settings(db).items() if k in body and before.get(k) != v}
+            self.service.audit(db, actor, "api-key.settings", metadata=changed)
             return {"ok": True, "settings": self.settings(db)}
         if method == "POST" and path == "/api/admin/keys/upstreams":
             return self.save_upstreams(db, actor, body)
@@ -763,20 +826,37 @@ class KeyService:
                              r["cache_write_1h_tokens"], r["requested_model"], r["first_token_ms"], r["client_ip"], r["upstream_request_id"])])
         return ("\ufeff" + out.getvalue()).encode("utf-8")
 
-    def admit(self, team, rpm):
-        """Per-team requests-per-minute and concurrency gate; caller must release() on success."""
-        current = time.monotonic()
-        with self.lock:
+    def admit(self, team, rpm, slot=True):
+        """Per-team requests-per-minute and concurrency gate; caller must release() when slot=True.
+
+        As sub2api: waiters are capped (QUEUE_CAP), and a request counts towards the RPM only once it actually proceeds,
+        so timeouts and queue rejections do not use up the minute. count_tokens takes an RPM entry but no slot.
+        """
+        def window_checked(now):
             window = self.recent[team]
-            while window and window[0] <= current - 60:
+            while window and window[0] <= now - 60:
                 window.popleft()
             if rpm and len(window) >= rpm:
-                raise APIError(429, f"本队每分钟最多 {rpm} 次请求，请稍后重试")
-            window.append(current)
-            # Agent tools fire bursts; queue briefly for a slot instead of failing at once.
-            if not self.slot_free.wait_for(lambda: self.inflight[team] < TEAM_CONCURRENCY, timeout=QUEUE_WAIT):
-                raise APIError(429, f"本队同时进行的请求最多 {TEAM_CONCURRENCY} 个，排队超时")
-            self.inflight[team] += 1
+                raise GatewayError("rate_limit", f"本队每分钟最多 {rpm} 次请求，请稍后重试", retry_after=max(1, int(window[0] + 60 - now) + 1))
+            return window
+
+        with self.lock:
+            window_checked(time.monotonic())
+            if slot and self.inflight[team] >= TEAM_CONCURRENCY:
+                if self.waiting[team] >= QUEUE_CAP:
+                    raise GatewayError("rate_limit", f"本队排队请求已满（最多 {QUEUE_CAP} 个），请稍后重试", retry_after=2)
+                self.waiting[team] += 1
+                try:
+                    # Agent tools fire bursts; queue briefly for a slot instead of failing at once.
+                    ready = self.slot_free.wait_for(lambda: self.inflight[team] < TEAM_CONCURRENCY, timeout=QUEUE_WAIT)
+                finally:
+                    self.waiting[team] -= 1
+                if not ready:
+                    raise GatewayError("rate_limit", f"本队同时进行的请求最多 {TEAM_CONCURRENCY} 个，排队超时", retry_after=2)
+            now = time.monotonic()
+            window_checked(now).append(now)
+            if slot:
+                self.inflight[team] += 1
 
     def reserve(self, handler, call, estimate):
         """After the queue wait: re-check the key, team and access, then atomically reserve the estimated cost.
@@ -785,7 +865,9 @@ class KeyService:
         so a revoke or withdrawal during the wait stops the request before it reaches the upstream.
         """
         team = call["key"]["team_id"]
-        with self.service.db() as db, self.lock:
+        with self.lock:
+            team_lock = self.team_locks[team]
+        with team_lock, self.service.db() as db:
             row = self.lookup(db, handler)
             if not row or row["id"] != call["key"]["id"]:
                 raise APIError(401, "API 密钥在排队期间已被停用")
@@ -802,6 +884,8 @@ class KeyService:
 
     def unreserve(self, team, estimate):
         with self.lock:
+            team_lock = self.team_locks[team]
+        with team_lock:
             self.reserved[team] -= estimate
 
     def release(self, team):
@@ -815,6 +899,10 @@ class KeyService:
                 "request": b"", "response": [], "size": 0, "started": time.monotonic(), "log": False,
                 "request_bytes": 0, "reply_bytes": 0, "done": False, "forwarded": False}
         try:
+            query = parse_qs(urlsplit(handler.path).query)
+            if "key" in query or "api_key" in query:
+                # As sub2api: a key in the URL ends up in proxy and browser logs, so it is refused outright.
+                raise GatewayError("invalid", "不支持在网址中携带 API 密钥，请改用 Authorization 或 x-api-key 请求头")
             self.serve(handler, path, call)
         except ClientGone:
             handler.close_connection = True  # the team's client went away; the call was already recorded
@@ -828,7 +916,10 @@ class KeyService:
             handler.close_connection = True
             if not call.get("headers_sent"):
                 try:
-                    handler.respond(error.status, error_body(path, info))
+                    payload = json.dumps(error_body(path, info), ensure_ascii=False).encode()
+                    extra = {"Retry-After": str(info["retry_after"])} if info.get("retry_after") else None
+                    handler.headers_out(error.status, "application/json; charset=utf-8", len(payload), extra=extra)
+                    handler.wfile.write(payload)
                 except OSError:
                     pass
         finally:
@@ -839,7 +930,7 @@ class KeyService:
         info = error_info(error)
         if not call.get("recorded"):
             call["status"], call["error"] = error.status, info
-            detail = (f"上游 HTTP {info['upstream_status']}：" if info["upstream_status"] else "") + info["upstream_message"]
+            detail = (f"上游 HTTP {info['upstream_status']}：" if info["upstream_status"] else "") + (info["detail"] or info["upstream_message"])
             detail = detail + "\n" if detail else ""
             self.keep(call, (detail + error.message).encode())
         return info
@@ -890,11 +981,11 @@ class KeyService:
         incomplete = call["forwarded"] and not call["done"]
         estimated = False
         if call.get("charge_reserved"):
-            usage, incomplete, estimated = [min(call["request_bytes"] // 4, RESERVE_INPUT_CAP), call.get("reserve_out", 0), 0, 0, 0], True, True
+            usage, incomplete, estimated = [call.get("input_estimate", call["request_bytes"] // 4), call.get("reserve_out", 0), 0, 0, 0], True, True
         elif call["forwarded"]:
             # sub2api bills only what it observed; a call with no usage would then be free and escape the budget.
             # Fill gaps with its reservation estimate instead: input ~ request bytes / 4, output ~ reply text bytes / 4.
-            est_in, est_out = min(call["request_bytes"] // 4, RESERVE_INPUT_CAP), call["reply_bytes"] // 4
+            est_in, est_out = call.get("input_estimate", call["request_bytes"] // 4), call["reply_bytes"] // 4
             if not any(usage):
                 usage[0], usage[1], estimated = est_in, est_out, True
             elif incomplete and usage[1] < est_out:
@@ -911,7 +1002,7 @@ class KeyService:
                                                      call["status"], call["path"], int(call["stream"]), int((time.monotonic() - call["started"]) * 1000),
                                                      (handler.headers.get("User-Agent") or "")[:300], int(incomplete), int(estimated),
                                                      error["type"], error["phase"], error["owner"], error["upstream_status"],
-                                                     (error["upstream_message"] or error["message"])[:500], usage[4], call.get("requested_model", "")[:100],
+                                                     (error.get("detail") or error["upstream_message"] or error["message"])[:500], usage[4], call.get("requested_model", "")[:100],
                                                      call.get("stream_first_ms") if call["stream"] else call.get("first_token_ms"),
                                                      client_ip(handler), call.get("upstream_request_id", "")[:100])).lastrowid
             db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (at, call["key"]["id"]))
@@ -923,27 +1014,65 @@ class KeyService:
                            zlib.compress(call["request"], 6), zlib.compress(response, 6), len(call["request"]), call["size"]))
 
     def lookup(self, db, handler):
-        header = handler.headers.get("Authorization", "")
-        token = header[7:].strip() if header.startswith("Bearer ") else handler.headers.get("x-api-key", "").strip()
+        parts = handler.headers.get("Authorization", "").split(None, 1)
+        token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" else handler.headers.get("x-api-key", "").strip()
         if not token:
-            raise APIError(401, "缺少 API 密钥")
+            raise GatewayError("auth", "缺少 API 密钥")
+        if len(token) > 200:
+            return None  # longer than any key we issue; not worth hashing
         # Keys stop with the team: API access disabled, team login revoked, or team withdrawn/disqualified.
         return db.execute("""SELECT k.id, k.team_id FROM api_keys k JOIN team_api t ON t.team_id=k.team_id
           JOIN team_accounts ta ON ta.team_id=k.team_id JOIN accounts a ON a.id=ta.account_id AND a.active=1
           LEFT JOIN team_details d ON d.team_id=k.team_id
           WHERE k.key_hash=? AND k.active=1 AND t.active=1 AND COALESCE(d.status,'active')='active'""", (self.digest(token),)).fetchone()
 
+    def auth_guard(self, handler):
+        """sub2api's invalid-auth limiter: too many failed keys from one address are blocked before any hashing."""
+        ip = client_ip(handler)
+        try:
+            if ipaddress.ip_address(ip).version == 6:
+                ip = str(ipaddress.ip_network(f"{ip}/64", strict=False))  # an IPv6 /64 is one client
+        except ValueError:
+            pass
+        now = time.monotonic()
+        with self.lock:
+            blocked = self.auth_blocked.get(ip, 0)
+            if blocked > now:
+                raise GatewayError("rate_limit", "密钥错误次数过多，请稍后再试", retry_after=int(blocked - now) + 1)
+        return ip
+
+    def auth_failed(self, ip):
+        now = time.monotonic()
+        with self.lock:
+            self.auth_failures_seen.append(now)
+            failures = self.auth_failures[ip]
+            while failures and failures[0] <= now - AUTH_FAIL_WINDOW:
+                failures.popleft()
+            failures.append(now)
+            if len(failures) >= AUTH_FAIL_LIMIT:
+                self.auth_blocked[ip] = now + AUTH_BLOCK
+                failures.clear()
+            if len(self.auth_failures) > 16384:  # bounded memory, as sub2api
+                self.auth_failures = defaultdict(deque, {k: v for k, v in self.auth_failures.items() if v and v[-1] > now - AUTH_FAIL_WINDOW})
+                self.auth_blocked = {k: v for k, v in self.auth_blocked.items() if v > now}
+
     def authenticate(self, handler, call=None):
+        ip = self.auth_guard(handler)
         with self.service.db() as db:
-            row = self.lookup(db, handler)
+            try:
+                row = self.lookup(db, handler)
+            except APIError:
+                self.auth_failed(ip)
+                raise
             if not row:
-                raise APIError(401, "API 密钥无效或已停用")
+                self.auth_failed(ip)
+                raise GatewayError("auth", "API 密钥无效或已停用")
             settings = self.settings(db)
             if call is not None:
                 call["key"], call["log"], call["settings"] = row, settings["logContent"], settings
-            reason = blocked_by(settings["clientRules"], handler.headers)
-            if reason:
-                raise APIError(403, reason)
+            detail = blocked_by(settings["clientRules"], handler.headers)
+            if detail:  # generic to the client so a fake client learns nothing (sub2api does the same)
+                raise GatewayError("forbidden", "当前应用或客户端不在本活动允许范围内，请使用组织方指定的客户端", detail=detail)
             if call is not None:
                 current = now_ms()
                 if settings["expiresAt"] is not None and current >= settings["expiresAt"]:
@@ -985,12 +1114,9 @@ class KeyService:
         if path == "/v1/messages/count_tokens" and handler.command == "POST" and "anthropic" in self.config:
             key = self.authenticate(handler, call)  # expiry, budget and client rules
             call["log"] = False  # metadata row only, zero cost
-            self.admit(key["team_id"], call["settings"]["teamRpm"])
-            try:
-                self.reserve(handler, call, 0)  # free call, but a revoke during the wait still stops it
-                return self.count_tokens(handler, call)
-            finally:
-                self.release(key["team_id"])
+            self.admit(key["team_id"], call["settings"]["teamRpm"], slot=False)  # RPM only, as sub2api: no slot
+            self.reserve(handler, call, 0)
+            return self.count_tokens(handler, call)
         name, suffix = ROUTES.get(path, (None, None))
         if handler.command != "POST" or name not in self.config:
             raise APIError(404, "接口不存在")
@@ -1008,11 +1134,13 @@ class KeyService:
         call["price"] = upstream["models"][model]
         settings = call["settings"]
         if settings["blockedWords"]:
-            # Whole decoded request (ensure_ascii=False undoes \u escapes); ponytail: substring scan, fine for a short list.
-            text = json.dumps(body, ensure_ascii=False).lower()
-            hit = next((w for w in settings["blockedWords"] if w.lower() in text), None)
+            # As sub2api: only the latest user turn, normalised, so one hit does not block the rest of a conversation and
+            # JSON keys or system prompts never match. ponytail: substring scan, fine for a short keyword list.
+            text = last_user_text(body)
+            words = {" ".join(unicodedata.normalize("NFKC", w).split()).lower() for w in settings["blockedWords"]}
+            hit = next((w for w in sorted(words) if w and w in text), None)
             if hit:
-                raise APIError(403, "请求内容包含本活动禁止的词语，已拦截")
+                raise GatewayError("forbidden", "请求内容包含本活动禁止的词语，已拦截", detail=f"命中屏蔽词：{hit}")
         if "stream" in body and type(body["stream"]) is not bool:
             raise APIError(400, "stream 必须是布尔值")
         tools = body.get("tools") or []
@@ -1032,7 +1160,8 @@ class KeyService:
         team = key["team_id"]
         price = call["price"]
         call["reserve_out"] = bound_output(body)
-        estimate = round(min(call["request_bytes"] // 4, RESERVE_INPUT_CAP) * price[0] + call["reserve_out"] * price[1])
+        call["input_estimate"] = estimate_input(body)
+        estimate = round(call["input_estimate"] * price[0] + call["reserve_out"] * price[1])
         self.admit(team, settings["teamRpm"])
         try:
             self.reserve(handler, call, estimate)

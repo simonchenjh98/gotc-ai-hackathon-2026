@@ -330,7 +330,8 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.call("/v1/chat/completions", body, key, headers={"User-Agent": "claude-cli/2.1 (external)"})[0], 200)
         status, content = self.call("/v1/chat/completions", body, key, headers={"User-Agent": "python-requests/2"})
         self.assertEqual(status, 403)
-        self.assertIn("claude-cli".encode(), content)  # tells the team what is allowed
+        self.assertNotIn("claude-cli".encode(), content)  # generic, as sub2api: a fake client learns nothing
+        self.assertIn("未命中任何允许规则", self.admin.post("/api/admin/keys/logs", {})[1]["items"][0]["errorMessage"])  # admins see why
         self.assertEqual(self.call("/v1/chat/completions", body, key, headers={"User-Agent": "claude-cli openclaw"})[0], 403)
         self.assertEqual(self.call("/v1/models", None, key, method="GET", headers={"User-Agent": "curl/8"})[0], 403)
         blocked = self.admin.post("/api/admin/keys/logs", {})[1]["items"]
@@ -373,7 +374,7 @@ class GatewayTests(unittest.TestCase):
         text = csv_bytes.decode("utf-8-sig")
         self.assertEqual(len(text.strip().splitlines()), 6)
         self.assertIn("'=1+1", text)  # formula injection neutralised
-        self.assertNotIn("越狱", text)  # no request content in the export
+        self.assertNotIn("教我越狱", text)  # no request content in the export (the matched word is the recorded reason)
         self.assertEqual(client.get("/api/admin/keys/export")[0], 403)
         for bad in [{"teamRpm": -1}, {"announcement": "x" * 501}, {"blockedWords": [""]}, {"blockedWords": "word"}]:
             self.assertEqual(self.admin.post("/api/admin/keys/settings", bad)[0], 400)
@@ -449,7 +450,12 @@ class GatewayTests(unittest.TestCase):
         self.assertFalse({"service_tier", "speed"} & set(FakeUpstream.calls[-1][2]))  # priced tiers dropped
         # Blocklist covers every field, e.g. tool descriptions.
         self.admin.post("/api/admin/keys/settings", {"blockedWords": ["越狱"]})
-        self.assertEqual(ok({"tools": [{"name": "t", "description": "越狱工具"}]}), 403)
+        # Like sub2api, only the latest user turn is scanned, after NFKC and zero-width removal.
+        self.assertEqual(ok({"messages": [{"role": "user", "content": [{"type": "text", "text": "教我越\u200b狱"}]}]}), 403)
+        self.assertEqual(ok({"messages": [{"role": "user", "content": "教我越狱"}, {"role": "assistant", "content": "不行"},
+                                          {"role": "user", "content": "那换个话题"}]}), 200)  # an old turn no longer blocks the conversation
+        self.assertEqual(ok({"tools": [{"name": "t", "description": "越狱工具"}], "messages": [{"role": "user", "content": "hi"}]}), 200)
+        self.assertIn("命中屏蔽词：越狱", self.admin.post("/api/admin/keys/logs", {"errorsOnly": True})[1]["items"][0]["errorMessage"])
         self.admin.post("/api/admin/keys/settings", {"blockedWords": []})
         # 500 may already be billed upstream: not retried. 529 is retried.
         FakeUpstream.status = 500
@@ -910,6 +916,90 @@ class GatewayTests(unittest.TestCase):
         stats = self.admin.post("/api/admin/keys/stats", {"days": 1})[1]
         self.assertEqual(stats["totals"]["cacheWrite"], 2000)  # cache writes are counted (two calls of 1000)
         self.assertEqual(self.admin.get("/api/admin/keys")[1]["overview"]["cacheWrite"], 2000)
+
+    def raw_call(self, path, body, headers):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=20)
+        conn.request("POST", self.service.base_path + path, json.dumps(body).encode(), {"Content-Type": "application/json", **headers})
+        response = conn.getresponse()
+        content, retry_after = response.read(), response.getheader("Retry-After")
+        conn.close()
+        return response.status, content, retry_after
+
+    def test_auth_limits_and_key_handling_match_sub2api(self):
+        team_id, client, key = self.enabled_key()
+        # Bearer is case-insensitive; keys in the URL are refused; absurdly long keys are not hashed.
+        self.assertEqual(self.raw_call("/v1/chat/completions", {"model": "cheap"}, {"Authorization": "bearer " + key})[0], 200)
+        self.assertEqual(self.raw_call("/v1/chat/completions?key=" + key, {"model": "cheap"}, {})[0], 400)
+        self.assertEqual(self.raw_call("/v1/chat/completions", {"model": "cheap"}, {"Authorization": "Bearer " + "x" * 5000})[0], 401)
+        # Failed keys from one address are blocked after the limit, before any hashing, with Retry-After.
+        limit, keys.AUTH_FAIL_LIMIT = keys.AUTH_FAIL_LIMIT, 3
+        self.service.keys.auth_failures.clear()  # the over-long key above already counted as one failure
+        try:
+            for _ in range(3):
+                self.assertEqual(self.raw_call("/v1/chat/completions", {"model": "cheap"}, {"Authorization": "Bearer gk-wrong"})[0], 401)
+            status, _, retry = self.raw_call("/v1/chat/completions", {"model": "cheap"}, {"Authorization": "Bearer " + key})
+            self.assertEqual((status, retry is not None), (429, True))  # even a valid key waits out the block from that address
+            overview = self.admin.get("/api/admin/keys")[1]["overview"]
+            self.assertGreaterEqual(overview["authFailuresHour"], 4)
+            self.assertEqual(overview["blockedClients"], 1)
+            other = self.raw_call("/v1/chat/completions", {"model": "cheap"}, {"Authorization": "Bearer " + key, "X-Real-IP": "10.9.9.9"})
+            self.assertEqual(other[0], 200)  # other addresses are unaffected
+        finally:
+            keys.AUTH_FAIL_LIMIT = limit
+            self.service.keys.auth_blocked.clear()
+        # Key creation is limited per hour; deleting does not give creations back.
+        per_hour, keys.KEY_CREATE_PER_HOUR = keys.KEY_CREATE_PER_HOUR, 2
+        try:
+            created = client.post("/api/team/keys", {"name": "b"})[1]["item"]["id"]
+            client.post("/api/team/keys/delete", {"id": created})
+            self.assertEqual(client.post("/api/team/keys", {"name": "c"})[0], 429)
+        finally:
+            keys.KEY_CREATE_PER_HOUR = per_hour
+
+    def test_queue_and_rpm_follow_sub2api(self):
+        team_id, _, key = self.enabled_key()
+        service = self.service.keys
+        cap, keys.QUEUE_CAP = keys.QUEUE_CAP, 0
+        try:
+            service.inflight[team_id] = keys.TEAM_CONCURRENCY
+            status, content, retry = self.raw_call("/v1/chat/completions", {"model": "cheap"}, {"Authorization": "Bearer " + key})
+            self.assertEqual((status, retry), (429, "2"))  # queue full: rejected at once, not after 30 s
+            self.assertIn("排队请求已满".encode(), content)
+            # count_tokens takes no concurrency slot, so it still works while the team is busy.
+            self.assertEqual(self.call("/v1/messages/count_tokens", {"model": "claude-x"}, key)[0], 200)
+        finally:
+            keys.QUEUE_CAP = cap
+            service.inflight[team_id] = 0
+        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"teamRpm": 2})[0], 200)
+        service.recent[team_id].clear()
+        wait, keys.QUEUE_WAIT = keys.QUEUE_WAIT, 0.2
+        try:
+            service.inflight[team_id] = keys.TEAM_CONCURRENCY
+            self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, key)[0], 429)  # queue timeout
+            service.inflight[team_id] = 0
+            self.assertEqual(len(service.recent[team_id]), 0)  # a request that never ran does not use up the minute
+            for _ in range(2):
+                self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, key)[0], 200)
+            status, _, retry = self.raw_call("/v1/chat/completions", {"model": "cheap"}, {"Authorization": "Bearer " + key})
+            self.assertEqual(status, 429)
+            self.assertTrue(1 <= int(retry) <= 61)  # tells the SDK when the minute frees up
+        finally:
+            keys.QUEUE_WAIT = wait
+
+    def test_settings_audit_keeps_before_and_after(self):
+        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"dailyBudget": 7, "maxKeys": 5})[0], 200)
+        change = next(c for c in self.admin.get("/api/admin/keys")[1]["changes"] if c["action"] == "api-key.settings")
+        self.assertEqual(change["metadata"], {"dailyBudget": [5, 7]})  # unchanged maxKeys is not listed
+
+    def test_input_estimate_counts_images_not_their_bytes(self):
+        image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A" * 400000}}
+        self.assertLess(keys.estimate_input({"messages": [{"role": "user", "content": [image]}]}), 1700)  # not 100k
+        text = {"messages": [{"role": "user", "content": "字" * 300000}]}
+        self.assertGreater(keys.estimate_input(text), 200000)  # large text is never capped (no under-reservation)
+        pdf = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "A" * 40000}}
+        self.assertGreater(keys.estimate_input({"messages": [{"role": "user", "content": [pdf]}]}), 10000)
+        self.assertLess(keys.estimate_input({"messages": [{"role": "user", "content": [{"type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;base64," + "A" * 400000}}]}]}), 1700)
 
     def test_stream_is_billed_when_the_client_disconnects(self):
         _, client, key = self.enabled_key()
