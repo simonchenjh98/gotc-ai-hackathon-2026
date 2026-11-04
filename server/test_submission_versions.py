@@ -44,6 +44,24 @@ class VersionSubmissionTests(unittest.TestCase):
                 self.assertEqual(result['submission']['submitted']['codeVersion'],('b'*64 if version=='B'*64 else 'a'*40))
                 self.assertEqual(client.get('/api/team')[1]['submission']['submittedVersion'],2)
 
+    def test_domestic_commit_links_and_presentation_urls_survive_formal_submission(self):
+        self.open_submissions()
+        client,_=self.access(self.team())
+        sha='AB'*20
+        for version,(repository,commit_path) in enumerate([
+            ('https://gitee.com/team/project','commit'),
+            ('https://gitcode.com/Team/Project','commit'),
+            ('https://gitcode.com/Team/Project','commits/detail'),
+        ]):
+            with self.subTest(repository=repository,commit_path=commit_path):
+                materials=self.materials(codeUrl=repository,codeVersion=f'{repository}/{commit_path}/{sha}')
+                status,result,_=self.save(client,version,materials=materials)
+                self.assertEqual(status,200,result)
+                saved=client.get('/api/team')[1]['submission']['submitted']
+                self.assertEqual(saved['codeVersion'],sha.lower())
+                for key in ('codeUrl','slidesUrl','videoUrl'):
+                    self.assertEqual(saved[key],materials[key])
+
     def test_normalized_formal_draft_partial_legacy_and_readback(self):
         client,_=self.access(self.team())
         self.open_submissions()

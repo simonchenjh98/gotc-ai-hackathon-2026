@@ -247,9 +247,9 @@ python3 -m py_compile server/app.py server/test_api.py
 
 ## 仓库与 commit 核对
 
-新正式提交的 `codeUrl` 应填写完整 HTTPS 仓库主页（不是代码包、文件页、个人页或本地路径）。GitHub、Gitee、GitLab 会检查仓库根地址形状；其他平台保持原 HTTPS 格式兼容，须直接填完整 SHA。例如 `https://github.com/your-team/your-project`。队伍应保证仓库公开、代码已 push；平台不联网检查存在性或可访问性。既有材料只读保留，旧草稿可继续保存，重新正式提交时按新规则补齐。
+新正式提交的 `codeUrl` 应填写完整 HTTPS 仓库主页（不是代码包、文件页、个人页或本地路径）。GitHub、Gitee、GitCode、GitLab 会检查仓库根地址形状；其他平台保持原 HTTPS 格式兼容，须直接填完整 SHA。例如 `https://github.com/your-team/your-project`。队伍应保证仓库公开、代码已 push；平台不联网检查存在性或可访问性。既有材料只读保留，旧草稿可继续保存，重新正式提交时按新规则补齐。
 
-`codeVersion` 输入40/64位十六进制完整SHA，或 GitHub/Gitee 的 `/owner/repo/commit/<完整SHA>`、GitLab 的 `/group/subgroup/repo/-/commit/<完整SHA>` 链接。仓库/commit链接主机和仓库路径必须一致，GitHub/Gitee路径忽略大小写，GitLab保持大小写并支持多级子组；允许仓库尾部 `.git` 和尾斜杠。拒绝凭据、显式端口、查询参数、片段、百分号编码及点路径。上述是三家已支持的 commit 链接解析范围；其他平台 commit 链接无法可靠解析时提示改填完整 SHA，不限制其原有 HTTPS 仓库输入。这里只做语法和路径比较；直接填SHA不能证明其属于该仓库，commit链接也不证明提交实际存在。正式保存小写完整SHA，草稿保留输入；摘要前6位不保证唯一，应使用完整值核对。
+`codeVersion` 输入40/64位十六进制完整SHA，或 GitHub、Gitee、GitCode 的 `/owner/repo/commit/<完整SHA>`、GitCode 的 `/owner/repo/commits/detail/<完整SHA>`、GitLab 的 `/group/subgroup/repo/-/commit/<完整SHA>` 链接。仓库/commit链接主机和仓库路径必须一致，GitHub/Gitee路径忽略大小写，GitCode 和 GitLab 按原路径匹配大小写，GitLab 支持多级子组；允许仓库尾部 `.git` 和尾斜杠。拒绝凭据、显式端口、查询参数、片段、百分号编码及点路径。其他平台 commit 链接无法可靠解析时提示改填完整 SHA，不限制其原有 HTTPS 仓库输入。这里只做语法和路径比较；直接填SHA不能证明其属于该仓库，commit链接也不证明提交实际存在。正式保存小写完整SHA，草稿保留输入；摘要前6位不保证唯一，应使用完整值核对。
 
 本队响应及管理员各队记录新增 `judgingMaterials:{exhibition,roadshow}`。每阶段为 `{runId,inRoster,frozenAt,materialSnapshot}`，后者为空或既有 `{materials,submissionVersion,submittedAt,capturedAt}` 快照。区分未入名单、未冻结、冻结时无材料和已有冻结版；不会拿最新正式版补空。队伍只能得到本队材料，不带评委或评语。原专业入口仍读最新正式版，展示/路演同轮重开保持快照，新轮首次开放才重新截取。
 

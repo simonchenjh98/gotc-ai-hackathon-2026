@@ -116,20 +116,26 @@ def valid_material_host(host):
     return len(domain)<=253 and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label, re.I) for label in domain.split("."))
 
 
+COMMIT_LINK_HOSTS={'github.com','gitee.com','gitcode.com','gitlab.com'}
+
+
 def repository_parts(value, commit=False):
     """Parse supported public-host URL shapes only; never contact the host."""
     try:
         url=urlsplit(value)
         host=url.hostname
-        if (url.scheme!='https' or host not in {'github.com','gitee.com','gitlab.com'} or url.username is not None
+        if (url.scheme!='https' or host not in COMMIT_LINK_HOSTS or url.username is not None
                 or url.password is not None or url.netloc.lower()!=host or url.port is not None or url.query or url.fragment
                 or re.search(r'[\s\\%]',value) or len(value.encode('utf-8'))>1024):
             return None
         parts=url.path.rstrip('/').split('/')[1:]
         sha=None
         if commit:
-            tail=3 if host=='gitlab.com' else 2
-            if len(parts)<tail+2 or parts[-tail:-1]!=(['-','commit'] if host=='gitlab.com' else ['commit']):
+            marker=['-','commit'] if host=='gitlab.com' else ['commit']
+            if host=='gitcode.com' and parts[-3:-1]==['commits','detail']:
+                marker=['commits','detail']
+            tail=len(marker)+1
+            if len(parts)<tail+2 or parts[-tail:-1]!=marker:
                 return None
             sha=parts[-1]
             if not re.fullmatch(r'(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})',sha):
@@ -141,9 +147,9 @@ def repository_parts(value, commit=False):
         # GitHub repository names may start with a dot; owners and other hosts keep their existing grammar.
         if len(parts)<2 or (host!='gitlab.com' and len(parts)!=2) or any(not re.fullmatch(r'[A-Za-z0-9_.][A-Za-z0-9_.-]*' if host=='github.com' and index==len(parts)-1 else r'[A-Za-z0-9_][A-Za-z0-9_.-]*',part) or part in {'.','..'} for index,part in enumerate(parts)):
             return None
-        # GitHub/Gitee names are case-insensitive; GitLab subgroup paths are kept exact.
+        # Fold only hosts whose existing contract compares names case-insensitively.
         path='/'.join(parts)
-        return host,path if host=='gitlab.com' else path.lower(),sha.lower() if sha else None
+        return host,path.lower() if host in {'github.com','gitee.com'} else path,sha.lower() if sha else None
     except (ValueError,TypeError):
         return None
 
@@ -158,13 +164,13 @@ def normalize_code_version(repository, version):
     except (ValueError,TypeError):
         valid=False
     repo=repository_parts(repository)
-    if not valid or (url.hostname in {'github.com','gitee.com','gitlab.com'} and not repo):
-        raise APIError(400,'仓库请填写完整 HTTPS 仓库主页链接，不是本地路径或文件页面；GitHub、Gitee、GitLab 请使用仓库根地址')
+    if not valid or (url.hostname in COMMIT_LINK_HOSTS and not repo):
+        raise APIError(400,'仓库请填写完整 HTTPS 仓库主页链接，不是本地路径或文件页面；GitHub、Gitee、GitCode、GitLab 请使用仓库根地址')
     if re.fullmatch(r'(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})',version):
         return version.lower()
     commit=repository_parts(version,commit=True)
     if not repo or not commit or commit[:2]!=repo[:2]:
-        raise APIError(400,'commit 请填写同一 GitHub、Gitee 或 GitLab 仓库的完整提交页面链接，或40/64位完整哈希；其他平台请填完整哈希，不要填写分支、tag或前6位')
+        raise APIError(400,'commit 请填写同一 GitHub、Gitee、GitCode 或 GitLab 仓库的完整提交页面链接，或40/64位完整哈希；其他平台请填完整哈希，不要填写分支、tag或前6位')
     return commit[2]
 
 
