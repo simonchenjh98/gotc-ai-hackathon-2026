@@ -141,3 +141,19 @@ test('ambiguous admin approval directs a status refresh and reconciliation befor
   assert.match(error.textContent,/后台可能仍在处理/);assert.match(error.textContent,/刷新申请列表核对状态/);assert.match(error.textContent,/勿重复批准/);
   assert.equal(calls.filter(c=>c.body).length,1);
 });
+
+for(const [status,code] of [[429,'repository_rate_limit'],[503,'repository_busy']]){
+  test(`${code} keeps materials editable and allows a later fresh SHA check`,async()=>{
+    const f=fixture();let attempts=0;
+    f.context.submissionResponse=async()=>{if(++attempts===1){const error=new Error('请稍后刷新状态再重试');error.status=status;error.code=code;throw error;}};
+    await f.context.render();f.node('material-summary').value='UNSAVED QUOTA MATERIALS';
+    await f.node('submission-form').onsubmit({preventDefault(){}});await f.node('confirm-submission').onclick();
+    assert.equal(f.node('material-summary').value,'UNSAVED QUOTA MATERIALS');
+    assert.equal(f.node('material-summary').readOnly,false);assert.equal(f.node('fieldset').disabled,false);
+    assert.equal(f.context.recoveryStates.at(-1),'editing');assert.equal(f.node('submission-preview').innerHTML,'');
+    assert.match(f.node('form-error').textContent,/稍后重新检查 SHA/);
+    await f.node('submission-form').onsubmit({preventDefault(){}});await f.node('confirm-submission').onclick();
+    assert.equal(f.calls.filter(c=>c.path==='team/repository/preview').length,2);
+    assert.match(f.root.innerHTML,/正式版 v1 已收到/);
+  });
+}

@@ -9,6 +9,10 @@ import os
 import re
 import secrets
 import socket
+import threading
+import time
+from collections import deque
+from contextlib import contextmanager
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -38,6 +42,51 @@ class UpstreamError(APIError):
     def __init__(self, upstream_status=None):
         super().__init__(502, '仓库服务未能确认操作结果，请由管理员核对后重试', 'repository_upstream')
         self.upstream_status = upstream_status
+
+
+class ProviderOperations:
+    """Single-process operation permits and bounded rolling team request quotas."""
+    LIMITS = {'preview': 10, 'confirmation': 20}
+    WINDOW_SECONDS = 60
+    MAX_BUCKETS = 4096
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.permits = {name: threading.BoundedSemaphore(4) for name in ('github', 'gitee')}
+        self.lock = threading.Lock()
+        self.buckets = {}
+
+    def spend(self, provider, team_id, kind):
+        with self.lock:
+            now = self.clock()
+            # Expire idle teams as well as the active bucket, bounding retained state.
+            for key in list(self.buckets):
+                bucket = self.buckets[key]
+                while bucket and bucket[0] <= now - self.WINDOW_SECONDS:
+                    bucket.popleft()
+                if not bucket:
+                    del self.buckets[key]
+            key = (provider, team_id, kind)
+            bucket = self.buckets.get(key)
+            if bucket is None:
+                if len(self.buckets) >= self.MAX_BUCKETS:
+                    raise APIError(503, '仓库查询繁忙，请等待一分钟后刷新状态再重试', 'repository_busy')
+                bucket = self.buckets[key] = deque()
+            if len(bucket) >= self.LIMITS[kind]:
+                raise APIError(429, '本队仓库查询过于频繁，请等待一分钟后重新检查材料或查询提交记录', 'repository_rate_limit')
+            bucket.append(now)
+
+    @contextmanager
+    def operation(self, provider, team_id=None, kind=None):
+        permit = self.permits[provider]
+        if not permit.acquire(blocking=False):
+            raise APIError(503, '仓库服务繁忙，本次尚未执行远端操作；请稍后刷新状态再重试', 'repository_busy')
+        try:
+            if kind is not None:
+                self.spend(provider, team_id, kind)
+            yield
+        finally:
+            permit.release()
 
 
 class Provider:
@@ -159,6 +208,7 @@ class Provider:
 class Repositories:
     def __init__(self, service):
         self.s = service
+        self.operations = ProviderOperations()
         self.providers = {}
         for name, default in [('github', 'GOTC-AI-HACKATHON'), ('gitee', 'gotc-ai-hackathon')]:
             prefix = 'GOTC_REPO_' + name.upper()
@@ -281,6 +331,20 @@ class Repositories:
     def provision(self, reconcile, body, cookie, login_id):
         if set(body) != {'teamId', 'expectedRevision', 'usernamesVerified'} or body['usernamesVerified'] is not True or type(body['expectedRevision']) is not int:
             raise APIError(400, '管理员须明确确认已核对全部用户名归属，并提供当前修订号')
+        # Inspect identity/provider without a writer lock, then acquire the shared permit.
+        # _provision rechecks the revision and identity atomically before changing state.
+        with self.s.db() as db:
+            self.identity(cookie, login_id, 'admin', db)
+            if not isinstance(body['teamId'], str):
+                raise APIError(400, '队伍编号不正确')
+            row = self.get(db, body['teamId'])
+            if not row:
+                raise APIError(404, '仓库申请不存在')
+            p = self.provider(row)
+        with self.operations.operation(p.name):
+            return self._provision(reconcile, body, cookie, login_id)
+
+    def _provision(self, reconcile, body, cookie, login_id):
         with self.s.db() as db:
             db.execute('BEGIN IMMEDIATE')
             actor = self.identity(cookie, login_id, 'admin', db)
@@ -363,8 +427,9 @@ class Repositories:
             if not self.s.submission_window(db)['canEdit']:
                 raise APIError(409, '作品提交尚未开放或已截止', 'submission_closed')
         p = self.provider(row)
-        self.verify_repository(row, p.repository(row))
-        sha = p.head(row)
+        with self.operations.operation(p.name, team['id'], 'preview'):
+            self.verify_repository(row, p.repository(row))
+            sha = p.head(row)
         with self.s.db() as db:
             db.execute('BEGIN IMMEDIATE')
             actor = self.identity(cookie, login_id, 'team', db)
@@ -398,8 +463,9 @@ class Repositories:
             row, preview = self.preview_row(db, team['id'], login_id, body.get('repoPreviewId'))
             row, preview = dict(row), dict(preview)
         p = self.provider(row)
-        self.verify_repository(row, p.repository(row))
-        sha = p.head(row)
+        with self.operations.operation(p.name, team['id'], 'confirmation'):
+            self.verify_repository(row, p.repository(row))
+            sha = p.head(row)
         if sha != preview['sha']:
             raise APIError(409, '正式分支已有新提交，请重新检查材料并预览 SHA', 'repository_head_changed')
         return {'previewId': preview['id'], 'sha': sha, 'sessionHash': login_id}

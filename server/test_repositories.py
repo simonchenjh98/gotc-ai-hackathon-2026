@@ -2,12 +2,15 @@
 import json
 import os
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
-from repositories import Provider, UpstreamError
+from errors import APIError
+from repositories import Provider, ProviderOperations, UpstreamError
 import test_submissions
 
 
@@ -417,6 +420,129 @@ class RepositoryTests(unittest.TestCase):
         self.assertIsNone(self.client.get('/api/team')[1]['submission']['submitted'])
         self.assertNotIn('synthetic-secret', json.dumps(result))
 
+    def test_preview_quota_is_rolling_and_independent_of_confirmation_and_other_teams(self):
+        self.provision()
+        self.open_submissions()
+        clock = [100.0]
+        self.repos.operations.clock = lambda: clock[0]
+        for _ in range(10):
+            status, preview, _ = self.preview()
+            self.assertEqual(status, 200, preview)
+        calls = len(self.remote.calls)
+        status, error, _ = self.preview()
+        self.assertEqual((status, error['code']), (429, 'repository_rate_limit'))
+        self.assertIn('一分钟', error['error'])
+        self.assertEqual(len(self.remote.calls), calls)
+        self.assertEqual(self.submit(preview)[0], 200)
+        # A second authenticated team on the same provider retains its own quota.
+        other, _ = self.access(self.team(number=2, name='Other synthetic quota team'))
+        status, data, _ = self.request(other, '/api/team/repository/apply', {'provider': 'github', 'usernames': ['Other-Developer']})
+        self.assertEqual(status, 200, data)
+        saved_repo = dict(self.remote.repo)
+        self.remote.repo = None
+        self.assertEqual(self.admin_action(data['repository'])[0], 200)
+        self.assertEqual(self.preview(other)[0], 200)
+        self.remote.repo = saved_repo
+        clock[0] = 159.999
+        self.assertEqual(self.preview()[0], 429)
+        clock[0] = 160.0
+        self.assertEqual(self.preview()[0], 200)
+
+    def test_confirmation_quota_and_replay_skip_quota_busy_provider_and_expired_preview(self):
+        self.provision()
+        self.open_submissions()
+        clock = [100.0]
+        self.repos.operations.clock = lambda: clock[0]
+        preview = self.preview()[1]
+        status, original, _ = self.submit(preview)
+        self.assertEqual(status, 200, original)
+        # An upstream error still spends one fresh confirmation verification.
+        self.remote.timeout_read = True
+        for i in range(19):
+            self.assertEqual(self.submit(preview, request_id='quota-new-request-%03d' % i, version=1)[0], 502)
+        calls = len(self.remote.calls)
+        self.assertEqual(self.submit(preview, request_id='quota-over-limit-001', version=1)[0], 429)
+        self.assertEqual(len(self.remote.calls), calls)
+        permit = self.repos.operations.permits['github']
+        for _ in range(4):
+            self.assertTrue(permit.acquire(blocking=False))
+        try:
+            with patch.object(self.repos, 'now', return_value=preview['expiresAt'] + 1):
+                status, replay, _ = self.submit(preview)
+                self.assertEqual(status, 200, replay)
+                self.assertEqual(replay['receipt'], original['receipt'])
+                self.assertTrue(replay['replayed'])
+                self.assertEqual(self.submit(preview, materials=self.materials())[0], 409)
+        finally:
+            for _ in range(4):
+                permit.release()
+        self.assertEqual(len(self.remote.calls), calls)
+        clock[0] = 160.0
+        self.remote.timeout_read = False
+        self.assertEqual(self.submit(preview, request_id='quota-reset-request-001', version=1)[0], 200)
+
+    def test_busy_operation_has_no_remote_or_persistent_provision_preview_or_confirmation_effect(self):
+        self.enable()
+        row = self.apply()[1]['repository']
+        permit = self.repos.operations.permits['github']
+        @contextmanager
+        def saturated():
+            for _ in range(4):
+                self.assertTrue(permit.acquire(blocking=False))
+            try:
+                yield
+            finally:
+                for _ in range(4):
+                    permit.release()
+        with saturated():
+            status, error, _ = self.admin_action(row)
+            self.assertEqual((status, error['code']), (503, 'repository_busy'))
+            self.assertEqual(self.request(self.client, '/api/team/repository')[1]['repository'], row)
+            self.assertEqual(self.remote.calls, [])
+        row = self.admin_action(row)[1]['repository']
+        self.open_submissions()
+        preview = self.preview()[1]
+        calls, buckets = len(self.remote.calls), dict(self.repos.operations.buckets)
+        with saturated():
+            self.assertEqual(self.preview()[0], 503)
+            self.assertEqual(self.submit(preview)[0], 503)
+            self.assertEqual(self.admin_action(row, 'reconcile')[0], 503)
+        self.assertEqual(len(self.remote.calls), calls)
+        self.assertEqual(self.repos.operations.buckets, buckets)
+        with self.service.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM repository_previews').fetchone()[0], 1)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM submission_requests').fetchone()[0], 0)
+        self.assertEqual(self.submit(preview)[0], 200)
+
+    def test_permit_acquisition_and_remote_operations_never_hold_writer_lock_and_release_on_error(self):
+        original = self.repos.operations.operation
+        @contextmanager
+        def checked(*args, **kwargs):
+            with closing(sqlite3.connect(self.service.db_path, timeout=.1)) as db:
+                db.execute('BEGIN IMMEDIATE')
+            with original(*args, **kwargs):
+                yield
+        with patch.object(self.repos.operations, 'operation', side_effect=checked):
+            row = self.provision()
+            self.open_submissions()
+            preview = self.preview()[1]
+            self.remote.timeout_read = True
+            for i in range(5):
+                self.assertEqual(self.preview()[0], 502)
+                self.assertEqual(self.submit(preview, request_id='error-release-request-%03d' % i)[0], 502)
+            # Failed provisioning/reconciliation releases the same shared provider permit.
+            for _ in range(5):
+                row = self.admin_action(row, 'reconcile')[1]['repository']
+                self.assertEqual(row['state'], 'reconcile')
+            self.remote.timeout_read = False
+            self.assertEqual(self.admin_action(row, 'reconcile')[1]['repository']['state'], 'invited')
+        permit = self.repos.operations.permits['github']
+        for _ in range(4):
+            self.assertTrue(permit.acquire(blocking=False))
+        self.assertFalse(permit.acquire(blocking=False))
+        for _ in range(4):
+            permit.release()
+
     def test_legacy_unbound_and_bound_drafts_remain_compatible(self):
         self.open_submissions()
         result = self.submit(materials=self.materials())
@@ -425,6 +551,70 @@ class RepositoryTests(unittest.TestCase):
         status, result, _ = self.request(self.client, '/api/submission', {'expectedVersion': 1, 'status': 'draft', 'materials': {'codeUrl': '', 'codeVersion': ''}})
         self.assertEqual(status, 200, result)
         self.assertEqual(result['submission']['submitted']['codeUrl'], 'https://github.com/synthetic/repository')
+
+
+class ProviderOperationTests(unittest.TestCase):
+    def test_four_concurrent_operations_and_provider_isolation_release_without_sleep(self):
+        operations = ProviderOperations()
+        barrier = threading.Barrier(5)
+        release = threading.Event()
+        def worker():
+            with operations.operation('github'):
+                barrier.wait(timeout=5)
+                if not release.wait(timeout=5):
+                    raise AssertionError('release signal missing')
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            pending = [pool.submit(worker) for _ in range(4)]
+            try:
+                barrier.wait(timeout=5)
+                with self.assertRaises(APIError) as busy:
+                    with operations.operation('github'):
+                        self.fail('fifth provider operation admitted')
+                self.assertEqual(busy.exception.status, 503)
+                with operations.operation('gitee'):
+                    pass
+            finally:
+                release.set()
+            for future in pending:
+                future.result(timeout=5)
+        with self.assertRaisesRegex(RuntimeError, 'synthetic'):
+            with operations.operation('github'):
+                raise RuntimeError('synthetic')
+        with operations.operation('github'):
+            pass
+
+    def test_quotas_are_thread_safe_bounded_and_keep_active_team_buckets(self):
+        clock = [100.0]
+        operations = ProviderOperations(clock=lambda: clock[0])
+        def spend(_):
+            try:
+                with operations.operation('github', 'same-team', 'preview'):
+                    pass
+                return 200
+            except APIError as error:
+                return error.status
+        # Exercise the quota lock directly: permit saturation should not obscure its limit.
+        def direct_spend(_):
+            try:
+                operations.spend('github', 'same-team', 'preview')
+                return 200
+            except APIError as error:
+                return error.status
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            statuses = list(pool.map(direct_spend, range(20)))
+        self.assertEqual(statuses.count(200), 10)
+        self.assertEqual(statuses.count(429), 10)
+        operations.spend('gitee', 'same-team', 'preview')
+        operations.spend('github', 'same-team', 'confirmation')
+        operations.MAX_BUCKETS = 3
+        with self.assertRaises(APIError) as full:
+            operations.spend('github', 'new-team', 'preview')
+        self.assertEqual(full.exception.status, 503)
+        self.assertEqual(len(operations.buckets), 3)
+        self.assertEqual(spend(None), 429)
+        clock[0] = 160.0
+        operations.spend('github', 'new-team', 'preview')
+        self.assertEqual(len(operations.buckets), 1)
 
 
 class ProviderTransportTests(unittest.TestCase):

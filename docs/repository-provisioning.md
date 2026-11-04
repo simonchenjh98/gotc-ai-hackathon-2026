@@ -64,6 +64,10 @@ Gitee 账户级令牌无法把“创建未来仓库”的能力限制到单一�
 | POST `/api/admin/repositories/reconcile` | 同上，仅恢复原操作 |
 | POST `/api/submission` | 现有字段加 `repoPreviewId`；仅绑定队伍正式提交需要 |
 
-预览记录绑定队伍、会话、SHA、仓库修订和过期时间。它不是公开查询凭据，不进入代码仓库或材料字段。当前未实现每队仓库查询限流或共享渠道并发上限；开放公众规模使用前须补充相应配额保护，当前适用于受控单队试点。离线测试覆盖禁用配置、权限和队伍隔离、用户名/仓库名、同名冲突、丢失响应恢复、只授予 push、超时脱敏、写锁释放、SHA 变化、预览隔离/过期、覆盖攻击、提交窗口、原子回执/历史以及成功重放。真实组织授权、邀请接受、Gitee 企业兼容、实际禁止强推、代码归档和生产可用性均须另外验收。
+预览记录绑定队伍、会话、SHA、仓库修订和过期时间。它不是公开查询凭据，不进入代码仓库或材料字段。单服务实例中，GitHub 与 Gitee 各自最多同时处理 4 个仓库操作（批准、恢复、SHA 预览和正式确认共享同一渠道配额），在任何 SQLite 写事务外以非等待方式获取许可，批准/恢复获取许可后才修改持久化状态。饱和返回 503 / repository_busy，并明确本次尚未执行远端操作；释放许可使用 finally，失败和异常不会占用后续容量。
+
+每个已登录队伍、每个渠道分别限制新 SHA 预览每滚动 60 秒 10 次、新正式确认上游核对每滚动 60 秒 20 次，二者独立。仅在实际获准进入上游操作前计次，上游错误也计次；忙碌拒绝不计次。超额返回 429 / repository_rate_limit，提示等待一分钟后重新检查或查询提交记录。计时使用 monotonic，线程锁保护滚动窗口，最多保留 4096 个活跃的队伍/渠道/操作窗口；空闲窗口会清除，容量已满时返回安全 503，绝不驱逐仍受限的队伍窗口。重启会重置内存配额；多实例部署须另设共享保护。精确成功请求重放在配额和远端核对前读取不可变回执，即使配额已满、渠道繁忙或预览过期也保持原结果。
+
+公开主页入口为 [申请 Gitee 仓库 / 提交作品](https://8.141.114.201/gotc/platform.html#team)。队伍使用独立提交码登录后申请；仅已绑定队伍自动读取 SHA，未绑定的旧队伍保留手填流程。离线测试覆盖禁用配置、权限和队伍隔离、用户名/仓库名、同名冲突、丢失响应恢复、只授予 push、超时脱敏、写锁释放、SHA 变化、预览隔离/过期、覆盖攻击、提交窗口、原子回执/历史以及成功重放。真实组织授权、邀请接受、Gitee 企业兼容、实际禁止强推、代码归档和生产可用性均须另外验收。
 
 官方调用依据（2026-11-04 读取）：[GitHub 创建组织仓库](https://docs.github.com/en/rest/repos/repos#create-an-organization-repository)、[GitHub 协作者与邀请](https://docs.github.com/en/rest/collaborators/collaborators#add-a-repository-collaborator)、[GitHub 分支保护](https://docs.github.com/en/rest/branches/branch-protection#update-branch-protection)、[Gitee API v5 文档](https://gitee.com/api/v5/swagger)、[Gitee 官方 OpenAPI schema](https://gitee.com/api/v5/doc_json)。
