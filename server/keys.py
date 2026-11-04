@@ -45,8 +45,11 @@ CREATE TABLE IF NOT EXISTS api_usage (
  duration_ms INTEGER NOT NULL, user_agent TEXT NOT NULL,
  incomplete INTEGER NOT NULL DEFAULT 0, estimated INTEGER NOT NULL DEFAULT 0,
  error_type TEXT NOT NULL DEFAULT '', error_phase TEXT NOT NULL DEFAULT '', error_owner TEXT NOT NULL DEFAULT '',
- upstream_status INTEGER, error_message TEXT NOT NULL DEFAULT ''
+ upstream_status INTEGER, error_message TEXT NOT NULL DEFAULT '',
+ cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0, requested_model TEXT NOT NULL DEFAULT '', first_token_ms INTEGER,
+ client_ip TEXT NOT NULL DEFAULT '', upstream_request_id TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS api_usage_at ON api_usage(at);
 CREATE INDEX IF NOT EXISTS api_usage_team ON api_usage(team_id, at);
 CREATE INDEX IF NOT EXISTS api_usage_key ON api_usage(key_id, at);
 CREATE TABLE IF NOT EXISTS gateway_config (
@@ -88,7 +91,8 @@ STATUS_KINDS = {400: "invalid", 401: "auth", 403: "forbidden", 404: "not_found",
 UPSTREAM_TIMEOUT = 300
 QUEUE_WAIT = 30  # seconds a request waits for a free team slot before 429 (agent tools send bursts)
 RESERVE_OUTPUT_DEFAULT = 8192  # output tokens reserved when the request sets no max_tokens (as sub2api)
-RESERVE_OUTPUT_CAP = 64000
+RESERVE_OUTPUT_CAP = 128000
+RESERVE_INPUT_CAP = 200000  # sub2api caps the input estimate: base64 images make bytes/4 far larger than real tokens
 RETRY_STATUSES = {429, 503, 529}  # explicit "not processed" answers; 5xx/timeouts may already be billed upstream
 # Tools must run on the client. Anthropic "client tools" (bash, text editor, computer, memory) are allowed;
 # anything else typed (web search, code execution, MCP, tool search, …) runs and is billed upstream.
@@ -219,6 +223,16 @@ def load_config(path):
     return data
 
 
+def full_price(p):
+    """[input, output, cache write 5m, cache read, cache write 1h]; missing cache prices use Anthropic's ratios to input."""
+    p = list(p)
+    if len(p) == 2:
+        p += [round(p[0] * 1.25, 6), round(p[0] * 0.1, 6)]
+    if len(p) == 4:
+        p.append(round(p[0] * 2, 6))
+    return p
+
+
 def parse_config(data):
     """Validate {"openai"|"anthropic": {"url", "key", "models": {name: price}, "aliases"?: {name|prefix*: model}}}.
 
@@ -237,14 +251,14 @@ def parse_config(data):
             raise ValueError(f"{name} upstream needs url, key and models")
         models = item["models"]
         if not isinstance(models, dict) or not models or len(models) > 200 or not all(
-                isinstance(m, str) and 0 < len(m) <= 100 and isinstance(p, list) and len(p) in (2, 4) and all(type(x) in (int, float) and 0 <= x <= 10000 for x in p)
+                isinstance(m, str) and 0 < len(m) <= 100 and isinstance(p, list) and len(p) in (2, 4, 5) and all(type(x) in (int, float) and 0 <= x <= 10000 for x in p)
                 for m, p in models.items()):
-            raise ValueError(f"{name} models must map a model name to [input, output(, cacheWrite, cacheRead)] USD per million tokens")
+            raise ValueError(f"{name} models must map a model name to [input, output(, cacheWrite5m, cacheRead(, cacheWrite1h))] USD per million tokens")
         aliases = item.get("aliases", {})
         if not isinstance(aliases, dict) or not all(isinstance(a, str) and a and target in models for a, target in aliases.items()):
             raise ValueError(f"{name} aliases must map a name (or prefix ending in *) to one of its models")
         result[name] = {"url": check_url(item["url"]), "key": item["key"], "aliases": aliases,
-                        "models": {m: p if len(p) == 4 else [p[0], p[1], p[0] * 1.25, p[0] * 0.1] for m, p in models.items()}}
+                        "models": {m: full_price(p) for m, p in models.items()}}
     return result
 
 
@@ -261,26 +275,61 @@ def resolve(upstream, model):
     return aliases[max(prefixes, key=len)] if prefixes else None
 
 
+USAGE_FIELDS = 5  # [input, output, cache write 5m, cache read, cache write 1h] tokens, in price order
+
+
+def _count(value):
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def read_usage(upstream, data, usage):
-    """Update usage=[input, output, cacheWrite, cacheRead] tokens from one response object or stream event."""
+    """Update usage from one response object or stream event, merging like sub2api.
+
+    Anthropic: message_start sets input and cache counts (even 0) and ignores its placeholder output; message_delta
+    and final objects only override counts > 0. The cache-write total is split into 5-minute and 1-hour parts when the
+    upstream reports cache_creation.ephemeral_5m/1h_input_tokens; without a split it is billed at the 5-minute price.
+    OpenAI-compatible: cached prompt tokens are read from the first field present (providers name it differently),
+    cache writes from prompt_tokens_details.cache_write_tokens, and input is prompt minus both, floored at zero.
+    """
     if not isinstance(data, dict):
         return
-    try:
-        if upstream == "openai":
-            u = data.get("usage")
-            if isinstance(u, dict):
-                cached = int((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)  # included in prompt_tokens
-                usage[:] = [int(u.get("prompt_tokens") or 0) - cached, int(u.get("completion_tokens") or 0), 0, cached]
+    if upstream == "openai":
+        u = data.get("usage")
+        if not isinstance(u, dict):
             return
-        u = (data.get("message") or {}).get("usage") if data.get("type") == "message_start" else data.get("usage")
-        if isinstance(u, dict):
-            # message_delta repeats or omits input counts; never let a later zero erase them.
-            for index, field in enumerate(("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")):
-                value = int(u.get(field) or 0)
-                if value or (field == "output_tokens" and field in u):
-                    usage[index] = value
-    except (TypeError, ValueError, AttributeError):
-        pass
+        details = u.get("prompt_tokens_details") if isinstance(u.get("prompt_tokens_details"), dict) else {}
+        alt = u.get("input_tokens_details") if isinstance(u.get("input_tokens_details"), dict) else {}
+        cached = next((_count(src[k]) for src, k in ((details, "cached_tokens"), (alt, "cached_tokens"), (u, "cache_read_input_tokens"),
+                                                     (u, "cache_read_tokens"), (u, "cached_tokens"), (u, "prompt_cache_hit_tokens"))
+                       if k in src), 0)
+        written = _count(details.get("cache_write_tokens") or u.get("cache_creation_input_tokens"))
+        prompt = _count(u.get("prompt_tokens") if "prompt_tokens" in u else u.get("input_tokens"))
+        output = _count(u.get("completion_tokens") if "completion_tokens" in u else u.get("output_tokens"))
+        usage[:] = [max(0, prompt - cached - written), output, written, cached, 0]
+        return
+    start = data.get("type") == "message_start"
+    u = (data.get("message") or {}).get("usage") if start else data.get("usage")
+    if not isinstance(u, dict):
+        return
+    split = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else None
+    written = _count(u.get("cache_creation_input_tokens"))
+    one_hour = _count(split.get("ephemeral_1h_input_tokens")) if split else 0
+    five_min = _count(split.get("ephemeral_5m_input_tokens")) if split else 0
+    if split and not (five_min or one_hour):
+        five_min = written  # a total without a split is billed at the 5-minute price
+    elif not split:
+        five_min = written
+    values = {0: _count(u.get("input_tokens")), 1: _count(u.get("output_tokens")), 2: five_min, 3: _count(u.get("cache_read_input_tokens")),
+              4: one_hour}
+    for index, value in values.items():
+        if start:
+            if index != 1:
+                usage[index] = value
+        elif value > 0:
+            usage[index] = value
 
 
 def stream_progress(upstream, data, call):
@@ -359,6 +408,21 @@ def failure_reason(error):
     return f"上游连接失败：{type(reason).__name__}：{reason}"[:300]
 
 
+def beijing_midnight():
+    return (now_ms() + 8 * 3600_000) // DAY_MS * DAY_MS - 8 * 3600_000
+
+
+def client_ip(handler):
+    """The team's address: Nginx's X-Real-IP is trusted only from a loopback peer, as in app.py."""
+    peer = handler.client_address[0]
+    try:
+        if ipaddress.ip_address(peer).is_loopback:
+            return str(ipaddress.ip_address(handler.headers.get("X-Real-IP", "")))
+    except ValueError:
+        pass
+    return peer
+
+
 def unpack(blob):
     return zlib.decompress(blob).decode("utf-8", "replace")
 
@@ -407,7 +471,9 @@ class KeyService:
         columns = {r["name"] for r in db.execute("PRAGMA table_info(api_usage)")}
         added = {"incomplete": "INTEGER NOT NULL DEFAULT 0", "estimated": "INTEGER NOT NULL DEFAULT 0",
                  "error_type": "TEXT NOT NULL DEFAULT ''", "error_phase": "TEXT NOT NULL DEFAULT ''",
-                 "error_owner": "TEXT NOT NULL DEFAULT ''", "upstream_status": "INTEGER", "error_message": "TEXT NOT NULL DEFAULT ''"}
+                 "error_owner": "TEXT NOT NULL DEFAULT ''", "upstream_status": "INTEGER", "error_message": "TEXT NOT NULL DEFAULT ''",
+                 "cache_write_1h_tokens": "INTEGER NOT NULL DEFAULT 0", "requested_model": "TEXT NOT NULL DEFAULT ''",
+                 "first_token_ms": "INTEGER", "client_ip": "TEXT NOT NULL DEFAULT ''", "upstream_request_id": "TEXT NOT NULL DEFAULT ''"}
         for column, kind in added.items():  # databases created before these columns existed
             if column not in columns:
                 db.execute(f"ALTER TABLE api_usage ADD COLUMN {column} {kind}")
@@ -505,7 +571,8 @@ class KeyService:
         if method == "GET" and path == "/api/team/keys/logs":
             items = self.logs(db, {"teamId": team_id})  # metadata only; content stays admin-only
             for item in items["items"]:  # teams see what failed and whose fault it was, not upstream internals
-                item.pop("errorMessage"), item.pop("upstreamStatus")
+                for field in ("errorMessage", "upstreamStatus", "upstreamRequestId", "clientIp"):
+                    item.pop(field)
             return items
         if method == "POST" and path == "/api/team/keys":
             if set(body) != {"name"}:
@@ -535,9 +602,11 @@ class KeyService:
             since = now_ms() - DAY_MS
             rows = db.execute("""SELECT t.team_id, t.active,
               (SELECT COUNT(*) FROM api_keys k WHERE k.team_id=t.team_id AND k.active=1) AS key_count FROM team_api t""").fetchall()
-            today = (now_ms() + 8 * 3600_000) // DAY_MS * DAY_MS - 8 * 3600_000  # Beijing midnight
+            today = beijing_midnight()
             overview = dict(db.execute("""SELECT COUNT(*) AS requests, COALESCE(SUM(cost_micro),0)/1e6 AS cost,
-              COALESCE(SUM(input_tokens),0) AS input, COALESCE(SUM(output_tokens),0) AS output, COALESCE(SUM(status>=400 OR incomplete=1),0) AS errors,
+              COALESCE(SUM(input_tokens),0) AS input, COALESCE(SUM(output_tokens),0) AS output,
+              COALESCE(SUM(cache_write_tokens),0) AS cacheWrite, COALESCE(SUM(cache_read_tokens),0) AS cacheRead,
+              COALESCE(SUM(status>=400 OR incomplete=1),0) AS errors,
               COUNT(DISTINCT team_id) AS teams, CAST(AVG(CASE WHEN status<400 THEN duration_ms END) AS INTEGER) AS avgMs
               FROM api_usage WHERE at>=?""", (today,)).fetchone())
             changes = [{"at": r["at"], "action": r["action"], "target": r["target"], "metadata": json.loads(r["metadata"])}
@@ -635,14 +704,17 @@ class KeyService:
         if type(days) is not int or not 1 <= days <= 90:
             raise APIError(400, "统计天数应为1至90")
         where.append("u.at>=?")
-        params.append(now_ms() - days * DAY_MS)
+        params.append(beijing_midnight() - (days - 1) * DAY_MS)  # whole Beijing calendar days, today included
         clause = " AND ".join(where)
         sums = ("COUNT(*) AS requests, COALESCE(SUM(u.input_tokens),0) AS input, COALESCE(SUM(u.output_tokens),0) AS output, "
-                "COALESCE(SUM(u.cache_read_tokens),0) AS cacheRead, COALESCE(SUM(u.cost_micro),0)/1e6 AS cost")
+                "COALESCE(SUM(u.cache_write_tokens),0) AS cacheWrite, COALESCE(SUM(u.cache_read_tokens),0) AS cacheRead, "
+                "COALESCE(SUM(u.cost_micro),0)/1e6 AS cost")
         rows = lambda sql: [dict(r) for r in db.execute(sql, params)]
         return {
             "days": days,
-            "totals": rows(f"SELECT {sums}, SUM(u.status>=400 OR u.incomplete=1) AS errors, CAST(AVG(u.duration_ms) AS INTEGER) AS avgMs FROM api_usage u WHERE {clause}")[0],
+            "totals": rows(f"SELECT {sums}, SUM(u.status>=400 OR u.incomplete=1) AS errors, "
+                           f"CAST(AVG(CASE WHEN u.status<400 AND u.incomplete=0 THEN u.duration_ms END) AS INTEGER) AS avgMs, "
+                           f"CAST(AVG(u.first_token_ms) AS INTEGER) AS avgFirstTokenMs FROM api_usage u WHERE {clause}")[0],
             "byKey": rows(f"""SELECT u.key_id AS keyId, k.name, k.masked, k.active, t.number AS teamNumber, t.name AS teamName, {sums},
               MAX(u.at) AS lastAt FROM api_usage u JOIN api_keys k ON k.id=u.key_id JOIN teams t ON t.id=u.team_id
               WHERE {clause} GROUP BY u.key_id ORDER BY cost DESC"""),
@@ -667,7 +739,9 @@ class KeyService:
         clause = ("WHERE " + " AND ".join(where)) if where else ""
         items = [dict(r) for r in db.execute(f"""SELECT u.id, u.at, u.key_id AS keyId, k.name AS keyName, t.number AS teamNumber, t.name AS teamName,
           u.model, u.path, u.stream, u.status, u.input_tokens AS input, u.output_tokens AS output, u.cache_write_tokens AS cacheWrite,
-          u.cache_read_tokens AS cacheRead, u.cost_micro/1e6 AS cost,
+          u.cache_read_tokens AS cacheRead, u.cache_write_1h_tokens AS cacheWrite1h, u.cost_micro/1e6 AS cost,
+          u.requested_model AS requestedModel, u.first_token_ms AS firstTokenMs, u.client_ip AS clientIp,
+          u.upstream_request_id AS upstreamRequestId,
           u.duration_ms AS durationMs, u.user_agent AS userAgent, u.incomplete, u.estimated, u.error_type AS errorType,
           u.error_phase AS errorPhase, u.error_owner AS errorOwner, u.upstream_status AS upstreamStatus, u.error_message AS errorMessage, EXISTS(SELECT 1 FROM api_logs l WHERE l.usage_id=u.id) AS hasContent,
           (SELECT l.request_bytes FROM api_logs l WHERE l.usage_id=u.id) AS requestBytes
@@ -679,12 +753,14 @@ class KeyService:
         out = io.StringIO(newline="")
         writer = csv.writer(out)
         writer.writerow(["时间(UTC毫秒)", "队号", "队名", "密钥", "模型", "接口", "流式", "状态", "输入tokens", "输出tokens", "缓存写入tokens", "缓存读取tokens", "费用USD", "耗时ms", "User-Agent", "中断", "估算计费",
-                         "错误类型", "错误阶段", "责任方", "上游状态", "错误信息"])
+                         "错误类型", "错误阶段", "责任方", "上游状态", "错误信息",
+                         "其中1小时缓存写入tokens", "请求模型", "首字耗时ms", "客户端IP", "上游请求ID"])
         for r in db.execute("""SELECT u.*, t.number, t.name AS team_name, k.name AS key_name FROM api_usage u
           JOIN teams t ON t.id=u.team_id JOIN api_keys k ON k.id=u.key_id ORDER BY u.id"""):
             writer.writerow([self.service.csv_safe(v) for v in (r["at"], r["number"], r["team_name"], r["key_name"], r["model"], r["path"],
                              r["stream"], r["status"], r["input_tokens"], r["output_tokens"], r["cache_write_tokens"], r["cache_read_tokens"], r["cost_micro"] / 1e6, r["duration_ms"], r["user_agent"], r["incomplete"], r["estimated"],
-                             r["error_type"], r["error_phase"], r["error_owner"], r["upstream_status"], r["error_message"])])
+                             r["error_type"], r["error_phase"], r["error_owner"], r["upstream_status"], r["error_message"],
+                             r["cache_write_1h_tokens"], r["requested_model"], r["first_token_ms"], r["client_ip"], r["upstream_request_id"])])
         return ("\ufeff" + out.getvalue()).encode("utf-8")
 
     def admit(self, team, rpm):
@@ -735,7 +811,7 @@ class KeyService:
 
     # Gateway (API keys from SDKs, no cookies or Origin).
     def gateway(self, handler, path):
-        call = {"key": None, "path": path, "model": "", "stream": False, "price": None, "usage": [0, 0, 0, 0], "status": 0,
+        call = {"key": None, "path": path, "model": "", "stream": False, "price": None, "usage": [0] * USAGE_FIELDS, "status": 0,
                 "request": b"", "response": [], "size": 0, "started": time.monotonic(), "log": False,
                 "request_bytes": 0, "reply_bytes": 0, "done": False, "forwarded": False}
         try:
@@ -808,17 +884,17 @@ class KeyService:
         call["recorded"] = True
         if not call["status"]:
             call["status"] = 500  # defensive: every stored call has a real outcome
-        usage, price = list(call["usage"]), call["price"] or (0, 0, 0, 0)
+        usage, price = list(call["usage"]), call["price"] or (0,) * USAGE_FIELDS
         # Billing follows whether the upstream generated output ("forwarded"), never the recorded status: a stream that
         # failed after output started is a 502 for the record but its tokens were still produced.
         incomplete = call["forwarded"] and not call["done"]
         estimated = False
         if call.get("charge_reserved"):
-            usage, incomplete, estimated = [call["request_bytes"] // 4, call.get("reserve_out", 0), 0, 0], True, True
+            usage, incomplete, estimated = [min(call["request_bytes"] // 4, RESERVE_INPUT_CAP), call.get("reserve_out", 0), 0, 0, 0], True, True
         elif call["forwarded"]:
             # sub2api bills only what it observed; a call with no usage would then be free and escape the budget.
             # Fill gaps with its reservation estimate instead: input ~ request bytes / 4, output ~ reply text bytes / 4.
-            est_in, est_out = call["request_bytes"] // 4, call["reply_bytes"] // 4
+            est_in, est_out = min(call["request_bytes"] // 4, RESERVE_INPUT_CAP), call["reply_bytes"] // 4
             if not any(usage):
                 usage[0], usage[1], estimated = est_in, est_out, True
             elif incomplete and usage[1] < est_out:
@@ -829,12 +905,15 @@ class KeyService:
         with self.service.db() as db:
             usage_id = db.execute("""INSERT INTO api_usage(key_id,team_id,at,model,input_tokens,output_tokens,cache_write_tokens,cache_read_tokens,
               cost_micro,status,path,stream,duration_ms,user_agent,incomplete,estimated,error_type,error_phase,error_owner,
-              upstream_status,error_message) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                  (call["key"]["id"], call["key"]["team_id"], at, call["model"], usage[0], usage[1], usage[2], usage[3], cost,
+              upstream_status,error_message,cache_write_1h_tokens,requested_model,first_token_ms,client_ip,upstream_request_id)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                  (call["key"]["id"], call["key"]["team_id"], at, call["model"], usage[0], usage[1], usage[2] + usage[4], usage[3], cost,
                                                      call["status"], call["path"], int(call["stream"]), int((time.monotonic() - call["started"]) * 1000),
                                                      (handler.headers.get("User-Agent") or "")[:300], int(incomplete), int(estimated),
                                                      error["type"], error["phase"], error["owner"], error["upstream_status"],
-                                                     (error["upstream_message"] or error["message"])[:500])).lastrowid
+                                                     (error["upstream_message"] or error["message"])[:500], usage[4], call.get("requested_model", "")[:100],
+                                                     call.get("stream_first_ms") if call["stream"] else call.get("first_token_ms"),
+                                                     client_ip(handler), call.get("upstream_request_id", "")[:100])).lastrowid
             db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (at, call["key"]["id"]))
             if call["log"]:
                 headers = {k: v[:500] for k, v in handler.headers.items() if k.lower() not in SECRET_HEADERS}
@@ -921,7 +1000,8 @@ class KeyService:
         call["request"] = handler.raw_body if call["log"] else b""  # exactly what the client sent
         call["request_bytes"] = len(handler.raw_body)
         model = resolve(upstream, body.get("model"))
-        call["model"] = model or (body["model"][:100] if isinstance(body.get("model"), str) else "")
+        call["requested_model"] = body["model"] if isinstance(body.get("model"), str) else ""
+        call["model"] = model or call["requested_model"][:100]
         if model is None:
             raise GatewayError("not_found", "模型不在本活动开放列表中，可用模型见 /v1/models")
         body["model"] = model
@@ -952,7 +1032,7 @@ class KeyService:
         team = key["team_id"]
         price = call["price"]
         call["reserve_out"] = bound_output(body)
-        estimate = round(call["request_bytes"] // 4 * price[0] + call["reserve_out"] * price[1])
+        estimate = round(min(call["request_bytes"] // 4, RESERVE_INPUT_CAP) * price[0] + call["reserve_out"] * price[1])
         self.admit(team, settings["teamRpm"])
         try:
             self.reserve(handler, call, estimate)
@@ -1072,6 +1152,7 @@ class KeyService:
                 payload = error.read(1_000_000)
             except (OSError, http.client.HTTPException):
                 payload = b""
+            call["upstream_request_id"] = error.headers.get("request-id") or error.headers.get("x-request-id") or ""
             message = upstream_message(payload, upstream["key"]) or f"HTTP {error.code}"
             mapped = upstream_http_error(call["path"], error.code, message)
             if mapped:
@@ -1087,6 +1168,9 @@ class KeyService:
         except OSError as error:
             self.upstream_failed(call, error)
         call["status"], call["forwarded"] = response.status, True
+        call["upstream_request_id"] = response.headers.get("request-id") or response.headers.get("x-request-id") or ""
+        if not call.get("first_token_ms"):  # non-streaming: the whole reply arrives with the headers
+            call["first_token_ms"] = int((time.monotonic() - call["started"]) * 1000)
         usage = call["usage"]
         with response:
             content_type = response.headers.get("Content-Type", "application/json")
@@ -1174,6 +1258,8 @@ class KeyService:
                         parsed = None
                     read_usage(name, parsed, usage)
                     stream_progress(name, parsed, call)
+                    if call["reply_bytes"] and call.get("stream_first_ms") is None:
+                        call["stream_first_ms"] = int((time.monotonic() - call["started"]) * 1000)
                     if isinstance(parsed, dict) and (parsed.get("type") == "error" or isinstance(parsed.get("error"), (dict, str))):
                         call["stream_error"] = parsed  # the upstream gave up mid-stream; the client gets its frame as-is
             self.keep(call, line)

@@ -870,6 +870,47 @@ class GatewayTests(unittest.TestCase):
             columns = {r[1] for r in db.execute("PRAGMA table_info(api_usage)")}
         self.assertTrue({"error_type", "error_phase", "error_owner", "upstream_status", "error_message"} <= columns)
 
+    def test_token_accounting_matches_sub2api(self):
+        """Usage parsing and pricing rules ported from sub2api's billing service."""
+        merged = [0] * keys.USAGE_FIELDS
+        keys.read_usage("anthropic", {"type": "message_start", "message": {"usage": {"input_tokens": 100, "output_tokens": 1,
+                        "cache_creation_input_tokens": 300, "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200},
+                        "cache_read_input_tokens": 50}}}, merged)
+        self.assertEqual(merged, [100, 0, 100, 50, 200])  # placeholder output ignored; 5m/1h split kept
+        keys.read_usage("anthropic", {"type": "message_delta", "usage": {"output_tokens": 70, "input_tokens": 0}}, merged)
+        self.assertEqual(merged, [100, 70, 100, 50, 200])  # a later zero never erases a count
+        total_only = [0] * keys.USAGE_FIELDS
+        keys.read_usage("anthropic", {"usage": {"input_tokens": 1, "output_tokens": 1, "cache_creation_input_tokens": 40}}, total_only)
+        self.assertEqual(total_only[2:], [40, 0, 0])  # no split: all at the 5-minute price
+        for usage_obj, expected in [
+                ({"prompt_tokens": 1000, "completion_tokens": 10, "prompt_tokens_details": {"cached_tokens": 800}}, [200, 10, 0, 800, 0]),
+                ({"prompt_tokens": 1000, "completion_tokens": 10, "prompt_cache_hit_tokens": 600}, [400, 10, 0, 600, 0]),  # DeepSeek naming
+                ({"prompt_tokens": 1000, "completion_tokens": 10, "prompt_tokens_details": {"cached_tokens": 300, "cache_write_tokens": 200}},
+                 [500, 10, 200, 300, 0]),
+                ({"prompt_tokens": 10, "completion_tokens": 1, "prompt_tokens_details": {"cached_tokens": 50}}, [0, 1, 0, 50, 0]),  # floored at 0
+                ({"input_tokens": 70, "output_tokens": 5, "input_tokens_details": {"cached_tokens": 20}}, [50, 5, 0, 20, 0])]:  # Responses API naming
+            got = [0] * keys.USAGE_FIELDS
+            keys.read_usage("openai", {"usage": usage_obj}, got)
+            self.assertEqual(got, expected, usage_obj)
+        self.assertEqual(keys.full_price([3, 15]), [3, 15, 3.75, 0.3, 6])  # 1h writes default to 2x input
+        self.assertEqual(keys.full_price([3, 15, 4, 0.2]), [3, 15, 4, 0.2, 6])
+        self.assertEqual(keys.full_price([3, 15, 4, 0.2, 9]), [3, 15, 4, 0.2, 9])
+
+        _, _, key = self.enabled_key()
+        FakeUpstream.usage = {"input_tokens": 100, "output_tokens": 10, "cache_creation_input_tokens": 1000,
+                              "cache_creation": {"ephemeral_5m_input_tokens": 400, "ephemeral_1h_input_tokens": 600}}
+        self.call("/v1/messages", {"model": "claude-x", "max_tokens": 50}, key, headers={"User-Agent": "ua-test", "X-Real-IP": "10.1.2.3"})
+        item = self.latest()
+        # claude-x [3, 15] -> 5m write 3.75, 1h write 6: 100*3 + 10*15 + 400*3.75 + 600*6 = 5550 micro-USD
+        self.assertEqual(round(item["cost"] * 1e6), 5550)
+        self.assertEqual((item["cacheWrite1h"], item["clientIp"], item["requestedModel"]), (600, "10.1.2.3", "claude-x"))
+        self.assertIsNotNone(item["firstTokenMs"])
+        self.call("/v1/messages", {"model": "claude-latest", "max_tokens": 50}, key)
+        self.assertEqual((self.latest()["requestedModel"], self.latest()["model"]), ("claude-latest", "claude-x"))
+        stats = self.admin.post("/api/admin/keys/stats", {"days": 1})[1]
+        self.assertEqual(stats["totals"]["cacheWrite"], 2000)  # cache writes are counted (two calls of 1000)
+        self.assertEqual(self.admin.get("/api/admin/keys")[1]["overview"]["cacheWrite"], 2000)
+
     def test_stream_is_billed_when_the_client_disconnects(self):
         _, client, key = self.enabled_key()
         import socket
