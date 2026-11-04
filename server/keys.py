@@ -24,6 +24,7 @@ import traceback
 import unicodedata
 import urllib.error
 import urllib.request
+import uuid
 import zlib
 from collections import defaultdict, deque
 from urllib.parse import parse_qs, urlsplit
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS api_usage (
  error_type TEXT NOT NULL DEFAULT '', error_phase TEXT NOT NULL DEFAULT '', error_owner TEXT NOT NULL DEFAULT '',
  upstream_status INTEGER, error_message TEXT NOT NULL DEFAULT '',
  cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0, requested_model TEXT NOT NULL DEFAULT '', first_token_ms INTEGER,
- client_ip TEXT NOT NULL DEFAULT '', upstream_request_id TEXT NOT NULL DEFAULT ''
+ client_ip TEXT NOT NULL DEFAULT '', upstream_request_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS api_usage_at ON api_usage(at);
 CREATE INDEX IF NOT EXISTS api_usage_team ON api_usage(team_id, at);
@@ -64,8 +65,9 @@ CREATE TABLE IF NOT EXISTS api_logs (
 DEFAULTS = {"keys.dailyBudget": 5, "keys.totalBudget": 50, "keys.maxKeys": 5, "keys.expiresAt": None,
             "keys.logContent": True, "keys.clientRules": [], "keys.teamRpm": 60, "keys.announcement": "", "keys.blockedWords": []}
 # Public path -> (upstream name, path appended to that upstream's base URL)
-ROUTES = {"/v1/chat/completions": ("openai", "/chat/completions"), "/v1/messages": ("anthropic", "/messages")}
-BODY_LIMIT = 4 * 1024 * 1024
+ROUTES = {"/v1/chat/completions": ("openai", "/chat/completions"), "/v1/messages": ("anthropic", "/messages"),
+          "/v1/responses": ("openai", "/responses")}  # Responses API: Codex CLI
+BODY_LIMIT = 32 * 1024 * 1024  # sub2api allows 32 MB text bodies; screenshots and long agent sessions need it
 # Error classification copied from sub2api (handler/ops_error_logger.go classifyOpsPhase + owner mapping):
 # kind -> (default status, Anthropic error type, OpenAI error type, OpenAI code, phase, owner).
 # phase: request|auth|upstream|network|internal; owner: client (the team's request), provider (upstream), platform (gateway).
@@ -89,9 +91,12 @@ ERROR_KINDS = {
 }
 STATUS_KINDS = {400: "invalid", 401: "auth", 403: "forbidden", 404: "not_found", 411: "invalid", 413: "too_large",
                 415: "invalid", 429: "rate_limit", 499: "client_closed"}
-UPSTREAM_TIMEOUT = 300
+UPSTREAM_TIMEOUT = 300  # waiting for the reply to start
+CONNECT_TIMEOUT = 10  # connect + TLS handshake (sub2api dial and TLS timeouts), so a dead upstream frees the slot fast
+STREAM_IDLE_TIMEOUT = 180  # silence between stream events before giving up (sub2api stream_data_interval_timeout)
 QUEUE_CAP = 20  # waiting requests per team beyond its running ones (sub2api defaultExtraWaitSlots)
 AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW, AUTH_BLOCK = 120, 60, 60  # per client IP, as sub2api's invalid-auth limiter
+COUNT_TOKENS_CONCURRENCY, COUNT_TOKENS_RPM = 4, 120  # count_tokens is free but uses our upstream key's rate limit
 KEY_CREATE_PER_HOUR = 60  # as sub2api; deleting a key does not give the quota back
 QUEUE_WAIT = 30  # seconds a request waits for a free team slot before 429 (agent tools send bursts)
 RESERVE_OUTPUT_DEFAULT = 8192  # output tokens reserved when the request sets no max_tokens (as sub2api)
@@ -100,12 +105,12 @@ IMAGE_TOKENS = 1600  # ceiling for one image (Anthropic: width*height/750, image
 RETRY_STATUSES = {429, 503, 529}  # explicit "not processed" answers; 5xx/timeouts may already be billed upstream
 # Tools must run on the client. Anthropic "client tools" (bash, text editor, computer, memory) are allowed;
 # anything else typed (web search, code execution, MCP, tool search, …) runs and is billed upstream.
-CLIENT_TOOL_TYPES = ("custom", "function", "bash_", "text_editor_", "computer_", "memory_")
+CLIENT_TOOL_TYPES = ("custom", "function", "bash_", "text_editor_", "computer_", "memory_", "local_shell")
 BILLED_FIELDS = {"mcp_servers", "web_search_options", "container"}  # upstream-billed extras outside token usage
 PRICING_FIELDS = ("service_tier", "speed", "inference_geo")  # dropped so requests run at the configured (standard) price
 # ponytail: denylist of beta prefixes that add upstream charges; extend when providers add more.
 BILLED_BETAS = ("mcp-client", "code-execution", "files-api", "context-1m", "skills", "web-fetch", "web-search")
-RETRY_DELAYS = (1, 2)  # seconds; retried only before any byte reaches the client
+RETRY_DELAYS = (0.3, 0.6, 1.2, 2.4)  # sub2api: 5 attempts, 300 ms doubling, 3 s cap  # seconds; retried only before any byte reaches the client
 TEAM_CONCURRENCY = 4
 DAY_MS = 86_400_000
 RESPONSE_LOG_CAP = 16 * 1024 * 1024  # bytes of a reply kept for the content viewer; requests are already capped by BODY_LIMIT
@@ -197,6 +202,66 @@ def upstream_http_error(path, status, message):
         return GatewayError("upstream", "上游请求失败", upstream_status=status, upstream_message=message)
     # OpenAI-compatible: keep the upstream status with its sanitized message
     return GatewayError("upstream_invalid", message or "上游请求失败", status=status, upstream_status=status, upstream_message=message)
+
+
+class _ShortConnect:
+    """Connect and TLS handshake within CONNECT_TIMEOUT; reads then use the request's own timeout."""
+
+    def connect(self):
+        read_timeout, self.timeout = self.timeout, CONNECT_TIMEOUT
+        try:
+            super().connect()
+        finally:
+            self.timeout = read_timeout
+        if self.sock is not None:
+            self.sock.settimeout(read_timeout)
+
+
+class _HTTPConnection(_ShortConnect, http.client.HTTPConnection):
+    pass
+
+
+class _HTTPSConnection(_ShortConnect, http.client.HTTPSConnection):
+    pass
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_HTTPConnection, req)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_HTTPSConnection, req, context=self._context)
+
+
+def make_opener(proxies=None):
+    """Upstream HTTP client: no redirects, short connect timeout; proxies from the environment unless given."""
+    handlers = [_NoRedirect, _HTTPHandler(), _HTTPSHandler()]
+    if proxies is not None:
+        handlers.append(urllib.request.ProxyHandler(proxies))
+    return urllib.request.build_opener(*handlers)
+
+
+def set_read_timeout(response, seconds):
+    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+    if sock is not None:
+        sock.settimeout(seconds)
+
+
+# Upstream reply headers passed to the team (sub2api responseheaders allowlist). Rate-limit headers are deliberately not
+# passed: they describe our shared upstream key, not the team.
+PASSED_HEADERS = ("x-request-id", "request-id", "retry-after", "openai-processing-ms")
+CLIENT_HEADERS = ("x-app", "x-claude-code-session-id", "accept-language")  # forwarded to Anthropic, as sub2api
+
+
+def passed_headers(headers):
+    return {name: headers[name][:200] for name in PASSED_HEADERS if headers.get(name)}
+
+
+def gateway_json(value):
+    """Compact UTF-8 JSON for upstream bodies: CJK is not escaped (half the bytes) and NaN/Infinity never go out."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
 
 
 class ClientGone(Exception):
@@ -304,6 +369,8 @@ def read_usage(upstream, data, usage):
         return
     if upstream == "openai":
         u = data.get("usage")
+        if not isinstance(u, dict) and isinstance(data.get("response"), dict):
+            u = data["response"].get("usage")  # Responses API: response.completed carries the usage
         if not isinstance(u, dict):
             return
         details = u.get("prompt_tokens_details") if isinstance(u.get("prompt_tokens_details"), dict) else {}
@@ -347,6 +414,10 @@ def stream_progress(upstream, data, call):
             call["done"] = True
         delta = data.get("delta") if isinstance(data.get("delta"), dict) else {}
         texts = [delta.get("text"), delta.get("thinking"), delta.get("partial_json")]
+    elif str(data.get("type", "")).startswith("response."):  # Responses API events
+        if data["type"] in ("response.completed", "response.incomplete"):
+            call["done"] = True
+        texts = [data.get("delta")] if data["type"].endswith(".delta") else []
     else:
         choices = data.get("choices") if isinstance(data.get("choices"), list) else []
         if isinstance(data.get("usage"), dict) or any(isinstance(c, dict) and c.get("finish_reason") for c in choices):
@@ -363,7 +434,7 @@ def stream_progress(upstream, data, call):
 OUTPUT_LIMIT_FIELDS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
 
 
-def bound_output(body):
+def bound_output(body, inject=True):
     """Clamp the output limit the upstream will honour to what gets reserved, so the reservation is a true ceiling.
 
     Any limit above the cap (or a non-integer one) is lowered to the cap; with no limit at all, max_tokens is set to
@@ -377,8 +448,14 @@ def bound_output(body):
         body[field] = min(value, RESERVE_OUTPUT_CAP)
     if present:
         limit = max(body[f] for f in present)
-    else:
-        body["max_tokens"] = limit
+    elif inject:
+        body["max_tokens"] = limit  # Anthropic requires max_tokens anyway
+    # OpenAI-compatible routes get no injected field (o-series/gpt-5 reject max_tokens); the default is then an estimate,
+    # not a ceiling, exactly as in sub2api.
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and type(thinking.get("budget_tokens")) is int and type(body.get("max_tokens")) is int \
+            and thinking["budget_tokens"] >= body["max_tokens"] > 1024:
+        thinking["budget_tokens"] = body["max_tokens"] - 1  # the clamp must not leave an invalid thinking budget
     return limit
 
 
@@ -420,26 +497,29 @@ def beijing_midnight():
 
 def estimate_input(body):
     """Input tokens for reservations and fallbacks: text at bytes/4 with no cap (so large prompts are never under-reserved),
-    each base64 image at most IMAGE_TOKENS instead of its byte size; other base64 data (PDFs...) stays at bytes/4."""
+    each base64 image at most IMAGE_TOKENS instead of its byte size; other base64 data (PDFs...) stays at bytes/4.
+    Only the image payload string itself is set aside; everything around it is still counted."""
     images = 0
-
-    def is_image(node):
-        source = node.get("source") if isinstance(node.get("source"), dict) else {}
-        url = node.get("image_url") if isinstance(node.get("image_url"), (dict, str)) else None
-        url = url.get("url") if isinstance(url, dict) else url
-        return (source.get("type") == "base64" and str(source.get("media_type", "")).startswith("image/")) or \
-            (isinstance(url, str) and url.startswith("data:image/"))
 
     def strip(node):
         nonlocal images
-        if isinstance(node, dict):
-            if is_image(node):
-                images += 1
-                return {}
-            return {k: strip(v) for k, v in node.items()}
         if isinstance(node, list):
             return [strip(v) for v in node]
-        return node
+        if not isinstance(node, dict):
+            return node
+        out = {k: strip(v) for k, v in node.items()}
+        source = node.get("source")
+        if node.get("type") == "image" and isinstance(source, dict) and source.get("type") == "base64" \
+                and str(source.get("media_type", "")).startswith("image/") and isinstance(source.get("data"), str):
+            images += 1
+            out["source"] = {**out["source"], "data": ""}
+        url = node.get("image_url")
+        if node.get("type") in ("image_url", "input_image"):
+            target = url.get("url") if isinstance(url, dict) else url
+            if isinstance(target, str) and target.startswith("data:image/"):
+                images += 1
+                out["image_url"] = {**out["image_url"], "url": ""} if isinstance(url, dict) else ""
+        return out
     text = json.dumps(strip(body), ensure_ascii=False).encode()
     return len(text) // 4 + images * IMAGE_TOKENS
 
@@ -484,17 +564,24 @@ def blocked_by(rules, headers):
 ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))
 
 
-def last_user_text(body):
-    """Text of the last user turn, normalised like sub2api's moderation input (NFKC, no zero-width, collapsed spaces)."""
-    turns = body.get("messages") if isinstance(body.get("messages"), list) else body.get("input")
-    if isinstance(turns, str):
-        texts = [turns]
-    else:
-        user = next((m for m in reversed(turns) if isinstance(m, dict) and m.get("role") == "user"), None) if isinstance(turns, list) else None
-        content = user.get("content") if user else None
-        blocks = content if isinstance(content, list) else [content]
-        texts = [b if isinstance(b, str) else b.get("text") for b in blocks if isinstance(b, (str, dict))]
-    text = " ".join(t for t in texts if isinstance(t, str))
+def request_text(body):
+    """All text the model will read (every message, the system prompt, Responses input), normalised like sub2api's
+    moderation input (NFKC, no zero-width, collapsed spaces, lowercase). Only values are read, never JSON keys."""
+    texts = []
+
+    def walk(node):
+        if isinstance(node, str):
+            texts.append(node)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+        elif isinstance(node, dict):
+            for key in ("text", "content", "input", "system", "thinking"):
+                if key in node:
+                    walk(node[key])
+    for field in ("system", "messages", "input", "instructions", "prompt"):
+        walk(body.get(field))
+    text = " ".join(texts)
     return " ".join(unicodedata.normalize("NFKC", text).translate(ZERO_WIDTH).split()).lower()
 
 
@@ -511,10 +598,11 @@ class KeyService:
         self.recent = defaultdict(deque)  # team -> monotonic times of requests in the last minute
         self.reserved = defaultdict(int)  # team -> micro-USD held by requests in flight
         self.waiting = defaultdict(int)  # team -> requests queued for a slot
+        self.counting = defaultdict(int)  # team -> count_tokens calls in flight
         self.team_locks = defaultdict(threading.Lock)  # per team, so one team's budget check never blocks the others
         self.auth_failures, self.auth_blocked = defaultdict(deque), {}
         self.auth_failures_seen = deque(maxlen=100000)  # failed key attempts, for the admin overview
-        self.opener = urllib.request.build_opener(_NoRedirect)  # honours HTTPS_PROXY for reaching upstreams
+        self.opener = make_opener()  # honours HTTPS_PROXY for reaching upstreams
 
     def digest(self, token):
         return hashlib.pbkdf2_hmac("sha256", token.encode(), self.pepper, KEY_HASH_ITERATIONS).hex()
@@ -526,7 +614,8 @@ class KeyService:
                  "error_type": "TEXT NOT NULL DEFAULT ''", "error_phase": "TEXT NOT NULL DEFAULT ''",
                  "error_owner": "TEXT NOT NULL DEFAULT ''", "upstream_status": "INTEGER", "error_message": "TEXT NOT NULL DEFAULT ''",
                  "cache_write_1h_tokens": "INTEGER NOT NULL DEFAULT 0", "requested_model": "TEXT NOT NULL DEFAULT ''",
-                 "first_token_ms": "INTEGER", "client_ip": "TEXT NOT NULL DEFAULT ''", "upstream_request_id": "TEXT NOT NULL DEFAULT ''"}
+                 "first_token_ms": "INTEGER", "client_ip": "TEXT NOT NULL DEFAULT ''", "upstream_request_id": "TEXT NOT NULL DEFAULT ''",
+                 "request_id": "TEXT NOT NULL DEFAULT ''"}
         for column, kind in added.items():  # databases created before these columns existed
             if column not in columns:
                 db.execute(f"ALTER TABLE api_usage ADD COLUMN {column} {kind}")
@@ -804,7 +893,7 @@ class KeyService:
           u.model, u.path, u.stream, u.status, u.input_tokens AS input, u.output_tokens AS output, u.cache_write_tokens AS cacheWrite,
           u.cache_read_tokens AS cacheRead, u.cache_write_1h_tokens AS cacheWrite1h, u.cost_micro/1e6 AS cost,
           u.requested_model AS requestedModel, u.first_token_ms AS firstTokenMs, u.client_ip AS clientIp,
-          u.upstream_request_id AS upstreamRequestId,
+          u.upstream_request_id AS upstreamRequestId, u.request_id AS requestId,
           u.duration_ms AS durationMs, u.user_agent AS userAgent, u.incomplete, u.estimated, u.error_type AS errorType,
           u.error_phase AS errorPhase, u.error_owner AS errorOwner, u.upstream_status AS upstreamStatus, u.error_message AS errorMessage, EXISTS(SELECT 1 FROM api_logs l WHERE l.usage_id=u.id) AS hasContent,
           (SELECT l.request_bytes FROM api_logs l WHERE l.usage_id=u.id) AS requestBytes
@@ -897,7 +986,8 @@ class KeyService:
     def gateway(self, handler, path):
         call = {"key": None, "path": path, "model": "", "stream": False, "price": None, "usage": [0] * USAGE_FIELDS, "status": 0,
                 "request": b"", "response": [], "size": 0, "started": time.monotonic(), "log": False,
-                "request_bytes": 0, "reply_bytes": 0, "done": False, "forwarded": False}
+                "request_bytes": 0, "reply_bytes": 0, "done": False, "forwarded": False,
+                "request_id": uuid.uuid4().hex, "reply_headers": {}}
         try:
             query = parse_qs(urlsplit(handler.path).query)
             if "key" in query or "api_key" in query:
@@ -917,7 +1007,9 @@ class KeyService:
             if not call.get("headers_sent"):
                 try:
                     payload = json.dumps(error_body(path, info), ensure_ascii=False).encode()
-                    extra = {"Retry-After": str(info["retry_after"])} if info.get("retry_after") else None
+                    extra = {"X-Client-Request-ID": call["request_id"]}
+                    if info.get("retry_after"):
+                        extra["Retry-After"] = str(info["retry_after"])
                     handler.headers_out(error.status, "application/json; charset=utf-8", len(payload), extra=extra)
                     handler.wfile.write(payload)
                 except OSError:
@@ -954,8 +1046,10 @@ class KeyService:
         """Write to the team's client; a closed connection becomes ClientGone so it is never mistaken for an upstream error."""
         try:
             if not call.get("headers_sent"):
-                handler.headers_out(status, content_type, len(payload) if length is None and payload is not None else length,
-                                    extra={"X-Accel-Buffering": "no"} if payload is None else None)
+                extra = {"X-Client-Request-ID": call["request_id"], **call["reply_headers"]}
+                if payload is None:
+                    extra["X-Accel-Buffering"] = "no"
+                handler.headers_out(status, content_type, len(payload) if length is None and payload is not None else length, extra=extra)
                 call["headers_sent"] = True
             if payload:
                 handler.wfile.write(payload)
@@ -996,15 +1090,15 @@ class KeyService:
         with self.service.db() as db:
             usage_id = db.execute("""INSERT INTO api_usage(key_id,team_id,at,model,input_tokens,output_tokens,cache_write_tokens,cache_read_tokens,
               cost_micro,status,path,stream,duration_ms,user_agent,incomplete,estimated,error_type,error_phase,error_owner,
-              upstream_status,error_message,cache_write_1h_tokens,requested_model,first_token_ms,client_ip,upstream_request_id)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              upstream_status,error_message,cache_write_1h_tokens,requested_model,first_token_ms,client_ip,upstream_request_id,request_id)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                   (call["key"]["id"], call["key"]["team_id"], at, call["model"], usage[0], usage[1], usage[2] + usage[4], usage[3], cost,
                                                      call["status"], call["path"], int(call["stream"]), int((time.monotonic() - call["started"]) * 1000),
                                                      (handler.headers.get("User-Agent") or "")[:300], int(incomplete), int(estimated),
                                                      error["type"], error["phase"], error["owner"], error["upstream_status"],
                                                      (error.get("detail") or error["upstream_message"] or error["message"])[:500], usage[4], call.get("requested_model", "")[:100],
                                                      call.get("stream_first_ms") if call["stream"] else call.get("first_token_ms"),
-                                                     client_ip(handler), call.get("upstream_request_id", "")[:100])).lastrowid
+                                                     client_ip(handler), call.get("upstream_request_id", "")[:100], call["request_id"])).lastrowid
             db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (at, call["key"]["id"]))
             if call["log"]:
                 headers = {k: v[:500] for k, v in handler.headers.items() if k.lower() not in SECRET_HEADERS}
@@ -1027,19 +1121,23 @@ class KeyService:
           WHERE k.key_hash=? AND k.active=1 AND t.active=1 AND COALESCE(d.status,'active')='active'""", (self.digest(token),)).fetchone()
 
     def auth_guard(self, handler):
-        """sub2api's invalid-auth limiter: too many failed keys from one address are blocked before any hashing."""
+        """sub2api's invalid-auth limiter, applied only to failures: a hackathon venue puts every team behind one NAT
+        address, so a valid key is never refused because of someone else's bad ones."""
         ip = client_ip(handler)
         try:
             if ipaddress.ip_address(ip).version == 6:
                 ip = str(ipaddress.ip_network(f"{ip}/64", strict=False))  # an IPv6 /64 is one client
         except ValueError:
             pass
+        return ip
+
+    def auth_blocked_error(self, ip):
         now = time.monotonic()
         with self.lock:
             blocked = self.auth_blocked.get(ip, 0)
-            if blocked > now:
-                raise GatewayError("rate_limit", "密钥错误次数过多，请稍后再试", retry_after=int(blocked - now) + 1)
-        return ip
+        if blocked > now:
+            return GatewayError("rate_limit", "密钥错误次数过多，请稍后再试", retry_after=int(blocked - now) + 1)
+        return None
 
     def auth_failed(self, ip):
         now = time.monotonic()
@@ -1061,12 +1159,14 @@ class KeyService:
         with self.service.db() as db:
             try:
                 row = self.lookup(db, handler)
-            except APIError:
+            except APIError as error:
+                blocked = self.auth_blocked_error(ip)  # blocked from the attempt after the limit, as sub2api
                 self.auth_failed(ip)
-                raise
+                raise blocked or error
             if not row:
+                blocked = self.auth_blocked_error(ip)
                 self.auth_failed(ip)
-                raise GatewayError("auth", "API 密钥无效或已停用")
+                raise blocked or GatewayError("auth", "API 密钥无效或已停用")
             settings = self.settings(db)
             if call is not None:
                 call["key"], call["log"], call["settings"] = row, settings["logContent"], settings
@@ -1092,12 +1192,30 @@ class KeyService:
         except ValueError:
             raise APIError(400, "请求长度不正确") from None
         if not 0 < length <= BODY_LIMIT:
-            raise APIError(413, "请求内容超过4MB限制")
+            raise GatewayError("too_large", f"请求内容超过 {BODY_LIMIT // 1048576}MB 限制")
         if handler.headers.get_content_type() != "application/json":
             raise APIError(415, "请使用JSON请求")
+        raw = handler.rfile.read(length)
+        encoding = (handler.headers.get("Content-Encoding") or "identity").strip().lower()
+        if encoding in ("gzip", "deflate"):
+            # As sub2api: compressed request bodies are accepted; the expanded size is bounded (no decompression bombs).
+            try:
+                inflater = zlib.decompressobj(47 if encoding == "gzip" else 15)
+                expanded = inflater.decompress(raw, BODY_LIMIT + 1)
+            except zlib.error:
+                raise APIError(400, "请求内容解压失败") from None
+            if len(expanded) > BODY_LIMIT or inflater.unconsumed_tail:
+                raise GatewayError("too_large", f"解压后的请求内容超过 {BODY_LIMIT // 1048576}MB 限制")
+            raw = expanded
+        elif encoding != "identity":
+            raise APIError(415, f"不支持的请求压缩格式：{encoding}")
+        handler.raw_body = raw
+
+        def reject_constant(name):
+            raise ValueError(name)
         try:
-            handler.raw_body = handler.rfile.read(length)
-            body = json.loads(handler.raw_body)
+            body = json.loads(raw, parse_constant=reject_constant)
+            gateway_json(body)  # 1e400 parses to inf: refuse here rather than send invalid JSON upstream
         except (UnicodeError, ValueError):
             raise APIError(400, "JSON格式不正确") from None
         if not isinstance(body, dict):
@@ -1107,16 +1225,34 @@ class KeyService:
     def serve(self, handler, path, call):
         if self.config is None:
             raise APIError(404, "接口不存在")
-        if path == "/v1/models" and handler.command == "GET":
+        if (path == "/v1/models" or path.startswith("/v1/models/")) and handler.command == "GET":
             self.authenticate(handler)  # client rules apply; not metered or logged
-            data = [{"id": m, "object": "model", "owned_by": name} for name, models in self.models().items() for m in models]
-            return handler.respond(200, {"object": "list", "data": data})
+            # Fields of both APIs, so OpenAI and Anthropic SDKs can each parse the list (sub2api answers per platform).
+            data = [{"id": m, "object": "model", "owned_by": name, "created": 0, "type": "model", "display_name": m,
+                     "created_at": "2024-01-01T00:00:00Z"} for name, models in self.models().items() for m in models]
+            if path != "/v1/models":
+                item = next((d for d in data if d["id"] == path[len("/v1/models/"):]), None)
+                if item is None:
+                    raise GatewayError("not_found", "模型不在本活动开放列表中")
+                return self.send(handler, call, 200, "application/json", gateway_json(item))
+            listing = {"object": "list", "data": data, "has_more": False,
+                       "first_id": data[0]["id"] if data else None, "last_id": data[-1]["id"] if data else None}
+            return self.send(handler, call, 200, "application/json", gateway_json(listing))
         if path == "/v1/messages/count_tokens" and handler.command == "POST" and "anthropic" in self.config:
             key = self.authenticate(handler, call)  # expiry, budget and client rules
             call["log"] = False  # metadata row only, zero cost
-            self.admit(key["team_id"], call["settings"]["teamRpm"], slot=False)  # RPM only, as sub2api: no slot
-            self.reserve(handler, call, 0)
-            return self.count_tokens(handler, call)
+            team = key["team_id"]
+            self.admit(team, call["settings"]["teamRpm"] or COUNT_TOKENS_RPM, slot=False)  # no team slot, as sub2api
+            with self.lock:  # but its own small pool, so free calls cannot flood the upstream with our key
+                if self.counting[team] >= COUNT_TOKENS_CONCURRENCY:
+                    raise GatewayError("rate_limit", "本队同时进行的 token 计数请求过多，请稍后重试", retry_after=1)
+                self.counting[team] += 1
+            try:
+                self.reserve(handler, call, 0)
+                return self.count_tokens(handler, call)
+            finally:
+                with self.lock:
+                    self.counting[team] -= 1
         name, suffix = ROUTES.get(path, (None, None))
         if handler.command != "POST" or name not in self.config:
             raise APIError(404, "接口不存在")
@@ -1134,9 +1270,10 @@ class KeyService:
         call["price"] = upstream["models"][model]
         settings = call["settings"]
         if settings["blockedWords"]:
-            # As sub2api: only the latest user turn, normalised, so one hit does not block the rest of a conversation and
-            # JSON keys or system prompts never match. ponytail: substring scan, fine for a short keyword list.
-            text = last_user_text(body)
+            # Normalised like sub2api, but every message and the system prompt are scanned (sub2api reads only the last
+            # user turn, which a fake earlier turn would bypass). Values only, so JSON keys never match.
+            # ponytail: substring scan, fine for a short keyword list.
+            text = request_text(body)
             words = {" ".join(unicodedata.normalize("NFKC", w).split()).lower() for w in settings["blockedWords"]}
             hit = next((w for w in sorted(words) if w and w in text), None)
             if hit:
@@ -1154,12 +1291,12 @@ class KeyService:
         for field in PRICING_FIELDS:
             body.pop(field, None)
         call["stream"] = stream = body.get("stream") is True
-        if stream and name == "openai":
+        if stream and path == "/v1/chat/completions":  # the Responses API reports usage on its own
             options = body.get("stream_options")
             body["stream_options"] = {**(options if isinstance(options, dict) else {}), "include_usage": True}
         team = key["team_id"]
         price = call["price"]
-        call["reserve_out"] = bound_output(body)
+        call["reserve_out"] = bound_output(body, inject=name == "anthropic")
         call["input_estimate"] = estimate_input(body)
         estimate = round(call["input_estimate"] * price[0] + call["reserve_out"] * price[1])
         self.admit(team, settings["teamRpm"])
@@ -1200,6 +1337,10 @@ class KeyService:
             except urllib.error.HTTPError as error:
                 if delay is None or error.code not in RETRY_STATUSES:
                     raise
+                try:  # the upstream says when to come back; honoured up to the 3 s cap
+                    delay = min(3.0, max(delay, float(error.headers.get("retry-after") or 0)))
+                except ValueError:
+                    pass
                 error.close()
             except OSError as error:
                 # Retry only when the request certainly never reached the upstream and the failure can be transient.
@@ -1223,7 +1364,8 @@ class KeyService:
         beta = allowed_betas(handler.headers.get("anthropic-beta"))
         if beta:
             headers["anthropic-beta"] = beta
-        request = urllib.request.Request(upstream["url"] + "/messages/count_tokens", data=json.dumps(body).encode(), headers=headers, method="POST")
+        headers["User-Agent"] = (handler.headers.get("User-Agent") or "gotc-gateway/1.0")[:300]
+        request = urllib.request.Request(upstream["url"] + "/messages/count_tokens", data=gateway_json(body), headers=headers, method="POST")
         try:
             with self.open_with_retry(request) as response:
                 status, payload, content_type = response.status, response.read(1_000_000), response.headers.get("Content-Type", "application/json")
@@ -1271,7 +1413,12 @@ class KeyService:
             beta = allowed_betas(handler.headers.get("anthropic-beta"))
             if beta:
                 headers["anthropic-beta"] = beta
-        request = urllib.request.Request(upstream["url"] + suffix, data=json.dumps(body).encode(), headers=headers, method="POST")
+            for header, value in handler.headers.items():  # not `name`: that is the upstream kind used below
+                if header.lower() in CLIENT_HEADERS or header.lower().startswith("x-stainless-"):
+                    headers[header] = value[:500]
+        # The client's own User-Agent (sub2api passes it); the urllib default is blocked by Cloudflare-fronted upstreams.
+        headers["User-Agent"] = (handler.headers.get("User-Agent") or "gotc-gateway/1.0")[:300]
+        request = urllib.request.Request(upstream["url"] + suffix, data=gateway_json(body), headers=headers, method="POST")
         handler.connection.settimeout(UPSTREAM_TIMEOUT)
         try:
             response = self.open_with_retry(request)
@@ -1285,6 +1432,8 @@ class KeyService:
             message = upstream_message(payload, upstream["key"]) or f"HTTP {error.code}"
             mapped = upstream_http_error(call["path"], error.code, message)
             if mapped:
+                retry = error.headers.get("retry-after")
+                mapped.retry_after = retry[:20] if retry and error.code in (429, 503, 529) else None
                 raise mapped from None
             # 400: the team's request was wrong; pass the upstream body through so it can fix it (as sub2api does).
             self.note_error(call, GatewayError("upstream_invalid", message, status=400, upstream_status=400, upstream_message=message))
@@ -1298,6 +1447,7 @@ class KeyService:
             self.upstream_failed(call, error)
         call["status"], call["forwarded"] = response.status, True
         call["upstream_request_id"] = response.headers.get("request-id") or response.headers.get("x-request-id") or ""
+        call["reply_headers"] = passed_headers(response.headers)
         if not call.get("first_token_ms"):  # non-streaming: the whole reply arrives with the headers
             call["first_token_ms"] = int((time.monotonic() - call["started"]) * 1000)
         usage = call["usage"]
@@ -1346,6 +1496,7 @@ class KeyService:
         """
         usage, path = call["usage"], call["path"]
         handler.close_connection = True  # HTTP/1.0: the stream ends when the connection closes
+        set_read_timeout(response, STREAM_IDLE_TIMEOUT)  # silence between events, not the whole reply
         held = []
         try:
             for line in response:
@@ -1362,7 +1513,7 @@ class KeyService:
                     event = json.loads(line[5:])
                 except ValueError:
                     event = None
-        if isinstance(event, dict) and (event.get("type") == "error" or isinstance(event.get("error"), (dict, str))):
+        if isinstance(event, dict) and (event.get("type") in ("error", "response.failed") or isinstance(event.get("error"), (dict, str))):
             call["forwarded"] = False  # the upstream refused before generating anything: not billed
             message = upstream_message(json.dumps(event).encode())
             raw = json.dumps(event.get("error"))
@@ -1389,7 +1540,7 @@ class KeyService:
                     stream_progress(name, parsed, call)
                     if call["reply_bytes"] and call.get("stream_first_ms") is None:
                         call["stream_first_ms"] = int((time.monotonic() - call["started"]) * 1000)
-                    if isinstance(parsed, dict) and (parsed.get("type") == "error" or isinstance(parsed.get("error"), (dict, str))):
+                    if isinstance(parsed, dict) and (parsed.get("type") in ("error", "response.failed") or isinstance(parsed.get("error"), (dict, str))):
                         call["stream_error"] = parsed  # the upstream gave up mid-stream; the client gets its frame as-is
             self.keep(call, line)
             if client_open:
