@@ -253,6 +253,7 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
             package.extractall(extract)
         self.assertTrue((extract / 'index.html').is_file())
         self.assertTrue((extract / 'platform-draft-recovery.js').is_file())
+        self.assertTrue((extract / 'server' / 'write_conflicts.py').is_file())
         with urllib.request.urlopen('file://' + str(extract / 'index.html')) as page:
             self.assertIn(b'<!doctype html', page.read(200).lower())
         env = os.environ | {'GOTC_DATA_DIR': str(self.root / 'data'), 'GOTC_HOST': '127.0.0.1', 'GOTC_PORT': '55991', 'GOTC_BASE_PATH': '/gotc', 'GOTC_PUBLIC_ORIGIN': 'https://example.invalid'}
@@ -306,8 +307,13 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
                         team_req = urllib.request.Request(f'http://127.0.0.1:{port}/gotc/api/team', headers={'Cookie':cookie})
                         with urllib.request.urlopen(team_req) as team_response: self.assertEqual(json.load(team_response)['submission']['submittedVersion'], 1)
                         judge_cookie = urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{port}/gotc/api/login', data=json.dumps({'role':'judge','code':judge_code}).encode(), headers={'Content-Type':'application/json','Origin':'https://example.invalid'})).headers['Set-Cookie']
-                        scored, _ = http_json('/api/score', {'teamId':team_id,'scores':[16,16,16,12,12,8],'feedback':'Tar synthetic score','status':'submitted'}, judge_cookie)
+                        judge_req = urllib.request.Request(f'http://127.0.0.1:{port}/gotc/api/judge', headers={'Cookie':judge_cookie})
+                        with urllib.request.urlopen(judge_req) as judge_response:
+                            before_score=json.load(judge_response)
+                        record=next((row for row in before_score['myScores'] if row['teamId']==team_id),None)
+                        scored, _ = http_json('/api/score', {'teamId':team_id,'scores':[16,16,16,12,12,8],'feedback':'Tar synthetic score','status':'submitted','expectedRevision':record['revision'] if record else 0}, judge_cookie)
                         self.assertEqual(scored['ok'], True)
+                        self.assertEqual(scored['score']['revision'],1)
                         judge_req = urllib.request.Request(f'http://127.0.0.1:{port}/gotc/api/judge', headers={'Cookie':judge_cookie})
                         with urllib.request.urlopen(judge_req) as judge_response:
                             judge_payload = json.load(judge_response); self.assertTrue(any(row['teamId'] == team_id for row in judge_payload['myScores']))

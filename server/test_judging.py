@@ -166,7 +166,7 @@ class ExhibitionFrameworkTests(unittest.TestCase):
         code_response=self.admin.post('/api/admin/team-access',{'teamId':team_id,'action':'issue'})[1]
         team_client=api_helpers.Client(self.server)
         self.assertEqual(team_client.post('/api/login',{'role':'team','code':code_response['code']})[0],200)
-        self.assertEqual(self.admin.post('/api/admin/settings',{'submissionsOpen':True})[0],200)
+        self.assertEqual(self.admin.settings({'submissionsOpen':True})[0],200)
         materials=SubmissionAPITests.materials(self,projectName='FORMAL_CAPTURED',summary='PRIVATE_MATERIAL_SUMMARY')
         self.assertEqual(team_client.post('/api/submission',{'expectedVersion':0,'status':'submitted','materials':materials})[0],200)
         self.configure([team_id])
@@ -298,8 +298,8 @@ class ExhibitionFrameworkTests(unittest.TestCase):
     def test_legacy_scores_remain_untouched_and_are_not_exhibition_reviews(self):
         team_id=self.team()
         judge,invitation=self.invitation()
-        self.assertEqual(self.admin.post('/api/admin/settings',{'scoringOpen':True,'minJudges':1})[0],200)
-        self.assertEqual(judge.post('/api/score',{'teamId':team_id,'scores':[20,20,20,15,15,10],
+        self.assertEqual(self.admin.settings({'scoringOpen':True,'minJudges':1})[0],200)
+        self.assertEqual(judge.score({'teamId':team_id,'scores':[20,20,20,15,15,10],
                                                'feedback':'LEGACY_ONLY','status':'submitted'})[0],200)
         with self.service.db() as db:
             before=[tuple(row) for row in db.execute('SELECT * FROM scores')]

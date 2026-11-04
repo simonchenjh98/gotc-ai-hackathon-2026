@@ -36,7 +36,7 @@ class SubmissionConsistencyTests(unittest.TestCase):
         second = api_helpers.Client(self.server)
         self.assertEqual(second.post('/api/login', {'role': 'team', 'code': access['code']})[0], 200)
         self.assertNotEqual(first.cookie, second.cookie)
-        self.assertEqual(self.admin.post('/api/admin/settings', {'submissionsOpen': True})[0], 200)
+        self.assertEqual(self.admin.settings({'submissionsOpen': True})[0], 200)
         payloads = [{'expectedVersion': 0, 'status': 'submitted',
                      'materials': self.materials(projectName='Concurrent ' + suffix)} for suffix in ['A', 'B']]
         barrier = threading.Barrier(2)
@@ -76,7 +76,7 @@ class SubmissionConsistencyTests(unittest.TestCase):
                         return db.execute(sql, *values)
                 yield Observed()
         with patch('app.now_ms', side_effect=lambda: clock[0]):
-            self.assertEqual(self.admin.post('/api/admin/settings', {
+            self.assertEqual(self.admin.settings({
                 'submissionsOpen': True, 'submissionDeadline': deadline})[0], 200)
             self.assertEqual(client.post('/api/submission', {
                 'expectedVersion': 0, 'status': 'draft', 'materials': {'summary': 'Retain this draft'}})[0], 200)
@@ -110,7 +110,7 @@ class SubmissionConsistencyTests(unittest.TestCase):
         team_id = self.team()
         client, _ = self.access(team_id)
         judge, _ = self.invitation()
-        self.assertEqual(self.admin.post('/api/admin/settings', {'submissionsOpen': True})[0], 200)
+        self.assertEqual(self.admin.settings({'submissionsOpen': True})[0], 200)
         materials = self.materials(codeUrl='https://github.com/synthetic/repository',
                                    readmeUrl='https://example.invalid/README?version=1')
         original = copy.deepcopy(materials)

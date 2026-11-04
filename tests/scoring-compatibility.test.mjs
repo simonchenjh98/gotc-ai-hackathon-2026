@@ -80,8 +80,8 @@ test('professional settings edited during their POST retain new values and unsav
   const root={innerHTML:'',insertAdjacentHTML(_position,html){this.innerHTML+=html;},querySelectorAll:()=>[settings]};
   const elements={'platform-main':root,'settings-form':settings,'platform-toast':{textContent:'',classList:{add(){},remove(){}}}};
   const ctx=vm.createContext({document:{getElementById:id=>elements[id]??={isConnected:true},querySelectorAll:()=>[]},location:{href:'https://example.test/platform.html#admin'},URL,Date,setTimeout:()=>0,clearTimeout,confirm:()=>false,fetch:async(url,options)=>{
-    if(options.method==='POST'){sent=JSON.parse(options.body);return new Promise(resolve=>{resolvePost=()=>resolve({ok:true,json:async()=>({ok:true})});});}
-    return {ok:true,json:async()=>url.pathname.endsWith('/admin')?{config:{},teams:[],judges:[],audience:[]}:{stage:{id:'exhibition'},roster:{judgeIds:[]},reviews:[]}};
+    if(options.method==='POST'){sent=JSON.parse(options.body);return new Promise(resolve=>{resolvePost=()=>resolve({ok:true,json:async()=>({ok:true,config:{writeRevisions:{scoring:1,submissions:0,voting:0}}})});});}
+    return {ok:true,json:async()=>url.pathname.endsWith('/admin')?{config:{writeRevisions:{scoring:0,submissions:0,voting:0}},teams:[],judges:[],audience:[]}:{stage:{id:'exhibition'},roster:{judgeIds:[]},reviews:[]}};
   }});
   vm.runInContext(source+"\nroute='admin';routeVersion=1;installJudgingAdmin=()=>{};installSubmissionAdmin=()=>{};",ctx);
   await vm.runInContext('renderAdmin(1)',ctx);

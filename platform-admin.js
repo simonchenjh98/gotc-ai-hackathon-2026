@@ -217,9 +217,8 @@ function installAdminData(data,version){
 
   const voting=formFrom('audience-settings');
   voting.innerHTML=`<h3>观众投票窗口</h3><label class="toggle-line"><input type="checkbox" name="votingOpen" ${data.config.votingOpen?'checked':''}>开放观众投票</label><label class="field">截止时间（北京时间）<input name="votingDeadline" type="datetime-local" value="${esc(beijingInput(data.config.votingDeadline))}"><small>留空表示不设截止。此窗口独立于专业评分、作品提交、展示和路演评审。</small></label><button class="btn small" type="submit">保存投票窗口</button><p class="form-error" role="alert"></p>`;
-  voting.onsubmit=event=>{event.preventDefault();try{adminSaveForm(voting,'admin/settings',{votingOpen:voting.elements.votingOpen.checked,votingDeadline:parseBeijingInput(voting.elements.votingDeadline.value)},()=>toast('观众投票窗口已保存。'));}catch(error){formError(voting,error.message);}};
-  const submissions=formFrom('submission-settings');
-  submissions.onsubmit=event=>{event.preventDefault();try{adminSaveForm(submissions,'admin/settings',{submissionsOpen:submissions.elements.submissionsOpen.checked,submissionDeadline:parseBeijingInput(submissions.elements.submissionDeadline.value)},()=>toast('作品提交窗口已保存。'));}catch(error){formError(submissions,error.message);}};
+  installSettingsForm(voting,'voting',data.config);
+  installSettingsForm(formFrom('submission-settings'),'submissions',data.config);
 
   installImportTools(ctx,{alive,next,fresh,refreshDirectory,track});
   installRecordTools(ctx,{alive,next,fresh,track});

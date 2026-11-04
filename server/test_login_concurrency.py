@@ -71,7 +71,7 @@ class LoginConcurrencyTests(unittest.TestCase):
 
         def write():
             try:
-                outcomes['write'] = self.admin.post('/api/admin/settings', {'submissionsOpen': True})
+                outcomes['write'] = self.admin.settings({'submissionsOpen': True})
             except Exception as error:
                 failures.append(error)
             finally:
@@ -188,7 +188,7 @@ class LoginConcurrencyTests(unittest.TestCase):
                     self.assertTrue(slots_full.wait(3))
                     self.assertTrue(all_attempted.wait(3))
                     # A legitimate write can finish while all hash slots and queued logins are occupied.
-                    self.assertEqual(self.admin.post('/api/admin/settings', {'submissionsOpen': True})[0], 200)
+                    self.assertEqual(self.admin.settings({'submissionsOpen': True})[0], 200)
                 finally:
                     release_hash.set()
                 self.assertEqual([future.result(5)[0] for future in futures], [200] * attempts)

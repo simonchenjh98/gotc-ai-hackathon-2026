@@ -33,14 +33,14 @@ class LegacyScoringCompatibilityTests(unittest.TestCase):
 
     def numeric(self, judge, team, total, status='submitted'):
         values = [total * part / 100 for part in (20, 20, 20, 15, 15, 10)]
-        return judge.post('/api/score', {
+        return judge.score({
             'teamId': team, 'scores': values, 'status': status, 'feedback': 'LEGACY_NUMERIC_FEEDBACK'})
 
     def test_numeric_average_ties_and_windows_do_not_mix_with_framework_records(self):
         teams = [self.team(i + 1, 'Numeric team ' + str(i + 1)) for i in range(3)]
         invited = [self.invitation(name='Numeric judge ' + str(i + 1)) for i in range(5)]
         judges = [item[0] for item in invited]
-        self.assertEqual(self.admin.post('/api/admin/settings', {
+        self.assertEqual(self.admin.settings({
             'scoringOpen': True, 'minJudges': 5, 'resultsPublished': True})[0], 200)
         run = self.open_framework([teams[0]], [invited[0][1]['id']])
         for index, judge in enumerate(judges):
@@ -67,7 +67,7 @@ class LegacyScoringCompatibilityTests(unittest.TestCase):
             'feedback': 'Not a numeric endpoint', 'scores': [20, 20, 20, 15, 15, 10]})[0], 409)
 
         self.assertEqual(self.numeric(judges[0], teams[0], 0, 'draft')[0], 409)
-        self.assertEqual(self.admin.post('/api/admin/settings', {'scoringOpen': False})[0], 200)
+        self.assertEqual(self.admin.settings({'scoringOpen': False})[0], 200)
         self.assertEqual(self.numeric(judges[0], teams[0], 90)[0], 409)
         self.assertTrue(judges[0].get('/api/judging/exhibition')[1]['window']['canEdit'])
         self.assertEqual(judges[0].post('/api/judging/exhibition/review', {
@@ -76,11 +76,11 @@ class LegacyScoringCompatibilityTests(unittest.TestCase):
         current = self.stage()
         self.assertEqual(self.admin.post('/api/admin/judging/exhibition/window', {
             'expectedRevision': current['stage']['revision'], 'open': False, 'deadline': None})[0], 200)
-        self.assertEqual(self.admin.post('/api/admin/settings', {'scoringOpen': True})[0], 200)
+        self.assertEqual(self.admin.settings({'scoringOpen': True})[0], 200)
         self.assertEqual(self.numeric(judges[4], teams[0], 50)[0], 200)
         self.assertEqual(self.public.get('/api/board')[1]['teams'][0]['score'], 78)
         self.assertFalse(judges[0].get('/api/judging/exhibition')[1]['window']['canEdit'])
-        self.assertEqual(self.admin.post('/api/admin/settings', {'resultsPublished': False})[0], 200)
+        self.assertEqual(self.admin.settings({'resultsPublished': False})[0], 200)
         self.assertTrue(all(row['score'] is None and row['rank'] is None for row in self.public.get('/api/board')[1]['teams']))
         self.assertEqual(self.admin.get('/api/admin')[1]['teams'][0]['score'], 78)
         self.assertEqual(self.public.get('/api/judging/exhibition/board')[1]['teams'][0]['reviewCount'], 1)
@@ -97,7 +97,7 @@ class LegacyScoringCompatibilityTests(unittest.TestCase):
         team_client, _ = self.access(team)
         judge, invitation = self.invitation()
         audience, _ = self.invitation('audience', 'Compatibility audience')
-        self.assertEqual(self.admin.post('/api/admin/settings', {
+        self.assertEqual(self.admin.settings({
             'submissionsOpen': True, 'scoringOpen': True, 'minJudges': 1})[0], 200)
         formal = self.materials(projectName='FORMAL_ORIGINAL', summary='PRIVATE_FORMAL_BODY')
         self.assertEqual(team_client.post('/api/submission', {
@@ -124,11 +124,11 @@ class LegacyScoringCompatibilityTests(unittest.TestCase):
         self.assertEqual(framed['myReviews'], [])
         for client, expected in [(self.public, 401), (self.admin, 403), (audience, 403), (team_client, 403)]:
             self.assertEqual(client.get('/api/judge')[0], expected)
-            self.assertEqual(client.post('/api/score', {
+            self.assertEqual(client.score({
                 'teamId': team, 'scores': [0] * 6, 'status': 'submitted'})[0], expected)
         config = self.admin.get('/api/admin')[1]['config']
         if 'votingOpen' in config:
-            self.assertEqual(self.admin.post('/api/admin/settings', {
+            self.assertEqual(self.admin.settings({
                 'votingOpen': True, 'votingDeadline': None, 'scoringOpen': False})[0], 200)
             self.assertFalse(judge.get('/api/judge')[1]['scoringOpen'])
         self.assertEqual(audience.post('/api/vote', {'teamId': team})[0], 200)

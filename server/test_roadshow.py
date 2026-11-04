@@ -143,7 +143,7 @@ class RoadshowIsolationTests(unittest.TestCase):
         issued=self.admin.post('/api/admin/team-access',{'teamId':team_id,'action':'issue'})[1]
         client=api_helpers.Client(self.server)
         self.assertEqual(client.post('/api/login',{'role':'team','code':issued['code']})[0],200)
-        self.assertEqual(self.admin.post('/api/admin/settings',{'submissionsOpen':True})[0],200)
+        self.assertEqual(self.admin.settings({'submissionsOpen':True})[0],200)
         def submit(version,name,state='submitted'):
             self.assertEqual(client.post('/api/submission',{'expectedVersion':version,'status':state,
                 'materials':test_submissions.SubmissionAPITests.materials(self,projectName=name)})[0],200)

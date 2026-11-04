@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 from errors import APIError
 from submission_records import SubmissionRecords, query_path
+from write_conflicts import WriteConflicts
 from judging import JudgingService
 from admin_data import AdminDataService, TRACK_OPTIONS
 
@@ -209,6 +210,8 @@ class EventService:
             enrich_team=lambda db,team:self.admin_data.enrich_team(db,team))
         self.admin_data=AdminDataService(self)
         self.submission_records=SubmissionRecords(self)
+        self.write_conflicts=WriteConflicts(self)
+        self.write_conflicts.backup_before_upgrade()
         self.admin_data.backup_before_upgrade()
         self.migrate_accounts()
         with self.db() as db:
@@ -249,6 +252,7 @@ class EventService:
             os.chmod(access_file, 0o600)
         os.chmod(self.db_path, 0o600)
         self.submission_records.initialize(backup=database_existed)
+        self.write_conflicts.initialize()
 
     def migrate_accounts(self):
         """Rebuild only the legacy role CHECK; preserve IDs and referencing tables."""
@@ -453,8 +457,11 @@ class EventService:
             # Resolve write identities only after the lock: revocation may have committed while queued.
             if method=="POST":
                 db.execute("BEGIN IMMEDIATE")
+            elif method=="GET" and path=="/api/admin":
+                # Keep form values and their revision tokens in one read snapshot.
+                db.execute("BEGIN")
             actor = self.account(db, cookie)
-            if (path in {"/api/team", "/api/submission", "/api/logout"} or path.startswith("/api/submission/")) and expected_login_id is not None and (not actor or expected_login_id != self.login_id(cookie)):
+            if (path in {"/api/team", "/api/submission", "/api/logout", "/api/judge", "/api/score", "/api/admin", "/api/admin/settings"} or path.startswith("/api/submission/")) and expected_login_id is not None and (not actor or expected_login_id != self.login_id(cookie)):
                 raise APIError(401, "登录身份已变化，请重新登录后操作")
             if self.submission_records.supports(path):return self.submission_records.dispatch(db,actor,method,path,body,query or {}),None,None
             if path.startswith('/api/admin/data/'):
@@ -483,18 +490,18 @@ class EventService:
                 return {"ok": True}, None, None
             if method == "GET" and path == "/api/judge":
                 self.require(actor, "judge")
-                scores = [{"teamId": r["team_id"], "scores": json.loads(r["scores_json"]), "feedback": r["feedback"], "status": r["status"]}
-                          for r in db.execute("SELECT * FROM scores WHERE judge_id=?", (actor["id"],))]
+                scores=self.write_conflicts.scores(db,actor["id"])
                 return {"teams": self.teams(db), "myScores": scores, "dimensions": DIMENSIONS, "scoringOpen": self.config(db)["scoringOpen"], "name": actor["name"], "submissions": self.judge_submissions(db)}, None, None
             if method == "POST" and path == "/api/score":
                 self.require(actor, "judge")
                 if not self.config(db)["scoringOpen"]:
                     raise APIError(409, "评分尚未开放或已关闭")
                 team_id = self.team_exists(db, body.get("teamId"))
+                revision=self.write_conflicts.check_score(db,actor["id"],team_id,body)
                 status = body.get("status")
                 if status not in {"draft", "submitted", "recused"}:
                     raise APIError(400, "评分状态不正确")
-                previous = db.execute("SELECT status FROM scores WHERE judge_id=? AND team_id=?", (actor["id"], team_id)).fetchone()
+                previous = db.execute("SELECT * FROM scores WHERE judge_id=? AND team_id=?", (actor["id"], team_id)).fetchone()
                 if previous and previous["status"] == "submitted" and status == "draft":
                     raise APIError(409, "已有正式评分，请修改后重新提交；草稿不会覆盖正式评分")
                 feedback = text_field(body.get("feedback", ""), "反馈", 2000)
@@ -504,9 +511,13 @@ class EventService:
                 db.execute("""INSERT INTO scores VALUES (?,?,?,?,?,?,?) ON CONFLICT(judge_id,team_id) DO UPDATE SET
                   scores_json=excluded.scores_json,total_tenths=excluded.total_tenths,feedback=excluded.feedback,status=excluded.status,updated_at=excluded.updated_at""",
                            (actor["id"], team_id, json.dumps(values), total, feedback, status, now_ms()))
-                self.audit(db, actor, "score." + status, team_id)
+                score=self.write_conflicts.advance_score(db,actor["id"],team_id,revision)
+                self.audit(db,actor,"score."+status,team_id,metadata={
+                    "before":{"revision":revision-1,"status":previous["status"],"total":previous["total_tenths"]/10 if previous["total_tenths"] is not None else None} if previous else None,
+                    "after":{"revision":revision,"status":status,"total":total/10 if total is not None else None},
+                    "feedbackChanged":feedback!=(previous["feedback"] if previous else "")})
                 self.touch(db)
-                return {"ok": True, "status": status}, None, None
+                return {"ok": True, "status": status,"score":score}, None, None
             if method == "GET" and path == "/api/audience":
                 self.require(actor, "audience")
                 voted = [r[0] for r in db.execute("SELECT team_id FROM votes WHERE account_id=? ORDER BY created_at,team_id", (actor["id"],))]
@@ -545,25 +556,17 @@ class EventService:
                     for person in judges:person['credentialMode']=self.admin_data.credential_mode(db,person['id'],'judge')
                     for person in audience:person['credentialMode']=self.admin_data.credential_mode(db,person['id'],'audience')
                     stats = {"teamCount": db.execute("SELECT COUNT(*) FROM teams").fetchone()[0], "submittedScores": db.execute("SELECT COUNT(*) FROM scores WHERE status='submitted'").fetchone()[0], "audienceVotes": db.execute("SELECT COUNT(*) FROM votes").fetchone()[0]}
-                    return {"teams": self.teams(db, public=False), "judges": judges, "audience": audience, "config": self.config(db), "stats": stats, "submissions": self.admin_submissions(db),'trackOptions':TRACK_OPTIONS}, None, None
+                    return {"teams": self.teams(db, public=False), "judges": judges, "audience": audience, "config": self.write_conflicts.admin_config(db), "stats": stats, "submissions": self.admin_submissions(db),'trackOptions':TRACK_OPTIONS}, None, None
                 if method == "POST" and path == "/api/admin/settings":
-                    allowed = {"scoringOpen", "resultsPublished", "minJudges", "submissionsOpen", "submissionDeadline",'votingOpen','votingDeadline'}
-                    if not body or not set(body).issubset(allowed):
-                        raise APIError(400, "设置字段不正确")
-                    before={key:self.config(db).get(key) for key in body}
-                    for key, value in body.items():
-                        if key == "minJudges":
-                            if type(value) is not int or not 1 <= value <= 50:
-                                raise APIError(400, "最少评委数应为1至50的整数")
-                        elif key in {"submissionDeadline",'votingDeadline'}:
-                            if value is not None and (type(value) is not int or not 0<=value<=253402300799999):
-                                raise APIError(400, "窗口截止时间必须是有效的毫秒时间戳或空值")
-                        elif type(value) is not bool:
-                            raise APIError(400, "开放与公开状态必须为布尔值")
-                        db.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(value), key))
+                    changes,groups=self.write_conflicts.check_settings(db,body)
+                    before={key:self.config(db).get(key) for key in changes}
+                    for key,value in changes.items():
+                        db.execute("UPDATE settings SET value=? WHERE key=?",(json.dumps(value),key))
+                    self.write_conflicts.advance_settings(db,groups)
                     self.touch(db)
-                    self.audit(db, actor, "settings", metadata={'before':before,'after':body})
-                    return {"ok": True, "config": self.config(db)}, None, None
+                    self.audit(db,actor,"settings",metadata={'before':before,'after':changes,
+                        'beforeRevisions':body['expectedRevisions'],'afterRevisions':{group:body['expectedRevisions'][group]+1 for group in sorted(groups)}})
+                    return {"ok":True,"config":self.write_conflicts.admin_config(db)},None,None
                 if method == "POST" and path == "/api/admin/teams":
                     return {'ok':True,'team':self.admin_data.save_team(db,actor,body)},None,None
                 if method=='POST' and path=='/api/admin/credentials':

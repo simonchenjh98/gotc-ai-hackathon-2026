@@ -30,7 +30,7 @@ class SubmissionRecordAPITests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT COUNT(*) FROM submission_history').fetchone()[0],1)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE action='submission.submitted'").fetchone()[0],1)
         self.assertEqual(self.submit(client,'request-test-000002',1,materials=self.materials(projectName='LATEST'))[0],200)
-        self.admin.post('/api/admin/settings',{'submissionsOpen':False});replay=self.submit(client)[1]
+        self.admin.settings({'submissionsOpen':False});replay=self.submit(client)[1]
         self.assertTrue(replay['replayed']);self.assertEqual(replay['receipt'],receipt);self.assertEqual(replay['submission']['submitted']['projectName'],'LATEST')
         self.assertEqual(client.get('/api/submission/requests/request-test-000001')[1],receipt)
 

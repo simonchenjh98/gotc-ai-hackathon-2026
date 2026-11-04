@@ -22,9 +22,9 @@ function publishLogin(login){if(!login.loginId)return;try{localStorage.setItem(l
 function ownsBrowserLogin(login){const owner=browserLoginOwner();return !owner || !login.loginId || owner===login.loginId || (verifiedBrowserLogin?.loginId===login.loginId && verifiedBrowserLogin.owner===owner);}
 async function api(path, data, options={}) {
   const recoveryAtStart=currentTeamRecovery,sessionAtStart=session,ownerAtStart=path==='session'?browserLoginOwner():null;
-  const res = await fetch(new URL(`api/${path}`, base), {credentials:'same-origin',cache:'no-store',method:data === undefined ? 'GET' : 'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json'}),...((['team','submission','logout'].includes(path) || path.startsWith('submission/')) && (options.loginId ?? session.loginId)?{'X-GOTC-Login':options.loginId ?? session.loginId}:{})},body:data === undefined ? undefined : JSON.stringify(data),signal:options.signal});
+  const res = await fetch(new URL(`api/${path}`, base), {credentials:'same-origin',cache:'no-store',method:data === undefined ? 'GET' : 'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json'}),...((['team','submission','logout','judge','score','admin','admin/settings'].includes(path) || path.startsWith('submission/')) && (options.loginId ?? session.loginId)?{'X-GOTC-Login':options.loginId ?? session.loginId}:{})},body:data === undefined ? undefined : JSON.stringify(data),signal:options.signal});
   let body; try { body = await res.json(); } catch { throw new Error('服务暂时不可用，请稍后重试。'); }
-  if (!res.ok) { if((res.status===401 || res.status===403) && recoveryAtStart && currentTeamRecovery===recoveryAtStart)recoveryAtStart.lock();if(res.status===401 && session===sessionAtStart && (!recoveryAtStart || currentTeamRecovery===recoveryAtStart))session={role:null}; const error = new Error(body.error || '操作未成功，请重试。'); error.status = res.status; throw error; }
+  if (!res.ok) { if((res.status===401 || res.status===403) && recoveryAtStart && currentTeamRecovery===recoveryAtStart)recoveryAtStart.lock();if(res.status===401 && session===sessionAtStart && (!recoveryAtStart || currentTeamRecovery===recoveryAtStart))session={role:null}; const error = new Error(body.error || '操作未成功，请重试。'); error.status = res.status; error.code=body.code; throw error; }
   if(path==='session')verifiedBrowserLogin={loginId:body.loginId,owner:ownerAtStart};
   return body;
 }
@@ -52,6 +52,78 @@ function heading(kicker,title,description,tools='') { return `<div class="page-h
 function empty(title,description,action='') { return `<div class="empty-state"><span class="empty-symbol" aria-hidden="true">▦</span><h2>${title}</h2><p>${description}</p>${action}</div>`; }
 function metrics(items) { return `<div class="metrics">${items.map(i=>`<div class="metric"><strong${i[2]?` id="${esc(i[2])}"`:''}>${esc(i[0])}</strong><span>${esc(i[1])}</span></div>`).join('')}</div>`; }
 function formError(form,error) { form.querySelector('.form-error').textContent = error; }
+const settingsGroups={
+  scoring:[['scoringOpen','开放专业评分'],['resultsPublished','公开专业均分'],['minJudges','公开均分所需评委数']],
+  submissions:[['submissionsOpen','开放作品提交'],['submissionDeadline','提交截止时间（北京时间）']],
+  voting:[['votingOpen','开放观众投票'],['votingDeadline','投票截止时间（北京时间）']]
+};
+function settingsValue(key,value){return key.endsWith('Open') || key==='resultsPublished'?(value?'开放':'关闭'):key.endsWith('Deadline')?beijingTime(value):String(value);}
+// Keep an expired editor readable for copying. Late responses cannot update a new login.
+function editorHasLogin(form,owner,{notify=false,error}={}){
+  const sameBrowser=ownsBrowserLogin(owner);
+  if(session===owner && sameBrowser)return true;
+  if(notify || (error?.status===401 && !session.role && sameBrowser)){
+    formError(form,'当前登录已失效或已切换。请先复制要保留的输入，再刷新页面并核对登录身份。');
+  }
+  return false;
+}
+function installSettingsForm(form,group,config){
+  const owner=session,version=routeVersion,fields=settingsGroups[group];
+  let revision=config.writeRevisions?.[group],blocked=false,saving=false,previewRequest=0;
+  const alive=options=>version===routeVersion && route==='admin' && form.isConnected && editorHasLogin(form,owner,options);
+  form.wouldLoseSettings=latest=>saving || latest?.writeRevisions?.[group]<revision;
+  const validRevision=value=>Number.isSafeInteger(value) && value>=0;
+  let button;
+  function payload(){return Object.fromEntries(fields.map(([key])=>{const input=form.elements[key];return [key,key.endsWith('Open') || key==='resultsPublished'?input.checked:key.endsWith('Deadline')?parseBeijingInput(input.value):Number(input.value)];}));}
+  function conflict(){
+    blocked=true;button.disabled=true;dirtyAdminForms.add(form);
+    if(!form.querySelector('[data-settings-conflict]'))form.insertAdjacentHTML('beforeend','<div data-settings-conflict aria-live="polite"></div>');
+    const panel=form.querySelector('[data-settings-conflict]');
+    panel.innerHTML='<div class="info-banner warning"><strong>当前输入已保留</strong><p>服务端设置已更新。请先查看最新值并与上方输入核对，复制需要保留的内容，再载入最新值重新填写。</p><button class="btn secondary small" type="button" data-settings-preview>查看服务器最新设置</button></div>';
+    form.querySelector('[data-settings-preview]').onclick=async()=>{
+      if(!alive({notify:true}))return;
+      const request=++previewRequest;
+      try{
+        const latest=(await api('admin',undefined,{loginId:owner.loginId})).config;
+        if(!alive() || request!==previewRequest)return;
+        if(!validRevision(latest?.writeRevisions?.[group]))throw new Error('无法读取设置版本，请刷新页面后重试。');
+        panel.innerHTML='<div class="info-banner warning"><strong>当前输入已保留 · 服务器最新设置</strong><p>请与上方当前输入核对；需要保留的内容请先复制。</p><dl>'+fields.map(([key,label])=>`<dt>${esc(label)}</dt><dd>${esc(settingsValue(key,latest[key]))}</dd>`).join('')+`</dl><p>设置版本 ${latest.writeRevisions[group]}</p><button class="btn secondary small" type="button" data-settings-load>载入最新设置并替换当前输入</button></div>`;
+        form.querySelector('[data-settings-load]').onclick=()=>{
+          if(!alive({notify:true}) || !confirm('将用上面显示的服务器最新设置替换本组当前输入。请先复制需要保留的内容，确认载入？'))return;
+          for(const [key] of fields){const input=form.elements[key];if(key.endsWith('Open') || key==='resultsPublished')input.checked=latest[key];else input.value=key.endsWith('Deadline')?beijingInput(latest[key]):String(latest[key]);}
+          revision=latest.writeRevisions[group];blocked=false;button.disabled=false;form.editRevision=(form.editRevision || 0)+1;dirtyAdminForms.delete(form);panel.innerHTML='';formError(form,'');
+        };
+      }catch(error){if(request===previewRequest && alive({error}))formError(form,error.message);}
+    };
+  }
+  form.onsubmit=async event=>{
+    event.preventDefault();if(!alive({notify:true}) || saving || blocked)return;
+    button=form.querySelector('[type=submit]') || form.querySelector('button');
+    if(!validRevision(revision)){formError(form,'缺少设置版本，请刷新页面升级后再保存。当前输入已保留。');return;}
+    let values;try{values=payload();}catch(error){formError(form,error.message);return;}
+    const editRevision=form.editRevision || 0;
+    saving=true;button.disabled=true;
+    formError(form,'');
+    try{
+      const result=await api('admin/settings',{...values,expectedRevisions:{[group]:revision}},{loginId:owner.loginId});
+      if(!alive())return;
+      const savedRevision=result.config?.writeRevisions?.[group];
+      if(!validRevision(savedRevision)){conflict();formError(form,'保存结果缺少版本，请查看服务器最新设置核对。');return;}
+      // Only this POST may advance this form's baseline. Directory/poll reads do not.
+      revision=savedRevision;
+      const unchanged=(form.editRevision || 0)===editRevision;
+      if(unchanged)dirtyAdminForms.delete(form);
+      toast(unchanged?'设置已保存。':'设置已保存。保存期间的新输入已保留，请核对后再次保存。');
+    }catch(error){
+      if(!alive({error}))return;
+      formError(form,error.status===428?'页面版本已过期，请先复制当前输入，再刷新页面升级。':error.message);
+      if(error.status===409 && error.code==='settings_revision_conflict')conflict();
+      else if(error.status===409){blocked=true;dirtyAdminForms.add(form);formError(form,error.message+'。当前输入已保留，请先复制，再刷新页面核对。');}
+      if(error.status===428)blocked=true;
+    }finally{saving=false;if(alive())button.disabled=blocked;}
+
+  };
+}
 async function withBusy(button, fn) { if (!button || button.disabled) return; button.disabled = true; try { await fn(); } catch(e) { toast(e.message); } finally { if (button.isConnected) button.disabled = false; } }
 function showConnectionError(error) { root.innerHTML = heading('CONNECTION / 连接状态','暂时无法连接平台',esc(error.message)) + empty('连接暂时中断','请检查网络，稍后重试。尚未提交的操作不会显示为成功。','<button class="btn" id="retry">重新连接</button>'); document.getElementById('retry').onclick = renderRoute; }
 
@@ -175,50 +247,115 @@ function renderExhibitionJudgeEditor(){
   form.onsubmit=e=>{e.preventDefault();save('submitted');};document.getElementById('save-review-draft').onclick=()=>save('draft');document.getElementById('recuse-review').onclick=()=>{if(confirm('确认回避此队？已有正式记录会保留，但不计入本轮正式评审记录数。'))save('recused');};
 }
 async function renderJudge(version,expectedForm=null) {
-  const data=await api('judge');if(version!==routeVersion || (expectedForm && !expectedForm.isConnected))return;judgeData=data;
-  const submitted=judgeData.myScores.filter(s=>s.status==='submitted').length;
-  root.innerHTML=heading('JUDGE / 专业评审','专业评分（六维 100 分）',`${esc(judgeData.name || session.name)} · 已正式提交 ${submitted} 份评分`, `<span class="status-chip ${judgeData.scoringOpen ? '' : 'closed'}">${judgeData.scoringOpen ? '评分开放中' : '评分尚未开放 / 已截止'}</span>`) + '<div class="info-banner">本届使用六维 100 分评分方案。请先看演示、询问过程，再据实评分；草稿不计入成绩。最终规则以现场通知为准。</div>';
+  const owner=session;const data=await api('judge',undefined,{loginId:owner.loginId});if(session!==owner || !ownsBrowserLogin(owner) || version!==routeVersion || route!=='judge' || (expectedForm && !expectedForm.isConnected))return;judgeData=data;
+  root.innerHTML=heading('JUDGE / 专业评审','专业评分（六维 100 分）',`${esc(judgeData.name || session.name)} · 已正式提交 <span id="judge-score-count"></span> 份评分`, `<span id="judge-score-window" class="status-chip"></span>`) + '<div class="info-banner">本届使用六维 100 分评分方案。请先看演示、询问过程，再据实评分；草稿不计入成绩。最终规则以现场通知为准。</div>';
+  updateScoreSummary(data);
   if(!judgeData.teams.length){root.innerHTML+=empty('还没有可评审的队伍','主办方录入队伍后即可开始评审。');return;}
   if(!judgeData.teams.some(t=>String(t.id)===String(selectedTeam)))selectedTeam=judgeData.teams[0].id;
   root.innerHTML+='<div class="workspace-grid"><aside class="team-sidebar"><h2>选择参赛队伍</h2><div class="team-picker" id="team-picker"></div></aside><div id="judge-editor"></div></div>';
   renderTeamPicker();renderJudgeEditor();
 }
+function updateScoreSummary(data){
+  const count=document.getElementById('judge-score-count'),windowChip=document.getElementById('judge-score-window');
+  if(count)count.textContent=String(data.myScores.filter(item=>item.status==='submitted').length);
+  if(windowChip){
+    windowChip.className=data.scoringOpen?'status-chip':'status-chip closed';
+    windowChip.textContent=data.scoringOpen?'评分开放中':'评分尚未开放 / 已截止';
+  }
+}
 function renderTeamPicker(){document.getElementById('team-picker').innerHTML=judgeData.teams.map(t=>{const score=judgeData.myScores.find(s=>String(s.teamId)===String(t.id));return `<button class="team-pick ${String(t.id)===String(selectedTeam)?'selected':''}" data-team="${esc(t.id)}"><span class="team-number">TEAM ${String(t.number).padStart(2,'0')}</span><strong>${esc(t.name)}</strong><small class="${score?.status==='submitted'?'saved-status':''}">${score?({submitted:'已正式提交',draft:'草稿已保存',recused:'已回避'}[score.status] || '待评分'):'待评分'}</small></button>`;}).join('');document.querySelectorAll('[data-team]').forEach(b=>b.onclick=()=>{if(String(selectedTeam)===b.dataset.team)return;if(!confirmLeave())return;scoreDirty=false;selectedTeam=b.dataset.team;renderTeamPicker();renderJudgeEditor();});}
-function renderJudgeEditor(){const team=judgeData.teams.find(t=>String(t.id)===String(selectedTeam));const saved=judgeData.myScores.find(s=>String(s.teamId)===String(selectedTeam));const dimensions=judgeData.dimensions;const disabled=judgeData.scoringOpen?'':'disabled';
-  document.getElementById('judge-editor').innerHTML=judgeSubmissionMarkup((judgeData.submissions || []).find(s=>s.teamId===team.id))+`<form class="judge-form" id="score-form"><span class="eyebrow">TEAM ${String(team.number).padStart(2,'0')}</span><h2>${esc(team.name)}</h2><p class="project-line">${esc(team.project || '作品名称待完善')} · ${esc(team.track || '方向待完善')}</p>${saved?`<p class="status-chip">${({submitted:'已提交，可修改后重新提交；草稿不会覆盖正式评分',draft:'草稿已保存，尚未计入成绩',recused:'已回避，可在评分开放期间重新评分'}[saved.status])}</p>`:''}${dimensions.map((d,i)=>`<div class="dimension-row"><label for="score-${i}">${esc(d.name)}<small>满分 ${Number(d.max)} 分</small></label><input type="range" data-slider="${i}" aria-label="${esc(d.name)}滑块" min="0" max="${Number(d.max)}" step="0.1" value="${Number(saved?.scores?.[i] || 0)}" ${disabled}><input type="number" id="score-${i}" name="score${i}" data-score="${i}" aria-label="${esc(d.name)}分数" min="0" max="${Number(d.max)}" step="0.1" value="${Number(saved?.scores?.[i] || 0)}" required ${disabled}></div>`).join('')}<div class="score-preview"><span>专业评分总计</span><strong id="score-total">0.0 <small>/ 100</small></strong></div><label class="field">给团队的评语（选填）<textarea name="feedback" maxlength="2000" placeholder="记录你观察到的优点，以及一条具体的改进建议。" ${disabled}>${esc(saved?.feedback || '')}</textarea><small>评语仅供评委本人及组织方查看，不会出现在公开看板上。</small></label><p class="form-error" role="alert"></p><div class="form-actions"><button type="submit" class="btn" ${disabled}>正式提交评分 ↗</button><button type="button" class="btn secondary" id="save-draft" ${saved?.status==='submitted'?'disabled':disabled}>保存草稿</button><button type="button" class="btn secondary" id="recuse" ${disabled}>回避此队</button></div></form>`;
-  const form=document.getElementById('score-form');let saving=false;const version=routeVersion;form.addEventListener('input',()=>{scoreDirty=true;});function updateTotal(){let total=0;form.querySelectorAll('[data-score]').forEach(input=>{total+=Number(input.value || 0);});document.getElementById('score-total').innerHTML=`${total.toFixed(1)} <small>/ 100</small>`;}
+function renderJudgeEditor(){
+  const data=judgeData,team=data.teams.find(t=>String(t.id)===String(selectedTeam));
+  const saved=data.myScores.find(s=>String(s.teamId)===String(selectedTeam)),dimensions=data.dimensions,owner=session,version=routeVersion;
+  const disabled=data.scoringOpen?'':'disabled';
+  document.getElementById('judge-editor').innerHTML=judgeSubmissionMarkup((judgeData.submissions || []).find(s=>s.teamId===team.id))+`<form class="judge-form" id="score-form"><span class="eyebrow">TEAM ${String(team.number).padStart(2,'0')}</span><h2>${esc(team.name)}</h2><p class="project-line">${esc(team.project || '作品名称待完善')} · ${esc(team.track || '方向待完善')}</p><p class="status-chip" id="score-status">${saved?({submitted:'已提交，可修改后重新提交；草稿不会覆盖正式评分',draft:'草稿已保存，尚未计入成绩',recused:'已回避，可在评分开放期间重新评分'}[saved.status]):'待评分'}</p>${dimensions.map((d,i)=>`<div class="dimension-row"><label for="score-${i}">${esc(d.name)}<small>满分 ${Number(d.max)} 分</small></label><input type="range" data-slider="${i}" aria-label="${esc(d.name)}滑块" min="0" max="${Number(d.max)}" step="0.1" value="${Number(saved?.scores?.[i] || 0)}" ${disabled}><input type="number" id="score-${i}" name="score${i}" data-score="${i}" aria-label="${esc(d.name)}分数" min="0" max="${Number(d.max)}" step="0.1" value="${Number(saved?.scores?.[i] || 0)}" required ${disabled}></div>`).join('')}<div class="score-preview"><span>专业评分总计</span><strong id="score-total">0.0 <small>/ 100</small></strong></div><label class="field">给团队的评语（选填）<textarea name="feedback" maxlength="2000" placeholder="记录你观察到的优点，以及一条具体的改进建议。" ${disabled}>${esc(saved?.feedback || '')}</textarea><small>评语仅供评委本人及组织方查看，不会出现在公开看板上。</small></label><p class="form-error" role="alert"></p><div class="form-actions"><button type="submit" class="btn" ${disabled}>正式提交评分 ↗</button><button type="button" class="btn secondary" id="save-draft" ${saved?.status==='submitted'?'disabled':disabled}>保存草稿</button><button type="button" class="btn secondary" id="recuse" ${disabled}>回避此队</button></div><div id="score-conflict" aria-live="polite"></div></form>`;
+  const form=document.getElementById('score-form');
+  let saving=false,blocked=false,revision=saved?.revision ?? 0,currentStatus=saved?.status,editRevision=0,previewRequest=0;
+  const alive=options=>version===routeVersion && route==='judge' && form.isConnected && judgeData===data && String(selectedTeam)===String(team.id) && editorHasLogin(form,owner,options);
+  const buttons=[...form.querySelectorAll('button')];
+  function updateButtons(){buttons.forEach(button=>button.disabled=saving || blocked || !data.scoringOpen);document.getElementById('save-draft').disabled=saving || blocked || !data.scoringOpen || currentStatus==='submitted';}
+  form.addEventListener('input',()=>{editRevision++;scoreDirty=true;});
+  function updateTotal(){let total=0;form.querySelectorAll('[data-score]').forEach(input=>{total+=Number(input.value || 0);});document.getElementById('score-total').innerHTML=`${total.toFixed(1)} <small>/ 100</small>`;}
   form.querySelectorAll('[data-slider]').forEach(slider=>slider.oninput=()=>{form.elements[`score${slider.dataset.slider}`].value=slider.value;updateTotal();});
   form.querySelectorAll('[data-score]').forEach(input=>input.oninput=()=>{form.querySelector(`[data-slider="${input.dataset.score}"]`).value=input.value;updateTotal();});updateTotal();
-  async function save(status,button){
-    if(saving || !judgeData.scoringOpen)return;
-    if(status!=='recused' && !form.reportValidity())return;
-    const payload={teamId:team.id,scores:dimensions.map((_,i)=>Number(form.elements[`score${i}`].value)),feedback:form.elements.feedback.value,status};
-    const controls=[...form.querySelectorAll('input,textarea,button')],disabledBefore=controls.map(control=>control.disabled);
-    saving=true;controls.forEach(control=>control.disabled=true);formError(form,'');
-    try{await api('score',payload);if(version!==routeVersion || route!=='judge' || !form.isConnected || String(selectedTeam)!==String(team.id))return;scoreDirty=false;toast(status==='submitted'?'评分已正式提交。':status==='draft'?'草稿已保存，尚未计入成绩。':'已记录回避，不计入成绩。');await renderJudge(version,form);}
-    catch(error){if(form.isConnected)formError(form,error.message);}
-    finally{saving=false;if(form.isConnected)controls.forEach((control,i)=>control.disabled=disabledBefore[i]);}
+  function conflict(message='服务端评分已更新。'){
+    blocked=true;scoreDirty=true;const panel=document.getElementById('score-conflict');
+    panel.innerHTML='<section class="info-banner warning"><strong>当前输入已保留</strong><p>'+esc(message)+'先查看最新评分并与上方当前输入核对，复制需要保留的内容，再载入最新记录重新填写。</p><button class="btn secondary small" id="preview-score" type="button">查看服务器最新评分</button></section>';
+    document.getElementById('preview-score').onclick=async()=>{
+      if(!alive({notify:true}))return;
+      const request=++previewRequest;
+      try{
+        const latest=await api('judge',undefined,{loginId:owner.loginId});if(!alive() || request!==previewRequest)return;
+        const record=latest.myScores.find(item=>String(item.teamId)===String(team.id));
+        if(record && (!Number.isSafeInteger(record.revision) || record.revision<1))throw new Error('无法读取评分版本，请刷新页面后重试。');
+        panel.innerHTML='<section class="info-banner warning"><strong>当前输入已保留 · 服务器最新评分</strong><p>请与上方当前输入核对；需要保留的内容请先复制。</p>'+`<p>版本 ${record?.revision ?? 0} · ${esc({draft:'草稿',submitted:'正式提交',recused:'已回避'}[record?.status] || '尚无评分')}</p><dl>`+dimensions.map((dimension,i)=>`<dt>${esc(dimension.name)}</dt><dd>${Number(record?.scores?.[i] ?? 0)} / ${dimension.max}</dd>`).join('')+`</dl><p class="preserve-text">${esc(record?.feedback || '（无评语）')}</p><button class="btn secondary small" id="load-score" type="button">载入最新记录并替换当前输入</button></section>`;
+        document.getElementById('load-score').onclick=()=>{
+          if(!alive({notify:true}) || !confirm('将用上面显示的服务器最新记录替换本队当前输入。请先复制需要保留的内容，确认载入？'))return;
+          data.myScores=data.myScores.filter(item=>String(item.teamId)!==String(team.id));if(record)data.myScores.push(record);
+          data.scoringOpen=latest.scoringOpen;scoreDirty=false;updateScoreSummary(data);renderTeamPicker();renderJudgeEditor();
+        };
+      }catch(error){if(request===previewRequest && alive({error}))formError(form,error.message);}
+    };
   }
-  form.onsubmit=e=>{e.preventDefault();save('submitted',form.querySelector('[type=submit]'));};document.getElementById('save-draft').onclick=e=>save('draft',e.currentTarget);document.getElementById('recuse').onclick=e=>{if(confirm('确定回避此队伍？你对该队的评分将不计入专业均分。评分开放期间可重新评分。'))save('recused',e.currentTarget);};
+  async function save(status){
+    if(!alive({notify:true}) || saving || blocked || !data.scoringOpen || (status==='draft' && currentStatus==='submitted'))return;
+    if(status!=='recused' && !form.reportValidity())return;
+    const payload={teamId:team.id,scores:dimensions.map((_,i)=>Number(form.elements[`score${i}`].value)),feedback:form.elements.feedback.value,status,expectedRevision:revision};
+    const sentEditRevision=editRevision;saving=true;updateButtons();formError(form,'');
+    try{
+      const result=await api('score',payload,{loginId:owner.loginId});if(!alive())return;
+      const record=result.score;
+      if(!record || !Number.isSafeInteger(record.revision) || record.revision<1){conflict();formError(form,'保存结果缺少版本，请查看服务器最新评分核对。');return;}
+      // Keep edits made during the request; adopt only this POST's authoritative revision.
+      revision=record.revision;currentStatus=record.status;
+      data.myScores=data.myScores.filter(item=>String(item.teamId)!==String(team.id));data.myScores.push(record);
+      const unchanged=editRevision===sentEditRevision;scoreDirty=!unchanged;
+      if(unchanged){
+        dimensions.forEach((_,i)=>{const value=String(record.scores?.[i] ?? 0);form.elements[`score${i}`].value=value;form.querySelector(`[data-slider="${i}"]`).value=value;});
+        form.elements.feedback.value=record.feedback || '';updateTotal();
+      }
+      const statusNode=document.getElementById('score-status');if(statusNode)statusNode.textContent={submitted:'已正式提交，可修改后重新提交',draft:'草稿已保存，尚未计入成绩',recused:'已回避，可重新评分'}[record.status];
+      updateScoreSummary(data);
+      renderTeamPicker();toast(unchanged?(status==='submitted'?'评分已正式提交。':status==='draft'?'草稿已保存，尚未计入成绩。':'已记录回避，不计入成绩。'):'已保存提交时的评分，之后的新输入已保留，请核对后再次提交。');
+    }catch(error){
+      if(!alive({error}))return;
+      formError(form,error.status===428?'页面版本已过期，请先复制当前输入，再刷新页面升级。':error.message);
+      if(error.status===409 && error.code==='score_revision_conflict')conflict();
+      else if(error.status===409){blocked=true;scoreDirty=true;formError(form,error.message+'。当前输入已保留，请先复制，再刷新页面核对。');}
+      if(error.status===428 || error.status===403)blocked=true;
+    }finally{saving=false;if(alive())updateButtons();}
+  }
+  form.onsubmit=event=>{event.preventDefault();return save('submitted');};
+  document.getElementById('save-draft').onclick=()=>save('draft');
+  document.getElementById('recuse').onclick=()=>{if(confirm('确定回避此队伍？你对该队的评分将不计入专业均分。评分开放期间可重新评分。'))return save('recused');};
 }
 async function renderAudience(version){const data=await api('audience');if(version!==routeVersion)return;const voted=(data.votedTeamIds || []).map(String),limit=data.voteLimit || 3;root.innerHTML=heading('AUDIENCE / 观众选择','把一票，投给打动你的作品。',`已支持 ${voted.length} / ${limit} 支队伍。观众票独立展示，不叠加到专业总分。`)+`<div class="info-banner ${data.votingOpen?'':'warning'}">${data.votingOpen?'请先看作品演示，再选择支持的队伍。每支队伍每个邀请码最多计 1 票，提交后不能撤回。':'当前观众投票尚未开放或已截止。'}</div>`+(data.teams.length?`<div class="vote-grid">${data.teams.map(t=>`<article class="vote-card ${voted.includes(String(t.id))?'selected':''}"><span class="eyebrow">TEAM ${String(t.number).padStart(2,'0')}</span><h2>${esc(t.name)}</h2><p>${esc(t.project || '作品名称待完善')}<br>${esc(t.track || '')}</p><button class="btn ${voted.includes(String(t.id))?'secondary':''}" data-vote="${esc(t.id)}" ${voted.includes(String(t.id))||voted.length>=limit||!data.votingOpen?'disabled':''}>${voted.includes(String(t.id))?'已支持 ✓':voted.length>=limit?'投票名额已用完':'支持这个作品 ↗'}</button></article>`).join('')}</div>`:empty('队伍即将出现在这里','主办方录入队伍后，你就可以了解并支持他们的作品。'));document.querySelectorAll('[data-vote]').forEach(b=>b.onclick=()=>withBusy(b,async()=>{await api('vote',{teamId:b.dataset.vote});toast('已支持这支队伍，谢谢你的参与。');if(route==='audience')await renderAudience(routeVersion);}));}
 
-async function renderAdmin(version,expectedElement=null){
-  const requestedStage=adminStage,request=++adminJudgingVersion;
+async function renderAdmin(version,expectedElement=null,discardedEdits=null){
+  const owner=session,requestedStage=adminStage,request=++adminJudgingVersion;
   adminLoadPending=request;
   try{
-  const [data,judging]=await Promise.all([api('admin'),api(`admin/judging/${requestedStage}`)]);if(version!==routeVersion || request!==adminJudgingVersion || requestedStage!==adminStage || (expectedElement && (!expectedElement.isConnected || dirtyAdminForms.size)))return;
+  const [data,judging]=await Promise.all([api('admin'),api(`admin/judging/${requestedStage}`)]);
+  if(session!==owner || !ownsBrowserLogin(owner) || route!=='admin' || version!==routeVersion || request!==adminJudgingVersion || requestedStage!==adminStage)return;
+  if(expectedElement){
+    if(!expectedElement.isConnected || [...dirtyAdminForms].some(form=>discardedEdits?.get(form)!==(form.editRevision || 0)))return;
+    if([...root.querySelectorAll('form')].some(form=>form.wouldLoseSettings?.(data.config)))return;
+  }
   if(typeof disposeAdminReviewSync==='function')disposeAdminReviewSync();adminReadOnlyView=null;
   adminEventData=data;dirtyAdminForms.clear();
   const cfg=data.config || {},teams=data.teams || [],judges=data.judges || [],audience=data.audience || [];
   root.innerHTML=heading('ORGANIZER / 活动控制台','活动管理','管理专业评分、成绩发布、参赛身份和独立的展示、路演评审记录。','<span class="small-note" id="admin-sync-status" role="status">所选阶段正式数与评审记录自动同步 · 每 3 秒检查</span><a class="btn secondary small" href="api/admin/export" download>导出评分明细 CSV ↓</a><button class="btn secondary small" id="refresh-admin">刷新数据</button>')+metrics([[teams.length,'本届队伍','admin-total-teams'],[judges.filter(j=>j.active).length,'有效专业评委'],[judges.reduce((n,j)=>n+Number(j.submittedCount || 0),0),'正式提交评分'],[audience.filter(a=>a.active).length,'有效观众邀请码','admin-active-audience']])+`<div class="admin-columns"><section class="surface"><h2>01 / 评分与发布</h2><form id="settings-form"><label class="toggle-line"><input type="checkbox" name="scoringOpen" ${cfg.scoringOpen?'checked':''}>开放专业评分</label><label class="toggle-line"><input type="checkbox" name="resultsPublished" ${cfg.resultsPublished?'checked':''}>公开达到门槛的专业均分</label><div class="settings-row"><label class="field">公开均分所需评委数<input name="minJudges" type="number" min="1" max="50" value="${Number(cfg.minJudges || 5)}" required><small>方案默认 5 人；修改将立即影响公开看板。</small></label><button class="btn small" type="submit">保存设置</button></div><p class="form-error" role="alert"></p></form><div class="info-banner">六维权重为 20 / 20 / 20 / 15 / 15 / 10，总分 100。评分关闭后草稿、提交与改分均锁定；成绩发布可单独控制。</div></section><section class="surface"><h2>发放身份邀请码</h2><form id="invite-form"><div class="form-grid"><label class="field">身份<select name="role"><option value="judge">专业评委</option><option value="audience">观众</option></select></label><label class="field">显示名称<input name="name" required maxlength="80" placeholder="例如：评委 01"></label></div><button class="btn small" type="submit">创建邀请码 ↗</button><p class="form-error" role="alert"></p></form><div id="new-code"></div><p class="small-note">专业评分使用评委身份即可；参与展示或路演评审记录还需加入对应阶段工作名单。统一评委码下，各评委仍选择各自身份。</p><div class="invite-list">${[...judges.map(j=>({...j,role:'judge'})),...audience.map(a=>({...a,role:'audience'}))].map(a=>`<div class="invite-row"><span>${esc(a.name)}<small>${roleName[a.role]} · ${a.active?'有效':'已停用'}</small></span>${a.active?`<button class="btn secondary small" data-revoke="${esc(a.id)}" data-role="${a.role}">停用</button>`:''}</div>`).join('') || '<p class="small-note">尚未创建身份。</p>'}</div></section></div><section class="surface"><h2>观众投票</h2><form id="audience-settings"><p class="small-note">正在读取独立投票窗口…</p></form></section><div class="admin-section-title"><h2>本届参赛队伍</h2><span class="small-note">维护队伍信息；加入各阶段工作名单后才进入对应评审。</span></div><section class="surface"><form id="team-form"><input type="hidden" name="id"><div class="form-grid"><label class="field">队伍编号<input name="number" type="number" min="1" max="999" required placeholder="例如：1"></label><label class="field">队伍名称<input name="name" required maxlength="80" placeholder="团队公开名称"></label><label class="field">作品名称<input name="project" maxlength="140" placeholder="可以稍后补充"></label><label class="field">探索方向<select name="track"><option>AI for Science</option><option>城市与社区问题</option><option>未来学习样态</option></select></label></div><div class="form-actions"><button class="btn small" type="submit" id="save-team">新增队伍 ↗</button><button class="btn secondary small" type="button" id="clear-team">清空表单</button></div><p class="form-error" role="alert"></p></form></section><div class="table-wrap admin-team-table"><table class="board-table"><thead><tr><th>编号</th><th>队伍 / 作品</th><th class="track-col">探索方向</th><th>操作</th></tr></thead><tbody>${teams.map(t=>`<tr><td>${String(t.number).padStart(2,'0')}</td><td><strong>${esc(t.name)}</strong><br><small>${esc(t.project || '待补充')}</small></td><td class="track-col">${esc(t.track || '—')}</td><td><button class="btn secondary small" data-edit="${esc(t.id)}">编辑</button></td></tr>`).join('') || '<tr><td colspan="4">尚未录入本届队伍。</td></tr>'}</tbody></table></div>`;
-  document.getElementById('refresh-admin').onclick=event=>{if(!confirmLeave())return;dirtyAdminForms.clear();renderAdmin(routeVersion,event.currentTarget);};
+  document.getElementById('refresh-admin').onclick=event=>{
+    if(!confirmLeave())return;
+    const discarded=new Map([...dirtyAdminForms].map(form=>[form,form.editRevision || 0]));
+    return renderAdmin(routeVersion,event.currentTarget,discarded);
+  };
   root.insertAdjacentHTML('beforeend',metrics([[judging.roster.judgeIds.length,'所选阶段评委','admin-stage-judges'],[judging.reviews.filter(r=>r.submitted && !r.recused && !r.invalidated).length,'所选阶段正式记录（未计分）','admin-stage-reviews']])+`<div class="stage-switch" aria-label="选择评审阶段"><button type="button" class="btn secondary" data-admin-stage="exhibition" aria-pressed="${adminStage==='exhibition'}">展示评审</button><button type="button" class="btn secondary" data-admin-stage="roadshow" aria-pressed="${adminStage==='roadshow'}">路演评审</button></div><div id="judging-admin"></div>`);
   document.querySelectorAll('[data-admin-stage]').forEach(button=>button.onclick=()=>{const next=button.dataset.adminStage;if(next===adminStage)return;if(stageHasUnsavedInputs() && !confirm('本轮有尚未保存的输入，确认切换阶段并放弃这些输入？'))return;clearStageUnsavedInputs();adminStage=next;loadAdminJudging(version);});
 
   installJudgingAdmin(data,judging);
   const settings=document.getElementById('settings-form');
-  settings.onsubmit=async e=>{e.preventDefault();const editRevision=settings.editRevision || 0,viewVersion=routeVersion;await withBusy(settings.querySelector('button'),async()=>{formError(settings,'');try{await api('admin/settings',{scoringOpen:settings.elements.scoringOpen.checked,resultsPublished:settings.elements.resultsPublished.checked,minJudges:Number(settings.elements.minJudges.value)});if(viewVersion!==routeVersion || route!=='admin' || !settings.isConnected)return;if((settings.editRevision || 0)!==editRevision){toast('设置已保存。保存期间的新输入已保留，请核对后再次保存。');return;}dirtyAdminForms.delete(settings);toast('评分与发布设置已保存。');}catch(err){if(settings.isConnected)formError(settings,err.message);}});};
+  installSettingsForm(settings,'scoring',cfg);
 
   const invite=document.getElementById('invite-form');invite.onsubmit=e=>{e.preventDefault();withBusy(invite.querySelector('button'),async()=>{formError(invite,'');try{const result=await api('admin/invitations',{role:invite.elements.role.value,name:invite.elements.name.value.trim()});document.getElementById('new-code').innerHTML=`<div class="code-output"><strong>${esc(result.name)} · ${roleName[invite.elements.role.value]}</strong><code>${esc(result.code)}</code><span>请立即复制并单独发放；刷新后不再显示。</span><br><button class="btn secondary small" id="copy-code" type="button">复制邀请码</button></div>`;document.getElementById('copy-code').onclick=async()=>{try{await navigator.clipboard.writeText(result.code);toast('邀请码已复制，请单独发放。');}catch{toast('请选中上方邀请码手动复制。');}};invite.elements.name.value='';dirtyAdminForms.delete(invite);toast('身份已创建。参与展示或路演评审记录时，需刷新数据后加入对应阶段名单。');}catch(error){formError(invite,error.message);}});};
   const teamForm=document.getElementById('team-form');teamForm.onsubmit=e=>{e.preventDefault();const editRevision=teamForm.editRevision || 0;withBusy(teamForm.querySelector('[type=submit]'),async()=>{formError(teamForm,'');try{const payload={number:Number(teamForm.elements.number.value),name:teamForm.elements.name.value.trim(),project:teamForm.elements.project.value.trim(),track:teamForm.elements.track.value};if(teamForm.elements.id.value)payload.id=teamForm.elements.id.value;await api('admin/teams',payload);toast('队伍信息已保存。');if(route==='admin' && teamForm.isConnected){if((teamForm.editRevision || 0)!==editRevision){toast('已保存提交时的内容，之后的新输入已保留。');return;}dirtyAdminForms.delete(teamForm);if(!dirtyAdminForms.size)await renderAdmin(routeVersion,teamForm);}}catch(error){formError(teamForm,error.message);}});};
@@ -485,7 +622,7 @@ function installSubmissionOverview(data){
 }
 
 function installSubmissionAdmin(data){const cfg=data.config || {};root.insertAdjacentHTML('beforeend',`<div class="admin-section-title"><h2>作品提交管理</h2><a class="btn secondary small" href="api/admin/submissions/export" download>导出项目提交 CSV ↓</a></div><section class="surface"><h3>提交窗口与截止</h3><form id="submission-settings"><label class="toggle-line"><input type="checkbox" name="submissionsOpen" ${cfg.submissionsOpen?'checked':''}>开放作品提交（独立于评分与投票）</label><label class="field">截止时间（北京时间）<input name="submissionDeadline" type="datetime-local" step="60" value="${esc(beijingInput(cfg.submissionDeadline))}"><small>留空表示不设截止；到点服务器自动锁定。补交时延长截止并重新开放。建议先关闭提交，再使用正式材料评审。</small></label><button class="btn small" type="submit">保存提交窗口</button><p class="form-error" role="alert"></p></form></section><div id="team-access-code" aria-live="polite"></div>${submissionOverviewMarkup()}`);
-  const settings=document.getElementById('submission-settings');settings.onsubmit=e=>{e.preventDefault();withBusy(settings.querySelector('button'),async()=>{formError(settings,'');try{const deadline=parseBeijingInput(settings.elements.submissionDeadline.value);await api('admin/settings',{submissionsOpen:settings.elements.submissionsOpen.checked,submissionDeadline:deadline});dirtyAdminForms.delete(settings);toast('作品提交窗口已保存。');}catch(error){formError(settings,error.message);}});};
+  installSettingsForm(document.getElementById('submission-settings'),'submissions',cfg);
   installSubmissionOverview(data);
 }
 
