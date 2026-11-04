@@ -33,7 +33,8 @@ from errors import APIError
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS team_api (
- team_id TEXT PRIMARY KEY REFERENCES teams(id), active INTEGER NOT NULL CHECK(active IN (0,1)), created_at INTEGER NOT NULL
+ team_id TEXT PRIMARY KEY REFERENCES teams(id), active INTEGER NOT NULL CHECK(active IN (0,1)), created_at INTEGER NOT NULL,
+ daily_budget REAL, total_budget REAL, note TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS api_keys (
  id TEXT PRIMARY KEY, team_id TEXT NOT NULL REFERENCES teams(id), name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE,
@@ -52,6 +53,9 @@ CREATE TABLE IF NOT EXISTS api_usage (
  client_ip TEXT NOT NULL DEFAULT '', upstream_request_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS api_usage_at ON api_usage(at);
+CREATE TABLE IF NOT EXISTS api_responses (
+ response_id TEXT PRIMARY KEY, team_id TEXT NOT NULL REFERENCES teams(id), at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS api_usage_team ON api_usage(team_id, at);
 CREATE INDEX IF NOT EXISTS api_usage_key ON api_usage(key_id, at);
 CREATE TABLE IF NOT EXISTS gateway_config (
@@ -63,7 +67,8 @@ CREATE TABLE IF NOT EXISTS api_logs (
 );
 """
 DEFAULTS = {"keys.dailyBudget": 5, "keys.totalBudget": 50, "keys.maxKeys": 5, "keys.expiresAt": None,
-            "keys.logContent": True, "keys.clientRules": [], "keys.teamRpm": 60, "keys.announcement": "", "keys.blockedWords": []}
+            "keys.logContent": True, "keys.clientRules": [], "keys.teamRpm": 60, "keys.announcement": "", "keys.blockedWords": [],
+            "keys.logRetentionHours": 72, "keys.logMaxMB": 2048}  # request content is bounded (sub2api keeps no bodies at all)
 # Public path -> (upstream name, path appended to that upstream's base URL)
 ROUTES = {"/v1/chat/completions": ("openai", "/chat/completions"), "/v1/messages": ("anthropic", "/messages"),
           "/v1/responses": ("openai", "/responses")}  # Responses API: Codex CLI
@@ -450,8 +455,10 @@ def bound_output(body, inject=True):
         limit = max(body[f] for f in present)
     elif inject:
         body["max_tokens"] = limit  # Anthropic requires max_tokens anyway
-    # OpenAI-compatible routes get no injected field (o-series/gpt-5 reject max_tokens); the default is then an estimate,
-    # not a ceiling, exactly as in sub2api.
+    else:
+        # OpenAI-compatible routes get no injected field (o-series/gpt-5 reject max_tokens, some providers reject the
+        # alternatives), so without a client limit the reservation is the cap: a true ceiling, released after the call.
+        limit = RESERVE_OUTPUT_CAP
     thinking = body.get("thinking")
     if isinstance(thinking, dict) and type(thinking.get("budget_tokens")) is int and type(body.get("max_tokens")) is int \
             and thinking["budget_tokens"] >= body["max_tokens"] > 1024:
@@ -565,22 +572,25 @@ ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))
 
 
 def request_text(body):
-    """All text the model will read (every message, the system prompt, Responses input), normalised like sub2api's
-    moderation input (NFKC, no zero-width, collapsed spaces, lowercase). Only values are read, never JSON keys."""
+    """All text the model will read, normalised like sub2api's moderation input (NFKC, no zero-width, collapsed spaces,
+    lowercase). Every string value is read (tool arguments, outputs and summaries too); JSON keys never are, and image
+    or base64 payloads are skipped."""
     texts = []
 
-    def walk(node):
+    def walk(node, key=""):
         if isinstance(node, str):
+            if key in ("data", "url", "image_url", "file_data") or node.startswith("data:"):
+                return  # media payloads
             texts.append(node)
         elif isinstance(node, list):
             for item in node:
-                walk(item)
+                walk(item, key)
         elif isinstance(node, dict):
-            for key in ("text", "content", "input", "system", "thinking"):
-                if key in node:
-                    walk(node[key])
-    for field in ("system", "messages", "input", "instructions", "prompt"):
-        walk(body.get(field))
+            for k, v in node.items():
+                if k not in ("type", "role", "id", "model", "cache_control", "media_type", "tool_use_id", "call_id"):
+                    walk(v, k)
+    for field in ("system", "messages", "input", "instructions", "prompt", "tools"):
+        walk(body.get(field), field)
     text = " ".join(texts)
     return " ".join(unicodedata.normalize("NFKC", text).translate(ZERO_WIDTH).split()).lower()
 
@@ -599,6 +609,7 @@ class KeyService:
         self.reserved = defaultdict(int)  # team -> micro-USD held by requests in flight
         self.waiting = defaultdict(int)  # team -> requests queued for a slot
         self.counting = defaultdict(int)  # team -> count_tokens calls in flight
+        self.last_prune = 0.0
         self.team_locks = defaultdict(threading.Lock)  # per team, so one team's budget check never blocks the others
         self.auth_failures, self.auth_blocked = defaultdict(deque), {}
         self.auth_failures_seen = deque(maxlen=100000)  # failed key attempts, for the admin overview
@@ -619,6 +630,10 @@ class KeyService:
         for column, kind in added.items():  # databases created before these columns existed
             if column not in columns:
                 db.execute(f"ALTER TABLE api_usage ADD COLUMN {column} {kind}")
+        team_columns = {r["name"] for r in db.execute("PRAGMA table_info(team_api)")}
+        for column, kind in {"daily_budget": "REAL", "total_budget": "REAL", "note": "TEXT NOT NULL DEFAULT ''"}.items():
+            if column not in team_columns:  # per-team overrides of the global budgets (sub2api: per-user limits)
+                db.execute(f"ALTER TABLE team_api ADD COLUMN {column} {kind}")
         for key, value in DEFAULTS.items():
             db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, json.dumps(value)))
         if self.seed:
@@ -674,6 +689,26 @@ class KeyService:
         # Config order is kept: the first model of each upstream is the default shown in setup snippets.
         return {name: list(item["models"]) for name, item in (self.config or {}).items()}
 
+    def limits(self, db, team_id, settings):
+        """(24h, total) budget for a team: its own override if the organizer set one, else the global setting."""
+        row = db.execute("SELECT daily_budget,total_budget FROM team_api WHERE team_id=?", (team_id,)).fetchone()
+        daily = row["daily_budget"] if row and row["daily_budget"] is not None else settings["dailyBudget"]
+        total = row["total_budget"] if row and row["total_budget"] is not None else settings["totalBudget"]
+        return daily, total
+
+    def daily_reset_at(self, db, team_id, limit):
+        """When the rolling 24h spend first drops back under the limit, or None if it is already under."""
+        used = 0
+        rows = db.execute("SELECT at,cost_micro FROM api_usage WHERE team_id=? AND at>=? ORDER BY at", (team_id, now_ms() - DAY_MS)).fetchall()
+        used = sum(r["cost_micro"] for r in rows) / 1e6
+        if used < limit:
+            return None
+        for r in rows:
+            used -= r["cost_micro"] / 1e6
+            if used < limit:
+                return r["at"] + DAY_MS
+        return None
+
     def spend(self, db, team_id, since=0):
         return db.execute("SELECT COALESCE(SUM(cost_micro),0) FROM api_usage WHERE team_id=? AND at>=?", (team_id, since)).fetchone()[0] / 1e6
 
@@ -696,6 +731,7 @@ class KeyService:
         if method == "GET" and path == "/api/team/keys":
             if not enabled:
                 return {"enabled": False, "keys": []}
+            daily_limit, total_limit = self.limits(db, team_id, settings)
             since = now_ms() - DAY_MS
             keys = [{"id": r["id"], "name": r["name"], "masked": r["masked"], "createdAt": r["created_at"], "lastUsedAt": r["last_used_at"],
                      "used24h": r["day"] / 1e6, "usedTotal": r["total"] / 1e6, "requests": r["requests"]}
@@ -706,8 +742,8 @@ class KeyService:
             return {"enabled": True, "baseUrl": self.service.origin + self.service.base_path, "models": self.models(),
                     "maxKeys": settings["maxKeys"], "keys": keys, "logContent": settings["logContent"],
                     "clientRules": settings["clientRules"], "announcement": settings["announcement"],
-                    "budget": {"used24h": self.spend(db, team_id, since), "dailyLimit": settings["dailyBudget"],
-                               "usedTotal": self.spend(db, team_id), "totalLimit": settings["totalBudget"], "expiresAt": settings["expiresAt"]}}
+                    "budget": {"used24h": self.spend(db, team_id, since), "dailyLimit": daily_limit, "dailyResetAt": self.daily_reset_at(db, team_id, daily_limit),
+                               "usedTotal": self.spend(db, team_id), "totalLimit": total_limit, "expiresAt": settings["expiresAt"]}}
         if not enabled:
             raise APIError(409, "本队 API 额度尚未开通或已停用")
         if method == "GET" and path == "/api/team/keys/logs":
@@ -745,7 +781,7 @@ class KeyService:
     def admin(self, db, actor, method, path, body, settings):
         if method == "GET" and path == "/api/admin/keys":
             since = now_ms() - DAY_MS
-            rows = db.execute("""SELECT t.team_id, t.active,
+            rows = db.execute("""SELECT t.team_id, t.active, t.daily_budget, t.total_budget, t.note,
               (SELECT COUNT(*) FROM api_keys k WHERE k.team_id=t.team_id AND k.active=1) AS key_count FROM team_api t""").fetchall()
             today = beijing_midnight()
             overview = dict(db.execute("""SELECT COUNT(*) AS requests, COALESCE(SUM(cost_micro),0)/1e6 AS cost,
@@ -754,6 +790,14 @@ class KeyService:
               COALESCE(SUM(status>=400 OR incomplete=1),0) AS errors,
               COUNT(DISTINCT team_id) AS teams, CAST(AVG(CASE WHEN status<400 THEN duration_ms END) AS INTEGER) AS avgMs
               FROM api_usage WHERE at>=?""", (today,)).fetchone())
+            recent = db.execute("SELECT COUNT(*), COALESCE(SUM(input_tokens+output_tokens+cache_write_tokens+cache_read_tokens),0) FROM api_usage WHERE at>=?",
+                                (now_ms() - 300_000,)).fetchone()
+            overview["rpm"], overview["tpm"] = round(recent[0] / 5, 1), round(recent[1] / 5)  # last 5 minutes, as sub2api
+            ok = db.execute("SELECT COUNT(*) FROM api_usage WHERE at>=? AND status<400 AND incomplete=0", (today,)).fetchone()[0]
+            overview["p95Ms"] = db.execute("""SELECT duration_ms FROM api_usage WHERE at>=? AND status<400 AND incomplete=0
+              ORDER BY duration_ms LIMIT 1 OFFSET ?""", (today, max(0, int(ok * 0.95) - 1))).fetchone()[0] if ok else None
+            overview["avgFirstTokenMs"] = db.execute("SELECT CAST(AVG(first_token_ms) AS INTEGER) FROM api_usage WHERE at>=?", (today,)).fetchone()[0]
+            storage = dict(db.execute("SELECT COUNT(*) AS rows, COALESCE(SUM(length(request)+length(response)),0) AS bytes FROM api_logs").fetchone())
             changes = [{"at": r["at"], "action": r["action"], "target": r["target"], "metadata": json.loads(r["metadata"])}
                        for r in db.execute("SELECT at,action,target,metadata FROM audit WHERE action LIKE 'api-%' ORDER BY id DESC LIMIT 50")]
             with self.lock:
@@ -764,21 +808,28 @@ class KeyService:
                                  "blockedClients": sum(1 for t in self.auth_blocked.values() if t > time.monotonic())}
             overview.update(overview_auth)
             return {"enabled": self.config is not None, "settings": settings, "models": self.models(), "overview": overview,
-                    "upstreams": self.public_config(db),
+                    "upstreams": self.public_config(db), "storage": storage,
                     "changes": changes,
                     "teams": [{"teamId": r["team_id"], "active": bool(r["active"]), "keyCount": r["key_count"], "inflight": inflight.get(r["team_id"], 0), "waiting": waiting.get(r["team_id"], 0),
-                               "used24h": self.spend(db, r["team_id"], since), "usedTotal": self.spend(db, r["team_id"])} for r in rows]}
+                               "used24h": self.spend(db, r["team_id"], since), "usedTotal": self.spend(db, r["team_id"]),
+                               "dailyBudget": r["daily_budget"], "totalBudget": r["total_budget"], "note": r["note"],
+                               "dailyLimit": self.limits(db, r["team_id"], settings)[0]} for r in rows]}
         if method == "GET" and path == "/api/admin/keys/export":
             self.service.audit(db, actor, "api-usage.export")
             return self.export(db)
         if method == "POST" and path == "/api/admin/keys/settings":
-            if not body or not set(body).issubset({"dailyBudget", "totalBudget", "maxKeys", "expiresAt", "logContent", "clientRules", "teamRpm", "announcement", "blockedWords"}):
+            if not body or not set(body).issubset({"dailyBudget", "totalBudget", "maxKeys", "expiresAt", "logContent", "clientRules", "teamRpm",
+                                                   "announcement", "blockedWords", "logRetentionHours", "logMaxMB"}):
                 raise APIError(400, "API 设置字段不正确")
             before = dict(settings)
             for key, value in body.items():
                 if key == "clientRules":
                     check_rules(value)
                     ok = True
+                elif key == "logRetentionHours":
+                    ok = type(value) is int and 1 <= value <= 8760
+                elif key == "logMaxMB":
+                    ok = type(value) is int and 50 <= value <= 102400
                 elif key == "teamRpm":
                     ok = type(value) is int and 0 <= value <= 10000
                 elif key == "announcement":
@@ -797,11 +848,40 @@ class KeyService:
                 if not ok:
                     raise APIError(400, {"maxKeys": "每队密钥上限应为1至20的整数", "expiresAt": "到期时间必须是有效的毫秒时间戳或空值", "logContent": "记录内容开关必须为布尔值",
                                                "teamRpm": "每分钟请求上限应为0至10000的整数（0为不限）", "announcement": "公告最多500字",
-                                               "blockedWords": "屏蔽词最多200个，每个1至100字"}.get(key, "额度应为0至100000美元"))
+                                               "blockedWords": "屏蔽词最多200个，每个1至100字",
+                                               "logRetentionHours": "调用内容保留时长应为1至8760小时", "logMaxMB": "调用内容总容量应为50至102400MB"}.get(key, "额度应为0至100000美元"))
                 db.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(value), "keys." + key))
             changed = {k: [before.get(k), v] for k, v in self.settings(db).items() if k in body and before.get(k) != v}
             self.service.audit(db, actor, "api-key.settings", metadata=changed)
             return {"ok": True, "settings": self.settings(db)}
+        if method == "POST" and path == "/api/admin/keys/team":
+            if not isinstance(body, dict) or set(body) != {"teamId", "dailyBudget", "totalBudget", "note"}:
+                raise APIError(400, "队伍额度字段不正确")
+            team_id = self.service.team_exists(db, body["teamId"])
+            before = db.execute("SELECT daily_budget,total_budget,note FROM team_api WHERE team_id=?", (team_id,)).fetchone()
+            if not before:
+                raise APIError(409, "该队 API 额度尚未开通")
+            for field in ("dailyBudget", "totalBudget"):
+                value = body[field]
+                if value is not None and (type(value) not in (int, float) or not 0 <= value <= 100000):
+                    raise APIError(400, "队伍额度应为0至100000美元，或留空使用全局设置")
+            note = self.text(body["note"], "备注", 200)
+            db.execute("UPDATE team_api SET daily_budget=?,total_budget=?,note=? WHERE team_id=?", (body["dailyBudget"], body["totalBudget"], note, team_id))
+            self.service.audit(db, actor, "api-key.team-limits", team_id, {"dailyBudget": [before["daily_budget"], body["dailyBudget"]],
+                                                                           "totalBudget": [before["total_budget"], body["totalBudget"]], "note": note})
+            return {"ok": True}
+        if method == "POST" and path == "/api/admin/keys/logs/clear":
+            deleted = self.prune_logs(db, settings, everything=True)
+            self.service.audit(db, actor, "api-log.clear", metadata={"deleted": deleted})
+            return {"ok": True, "deleted": deleted}
+        if method == "GET" and path.startswith(("/api/admin/keys/upstreams/test/", "/api/admin/keys/upstreams/models/")):
+            # GET on purpose: these call the upstream, and POSTs run inside a write transaction that would block others.
+            kind = path.rsplit("/", 1)[1]
+            if not self.config or kind not in self.config:
+                raise APIError(404, "该类上游尚未配置")
+            result = self.probe_upstream(kind, models_only=path.startswith("/api/admin/keys/upstreams/models/"))
+            self.service.audit(db, actor, "api-upstreams.test", kind, {"ok": result["ok"], "status": result.get("status")})
+            return result
         if method == "POST" and path == "/api/admin/keys/upstreams":
             return self.save_upstreams(db, actor, body)
         if method == "POST" and path == "/api/admin/keys/stats":
@@ -811,11 +891,11 @@ class KeyService:
         if method == "POST" and path == "/api/admin/keys/log":
             if set(body) != {"id"} or type(body["id"]) is not int:
                 raise APIError(400, "记录编号不正确")
-            row = db.execute("SELECT * FROM api_logs WHERE usage_id=?", (body["id"],)).fetchone()
+            row = db.execute("SELECT l.*, u.request_id FROM api_logs l JOIN api_usage u ON u.id=l.usage_id WHERE l.usage_id=?", (body["id"],)).fetchone()
             if not row:
                 raise APIError(404, "该请求没有记录内容")
             self.service.audit(db, actor, "api-log.view", str(body["id"]))
-            return {"id": body["id"], "headers": json.loads(row["headers"]), "request": unpack(row["request"]), "response": unpack(row["response"]),
+            return {"id": body["id"], "requestId": row["request_id"], "headers": json.loads(row["headers"]), "request": unpack(row["request"]), "response": unpack(row["response"]),
                     "requestBytes": row["request_bytes"], "responseBytes": row["response_bytes"],
                     "responseTruncated": row["response_bytes"] > RESPONSE_LOG_CAP}
         if method == "POST" and path in {"/api/admin/keys/provision", "/api/admin/keys/revoke"}:
@@ -830,10 +910,46 @@ class KeyService:
                     raise APIError(409, "尚未配置模型上游，请先在“模型上游”中填写")
                 if self.team_active(db, team_id):
                     raise APIError(409, "该队 API 额度已开通")
-                db.execute("INSERT INTO team_api VALUES (?,1,?) ON CONFLICT(team_id) DO UPDATE SET active=1", (team_id, now_ms()))
+                db.execute("INSERT INTO team_api(team_id,active,created_at) VALUES (?,1,?) ON CONFLICT(team_id) DO UPDATE SET active=1", (team_id, now_ms()))
             self.service.audit(db, actor, "api-key." + path.rsplit("/", 1)[1], team_id)
             return {"ok": True}
         raise APIError(404, "接口不存在")
+
+    def probe_upstream(self, kind, models_only=False):
+        """sub2api's account test: a 1-token request to the first model, or the upstream's own model list, with the saved key."""
+        upstream = self.config[kind]
+        headers = {"Content-Type": "application/json", "User-Agent": "gotc-gateway/1.0"}
+        if kind == "openai":
+            headers["Authorization"] = "Bearer " + upstream["key"]
+        else:
+            headers["x-api-key"], headers["anthropic-version"] = upstream["key"], "2023-06-01"
+        model = next(iter(upstream["models"]))
+        if models_only:
+            request = urllib.request.Request(upstream["url"] + "/models", headers=headers, method="GET")
+        else:
+            body = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
+            request = urllib.request.Request(upstream["url"] + ("/chat/completions" if kind == "openai" else "/messages"),
+                                             data=gateway_json(body), headers=headers, method="POST")
+        started = time.monotonic()
+        try:
+            with self.opener.open(request, timeout=30) as response:
+                status, payload = response.status, response.read(2_000_000)
+        except urllib.error.HTTPError as error:
+            status, payload = error.code, error.read(100_000) if error.fp else b""
+        except (OSError, http.client.HTTPException) as error:
+            return {"ok": False, "status": None, "latencyMs": int((time.monotonic() - started) * 1000), "message": failure_reason(error)}
+        latency = int((time.monotonic() - started) * 1000)
+        if status >= 400:
+            return {"ok": False, "status": status, "latencyMs": latency, "message": upstream_message(payload, upstream["key"])}
+        if not models_only:
+            return {"ok": True, "status": status, "latencyMs": latency, "model": model, "message": "连接正常，上游已返回回复"}
+        try:
+            listed = json.loads(payload).get("data")
+        except (ValueError, AttributeError):
+            listed = None
+        ids = sorted({str(m.get("id"))[:100] for m in listed if isinstance(m, dict) and m.get("id")}) if isinstance(listed, list) else []
+        return {"ok": bool(ids), "status": status, "latencyMs": latency, "models": ids[:500],
+                "message": f"上游提供 {len(ids)} 个模型" if ids else "上游未返回模型列表"}
 
     def scope(self, db, body, allowed):
         """Shared filter for stats and logs: optional teamId / keyId."""
@@ -851,7 +967,11 @@ class KeyService:
         return where, params
 
     def stats(self, db, body):
-        where, params = self.scope(db, body, {"teamId", "keyId", "days"})
+        where, params = self.scope(db, body, {"teamId", "keyId", "days", "granularity"})
+        granularity = body.get("granularity", "day")
+        if granularity not in ("day", "hour"):
+            raise APIError(400, "统计粒度只能是 day 或 hour")
+        bucket = "date(u.at/1000+28800,'unixepoch')" if granularity == "day" else "strftime('%Y-%m-%d %H:00',u.at/1000+28800,'unixepoch')"
         days = body.get("days", 7)
         if type(days) is not int or not 1 <= days <= 90:
             raise APIError(400, "统计天数应为1至90")
@@ -876,11 +996,19 @@ class KeyService:
               ORDER BY requests DESC"""),
             "byClient": rows(f"SELECT u.user_agent AS userAgent, {sums} FROM api_usage u WHERE {clause} GROUP BY u.user_agent ORDER BY requests DESC LIMIT 20"),
             # Calendar days in Beijing time.
-            "daily": rows(f"SELECT date(u.at/1000+28800,'unixepoch') AS day, {sums} FROM api_usage u WHERE {clause} GROUP BY day ORDER BY day"),
+            "granularity": granularity,  # Beijing time buckets
+            "daily": rows(f"SELECT {bucket} AS day, {sums} FROM api_usage u WHERE {clause} GROUP BY day ORDER BY day"),
         }
 
     def logs(self, db, body):
-        where, params = self.scope(db, body, {"teamId", "keyId", "beforeId", "errorsOnly"})
+        where, params = self.scope(db, body, {"teamId", "keyId", "beforeId", "errorsOnly", "model", "requestId"})
+        for field, column in (("model", "u.model"), ("requestId", "u.request_id")):
+            value = body.get(field)
+            if value not in (None, ""):
+                if not isinstance(value, str) or len(value) > 100:
+                    raise APIError(400, "筛选条件不正确")
+                where.append(f"({column}=? OR u.requested_model=?)" if field == "model" else f"{column}=?")
+                params.extend([value.strip(), value.strip()] if field == "model" else [value.strip()])
         if body.get("beforeId") is not None:
             if type(body["beforeId"]) is not int:
                 raise APIError(400, "分页参数不正确")
@@ -965,9 +1093,10 @@ class KeyService:
             if settings["expiresAt"] is not None and current >= settings["expiresAt"]:
                 raise GatewayError("billing", "本活动 API 额度已到期")
             held = (self.reserved[team] + estimate) / 1e6
-            if self.spend(db, team, current - DAY_MS) + held > settings["dailyBudget"]:
+            daily, total = self.limits(db, team, settings)
+            if self.spend(db, team, current - DAY_MS) + held > daily:
                 raise GatewayError("usage_limit", "本队近24小时额度不足以完成本次请求")
-            if self.spend(db, team) + held > settings["totalBudget"]:
+            if self.spend(db, team) + held > total:
                 raise GatewayError("billing", "本队总额度不足以完成本次请求")
             self.reserved[team] += estimate
 
@@ -1035,6 +1164,29 @@ class KeyService:
         except (OSError, ValueError):
             return True
 
+    def prune_logs(self, db, settings, everything=False):
+        """Delete stored request content past the retention period, then oldest first above the size cap.
+        Call metadata (tokens, cost, status) is never deleted: budgets are computed from it."""
+        if everything:
+            return db.execute("DELETE FROM api_logs").rowcount
+        cutoff = now_ms() - settings["logRetentionHours"] * 3600_000
+        deleted = db.execute("DELETE FROM api_logs WHERE usage_id IN (SELECT id FROM api_usage WHERE at<?)", (cutoff,)).rowcount
+        cap = settings["logMaxMB"] * 1048576
+        total = db.execute("SELECT COALESCE(SUM(length(request)+length(response)),0) FROM api_logs").fetchone()[0]
+        while total > cap:
+            rows = db.execute("SELECT usage_id, length(request)+length(response) AS size FROM api_logs ORDER BY usage_id LIMIT 500").fetchall()
+            if not rows:
+                break
+            ids = []
+            for r in rows:
+                ids.append(r["usage_id"])
+                total -= r["size"]
+                if total <= cap:
+                    break
+            db.execute(f"DELETE FROM api_logs WHERE usage_id IN ({','.join('?' * len(ids))})", ids)
+            deleted += len(ids)
+        return deleted
+
     def safe_record(self, handler, call):
         """record(), but a storage failure must not hide the original error or leave the client without a reply."""
         try:
@@ -1100,6 +1252,11 @@ class KeyService:
                                                      call.get("stream_first_ms") if call["stream"] else call.get("first_token_ms"),
                                                      client_ip(handler), call.get("upstream_request_id", "")[:100], call["request_id"])).lastrowid
             db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (at, call["key"]["id"]))
+            if call.get("response_id"):
+                db.execute("INSERT OR IGNORE INTO api_responses VALUES (?,?,?)", (call["response_id"], call["key"]["team_id"], at))
+            if call["log"] and time.monotonic() - self.last_prune > 600:  # amortised: at most every 10 minutes
+                self.last_prune = time.monotonic()
+                self.prune_logs(db, call.get("settings") or self.settings(db))
             if call["log"]:
                 headers = {k: v[:500] for k, v in handler.headers.items() if k.lower() not in SECRET_HEADERS}
                 response = b"".join(call["response"])[:RESPONSE_LOG_CAP]
@@ -1178,9 +1335,10 @@ class KeyService:
                 if settings["expiresAt"] is not None and current >= settings["expiresAt"]:
                     raise GatewayError("billing", "本活动 API 额度已到期")
                 # Cheap early reject; the binding check is reserve() after the queue wait.
-                if self.spend(db, row["team_id"], current - DAY_MS) >= settings["dailyBudget"]:
+                daily, total = self.limits(db, row["team_id"], settings)
+                if self.spend(db, row["team_id"], current - DAY_MS) >= daily:
                     raise GatewayError("usage_limit", "本队近24小时额度已用完")
-                if self.spend(db, row["team_id"]) >= settings["totalBudget"]:
+                if self.spend(db, row["team_id"]) >= total:
                     raise GatewayError("billing", "本队总额度已用完")
         return row
 
@@ -1288,6 +1446,18 @@ class KeyService:
         if body.get("n", 1) != 1 or "best_of" in body:
             # Several completions per call multiply output cost beyond the reservation; one reply per request.
             raise APIError(400, "本活动每次请求只生成一条回复（n 必须为 1，不支持 best_of）")
+        if path == "/v1/responses":
+            # All teams share one upstream account: stored conversations must not cross teams, and background runs would
+            # finish after the call, outside billing.
+            if body.get("background") or body.get("conversation") is not None or isinstance(body.get("prompt"), dict):
+                raise GatewayError("invalid", "本活动不支持 background、conversation 与预存 prompt，请在请求中直接提供输入")
+            previous = body.get("previous_response_id")
+            if previous is not None:
+                with self.service.db() as db:
+                    owned = isinstance(previous, str) and db.execute("SELECT 1 FROM api_responses WHERE response_id=? AND team_id=?",
+                                                                     (previous, key["team_id"])).fetchone()
+                if not owned:
+                    raise GatewayError("forbidden", "previous_response_id 不属于本队", detail=f"previous_response_id={str(previous)[:80]}")
         for field in PRICING_FIELDS:
             body.pop(field, None)
         call["stream"] = stream = body.get("stream") is True
@@ -1483,6 +1653,8 @@ class KeyService:
                                    upstream_message=message) from None
             read_usage(name, data, usage)
             call["done"] = True  # a complete JSON body is a finished reply
+            if call["path"] == "/v1/responses" and isinstance(data, dict) and data.get("id"):
+                call["response_id"] = str(data["id"])[:100]
             self.keep(call, payload)
             self.safe_record(handler, call)
             self.send(handler, call, response.status, content_type, payload)
@@ -1538,6 +1710,8 @@ class KeyService:
                         parsed = None
                     read_usage(name, parsed, usage)
                     stream_progress(name, parsed, call)
+                    if isinstance(parsed, dict) and isinstance(parsed.get("response"), dict) and parsed["response"].get("id"):
+                        call["response_id"] = str(parsed["response"]["id"])[:100]
                     if call["reply_bytes"] and call.get("stream_first_ms") is None:
                         call["stream_first_ms"] = int((time.monotonic() - call["started"]) * 1000)
                     if isinstance(parsed, dict) and (parsed.get("type") in ("error", "response.failed") or isinstance(parsed.get("error"), (dict, str))):

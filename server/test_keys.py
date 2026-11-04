@@ -33,6 +33,15 @@ class FakeUpstream(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def do_GET(self):  # upstream model list, for the admin "fetch models" button
+        FakeUpstream.calls.append((self.path, dict(self.headers), None))
+        payload = json.dumps({"data": [{"id": "model-b"}, {"id": "model-a"}, {"id": "model-a"}]}).encode()
+        self.send_response(FakeUpstream.status if FakeUpstream.status != 200 else 200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         FakeUpstream.calls.append((self.path, dict(self.headers), body))
@@ -463,7 +472,12 @@ class GatewayTests(unittest.TestCase):
         self.admin.post("/api/admin/keys/settings", {"blockedWords": ["content"]})
         self.assertEqual(ok({"messages": [{"role": "user", "content": "hi"}]}), 200)
         self.admin.post("/api/admin/keys/settings", {"blockedWords": ["越狱"]})
-        self.assertEqual(ok({"tools": [{"name": "t", "description": "越狱工具"}], "messages": [{"role": "user", "content": "hi"}]}), 200)
+        # Everything the model reads is scanned: tool descriptions, tool arguments and results too.
+        self.assertEqual(ok({"tools": [{"name": "t", "description": "越狱工具"}], "messages": [{"role": "user", "content": "hi"}]}), 403)
+        self.assertEqual(ok({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x",
+                                                                         "content": [{"type": "text", "text": "越狱"}]}]}]}), 403)
+        self.assertEqual(ok({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64",
+                                         "media_type": "image/png", "data": "越狱"}}]}]}), 200)  # media payloads are not text
         self.assertIn("命中屏蔽词：越狱", self.admin.post("/api/admin/keys/logs", {"errorsOnly": True})[1]["items"][0]["errorMessage"])
         self.admin.post("/api/admin/keys/settings", {"blockedWords": []})
         # 500 may already be billed upstream: not retried. 529 is retried.
@@ -1066,6 +1080,98 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual({"id", "object", "owned_by", "type", "display_name", "created_at", "created"}, set(listing["data"][0]))
         self.assertEqual(json.loads(self.call("/v1/models/claude-x", None, key, method="GET")[1])["id"], "claude-x")
         self.assertEqual(self.call("/v1/models/nope", None, key, method="GET")[0], 404)
+
+    def test_review_fixes_for_responses_and_reservations(self):
+        team_id, client, key = self.enabled_key()
+        other = self.team(number=2, name="别的队")
+        other_client = self.team_client(other)
+        self.assertEqual(self.admin.post("/api/admin/keys/provision", {"teamId": other})[0], 200)
+        other_key = other_client.post("/api/team/keys", {"name": "o"})[1]["key"]
+        FakeUpstream.reply = (200, "application/json", b'{"id":"resp_team1","status":"completed","usage":{"input_tokens":5,"output_tokens":1}}')
+        self.assertEqual(self.call("/v1/responses", {"model": "cheap", "input": "hi"}, key)[0], 200)
+        FakeUpstream.reply = None
+        # A response id continues only for the team that created it (one shared upstream account).
+        self.assertEqual(self.call("/v1/responses", {"model": "cheap", "input": "hi", "previous_response_id": "resp_team1"}, key)[0], 200)
+        self.assertEqual(self.call("/v1/responses", {"model": "cheap", "input": "hi", "previous_response_id": "resp_team1"}, other_key)[0], 403)
+        for extra in ({"background": True}, {"conversation": "conv_1"}, {"prompt": {"id": "pmpt_1"}}):
+            self.assertEqual(self.call("/v1/responses", {"model": "cheap", "input": "hi", **extra}, key)[0], 400, extra)
+        # Without a client limit, OpenAI-compatible routes reserve the full output cap (nothing injected upstream).
+        service = self.service.keys
+        seen = []
+        real = service.reserve
+        service.reserve = lambda handler, call, estimate: (seen.append(call["reserve_out"]), real(handler, call, estimate))[1]
+        try:
+            self.call("/v1/chat/completions", {"model": "cheap"}, key)
+            self.call("/v1/chat/completions", {"model": "cheap", "max_tokens": 100}, key)
+        finally:
+            service.reserve = real
+        self.assertEqual(seen, [keys.RESERVE_OUTPUT_CAP, 100])
+        self.assertNotIn("max_tokens", FakeUpstream.calls[-2][2])
+
+    def test_admin_tools_ported_from_sub2api(self):
+        team_id, client, key = self.enabled_key()
+        # Per-team budget override with a note; the team page and the budget checks use it.
+        self.assertEqual(self.admin.post("/api/admin/keys/team", {"teamId": team_id, "dailyBudget": 0.001, "totalBudget": None,
+                                                                  "note": "演示队，临时调低"})[0], 200)
+        self.assertEqual(client.get("/api/team/keys")[1]["budget"]["dailyLimit"], 0.001)
+        self.assertEqual(self.call("/v1/messages", {"model": "claude-x", "max_tokens": 100}, key)[0], 429)  # reservation > override
+        row = next(t for t in self.admin.get("/api/admin/keys")[1]["teams"] if t["teamId"] == team_id)
+        self.assertEqual((row["dailyBudget"], row["note"], row["dailyLimit"]), (0.001, "演示队，临时调低", 0.001))
+        change = next(c for c in self.admin.get("/api/admin/keys")[1]["changes"] if c["action"] == "api-key.team-limits")
+        self.assertEqual(change["metadata"]["dailyBudget"], [None, 0.001])
+        self.assertEqual(self.admin.post("/api/admin/keys/team", {"teamId": team_id, "dailyBudget": -1, "totalBudget": None, "note": ""})[0], 400)
+        self.assertEqual(self.admin.post("/api/admin/keys/team", {"teamId": team_id, "dailyBudget": None, "totalBudget": None, "note": ""})[0], 200)
+        # When an exhausted 24h budget frees up again.
+        self.call("/v1/messages", {"model": "claude-x", "max_tokens": 100}, key)  # costs $0.021
+        self.admin.post("/api/admin/keys/team", {"teamId": team_id, "dailyBudget": 0.02, "totalBudget": None, "note": ""})
+        budget = client.get("/api/team/keys")[1]["budget"]
+        self.assertGreater(budget["dailyResetAt"], keys.now_ms() + 23 * 3600_000)
+        self.admin.post("/api/admin/keys/team", {"teamId": team_id, "dailyBudget": None, "totalBudget": None, "note": ""})
+        self.assertIsNone(client.get("/api/team/keys")[1]["budget"]["dailyResetAt"])
+        # Live metrics and storage on the overview.
+        overview = self.admin.get("/api/admin/keys")[1]
+        self.assertGreater(overview["overview"]["rpm"], 0)
+        self.assertIsNotNone(overview["overview"]["p95Ms"])
+        self.assertGreater(overview["storage"]["rows"], 0)
+        # Hourly buckets and log filters (model, requested model, request id).
+        stats = self.admin.post("/api/admin/keys/stats", {"days": 1, "granularity": "hour"})[1]
+        self.assertRegex(stats["daily"][0]["day"], r"^\d{4}-\d{2}-\d{2} \d{2}:00$")
+        self.call("/v1/messages", {"model": "claude-latest", "max_tokens": 10}, key)
+        wanted = self.latest()["requestId"]
+        self.assertEqual([i["requestId"] for i in self.admin.post("/api/admin/keys/logs", {"requestId": wanted})[1]["items"]], [wanted])
+        found = self.admin.post("/api/admin/keys/logs", {"requestId": wanted})[1]["items"][0]
+        self.assertEqual(self.admin.post("/api/admin/keys/log", {"id": found["id"]})[1]["requestId"], wanted)
+        self.assertEqual(len(self.admin.post("/api/admin/keys/logs", {"model": "claude-latest"})[1]["items"]), 1)
+        self.assertGreaterEqual(len(self.admin.post("/api/admin/keys/logs", {"model": "claude-x"})[1]["items"]), 3)
+        # Upstream test and model list use the saved key, which never reaches the browser.
+        tested = self.admin.get("/api/admin/keys/upstreams/test/anthropic")[1]
+        self.assertEqual((tested["ok"], tested["status"], tested["model"]), (True, 200, "claude-x"))
+        self.assertEqual(FakeUpstream.calls[-1][2]["max_tokens"], 1)
+        listed = self.admin.get("/api/admin/keys/upstreams/models/openai")[1]
+        self.assertEqual(listed["models"], ["model-a", "model-b"])
+        self.assertEqual(FakeUpstream.calls[-1][1]["Authorization"], "Bearer sk-upstream-openai")
+        self.assertNotIn("sk-upstream", json.dumps([tested, listed]))
+        FakeUpstream.status = 401
+        failed = self.admin.get("/api/admin/keys/upstreams/test/openai")[1]
+        self.assertEqual((failed["ok"], failed["status"]), (False, 401))
+        FakeUpstream.status = 200
+        self.assertEqual(client.get("/api/admin/keys/upstreams/test/openai")[0], 403)
+        # Request content: retention, size cap and clearing; call metadata (budgets) is never deleted.
+        calls_before = len(self.admin.post("/api/admin/keys/logs", {})[1]["items"])
+        with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
+            db.execute("UPDATE api_usage SET at=at-? WHERE id=(SELECT MIN(id) FROM api_usage)", (100 * 3600_000,))
+            db.commit()
+        with self.service.db() as db:
+            settings = self.service.keys.settings(db)
+            self.assertGreaterEqual(self.service.keys.prune_logs(db, settings), 1)  # older than 72 h
+            self.assertEqual(self.service.keys.prune_logs(db, {**settings, "logMaxMB": 0}) >= 1, True)  # over the cap
+        self.assertEqual(len(self.admin.post("/api/admin/keys/logs", {})[1]["items"]), calls_before)
+        self.call("/v1/messages", {"model": "claude-x", "max_tokens": 10}, key)
+        cleared = self.admin.post("/api/admin/keys/logs/clear", {})[1]
+        self.assertGreaterEqual(cleared["deleted"], 1)
+        self.assertEqual(self.admin.get("/api/admin/keys")[1]["storage"]["rows"], 0)
+        for bad in ({"logRetentionHours": 0}, {"logMaxMB": 10}):
+            self.assertEqual(self.admin.post("/api/admin/keys/settings", bad)[0], 400)
 
     def test_responses_api_for_codex(self):
         _, _, key = self.enabled_key()
