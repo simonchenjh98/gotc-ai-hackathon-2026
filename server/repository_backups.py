@@ -24,7 +24,8 @@ SCHEMA='''CREATE TABLE IF NOT EXISTS repository_backups (
  next_at REAL NOT NULL DEFAULT 0,error TEXT,artifact_id TEXT,manifest_json TEXT,
  PRIMARY KEY(team_id,version),UNIQUE(team_id,request_id),
  FOREIGN KEY(team_id,version) REFERENCES repository_submission_seals(team_id,version));
-CREATE INDEX IF NOT EXISTS repository_backup_artifact ON repository_backups(artifact_id);'''
+CREATE INDEX IF NOT EXISTS repository_backup_artifact ON repository_backups(artifact_id);
+CREATE TABLE IF NOT EXISTS repository_backup_migrations (name TEXT PRIMARY KEY);'''
 
 
 class BackupFailure(Exception):
@@ -78,9 +79,9 @@ class RepositoryBackups:
 
     def initialize(self,db):
         db.executescript(SCHEMA)
-        if not db.execute("SELECT 1 FROM submission_records_meta WHERE key='repositoryBackupSummaryV1'").fetchone():
+        if not db.execute("SELECT 1 FROM repository_backup_migrations WHERE name='summary_v1'").fetchone():
             self.compact_prior_manifests(db)
-            db.execute("INSERT INTO submission_records_meta VALUES ('repositoryBackupSummaryV1','1')")
+            db.execute("INSERT OR IGNORE INTO repository_backup_migrations VALUES ('summary_v1')")
         db.execute("UPDATE repository_backups SET status=CASE WHEN attempts>=? THEN 'failed' ELSE 'queued' END,error='worker_interrupted' WHERE status='running'",(self.MAX_ATTEMPTS,))
 
     def compact_prior_manifests(self,db):
@@ -208,8 +209,11 @@ class RepositoryBackups:
             with output.open('xb') as stdout, (input_path.open('rb') if input_path else open(os.devnull,'rb')) as stdin:
                 with self.process_lock:
                     if self.stopping.is_set():raise BackupFailure('worker_interrupted')
-                    self.process=subprocess.Popen([sys.executable,'-c',wrapper,str(remaining),*argv],stdin=stdin,stdout=stdout,stderr=subprocess.DEVNULL,env=env or ctx['env'],start_new_session=True)
-                    process=self.process
+                    try:
+                        process=subprocess.Popen([sys.executable,'-c',wrapper,str(remaining),*argv],stdin=stdin,stdout=stdout,stderr=subprocess.DEVNULL,env=env or ctx['env'],start_new_session=True)
+                    except OSError:
+                        raise BackupFailure('git_unavailable') from None
+                    self.process=process
                 try:
                     while process.poll() is None:
                         self.check(ctx)
@@ -220,14 +224,21 @@ class RepositoryBackups:
                         if self.usage(self.root)>=self.TOTAL_BYTES:raise BackupFailure('storage_limit')
                         raise BackupFailure('git_failed')
                 finally:
-                    with self.process_lock:
-                        if process.poll() is None:
-                            try:os.killpg(process.pid,signal.SIGKILL)
-                            except ProcessLookupError:pass
-                        process.wait()
-                        self.process=None
+                    self.terminate_git_group()
+                    process.wait()
             return output
-        except OSError:raise BackupFailure('git_unavailable') from None
+        except OSError:
+            if self.stopping.is_set():raise BackupFailure('worker_interrupted') from None
+            raise
+
+    def terminate_git_group(self):
+        # stop() and the worker can both observe the same exiting child. Take
+        # its signal target once under the lock; the launching worker always reaps it.
+        with self.process_lock:
+            if self.process and self.process.poll() is None:
+                try:os.killpg(self.process.pid,signal.SIGKILL)
+                except ProcessLookupError:pass
+            self.process=None
 
     def fetch_source(self,repo,source,env,ctx,provider):
         # Source identity is immutable local seal evidence; no user URL or branch input.
@@ -439,8 +450,5 @@ class RepositoryBackups:
 
     def stop(self):
         self.stopping.set()
-        with self.process_lock:
-            if self.process and self.process.poll() is None:
-                try:os.killpg(self.process.pid,signal.SIGKILL)
-                except ProcessLookupError:pass
+        self.terminate_git_group()
         if self.thread:self.thread.join(30)

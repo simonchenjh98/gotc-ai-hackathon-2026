@@ -498,7 +498,7 @@ class BackupTests(unittest.TestCase):
             old['missingAssets']=paths
             self.backups.artifact(row['artifact_id'],'manifest.json').write_text(json.dumps(old))
             db.execute("UPDATE repository_backups SET status='partial',manifest_json=?",(json.dumps(old),))
-            db.execute("DELETE FROM submission_records_meta WHERE key='repositoryBackupSummaryV1'")
+            db.execute("DELETE FROM repository_backup_migrations WHERE name='summary_v1'")
         with self.service.db() as db:self.backups.initialize(db)
         result=self.record()
         self.assertEqual((result['status'],result['missingAssetCount'],result['missingAssetOmitted']),('partial',20,20))
@@ -523,3 +523,40 @@ class BackupTests(unittest.TestCase):
         with patch.object(self.backups,'SAMPLE_BYTES',2):self.backups.run_once()
         value=self.request(self.client,'/api/submission/history/2')[1]['repositoryBackup']
         self.assertEqual((value['status'],value['missingAssets'],value['missingAssetCount'],value['missingAssetOmitted']),('partial',[],3,3))
+
+    def test_stop_during_active_git_io_error_records_interruption(self):
+        import threading
+        self.enqueue_selected(self.sha_a)
+        worker=self.backups
+        checking=threading.Event()
+        release=threading.Event()
+        process_seen=[]
+        original_usage=worker.usage
+
+        def check_usage(path):
+            process=worker.process
+            if process and 'alias.wait=!sleep 20' in process.args and not checking.is_set():
+                process_seen.append(process)
+                checking.set()
+                if not release.wait(5):raise AssertionError('shutdown did not release the check')
+                raise InterruptedError('synthetic active I/O interruption')
+            return original_usage(path)
+
+        def slow(repo,source,env,ctx,provider):
+            worker._git(repo,['-c','alias.wait=!sleep 20','wait'],ctx)
+
+        worker.fetch_source=slow
+        with patch.object(worker,'usage',side_effect=check_usage),patch('repository_backups.os.killpg',wraps=os.killpg) as send:
+            thread=threading.Thread(target=worker.run_once)
+            thread.start()
+            try:
+                self.assertTrue(checking.wait(5))
+                worker.stop()
+            finally:
+                release.set()
+                thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.record()['error'],'worker_interrupted')
+        self.assertLess(process_seen[0].returncode,0)
+        self.assertIsNone(worker.process)
+        send.assert_called_once()
