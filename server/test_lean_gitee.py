@@ -174,6 +174,47 @@ class LeanGiteeTests(unittest.TestCase):
         self.assertTrue(replay['replayed'])
         self.assertEqual(replay['receipt'],result['receipt'])
 
+    def test_unchanged_formal_snapshot_saved_as_draft_is_clean_but_real_edits_remain_dirty(self):
+        self.admin_action(self.application())
+        self.open_submissions()
+        selected=self.preview()[1]
+        status,formal,_=self.submit(selected)
+        self.assertEqual(status,200,formal)
+        saved=formal['receipt']['materials']
+        self.assertIn('repositoryMaterialsUrl',saved)
+        status,unchanged,_=self.request(self.client,'/api/submission',{
+            'requestId':'same-formal-as-draft-0001','expectedVersion':1,'status':'draft','materials':saved})
+        self.assertEqual(status,200,unchanged)
+        self.assertFalse(unchanged['submission']['hasUnsubmittedChanges'])
+        self.assertNotIn('repositoryMaterialsUrl',unchanged['submission']['draft'])
+        self.assertEqual(unchanged['submission']['submitted'],saved)
+        for version,(field,value) in enumerate((('summary','An actual edit'),('codeVersion','b'*40),
+                                               ('codeUrl','https://gitee.com/other/project'),('confirmed',False)),start=2):
+            with self.subTest(field=field):
+                edited={key:entry for key,entry in saved.items() if key!='repositoryMaterialsUrl'}
+                edited[field]=value
+                status,result,_=self.request(self.client,'/api/submission',{
+                    'requestId':'real-draft-edit-'+field,'expectedVersion':version,'status':'draft','materials':edited})
+                self.assertEqual(status,200,result)
+                self.assertTrue(result['submission']['hasUnsubmittedChanges'])
+                self.assertEqual(result['submission']['submitted'],saved)
+        self.assertEqual(self.request(self.client,'/api/submission/history/1')[1]['materials'],saved)
+
+    def test_legacy_material_differences_remain_dirty_across_generated_metadata(self):
+        self.open_submissions()
+        original=self.materials()
+        status,formal,_=self.request(self.client,'/api/submission',{
+            'requestId':'legacy-before-gitee-0001','expectedVersion':0,'status':'submitted','materials':original})
+        self.assertEqual(status,200,formal)
+        saved=formal['submission']['submitted']
+        self.admin_action(self.application())
+        status,draft,_=self.request(self.client,'/api/submission',{
+            'requestId':'legacy-bound-gitee-draft-0001','expectedVersion':1,'status':'draft','materials':saved})
+        self.assertEqual(status,200,draft)
+        self.assertTrue(draft['submission']['hasUnsubmittedChanges'])
+        self.assertEqual(draft['submission']['submitted'],saved)
+        self.assertEqual(self.request(self.client,'/api/submission/history/1')[1]['materials'],saved)
+
     def test_unbound_and_github_still_require_duplicate_fields_and_client_cannot_forge_reference(self):
         materials={k:v for k,v in self.materials().items() if k not in {'readmeUrl','license','sourcesAndLimitations'}}
         self.open_submissions()

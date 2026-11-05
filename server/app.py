@@ -670,9 +670,12 @@ class EventService:
                     "firstSubmittedAt": None, "submittedAt": None, "updatedAt": None, "hasUnsubmittedChanges": False}
         draft=json.loads(row["draft_json"]) if row["draft_json"] else None
         submitted=json.loads(row["submitted_json"]) if row["submitted_json"] else None
+        # This locator is server metadata; editing state compares contestant values.
+        draft_values={key:value for key,value in draft.items() if key!='repositoryMaterialsUrl'} if draft is not None else None
+        submitted_values={key:value for key,value in submitted.items() if key!='repositoryMaterialsUrl'} if submitted is not None else None
         return {"version": row["version"], "draft": draft, "submitted": submitted, "submittedVersion": row["submitted_version"],
                 "firstSubmittedAt": row["first_submitted_at"], "submittedAt": row["submitted_at"], "updatedAt": row["updated_at"],
-                "hasUnsubmittedChanges": submitted is not None and draft!=submitted}
+                "hasUnsubmittedChanges": submitted is not None and draft_values!=submitted_values}
 
     def team_submission_response(self, db, team):
         submission=self.submission(db, team['id'])
