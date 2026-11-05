@@ -114,9 +114,17 @@ class RepositoryBackups:
         if row['status'] in {'ready','partial'}:
             try:
                 manifest=json.loads(row['manifest_json'])
+                # Publication already verified these hashes. Responses may hold the
+                # submission writer, so only bounded filesystem metadata checks belong here.
+                if manifest['sha']!=row['sha']:raise BackupFailure('artifact_unavailable')
                 for name in ('source.zip','repo.bundle'):
-                    stream,_=self.open_verified(row,name)
-                    stream.close()
+                    item=manifest['files'][name]
+                    info=self.artifact(row['artifact_id'],name).lstat()
+                    if (not stat.S_ISREG(info.st_mode) or type(item['bytes']) is not int
+                            or not 0<=info.st_size==item['bytes']<=self.TASK_BYTES
+                            or not isinstance(item['sha256'],str)
+                            or not re.fullmatch('[0-9a-f]{64}',item['sha256'])):
+                        raise BackupFailure('artifact_unavailable')
                 result.update(sourceZipSha256=manifest['files']['source.zip']['sha256'],bundleSha256=manifest['files']['repo.bundle']['sha256'],missingAssets=manifest['missingAssets'])
                 base=self.s.base_path+'/api/submission/backups/'+quote(team_id,safe='')+'/'+str(version)
                 result.update(downloadUrl=base+'/source.zip',bundleUrl=base+'/repo.bundle')

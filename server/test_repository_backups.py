@@ -1,5 +1,6 @@
 """Offline source backups: real Git/ZIP/bundle; synthetic local provider only."""
 import os
+from contextlib import closing
 from pathlib import Path
 import subprocess
 import zipfile
@@ -358,3 +359,51 @@ class BackupTests(unittest.TestCase):
         service.repository_backups.start.assert_called_once()
         service.repository_backups.stop.assert_called_once()
         server.server_close.assert_called_once()
+
+    def test_ready_replay_and_draft_metadata_do_not_read_artifacts_under_writer(self):
+        import sqlite3
+        self.enqueue_selected(self.sha_a);self.backups.run_once()
+        receipt=self.result['receipt']
+        artifact_opens=[];writer_held=[]
+        original_open=os.open
+        def observed_open(path,*args,**kwargs):
+            if Path(path).is_relative_to(self.backups.root/'artifacts'):
+                artifact_opens.append(str(path))
+                with closing(sqlite3.connect(self.service.db_path,timeout=.01)) as other:
+                    try:other.execute('BEGIN IMMEDIATE')
+                    except sqlite3.OperationalError:writer_held.append(True)
+                    finally:other.rollback()
+            return original_open(path,*args,**kwargs)
+        with patch('repository_backups.os.open',side_effect=observed_open),patch.object(self.backups,'open_verified',wraps=self.backups.open_verified) as verify:
+            replay=self.formal_submit(self.selected)[1]
+            self.assertTrue(replay['replayed']);self.assertEqual(replay['receipt'],receipt)
+            self.assertEqual(replay['repositoryBackup']['status'],'ready')
+            status,draft,_=self.request(self.client,'/api/submission',{'requestId':'ready-draft-metadata','expectedVersion':1,'status':'draft','materials':{**receipt['materials'],'summary':'Draft retaining ready formal version'}})
+            self.assertEqual(status,200,draft)
+            self.assertEqual(draft['repositoryBackup']['status'],'ready')
+            self.assertEqual(self.client.get('/api/team')[1]['repositoryBackup']['status'],'ready')
+            self.assertEqual(self.request(self.client,'/api/submission/history/1')[1]['repositoryBackup']['status'],'ready')
+            self.assertEqual(verify.call_count,0,'Metadata must not invoke full artifact verification')
+        self.assertEqual(artifact_opens,[],'Responses must not open artifact contents')
+        self.assertEqual(writer_held,[],'No artifact reads may occur under the submission writer')
+        with closing(sqlite3.connect(self.service.db_path,timeout=.01)) as other:
+            other.execute('BEGIN IMMEDIATE');other.rollback()
+
+    def test_same_size_corruption_is_rejected_on_download_and_worker_reuse(self):
+        self.enqueue_selected(self.sha_a);self.backups.run_once()
+        route=self.record()['downloadUrl'][len(self.service.base_path):]
+        with self.service.db() as db:artifact_id=db.execute('SELECT artifact_id FROM repository_backups').fetchone()[0]
+        archive=self.backups.root/'artifacts'/artifact_id/'source.zip'
+        with archive.open('r+b') as stream:
+            byte=stream.read(1);stream.seek(0);stream.write(bytes([byte[0]^1]))
+        self.assertEqual(self.client.get(route)[0],404)
+        preview=self.sealed_preview()
+        status,result,_=self.formal_submit(preview,version=1,request_id='corrupt-reuse-version',materials=self.materials(codeUrl='',codeVersion='',summary='Updated summary'))
+        self.assertEqual(status,200,result)
+        self.remote.fail_all=True
+        self.backups.run_once()
+        with self.service.db() as db:
+            second=self.backups.for_version(db,self.team_id,2)
+            artifact=db.execute('SELECT artifact_id FROM repository_backups WHERE version=2').fetchone()[0]
+        self.assertEqual(second['status'],'queued')
+        self.assertIsNone(artifact)
