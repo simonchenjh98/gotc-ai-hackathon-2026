@@ -16,6 +16,7 @@
 | `GOTC_REPO_GITEE_BRANCH` | `main`，每队固定的正式分支 |
 | `GOTC_REPO_GITEE_ENABLED` | 仅精确的 `1` 显式启用；同时需要令牌 |
 | `GOTC_REPO_GITEE_SEAL_ENABLED` | 仅精确的 `1` 启用 Gitee 封存预览与本地确认，默认关闭 |
+| `GOTC_REPO_BACKUP_ENABLED` | 仅精确的 `1` 在主进程启动单个私有源码备份 worker，默认关闭 |
 
 组织和分支只允许 1–100 位 ASCII 字母、数字、下划线与连字符，首位须为字母或数字。修改配置不会改变已有申请/绑定的组织或分支；组织不匹配时停止远端访问，由管理员人工核对。分支创建以初始化 README 的默认分支为起点，不覆盖已有分支。仓库公开，初始化只含非敏感 README，不自动选择项目许可证。
 
@@ -51,6 +52,20 @@ Gitee 账户级令牌无法把“创建未来仓库”的能力限制到单一�
 封存凭据含 `id`、`ref`、`sha`、`sealedAt` 和固定 commit 的 `viewUrl`。正式回执、版本详情、本队最新正式版的 `repositorySeal` 另含 `receivedAt`，回执也在顶层提供 `receivedAt`。版本关联与正式历史、原始请求回执在同一事务持久化，旧正式版本的详情和本队响应中 `repositorySeal` 为 null。封存预览和确认只交换仓库元数据，不下载源码、PPT 或视频。
 
 在测试企业仓库中，精确规则拒绝了管理员 Git 推送、非快进强推和删除。管理员仍可通过 contents API 追加提交，因此正式记录与查看链接永久指向确认的原 SHA。普通协作者受平台角色规则约束是本活动接受的假设，尚未用普通账号实测。
+
+## 异步私有源码备份
+
+需要主机已安装 Git（生产基线为 Git 2.43.0）和 Python 3.12，无新增 Python 依赖。新封存正式版在原提交事务内排队；预览、确认和原始回执都不下载源码。即使 worker 未启用，任务也保留 queued；重启后可恢复。旧版、未封存版和 GitHub/手填提交没有任务。同一仓库数字身份、封存 ref 和 SHA 的其他正式版会在后台复用已校验的私有包，避免只改 PPT/摘要时重复抓取和占用空间；队伍版本关联与下载授权仍分别校验。备份状态独立于正式提交成功状态，失败不撤销提交，也不改写历史或原始回执。
+
+默认只运行一个 worker，每 5 秒轮询，最多尝试 3 次，失败后分别等待 60、300 秒。每个任务的 Git/生成阶段共享 180 秒墙钟上限；单任务临时文件与输出限额 268435456 字节，备份目录总限额 2147483648 字节，选定 commit 的源码内容上限 134217728 字节、最多 20000 个文件。运行期间轮询磁盘、剩余空间、停止标记和时间，必要时终止整个 Git 进程组；子进程还有文件大小限制。存储不足时重试同一个任务，不删除既有正式备份。备份文件保存在 `GOTC_DATA_DIR/repository-backups` 的私有目录，不属于静态发布目录；主机备份和容量规划也须覆盖此目录。
+
+worker 从不可变封存关联读取原仓库数字 ID、命名空间、仓库名、ref 和 SHA，在数据库写事务外重新核对数字身份。只从官方 Gitee HTTPS 地址获取该 ref 的完整历史；即使管理员将 ref 推进到后代提交，仍只打包原 SHA。原 SHA 不在抓取历史内则重试/失败，不以最新 head 替代。Git 禁用凭据 helper、系统/全局配置、重定向、hooks 和非 HTTPS 协议，pack 单线程、windowMemory 为 32m。令牌通过仅 fetch 子进程可见的环境交给私有 askpass；不放进 URL、argv、归档或错误内容。`/user` 只用于验证并缓存令牌账户的 login。
+
+归档含确切 commit 的所有已跟踪文件（包含 export-ignore 文件，不展开 export-subst）、可独立恢复的 `repo.bundle` 与私有哈希清单。ZIP 和 bundle 都校验后原子发布，路径或文件损坏时不提供下载。服务器不会 checkout、解包、执行项目、运行过滤器或拉取子模块。检测到 LFS 指针或 gitlink 时状态为 partial，`missingAssets` 列出 `{path,kind}`（kind 为 lfs 或 submodule）；指针本身仍保留在源码 ZIP。ready 仅表示已保存这些 Git 字节，不证明依赖齐备、项目可运行，也不包含 PPT/视频备份。
+
+本队最新响应和正式版本详情另含 `repositoryBackup`，旧版为 null；字段为 `status,sha,attempts,error,sourceZipSha256,bundleSha256,missingAssets,downloadUrl,bundleUrl`。状态包括 queued/running/ready/partial/failed；仅校验完毕的 ready/partial 提供同源链接。错误为固定代码，不含上游正文或本机路径。原始 receipt 不加入这些可变状态，重放仍返回原 receipt。
+
+`GET /api/submission/backups/{team_id}/{version}/source.zip` 和 `/repo.bundle` 仅允许管理员或所属队伍的现有登录 cookie；链接无 token，下载流按 64 KiB 分块，固定 MIME、attachment 和 nosniff。匿名、其他队伍和评委不得下载。评委继续使用已有固定 Gitee commit 链接，本次没有公开归档端点。bundle 可用 `git clone repo.bundle restored` 恢复到 selected 分支；恢复应在独立审核环境进行。
 
 ## 状态与故障恢复
 

@@ -176,3 +176,10 @@ class RepositorySeals:
             JOIN repository_seals s ON s.id=v.seal_id JOIN repository_seal_namespaces n USING(prefix)
             WHERE v.team_id=? AND v.version=?""", (team_id,version)).fetchone()
         return {**proof_fields(row), 'receivedAt': row['received_at']} if row else None
+
+    def source_for_version(self, db, team_id, version):
+        """Internal immutable source identity; never use the current mutable binding."""
+        row=db.execute(SEAL_SELECT+""" JOIN repository_submission_seals v ON v.seal_id=s.id
+            WHERE v.team_id=? AND v.version=? AND s.sealed_at IS NOT NULL""",(team_id,version)).fetchone()
+        return {**{key:row[key] for key in ('team_id','external_id','organization','slug','prefix','sha')},
+                'provider':'gitee','ref':row['prefix']+'-'+row['sha']} if row else None

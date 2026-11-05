@@ -123,6 +123,7 @@ class SubmissionRecords:
             if history_version is not None:
                 db.execute('INSERT INTO submission_history VALUES (?,?,?,?,?,?)',(team['id'],version,stable_json(s['submitted']),s['submittedAt'],request_id,'submitted'))
                 seal=self.s.repositories.seals.record_submission(db,team['id'],version,request_id,repository_proof)
+                result['repositoryBackup']=self.s.repository_backups.enqueue(db,team['id'],version,request_id)
             receipt={'requestId':request_id,'status':'succeeded','action':payload['status'],'baseVersion':payload['expectedVersion'],'version':version,'savedAt':saved_at,'materials':s['draft'],'historyVersion':history_version}
             if seal:
                 result['repositorySeal']=seal
@@ -163,7 +164,7 @@ class SubmissionRecords:
         row=db.execute('SELECT * FROM submission_history WHERE team_id=? AND submission_version=?',(team_id,version)).fetchone()
         if not row:raise APIError(404,'该正式版本不存在')
         return {'version':row['submission_version'],'submittedAt':row['submitted_at'],'requestId':row['request_id'],'origin':row['origin'],
-                'repositorySeal':self.s.repositories.seals.for_version(db,team_id,version),'materials':json.loads(row['materials_json'])}
+                'repositorySeal':self.s.repositories.seals.for_version(db,team_id,version),'repositoryBackup':self.s.repository_backups.for_version(db,team_id,version),'materials':json.loads(row['materials_json'])}
 
     def checks(self,db,team_id,version):
         detail=self.detail(db,team_id,version);latest=self.s.submission(db,team_id)['submittedVersion']

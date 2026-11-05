@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import sqlite3
 import threading
 import time
@@ -23,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 from errors import APIError
 from submission_records import SubmissionRecords, query_path
+from repository_backups import RepositoryBackups, ArchiveDownload
 from repositories import Repositories
 from write_conflicts import WriteConflicts
 from judging import JudgingService
@@ -219,6 +221,7 @@ class EventService:
         self.admin_data=AdminDataService(self)
         self.submission_records=SubmissionRecords(self)
         self.repositories=Repositories(self)
+        self.repository_backups=RepositoryBackups(self)
         self.write_conflicts=WriteConflicts(self)
         self.write_conflicts.backup_before_upgrade()
         self.admin_data.backup_before_upgrade()
@@ -265,6 +268,7 @@ class EventService:
             os.chmod(access_file, 0o600)
         os.chmod(self.db_path, 0o600)
         self.submission_records.initialize(backup=database_existed)
+        with self.db() as db:self.repository_backups.initialize(db)
         self.write_conflicts.initialize()
 
     def migrate_accounts(self):
@@ -485,6 +489,7 @@ class EventService:
                     raise APIError(428, "缺少页面登录信息，请刷新页面并核对登录身份后重试", "login_required")
             if (team_keys_route or path in {"/api/team", "/api/submission", "/api/logout", "/api/judge", "/api/score", "/api/admin", "/api/admin/settings"} or path.startswith("/api/submission/")) and expected_login_id is not None and (not actor or expected_login_id != self.login_id(cookie)):
                 raise APIError(401, "登录身份已变化，请重新登录后操作")
+            if path.startswith('/api/submission/backups/'):return self.repository_backups.download(db,actor,method,path,query or {}),None,None
             if self.submission_records.supports(path):return self.submission_records.dispatch(db,actor,method,path,body,query or {}),None,None
             if path.startswith('/api/admin/data/'):
                 parsed_cookie=SimpleCookie()
@@ -673,6 +678,7 @@ class EventService:
         submission=self.submission(db, team['id'])
         return {"team": {key: team[key] for key in ("id", "number", "name", "project", "track")},
                 "repositorySeal": self.repositories.seals.for_version(db,team['id'],submission['submittedVersion']),
+                "repositoryBackup": self.repository_backups.for_version(db,team['id'],submission['submittedVersion']),
                 "submission": submission, "window": self.submission_window(db),
                 "repository": self.repositories.public(self.repositories.get(db,team['id'])),
                 "repositoryProviders": self.repositories.availability(),
@@ -967,7 +973,11 @@ class EventHandler(BaseHTTPRequestHandler):
                     cookie = f"{COOKIE_NAME}={token or ''}; Path={service.base_path or '/'}; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS if cookie_action == 'set' else 0}"
                     if service.secure:
                         cookie += "; Secure"
-                if isinstance(value, bytes):
+                if isinstance(value, ArchiveDownload):
+                    with value.stream as stream:
+                        self.headers_out(200,value.content_type,value.size,extra={"Content-Disposition":f'attachment; filename="{value.filename}"'})
+                        while chunk:=stream.read(65536):self.wfile.write(chunk)
+                elif isinstance(value, bytes):
                     filename='gotc-submissions.csv' if path=='/api/admin/submissions/export' else 'gotc-data.csv' if path.startswith('/api/admin/data/') else 'gotc-api-usage.csv' if path=='/api/admin/keys/export' else 'gotc-scores.csv'
                     self.headers_out(200, "text/csv; charset=utf-8", len(value), extra={"Content-Disposition": f'attachment; filename="{filename}"'})
                     self.wfile.write(value)
@@ -1014,13 +1024,18 @@ def main():
         raise SystemExit("GOTC_HOST must be a loopback IP address") from error
     service = EventService()
     server = EventHTTPServer((host, int(os.environ.get("GOTC_PORT", "5274"))), service)
-    print(f"GOTC service ready on {host}:{server.server_port}{service.base_path}/ (access code is in private data directory)", flush=True)
+    def interrupted(_signum,_frame):raise KeyboardInterrupt()
+    previous_term=signal.signal(signal.SIGTERM,interrupted)
     try:
+        service.repository_backups.start()
+        print(f"GOTC service ready on {host}:{server.server_port}{service.base_path}/ (access code is in private data directory)", flush=True)
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        service.repository_backups.stop()
         server.server_close()
+        signal.signal(signal.SIGTERM,previous_term)
 
 
 if __name__ == "__main__":
