@@ -102,3 +102,25 @@ worker 从不可变封存关联读取原仓库数字 ID、命名空间、仓库�
 公开主页入口为 [申请 Gitee 仓库 / 提交作品](https://8.141.114.201/gotc/platform.html#team)。队伍使用独立提交码登录后申请；仅已绑定队伍自动读取 SHA，未绑定的旧队伍保留手填流程。离线测试覆盖禁用配置、权限和队伍隔离、用户名/仓库名、同名冲突、丢失响应恢复、只授予 push、超时脱敏、写锁释放、SHA 变化、预览隔离/过期、覆盖攻击、提交窗口、原子回执/历史以及成功重放。真实组织授权、邀请接受、Gitee 企业兼容、实际禁止强推、代码归档和生产可用性均须另外验收。
 
 官方调用依据（2026-11-04 读取）：[GitHub 创建组织仓库](https://docs.github.com/en/rest/repos/repos#create-an-organization-repository)、[GitHub 协作者与邀请](https://docs.github.com/en/rest/collaborators/collaborators#add-a-repository-collaborator)、[GitHub 分支保护](https://docs.github.com/en/rest/branches/branch-protection#update-branch-protection)、[Gitee API v5 文档](https://gitee.com/api/v5/swagger)、[Gitee 官方 OpenAPI schema](https://gitee.com/api/v5/doc_json)。
+
+## 界面与逐版本核对
+
+队伍预览带 `repositorySeal` 时，页面显示“版本已封存”和“确认提交的是当前预览版本”。确认固定使用本次完整 SHA；之后 push 的代码需要重新预览。未启用封存、GitHub 与旧手填提交保留原流程，不新增文件上传要求。开发分支的保护状态仍单独显示，封存引用保护不等于开发分支保护或独立字节备份。
+
+新回执分别显示服务器 `receivedAt` 和实际 `savedAt`，封存引用与固定 commit 链接来自该回执自身。按请求编号查询或重放旧回执时，不能把当前最新正式版的封存或备份套到旧回执上。“最近正式材料”下另标“最新正式版 vN · 封存与备份”；历史详情只显示所选版。已有正式 v1 和旧不可变回执不回填；`repositorySeal` / `repositoryBackup` 为 null 的旧版明确显示“本版未归档”。
+
+| 界面状态 | 含义 |
+| --- | --- |
+| 版本已封存 | 已核对 Gitee 保护引用及原 SHA；不是独立源码备份 |
+| 独立源码备份排队中 / 处理中 | 任务尚未完成，不提供下载 |
+| 独立源码备份已就绪 | 已保存并校验该 SHA 的 Git 字节；不证明可运行、依赖齐全或 PPT/视频已保存 |
+| 独立源码备份不完整 | Git 字节已保存，但列出的 LFS / 子模块外部内容未抓取；可下载现有 ZIP / bundle |
+| 独立源码备份失败 | 正式提交仍有效；组织方须核对错误类别和服务条件 |
+
+“刷新本版备份状态”只更新该版本的备份小块，不重绘材料表单、原回执或组织方人工检查表。最新正式版通过现有 `GET /api/team` 查询；队伍历史用 `GET /api/submission/history/{version}`，管理员历史用 `GET /api/admin/submissions/{team_id}/history/{version}`。没有新增备份元数据端点。刷新捕获页面会话、浏览器登录标记、路由和组件版本；换号、切页、组件断开或返回其他版本的数据时丢弃结果，保留未保存材料与备注。
+
+固定 commit 链接仅从校验过的 GitHub / Gitee / GitCode / GitLab 仓库根地址和 40/64 位完整哈希生成；Gitee 优先使用同仓库同 SHA 的 `repositorySeal.viewUrl`。其他主机仅显示哈希。ZIP / bundle 下载只接受当前部署前缀下、同源、精确匹配队伍与正式版本的 API 地址，不含 token。Gitee 原仓库为外部开源仓库；这里私有的是新增服务器备份文件。独立源码备份仅本队和组织方可下载，评委仍走既有固定 commit 链接。本次没有自动公开归档或作品集入口；将来公开须主办方逐队逐正式版本确认。
+
+排队长期不动时先核对 worker 开关、主机 Git 和可用容量；queued 不代表失败，失败不代表正式提交未收到。超过三次的失败任务不会无限自动重试。修复环境后按现有恢复合同处理同一 SHA，不删除旧备份、不改历史，也不让队伍重复正式提交来绕过故障。不要把运营诊断路径、上游正文或凭据带到选手界面。
+
+本轮 UI 验证仅用合成数据运行实际 JavaScript 的 Node/vm 测试与静态检查，未访问 Gitee、浏览器或服务器。操作者已在此前固定 Task2 源码上完成实际抓取、私有 ZIP/bundle 下载、匿名拒绝、独立 bundle 恢复、原回执重放及同源码第二版本复用；这是该固定源码的实测，不能替代后续改动的离线复核或生产验收。普通账号测试仍未执行；普通开发者受平台权限规则约束是用户明确接受的假设，管理员 contents API 可追加提交的例外仍存在，正式记录始终取原 SHA。

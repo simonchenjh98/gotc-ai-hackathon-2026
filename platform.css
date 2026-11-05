@@ -46,3 +46,7 @@
 .repository-panel .repository-location { overflow-wrap: anywhere; }
 .repository-review { border-top: 1px solid var(--line, #d7d7ce); padding-top: 1rem; margin-top: 1.5rem; }
 .repository-review code, .repository-panel code { overflow-wrap: anywhere; }
+
+.repository-version { border-top: 1px solid var(--line); margin-top: 20px; padding-top: 20px; overflow-wrap: anywhere; }
+.repository-version a { color: var(--blue); text-decoration: underline; text-underline-offset: 3px; }
+.repository-version ul { font-size: 12px; line-height: 1.9; }
