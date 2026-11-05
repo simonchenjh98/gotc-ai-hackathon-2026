@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 from errors import APIError
 from submission_records import SubmissionRecords, query_path
+from repositories import Repositories
 from write_conflicts import WriteConflicts
 from judging import JudgingService
 from admin_data import AdminDataService, TRACK_OPTIONS
@@ -217,6 +218,7 @@ class EventService:
             enrich_team=lambda db,team:self.admin_data.enrich_team(db,team))
         self.admin_data=AdminDataService(self)
         self.submission_records=SubmissionRecords(self)
+        self.repositories=Repositories(self)
         self.write_conflicts=WriteConflicts(self)
         self.write_conflicts.backup_before_upgrade()
         self.admin_data.backup_before_upgrade()
@@ -228,6 +230,7 @@ class EventService:
             self.judging.initialize(db)
             self.admin_data.initialize(db)
             self.keys.initialize(db)
+            self.repositories.initialize(db)
             for key, value in {"scoringOpen": False, "resultsPublished": True, "minJudges": 5, "submissionsOpen": False, "submissionDeadline": None, "updatedAt": now_ms()}.items():
                 db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, json.dumps(value)))
             # Preserve an upgraded event's current audience window once; later changes are independent.
@@ -463,6 +466,8 @@ class EventService:
         if method == "POST" and path == "/api/login":
             return self.login(body, ip)
         if method=='POST' and path=='/api/submission':return self.dispatch_submission(body,cookie,expected_login_id)
+        if path.startswith(('/api/team/repository','/api/admin/repositories')):
+            return self.repositories.dispatch(method,path,body,cookie,expected_login_id,query or {}),None,None
         with self.db() as db:
             # Resolve write identities only after the lock: revocation may have committed while queued.
             if method=="POST":
@@ -625,12 +630,23 @@ class EventService:
         return team
 
     def dispatch_submission(self,body,cookie,expected_login_id=None):
+        try:
+            proof=self.repositories.preflight(body,cookie,expected_login_id)
+        except APIError:
+            # A concurrent identical request may have committed while upstream I/O failed.
+            # Let the receipt writer validate its fingerprint before returning any old result.
+            with self.db() as db:
+                actor=self.account(db,cookie);self.require(actor,'team')
+                team=self.bound_submission_team(db,actor)
+                request_id=body.get('requestId') if isinstance(body,dict) else None
+                if not isinstance(request_id,str) or not db.execute('SELECT 1 FROM submission_requests WHERE team_id=? AND request_id=?',(team['id'],request_id)).fetchone():raise
+            proof=None
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
             actor=self.account(db,cookie);self.require(actor,'team')
             if expected_login_id is not None and expected_login_id!=self.login_id(cookie):raise APIError(401,'登录身份已变化，请重新登录后操作')
             team=self.bound_submission_team(db,actor)
-            result=self.submission_records.save(db,actor,team,body)
+            result=self.submission_records.save(db,actor,team,body,repository_proof=proof)
         if isinstance(result,APIError):raise result
         return result,None,None
 
@@ -654,6 +670,8 @@ class EventService:
     def team_submission_response(self, db, team):
         return {"team": {key: team[key] for key in ("id", "number", "name", "project", "track")},
                 "submission": self.submission(db, team["id"]), "window": self.submission_window(db),
+                "repository": self.repositories.public(self.repositories.get(db,team['id'])),
+                "repositoryProviders": self.repositories.availability(),
                 "judgingMaterials":self.judging_materials(db,team['id'])}
 
     def judging_materials(self, db, team_id):

@@ -90,15 +90,16 @@ class SubmissionRecords:
         error.request_id=receipt['requestId']
         return error
 
-    def save(self,db,actor,team,body):
-        if (not isinstance(body,dict) or set(body)-{'expectedVersion','status','materials','requestId'}
+    def save(self,db,actor,team,body,repository_proof=None):
+        if (not isinstance(body,dict) or set(body)-{'expectedVersion','status','materials','requestId','repoPreviewId'}
                 or not {'expectedVersion','status','materials'}.issubset(body)
                 or type(body['expectedVersion']) is not int or not 0<=body['expectedVersion']<=9007199254740991
                 or not isinstance(body['status'],str) or body['status'] not in {'draft','submitted'} or not isinstance(body['materials'],dict)):
             raise APIError(400,'提交字段或状态不正确','submission_envelope_invalid')
         request_id=self.request_id(body['requestId']) if 'requestId' in body else 'legacy-'+secrets.token_hex(16)
         payload={key:body[key] for key in ('expectedVersion','status','materials')}
-        digest=hashlib.sha256(stable_json(payload).encode()).hexdigest()
+        fingerprint={**payload,**({'repoPreviewId':body['repoPreviewId']} if 'repoPreviewId' in body else {})}
+        digest=hashlib.sha256(stable_json(fingerprint).encode()).hexdigest()
         previous=db.execute('SELECT * FROM submission_requests WHERE team_id=? AND request_id=?',(team['id'],request_id)).fetchone()
         if previous:
             if previous['payload_sha256']!=digest:raise APIError(409,'同一请求编号已用于不同内容，请为新操作使用新编号','request_id_conflict')
@@ -108,7 +109,8 @@ class SubmissionRecords:
             return {'ok':True,**self.s.team_submission_response(db,current),'receipt':receipt,'replayed':True}
         db.execute('SAVEPOINT submission_attempt')
         try:
-            result=self.s.save_submission(db,actor,team,payload)
+            official=self.s.repositories.formal_payload(db,team,payload,body.get('repoPreviewId'),repository_proof)
+            result=self.s.save_submission(db,actor,team,official)
             s=result['submission'];saved_at=s['updatedAt'];version=s['version']
             history_version=version if payload['status']=='submitted' else None
             if history_version is not None:
