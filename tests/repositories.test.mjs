@@ -130,17 +130,64 @@ test('genuine material version conflicts still lock current inputs for manual re
   assert.equal(f.calls.filter(c=>c.path==='submission').length,1);
 });
 
-test('ambiguous admin approval directs a status refresh and reconciliation before retrying',async()=>{
-  const f=fixture(),box=f.node('repository-admin'),form=f.node('repository-review-form'),button=f.node('approve-button'),error=f.node('approve-error');
+for(const change of ['browser','session']){
+  test(`late admin repository response is ignored after ${change} identity changes`,async()=>{
+    const f=fixture(),box=f.node('repository-admin');let resolve;
+    f.context.localStorage={getItem:()=>f.context.ownerMarker};f.context.ownerMarker='synthetic-login';
+    f.context.adminTransport=()=>new Promise(done=>{resolve=done;});
+    vm.runInContext(`api=adminTransport;route='admin';globalThis.startAdmin=()=>installRepositoryAdmin(document.getElementById('repository-admin'));`,f.context);
+    box.innerHTML='INITIAL';const pending=f.context.startAdmin();
+    if(change==='browser')f.context.ownerMarker='another-login';
+    else vm.runInContext(`session={role:'admin',loginId:'another-login'};`,f.context);
+    resolve({providers,items:[repository]});await pending;
+    assert.equal(box.innerHTML,'INITIAL');
+  });
+}
+
+test('old admin approval and refresh do not run after a cross-tab login change',async()=>{
+  const f=fixture(),box=f.node('repository-admin'),form=f.node('repository-review-form'),button=f.node('approve-button');
+  f.context.localStorage={getItem:()=>f.context.ownerMarker};f.context.ownerMarker='synthetic-login';
   form.dataset.repositoryTeam=repository.teamId;form.elements={verified:{checked:true}};
-  form.querySelector=selector=>selector==='button'?button:error;
-  box.querySelectorAll=selector=>selector==='[data-repository-team]'?[form]:[];
-  const calls=[];f.context.adminTransport=async(path,body)=>{calls.push({path,body});if(body)throw new Error('Gateway timeout');return {providers,items:[{...repository,state:'requested'}]};};
+  form.querySelector=selector=>selector==='button'?button:f.node('approve-error');
+  box.querySelectorAll=()=>[form];let requests=0;
+  f.context.adminTransport=async()=>{requests++;return {providers,items:[{...repository,state:'requested'}]};};
   vm.runInContext(`api=adminTransport;route='admin';globalThis.startAdmin=()=>installRepositoryAdmin(document.getElementById('repository-admin'));`,f.context);
-  await f.context.startAdmin();await form.onsubmit({preventDefault(){}});
-  assert.match(error.textContent,/后台可能仍在处理/);assert.match(error.textContent,/刷新申请列表核对状态/);assert.match(error.textContent,/勿重复批准/);
-  assert.equal(calls.filter(c=>c.body).length,1);
+  await f.context.startAdmin();f.context.ownerMarker='another-login';
+  await form.onsubmit({preventDefault(){}});
+  await f.node('refresh-repositories').onclick({currentTarget:f.node('refresh-repositories')});
+  assert.equal(requests,1);
 });
+
+for(const status of [undefined,503]){
+  test(`ambiguous admin approval (${status ?? 'network error'}) directs a status refresh and reconciliation before retrying`,async()=>{
+    const f=fixture(),box=f.node('repository-admin'),form=f.node('repository-review-form'),button=f.node('approve-button'),error=f.node('approve-error');
+    form.dataset.repositoryTeam=repository.teamId;form.elements={verified:{checked:true}};
+    form.querySelector=selector=>selector==='button'?button:error;
+    box.querySelectorAll=selector=>selector==='[data-repository-team]'?[form]:[];
+    const calls=[];f.context.adminTransport=async(path,body)=>{calls.push({path,body});if(body){const failure=new Error('Gateway timeout');failure.status=status;throw failure;}return {providers,items:[{...repository,state:'requested'}]};};
+    vm.runInContext(`api=adminTransport;route='admin';globalThis.startAdmin=()=>installRepositoryAdmin(document.getElementById('repository-admin'));`,f.context);
+    await f.context.startAdmin();await form.onsubmit({preventDefault(){}});
+    assert.match(error.textContent,/后台可能仍在处理/);assert.match(error.textContent,/刷新申请列表核对状态/);assert.match(error.textContent,/勿重复批准/);
+    assert.equal(calls.filter(c=>c.body).length,1);
+  });
+}
+
+for(const state of ['requested','ready']){
+  test(`saturated provider ${state==='requested'?'approval':'reconciliation'} shows no-work guidance without an uncertain-operation warning`,async()=>{
+    const f=fixture(),box=f.node('repository-admin'),form=f.node('repository-review-form'),button=f.node('approve-button'),error=f.node('approve-error');
+    const busyMessage='仓库服务繁忙，本次尚未执行远端操作；请稍后刷新状态再重试';
+    form.dataset.repositoryTeam=repository.teamId;form.elements={verified:{checked:true}};
+    form.querySelector=selector=>selector==='button'?button:error;
+    box.querySelectorAll=selector=>selector==='[data-repository-team]'?[form]:[];
+    const calls=[];f.context.adminTransport=async(path,body)=>{calls.push({path,body});if(body){const failure=new Error(busyMessage);failure.status=503;failure.code='repository_busy';throw failure;}return {providers,items:[{...repository,state}]};};
+    vm.runInContext(`api=adminTransport;route='admin';globalThis.startAdmin=()=>installRepositoryAdmin(document.getElementById('repository-admin'));`,f.context);
+    await f.context.startAdmin();await form.onsubmit({preventDefault(){}});
+    assert.equal(error.textContent,busyMessage);assert.doesNotMatch(error.textContent,/后台可能仍在处理|操作结果尚未确认/);
+    assert.equal(button.disabled,false);assert.equal(form.elements.verified.checked,true);
+    assert.equal(calls.length,2);assert.equal(calls[1].path,'admin/repositories/'+(state==='requested'?'approve':'reconcile'));
+    assert.equal(calls[1].body.expectedRevision,repository.revision);
+  });
+}
 
 for(const [status,code] of [[429,'repository_rate_limit'],[503,'repository_busy']]){
   test(`${code} keeps materials editable and allows a later fresh SHA check`,async()=>{
