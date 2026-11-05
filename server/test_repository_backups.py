@@ -19,6 +19,9 @@ class BackupTests(unittest.TestCase):
     for _name in ('team','invitation','access','open_submissions','materials','request','apply','admin_action','preview','formal_submit','sealed_preview'):
         locals()[_name]=getattr(test_repository_seals.SealedTests,_name)
     def setUp(self):
+        env=patch.dict(os.environ,{'GOTC_REPO_BACKUP_ENABLED':'1'})
+        env.start()
+        self.addCleanup(env.stop)
         test_repository_seals.SealedTests.setUp(self)
         self.source=Path(self.service.data_dir).parent/'synthetic-source'
         self.source.mkdir()
@@ -219,6 +222,34 @@ class BackupTests(unittest.TestCase):
         self.backups.run_once()
         self.assertEqual(self.record()['status'],'queued')
         self.assertIsNone(self.record()['downloadUrl'])
+
+    def test_disabled_new_jobs_keep_sealed_receipt_without_queue_records(self):
+        for index,flag in enumerate(('', '0', 'true')):
+            with self.subTest(flag=flag),patch.dict(os.environ,{'GOTC_REPO_BACKUP_ENABLED':flag}):
+                selected=self.sealed_preview()
+                status,result,_=self.formal_submit(selected,version=index,request_id='disabled-backup-request-'+str(index))
+                self.assertEqual(status,200,result)
+                self.assertIsNotNone(result['repositorySeal'])
+                self.assertIsNone(result['repositoryBackup'])
+                self.assertEqual(result['receipt']['repositorySeal']['sha'],selected['sha'])
+                with self.service.db() as db:
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM repository_backups').fetchone()[0],0)
+
+    def test_disabling_new_jobs_preserves_existing_private_downloads(self):
+        self.enqueue_selected(self.sha_a)
+        self.backups.run_once()
+        old=self.record()
+        self.assertEqual(old['status'],'ready')
+        with patch.dict(os.environ,{'GOTC_REPO_BACKUP_ENABLED':'0'}):
+            selected=self.sealed_preview()
+            status,result,_=self.formal_submit(selected,version=1,request_id='disabled-after-old-backup-0001')
+            self.assertEqual(status,200,result)
+            self.assertIsNone(result['repositoryBackup'])
+            self.assertEqual(self.read_zip_file(old,'version.txt'),'A')
+            with self.service.db() as db:
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM repository_backups').fetchone()[0],1)
+            self.backups.start()
+            self.assertIsNone(self.backups.thread)
 
     def test_no_threads_on_construction_and_opt_in_is_exact(self):
         self.assertIsNone(self.backups.thread)

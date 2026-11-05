@@ -234,6 +234,7 @@ class SealedTests(unittest.TestCase):
         self.assertEqual(result['receipt']['savedAt'], preview['expiresAt'] + 1)
         self.assertEqual(result['submission']['submittedAt'], result['receipt']['savedAt'])
 
+    @patch.dict(os.environ,{'GOTC_REPO_BACKUP_ENABLED':'1'})
     def test_sealed_preview_survives_generation_flag_off_and_new_previews_are_legacy(self):
         selected=self.sealed_preview()
         self.repos.seals.enabled=False
