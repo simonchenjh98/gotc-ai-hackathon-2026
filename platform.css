@@ -50,3 +50,8 @@
 .repository-version { border-top: 1px solid var(--line); margin-top: 20px; padding-top: 20px; overflow-wrap: anywhere; }
 .repository-version a { color: var(--blue); text-decoration: underline; text-underline-offset: 3px; }
 .repository-version ul { font-size: 12px; line-height: 1.9; }
+
+.own-score {max-width: 640px; margin: 32px auto;}
+.own-score h2 {margin-top: 32px; font-size: 1.05rem;}
+.own-score-value {margin: 12px 0 28px; color: var(--blue); font-size: clamp(2.8rem, 9vw, 5rem); font-weight: 700; line-height: 1.15; font-variant-numeric: tabular-nums;}
+.own-score-value span {font-size: 1.15rem; color: var(--muted);}

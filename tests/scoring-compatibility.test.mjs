@@ -94,3 +94,45 @@ test('professional settings edited during their POST retain new values and unsav
   assert.equal(vm.runInContext('confirmLeave()',ctx),false,'Later edits must still require an unsaved-input confirmation');
   assert.match(elements['platform-toast'].textContent,/新输入已保留/);
 });
+
+test('team score route requires team login and only renders the fetched team result',async()=>{
+  const login=context('#team-score',null);
+  await vm.runInContext('renderRoute()',login);
+  assert.deepEqual([...login.calls],['login:team']);
+  const wrong=context('#team-score','judge');
+  await vm.runInContext('renderRoute()',wrong);
+  assert.deepEqual([...wrong.calls],['wrong-role:team']);
+
+  const elements={'platform-main':{innerHTML:''},'refresh-team-score':{}};
+  const requests=[];
+  let response={team:{number:12,name:'<Rocket>'},state:'published',score:0};
+  let send=async()=>response;
+  const h=vm.createContext({
+    document:{getElementById:id=>elements[id],querySelectorAll:()=>[],body:{classList:{remove(){}}}},
+    location:{href:'https://test.invalid/platform.html#team-score',hash:'#team-score'},
+    URL,setTimeout,clearTimeout,
+    fetch:async(url,options)=>{
+      requests.push([url.pathname,options.headers['X-GOTC-Login']]);
+      return {ok:true,json:send};
+    }
+  });
+  vm.runInContext(source+"\nsession={role:'team',loginId:'team-marker'};account=()=>{};",h);
+  await vm.runInContext('renderRoute()',h);
+  assert.deepEqual(requests,[['/api/team/score','team-marker']]);
+  assert.match(elements['platform-main'].innerHTML,/0\.00/);
+  assert.match(elements['platform-main'].innerHTML,/12 · &lt;Rocket&gt;/);
+  for(const [state,copy] of [['unpublished','成绩尚未发布'],['awaiting_scores','有效评委人数尚未达到']]){
+    response={...response,state,score:null};
+    await elements['refresh-team-score'].onclick();
+    assert.match(elements['platform-main'].innerHTML,new RegExp(copy));
+    assert.doesNotMatch(elements['platform-main'].innerHTML,/0\.00/);
+  }
+  let finish;
+  send=()=>new Promise(resolve=>{finish=resolve;});
+  const old=vm.runInContext('renderRoute()',h);
+  await new Promise(resolve=>setImmediate(resolve));
+  vm.runInContext("routeVersion++;session={role:'team',loginId:'new-team'};root.innerHTML='NEXT_TEAM';",h);
+  finish({team:{number:12,name:'Old'},state:'published',score:99});
+  await old;
+  assert.equal(elements['platform-main'].innerHTML,'NEXT_TEAM');
+});

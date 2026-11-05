@@ -189,6 +189,53 @@ class APITests(unittest.TestCase):
         self.assertIsNone(old.get('/api/session')[1]['role'])
         self.assertEqual(fresh.get('/api/judge')[0], 200)
 
+    def test_team_score_uses_bound_identity_and_published_board_rules(self):
+        path = "/api/team/score"
+        a, b = self.team(1, "甲队"), self.team(2, "乙队")
+
+        def team_login(team_id):
+            status, access, _ = self.admin.post("/api/admin/team-access", {"teamId": team_id, "action": "issue"})
+            self.assertEqual(status, 200)
+            client = Client(self.server)
+            status, login, _ = client.post("/api/login", {"role": "team", "code": access["code"]})
+            self.assertEqual(status, 200)
+            return client, {"X-GOTC-Login": login["loginId"]}
+
+        first, marker_a = team_login(a)
+        second, marker_b = team_login(b)
+
+        def lookup(client, headers):
+            status, result, response_headers = client.request("GET", path, headers=headers)
+            self.assertEqual(status, 200)
+            self.assertEqual(response_headers["Cache-Control"], "no-store")
+            self.assertEqual(set(result), {"team", "state", "score"})
+            return result
+
+        self.assertEqual(self.public.get(path)[0], 401)
+        self.assertEqual(self.admin.get(path)[0], 403)
+        self.assertEqual(first.get(path)[0], 428)
+        self.assertEqual(first.request("GET", path, headers=marker_b)[0], 401)
+        self.assertEqual(first.request("GET", path+"?teamId="+b, headers=marker_a)[0], 400)
+        self.assertEqual(lookup(first, marker_a), {"team":{"number":1, "name":"甲队"}, "state":"awaiting_scores", "score":None})
+        self.assertEqual(self.admin.settings({"scoringOpen":True, "resultsPublished":False, "minJudges":2})[0], 200)
+        judges = [self.invitation(name=name)[0] for name in ("甲评委","乙评委")]
+        for judge in judges:
+            self.assertEqual(judge.score({"teamId":b, "scores":[0]*6, "feedback":"私有", "status":"submitted"})[0], 200)
+        self.assertEqual(lookup(second, marker_b)["state"], "unpublished")
+        self.assertIsNone(lookup(second, marker_b)["score"])
+        self.assertEqual(self.admin.settings({"resultsPublished":True})[0], 200)
+        self.assertEqual(lookup(second, marker_b), {"team":{"number":2, "name":"乙队"}, "state":"published", "score":0})
+        self.assertEqual(judges[0].score({"teamId":a, "scores":[20,20,20,15,15,10], "status":"submitted"})[0], 200)
+        self.assertEqual(judges[1].score({"teamId":a, "scores":[10,10,10,5,5,0], "status":"draft"})[0], 200)
+        self.assertEqual(lookup(first, marker_a)["state"], "awaiting_scores")
+        self.assertEqual(judges[1].score({"teamId":a, "scores":[10,10,10,5,5,0], "status":"submitted"})[0], 200)
+        self.assertEqual(lookup(first, marker_a)["score"], 70)
+        self.assertEqual(self.public.get("/api/board")[1]["teams"][0]["score"], 70)
+        self.assertEqual(judges[1].score({"teamId":a, "status":"recused"})[0], 200)
+        self.assertIsNone(lookup(first, marker_a)["score"])
+        self.assertEqual(self.admin.post("/api/admin/team-access", {"teamId":a,"action":"revoke"})[0], 200)
+        self.assertEqual(first.request("GET",path,headers=marker_a)[0], 401)
+
     def test_score_threshold_average_recusal_edits_and_publication(self):
         team_id = self.team()
         self.open()

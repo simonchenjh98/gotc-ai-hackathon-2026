@@ -402,6 +402,28 @@ class EventService:
         return db.execute("SELECT a.* FROM sessions s JOIN accounts a ON a.id=s.account_id WHERE s.token_hash=? AND s.expires_at>? AND a.active=1",
                           (hashlib.sha256(token.encode()).hexdigest(), now_ms())).fetchone()
 
+    @staticmethod
+    def professional_score(average, judge_count, config, public=True):
+        if average is None or judge_count < config["minJudges"]:
+            return None
+        if public and not config["resultsPublished"]:
+            return None
+        return round(average, 2)
+
+    def own_team_score(self, db, actor):
+        team = self.bound_submission_team(db, actor)
+        config = self.config(db)
+        row = db.execute("""SELECT COUNT(judge_id) AS judge_count, AVG(total_tenths)/10.0 AS average
+                            FROM scores WHERE team_id=? AND status='submitted'""", (team["id"],)).fetchone()
+        score = self.professional_score(row["average"], row["judge_count"], config)
+        if score is not None:
+            state = "published"
+        elif config["resultsPublished"]:
+            state = "awaiting_scores"
+        else:
+            state = "unpublished"
+        return {"team": {"name": team["name"], "number": team["number"]}, "state": state, "score": score}
+
     def teams(self, db, public=True):
         config = self.config(db)
         rows = db.execute("""SELECT t.*, COUNT(s.judge_id) AS judge_count, AVG(s.total_tenths)/10.0 AS average,
@@ -410,7 +432,7 @@ class EventService:
           GROUP BY t.id ORDER BY t.number""").fetchall()
         result = [{"id": r["id"], "number": r["number"], "name": r["name"], "project": r["project"], "track": r["track"],
                    "judgeCount": r["judge_count"],
-                   "score": round(r["average"], 2) if r["average"] is not None and r["judge_count"] >= config["minJudges"] and (not public or config["resultsPublished"]) else None,
+                   "score": self.professional_score(r["average"], r["judge_count"], config, public),
                    "rank": None, "audienceVotes": r["audience_votes"]} for r in rows]
         ranked = sorted((r for r in result if r["score"] is not None), key=lambda r: (-r["score"], r["number"]))
         previous = None
@@ -476,10 +498,21 @@ class EventService:
             # Resolve write identities only after the lock: revocation may have committed while queued.
             if method=="POST":
                 db.execute("BEGIN IMMEDIATE")
-            elif method=="GET" and path=="/api/admin":
+            elif method=="GET" and path in {"/api/admin", "/api/team/score"}:
                 # Keep form values and their revision tokens in one read snapshot.
                 db.execute("BEGIN")
             actor = self.account(db, cookie)
+            if path == "/api/team/score":
+                self.require(actor, "team")
+                if method != "GET":
+                    raise APIError(405, "请使用查询入口读取成绩")
+                if query:
+                    raise APIError(400, "查分由当前登录队伍确定")
+                if not expected_login_id:
+                    raise APIError(428, "请刷新页面并核对登录队伍", "login_required")
+                if expected_login_id != self.login_id(cookie):
+                    raise APIError(401, "登录身份已变化，请重新登录")
+                return self.own_team_score(db, actor), None, None
             team_keys_route = path == "/api/team/keys" or path.startswith("/api/team/keys/")
             if team_keys_route:
                 self.require(actor, "team")

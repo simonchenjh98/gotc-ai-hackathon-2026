@@ -378,3 +378,5 @@ python3 -m py_compile server/app.py server/test_api.py
 管理员 `GET /api/admin/submissions/{teamId}/checks?version=N` 返回 `{teamId,version,latestVersion,items}`；每项 `{field,url,status,revision,checkedAt,actor,note}`。仅生成非空代码/README/许可证/演示/幻灯片/视频链接，地址来自不可变历史。POST同一路径接收 `{version,field,expectedRevision,status,note}`；备注最多500字，状态 `unchecked/accessible/permission_required/unavailable`。仅当前正式版可写，每项独立并发修订；版号推进或修订冲突均409。操作者与记录时间由服务器产生。新正式版默认未检查，旧版只读，即使地址相同也不复制。人工记录仅反映当时观察，不证明作品合格或永久可访问，不自动抓取或通知。
 
 新增请求账本、正式历史、人工检查和迁移元数据表。非空升级先创建私有 `before-submission-records-*.sqlite3` SQLite整库备份；备份失败停止启动。DDL、真实当前正式回填与标记独立原子提交，失败全部回滚，重复启动幂等。旧代码回退期间不维护新记录，再升级只补当时仍保有的当前正式一份并保留缺口，不虚构请求回执、不覆盖已有历史。代码回退不恢复数据库，不自动覆盖现库；整库SQLite备份恢复包含新表。私有临时库演练不代表生产迁移或部署。
+
+队伍使用原提交码进入 `#team-score` 查看专业评分总分。`GET /api/team/score` 根据队伍会话绑定确定队伍，要求当前页面的 `X-GOTC-Login`，返回队号、队名、发布状态和总分。总分沿用公开成绩看板的百分制正式均分及发布门槛。

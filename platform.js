@@ -22,7 +22,7 @@ function publishLogin(login){if(!login.loginId)return;try{localStorage.setItem(l
 function ownsBrowserLogin(login){const owner=browserLoginOwner();return !owner || !login.loginId || owner===login.loginId || (verifiedBrowserLogin?.loginId===login.loginId && verifiedBrowserLogin.owner===owner);}
 async function api(path, data, options={}) {
   const recoveryAtStart=currentTeamRecovery,sessionAtStart=session,ownerAtStart=path==='session'?browserLoginOwner():null;
-  const res = await fetch(new URL(`api/${path}`, base), {credentials:'same-origin',cache:'no-store',method:data === undefined ? 'GET' : 'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json'}),...((['team','submission','logout','judge','score','admin','admin/settings'].includes(path) || path.startsWith('submission/') || path==='team/keys' || path.startsWith('team/keys/') || path.startsWith('team/repository') || path.startsWith('admin/repositories')) && (options.loginId ?? session.loginId)?{'X-GOTC-Login':options.loginId ?? session.loginId}:{})},body:data === undefined ? undefined : JSON.stringify(data),signal:options.signal});
+  const res = await fetch(new URL(`api/${path}`, base), {credentials:'same-origin',cache:'no-store',method:data === undefined ? 'GET' : 'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json'}),...((['team','team/score','submission','logout','judge','score','admin','admin/settings'].includes(path) || path.startsWith('submission/') || path==='team/keys' || path.startsWith('team/keys/') || path.startsWith('team/repository') || path.startsWith('admin/repositories')) && (options.loginId ?? session.loginId)?{'X-GOTC-Login':options.loginId ?? session.loginId}:{})},body:data === undefined ? undefined : JSON.stringify(data),signal:options.signal});
   let body; try { body = await res.json(); } catch { throw new Error('服务暂时不可用，请稍后重试。'); }
   if (!res.ok) { if((res.status===401 || res.status===403) && recoveryAtStart && currentTeamRecovery===recoveryAtStart)recoveryAtStart.lock();if(res.status===401 && session===sessionAtStart && (!recoveryAtStart || currentTeamRecovery===recoveryAtStart))session={role:null}; const error = new Error(body.error || '操作未成功，请重试。'); error.status = res.status; error.code=body.code; throw error; }
   if(path==='session')verifiedBrowserLogin={loginId:body.loginId,owner:ownerAtStart};
@@ -178,8 +178,8 @@ async function renderBoard(version) {
 }
 function renderLogin(role) {
   const stage=stageForRoute();
-  const copy = {team:['把作品准备好，<br>把创造的过程留下来。','使用主办方为本队提供的独立提交码。草稿仅本队和组织方可见，正式提交后评委才能查看材料。'],judge:route==='judge'?['专业评分<br>六维 100 分','使用主办方提供的评委码，选择自己的身份。评分可保存草稿，正式提交后计入专业均分。']:[`${stageName(stage)}记录`,'使用主办方提供的评委码，选择自己的身份。可查看本轮队伍、保存草稿、提交评语或回避；本阶段记录暂不计分。'],audience:['选出让你<br>眼前一亮的作品。','观众选择票独立于专业成绩。使用观众邀请码登录，每个邀请码最多支持 3 支不同队伍。'],admin:['组织方<br>活动管理','管理队伍、评委、评审窗口和作品材料。请使用主办方管理码登录。']}[role];
-  root.innerHTML = `<div class="login-layout"><div class="login-story"><p class="eyebrow">GOTC 2026 / ${role.toUpperCase()}</p><h1>${copy[0]}</h1><p>${copy[1]}</p><span class="login-pixel" aria-hidden="true"></span></div><form class="login-card" id="login-form"><h2>${roleName[role]}登录</h2><p>邀请码仅用于本届活动，请妥善保管。<br>如未收到或无法登录，请联系现场主办方。</p><label class="field">${role === 'admin' ? '组织方管理码' : (role === 'judge' ? '评委登录码' : role === 'team' ? '队伍提交码' : '观众邀请码')}<input name="code" type="password" autocomplete="one-time-code" required maxlength="160" placeholder="输入你的${role === 'admin' ? '管理码' : '邀请码'}"></label><p class="form-error" role="alert"></p><button type="submit" class="btn">进入${roleName[role]}工作台 ↗</button><p class="form-footnote">公众查看成绩和评审进度无需登录。<a href="${route==='judge'?'#board':stage==='roadshow'?'#board-roadshow':'#board-exhibition'}">查看公开看板 →</a></p></form></div>`;
+  const copy = {team:route==='team-score'?['本队查分','输入主办方发给本队的提交码，查看本队已发布的专业评分总分。']:['把作品准备好，<br>把创造的过程留下来。','使用主办方为本队提供的独立提交码。草稿仅本队和组织方可见，正式提交后评委才能查看材料。'],judge:route==='judge'?['专业评分<br>六维 100 分','使用主办方提供的评委码，选择自己的身份。评分可保存草稿，正式提交后计入专业均分。']:[`${stageName(stage)}记录`,'使用主办方提供的评委码，选择自己的身份。可查看本轮队伍、保存草稿、提交评语或回避；本阶段记录暂不计分。'],audience:['选出让你<br>眼前一亮的作品。','观众选择票独立于专业成绩。使用观众邀请码登录，每个邀请码最多支持 3 支不同队伍。'],admin:['组织方<br>活动管理','管理队伍、评委、评审窗口和作品材料。请使用主办方管理码登录。']}[role];
+  root.innerHTML = `<div class="login-layout"><div class="login-story"><p class="eyebrow">GOTC 2026 / ${role.toUpperCase()}</p><h1>${copy[0]}</h1><p>${copy[1]}</p><span class="login-pixel" aria-hidden="true"></span></div><form class="login-card" id="login-form"><h2>${roleName[role]}登录</h2><p>邀请码仅用于本届活动，请妥善保管。<br>如未收到或无法登录，请联系现场主办方。</p><label class="field">${role === 'admin' ? '组织方管理码' : (role === 'judge' ? '评委登录码' : role === 'team' ? '队伍提交码' : '观众邀请码')}<input name="code" type="password" autocomplete="one-time-code" required maxlength="160" placeholder="输入你的${role === 'admin' ? '管理码' : '邀请码'}"></label><p class="form-error" role="alert"></p><button type="submit" class="btn">${route==='team-score'?'查看本队成绩':'进入'+roleName[role]+'工作台 ↗'}</button><p class="form-footnote">公众查看成绩和评审进度无需登录。<a href="${route==='judge' || route==='team-score'?'#board':stage==='roadshow'?'#board-roadshow':'#board-exhibition'}">查看公开看板 →</a></p></form></div>`;
   const form=document.getElementById('login-form');
   const identityField=document.createElement('label');
   identityField.className='field';identityField.hidden=true;
@@ -743,17 +743,36 @@ function installSubmissionAdmin(data){const cfg=data.config || {};root.insertAdj
   installRepositoryAdmin();
 }
 
+async function renderTeamScore(version) {
+  const owner=session;
+  if (!ownsBrowserLogin(owner)) {
+    root.innerHTML='<p class="info-banner" role="status">当前登录队伍已切换，请刷新页面重新查分。</p>';
+    return;
+  }
+  const data=await api('team/score',undefined,{loginId:owner.loginId});
+  if (version!==routeVersion || route!=='team-score' || session!==owner || !ownsBrowserLogin(owner)) return;
+  let result;
+  if (data.state==='published' && Number.isFinite(data.score)) {
+    result=`<p class="own-score-value">${data.score.toFixed(2)} <span>/ 100</span></p>`;
+  } else {
+    const message=data.state==='awaiting_scores'?'有效评委人数尚未达到公布门槛，请稍后查询。':'成绩尚未发布，请等待主办方通知。';
+    result=`<p role="status">${message}</p>`;
+  }
+  root.innerHTML=`<section class="surface own-score"><h1>本队查分</h1><p>${esc(teamLabel(data.team))}</p><h2>专业评分总分</h2>${result}<button type="button" id="refresh-team-score" class="btn secondary small">刷新成绩</button></section>`;
+  document.getElementById('refresh-team-score').onclick=()=>renderRoute();
+}
+
 async function renderRoute(){
   currentTeamKeys?.dispose();
   if(typeof disposeAdminReviewSync==='function')disposeAdminReviewSync();adminReadOnlyView=null;adminLoadPending=null;
   clearTimeout(pollTimer);const version=++routeVersion;
-  route=['team','judge','judge-exhibition','board-exhibition','judge-roadshow','board-roadshow','audience','admin'].includes(location.hash.slice(1))?location.hash.slice(1):'board';
+  route=['team','team-score','judge','judge-exhibition','board-exhibition','judge-roadshow','board-roadshow','audience','admin'].includes(location.hash.slice(1))?location.hash.slice(1):'board';
   lastBoard=null;document.body.classList.remove('screen-mode');
   document.querySelectorAll('[data-route]').forEach(a=>{a.classList.toggle('active',a.dataset.route===route);if(a.dataset.route===route)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});
-  document.title=`${{board:'成绩看板','board-exhibition':'展示评审进度（未计分）','board-roadshow':'路演评审进度（未计分）','judge-roadshow':'路演评审记录',team:'作品提交',judge:'专业评分（六维100分）','judge-exhibition':'展示评审记录',audience:'观众投票',admin:'组织方后台'}[route]} · GOTC 2026`;
+  document.title=`${{board:'成绩看板','board-exhibition':'展示评审进度（未计分）','board-roadshow':'路演评审进度（未计分）','judge-roadshow':'路演评审记录',team:'作品提交','team-score':'本队查分',judge:'专业评分（六维100分）','judge-exhibition':'展示评审记录',audience:'观众投票',admin:'组织方后台'}[route]} · GOTC 2026`;
   account();root.innerHTML='<div class="loading-state">正在读取活动数据…</div>';
-  const requiredRole=route.startsWith('judge-')?'judge':route;
-  try{if(route==='board')return await renderBoard(version);if(route==='board-exhibition' || route==='board-roadshow')return await renderExhibitionBoard(version);if(!session.role){renderLogin(requiredRole);return;}if(session.role!==requiredRole){renderWrongRole(requiredRole);return;}if(route==='team')await renderTeam(version);if(route==='judge')await renderJudge(version);if(route==='judge-exhibition' || route==='judge-roadshow')await renderExhibitionJudge(version);if(route==='audience')await renderAudience(version);if(route==='admin')await renderAdmin(version);}
+  const requiredRole=route==='team-score'?'team':route.startsWith('judge-')?'judge':route;
+  try{if(route==='board')return await renderBoard(version);if(route==='board-exhibition' || route==='board-roadshow')return await renderExhibitionBoard(version);if(!session.role){renderLogin(requiredRole);return;}if(session.role!==requiredRole){renderWrongRole(requiredRole);return;}if(route==='team-score')return await renderTeamScore(version);if(route==='team')await renderTeam(version);if(route==='judge')await renderJudge(version);if(route==='judge-exhibition' || route==='judge-roadshow')await renderExhibitionJudge(version);if(route==='audience')await renderAudience(version);if(route==='admin')await renderAdmin(version);}
   catch(e){if(version===routeVersion){if(e.status===401 && !['board','board-exhibition','board-roadshow'].includes(route)){account();renderLogin(requiredRole);}else showConnectionError(e);}}
 }
 // Cheap models cost fractions of a cent per call, so small amounts keep 4 decimals.
@@ -963,7 +982,9 @@ async function showKeyLogs(filter,title,errorsOnly=false,search={}){const box=do
   await load();if(!box.isConnected)return;render();box.scrollIntoView({block:'start'});}
 window.addEventListener('hashchange',()=>{if(restoreSubmissionRoute){restoreSubmissionRoute=false;return;}if(!confirmLeave()){restoreSubmissionRoute=true;location.hash=route;return;}submissionDirty=false;reviewDirty=false;scoreDirty=false;dirtyAdminForms.clear();renderRoute();});
 window.addEventListener('click',async event=>{const button=event.target.closest?.('[data-copy-value]');if(!button)return;try{await navigator.clipboard.writeText(button.dataset.copyValue);toast('已复制。');}catch{toast('复制不可用，请展开完整记录或哈希并手动复制。');}});
-window.addEventListener('storage',()=>{currentTeamKeys?.valid();currentTeamRecovery?.storageChanged();});
+window.addEventListener('storage',()=>{
+  if (route==='team-score' && session.role==='team' && !ownsBrowserLogin(session)) renderRoute();
+  currentTeamKeys?.valid();currentTeamRecovery?.storageChanged();});
 window.addEventListener('pagehide',()=>currentTeamRecovery?.flush());
 window.addEventListener('beforeunload',event=>{currentTeamRecovery?.flush();if(submissionDirty || reviewDirty || scoreDirty || dirtyAdminForms.size){event.preventDefault();event.returnValue='';}});
 (async()=>{try{session=await api('session');}catch{session={role:null};}await renderRoute();})();
