@@ -560,3 +560,51 @@ class BackupTests(unittest.TestCase):
         self.assertLess(process_seen[0].returncode,0)
         self.assertIsNone(worker.process)
         send.assert_called_once()
+
+    def test_first_signal_eperm_reaps_and_distinguishes_natural_exit_from_live_denial(self):
+        import errno
+        import sys
+        from repository_backups import BackupFailure
+        worker=self.backups
+        scratch=worker.directory(worker.root/'scratch')
+        ctx={'scratch':scratch,'deadline':time.monotonic()+5,'env':{}}
+        for natural_exit in (True,False):
+            with self.subTest(natural_exit=natural_exit):
+                read_fd,write_fd=os.pipe()
+                with os.fdopen(read_fd,'rb') as gate,os.fdopen(write_fd,'wb',buffering=0) as release:
+                    child=subprocess.Popen([sys.executable,'-c','import sys;sys.stdin.buffer.read(1)'],
+                                           stdin=gate,start_new_session=True)
+                    real_wait=child.wait
+                    def signal_group(pid,sig):
+                        self.assertEqual(pid,child.pid)
+                        if natural_exit:
+                            release.write(b'x')
+                            # Confirm actual exit without reaping before the raced signal.
+                            os.waitid(os.P_PID,pid,os.WEXITED|os.WNOWAIT)
+                        raise PermissionError(errno.EPERM,'synthetic signal result')
+                    def reap():
+                        if not natural_exit:release.write(b'x')
+                        return real_wait(timeout=3)
+                    try:
+                        with patch('repository_backups.subprocess.Popen',return_value=child), \
+                             patch.object(worker,'check',side_effect=[None,BackupFailure('git_timeout')]), \
+                             patch('repository_backups.os.killpg',side_effect=signal_group) as signal_mock, \
+                             patch.object(child,'wait',side_effect=reap) as waited:
+                            with self.assertRaises(BackupFailure if natural_exit else PermissionError) as failure:
+                                worker._git(scratch,['status'],ctx)
+                            if natural_exit:self.assertEqual(str(failure.exception),'git_timeout')
+                            else:self.assertEqual(failure.exception.errno,errno.EPERM)
+                            signal_mock.assert_called_once();waited.assert_called_once()
+                        self.assertIsNone(worker.process)
+                        self.assertEqual(child.returncode,0)
+                    finally:
+                        release.close()
+                        real_wait(timeout=3)
+
+    def test_stop_joins_worker_when_first_signal_is_denied(self):
+        from unittest.mock import Mock
+        worker=self.backups
+        worker.thread=Mock()
+        with patch.object(worker,'terminate_git_group',side_effect=PermissionError):
+            with self.assertRaises(PermissionError):worker.stop()
+        worker.thread.join.assert_called_once_with(30)

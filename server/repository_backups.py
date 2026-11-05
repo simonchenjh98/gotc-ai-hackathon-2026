@@ -205,40 +205,47 @@ class RepositoryBackups:
             raise BackupFailure('task_limit' if self.TASK_BYTES-self.usage(ctx['scratch'])<=self.TOTAL_BYTES-self.usage(self.root) else 'storage_limit')
         argv=[self.git_binary,'-c','credential.helper=','-c','core.hooksPath=/dev/null','-c','http.followRedirects=false','-c','protocol.allow=never','-c','protocol.https.allow=always','-c','pack.threads=1','-c','pack.windowMemory=32m','-c','gc.auto=0','-C',str(repo),*args]
         wrapper='import os,resource,sys; n=int(sys.argv[1]); resource.setrlimit(resource.RLIMIT_FSIZE,(n,n)); os.execve(sys.argv[2],sys.argv[2:],os.environ)'
-        try:
-            with output.open('xb') as stdout, (input_path.open('rb') if input_path else open(os.devnull,'rb')) as stdin:
-                with self.process_lock:
-                    if self.stopping.is_set():raise BackupFailure('worker_interrupted')
-                    try:
-                        process=subprocess.Popen([sys.executable,'-c',wrapper,str(remaining),*argv],stdin=stdin,stdout=stdout,stderr=subprocess.DEVNULL,env=env or ctx['env'],start_new_session=True)
-                    except OSError:
-                        raise BackupFailure('git_unavailable') from None
-                    self.process=process
+        with output.open('xb') as stdout, (input_path.open('rb') if input_path else open(os.devnull,'rb')) as stdin:
+            with self.process_lock:
+                if self.stopping.is_set():raise BackupFailure('worker_interrupted')
                 try:
-                    while process.poll() is None:
-                        self.check(ctx)
-                        time.sleep(.02)
+                    process=subprocess.Popen([sys.executable,'-c',wrapper,str(remaining),*argv],stdin=stdin,stdout=stdout,stderr=subprocess.DEVNULL,env=env or ctx['env'],start_new_session=True)
+                except OSError:
+                    raise BackupFailure('git_unavailable') from None
+                self.process=process
+            try:
+                while process.poll() is None:
                     self.check(ctx)
-                    if process.returncode:
-                        if self.usage(ctx['scratch'])>=self.TASK_BYTES:raise BackupFailure('task_limit')
-                        if self.usage(self.root)>=self.TOTAL_BYTES:raise BackupFailure('storage_limit')
-                        raise BackupFailure('git_failed')
-                finally:
+                    time.sleep(.02)
+                self.check(ctx)
+                if process.returncode:
+                    if self.usage(ctx['scratch'])>=self.TASK_BYTES:raise BackupFailure('task_limit')
+                    if self.usage(self.root)>=self.TOTAL_BYTES:raise BackupFailure('storage_limit')
+                    raise BackupFailure('git_failed')
+            except OSError:
+                if self.stopping.is_set():raise BackupFailure('worker_interrupted') from None
+                raise
+            finally:
+                try:
                     self.terminate_git_group()
+                finally:
                     process.wait()
-            return output
-        except OSError:
-            if self.stopping.is_set():raise BackupFailure('worker_interrupted') from None
-            raise
+        return output
 
     def terminate_git_group(self):
         # stop() and the worker can both observe the same exiting child. Take
         # its signal target once under the lock; the launching worker always reaps it.
         with self.process_lock:
-            if self.process and self.process.poll() is None:
-                try:os.killpg(self.process.pid,signal.SIGKILL)
-                except ProcessLookupError:pass
+            process=self.process
             self.process=None
+            if process is None or process.poll() is not None:return
+            try:
+                os.killpg(process.pid,signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                # macOS may return EPERM when the group exits after the live poll.
+                if process.poll() is None:raise
 
     def fetch_source(self,repo,source,env,ctx,provider):
         # Source identity is immutable local seal evidence; no user URL or branch input.
@@ -450,5 +457,7 @@ class RepositoryBackups:
 
     def stop(self):
         self.stopping.set()
-        self.terminate_git_group()
-        if self.thread:self.thread.join(30)
+        try:
+            self.terminate_git_group()
+        finally:
+            if self.thread:self.thread.join(30)
