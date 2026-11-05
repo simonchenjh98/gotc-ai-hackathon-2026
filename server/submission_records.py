@@ -90,12 +90,15 @@ class SubmissionRecords:
         error.request_id=receipt['requestId']
         return error
 
-    def save(self,db,actor,team,body,repository_proof=None):
+    def validate_envelope(self,body):
         if (not isinstance(body,dict) or set(body)-{'expectedVersion','status','materials','requestId','repoPreviewId'}
                 or not {'expectedVersion','status','materials'}.issubset(body)
                 or type(body['expectedVersion']) is not int or not 0<=body['expectedVersion']<=9007199254740991
                 or not isinstance(body['status'],str) or body['status'] not in {'draft','submitted'} or not isinstance(body['materials'],dict)):
             raise APIError(400,'提交字段或状态不正确','submission_envelope_invalid')
+
+    def save(self,db,actor,team,body,repository_proof=None):
+        self.validate_envelope(body)
         request_id=self.request_id(body['requestId']) if 'requestId' in body else 'legacy-'+secrets.token_hex(16)
         payload={key:body[key] for key in ('expectedVersion','status','materials')}
         fingerprint={**payload,**({'repoPreviewId':body['repoPreviewId']} if 'repoPreviewId' in body else {})}
@@ -110,12 +113,20 @@ class SubmissionRecords:
         db.execute('SAVEPOINT submission_attempt')
         try:
             official=self.s.repositories.formal_payload(db,team,payload,body.get('repoPreviewId'),repository_proof)
-            result=self.s.save_submission(db,actor,team,official)
+            seal=None
+            if repository_proof and repository_proof.get('repositorySeal'):
+                result=self.s.save_submission(db,actor,team,official,accepted_at=repository_proof['receivedAt'])
+            else:
+                result=self.s.save_submission(db,actor,team,official)
             s=result['submission'];saved_at=s['updatedAt'];version=s['version']
             history_version=version if payload['status']=='submitted' else None
             if history_version is not None:
                 db.execute('INSERT INTO submission_history VALUES (?,?,?,?,?,?)',(team['id'],version,stable_json(s['submitted']),s['submittedAt'],request_id,'submitted'))
+                seal=self.s.repositories.seals.record_submission(db,team['id'],version,request_id,repository_proof)
             receipt={'requestId':request_id,'status':'succeeded','action':payload['status'],'baseVersion':payload['expectedVersion'],'version':version,'savedAt':saved_at,'materials':s['draft'],'historyVersion':history_version}
+            if seal:
+                result['repositorySeal']=seal
+                receipt.update(repositorySeal=seal,receivedAt=seal['receivedAt'])
             db.execute('RELEASE submission_attempt')
         except APIError as error:
             db.execute('ROLLBACK TO submission_attempt');db.execute('RELEASE submission_attempt')
@@ -151,7 +162,8 @@ class SubmissionRecords:
     def detail(self,db,team_id,version):
         row=db.execute('SELECT * FROM submission_history WHERE team_id=? AND submission_version=?',(team_id,version)).fetchone()
         if not row:raise APIError(404,'该正式版本不存在')
-        return {'version':row['submission_version'],'submittedAt':row['submitted_at'],'requestId':row['request_id'],'origin':row['origin'],'materials':json.loads(row['materials_json'])}
+        return {'version':row['submission_version'],'submittedAt':row['submitted_at'],'requestId':row['request_id'],'origin':row['origin'],
+                'repositorySeal':self.s.repositories.seals.for_version(db,team_id,version),'materials':json.loads(row['materials_json'])}
 
     def checks(self,db,team_id,version):
         detail=self.detail(db,team_id,version);latest=self.s.submission(db,team_id)['submittedVersion']

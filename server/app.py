@@ -461,11 +461,11 @@ class EventService:
             self.audit(db, current, "login")
             return {"ok": True, "role": role, "name": current["name"], "loginId": self.login_id(f"{COOKIE_NAME}={token}")}, token, "set"
 
-    def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None):
+    def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None, server_received_at=None):
         """Return (JSON object or CSV bytes, optional session token, cookie action)."""
         if method == "POST" and path == "/api/login":
             return self.login(body, ip)
-        if method=='POST' and path=='/api/submission':return self.dispatch_submission(body,cookie,expected_login_id)
+        if method=='POST' and path=='/api/submission':return self.dispatch_submission(body,cookie,expected_login_id,server_received_at)
         if path.startswith(('/api/team/repository','/api/admin/repositories')):
             return self.repositories.dispatch(method,path,body,cookie,expected_login_id,query or {}),None,None
         with self.db() as db:
@@ -629,7 +629,7 @@ class EventService:
         if not team:raise APIError(403,'本账号未绑定队伍，请联系组织方')
         return team
 
-    def dispatch_submission(self,body,cookie,expected_login_id=None):
+    def dispatch_submission(self,body,cookie,expected_login_id=None,server_received_at=None):
         try:
             proof=self.repositories.preflight(body,cookie,expected_login_id)
         except APIError:
@@ -646,6 +646,8 @@ class EventService:
             actor=self.account(db,cookie);self.require(actor,'team')
             if expected_login_id is not None and expected_login_id!=self.login_id(cookie):raise APIError(401,'登录身份已变化，请重新登录后操作')
             team=self.bound_submission_team(db,actor)
+            if proof and proof.get('repositorySeal'):
+                proof['receivedAt']=now_ms() if server_received_at is None else server_received_at
             result=self.submission_records.save(db,actor,team,body,repository_proof=proof)
         if isinstance(result,APIError):raise result
         return result,None,None
@@ -668,8 +670,10 @@ class EventService:
                 "hasUnsubmittedChanges": submitted is not None and draft!=submitted}
 
     def team_submission_response(self, db, team):
+        submission=self.submission(db, team['id'])
         return {"team": {key: team[key] for key in ("id", "number", "name", "project", "track")},
-                "submission": self.submission(db, team["id"]), "window": self.submission_window(db),
+                "repositorySeal": self.repositories.seals.for_version(db,team['id'],submission['submittedVersion']),
+                "submission": submission, "window": self.submission_window(db),
                 "repository": self.repositories.public(self.repositories.get(db,team['id'])),
                 "repositoryProviders": self.repositories.availability(),
                 "judgingMaterials":self.judging_materials(db,team['id'])}
@@ -749,7 +753,7 @@ class EventService:
             result['codeVersion']=normalize_code_version(result['codeUrl'],result['codeVersion'])
         return result
 
-    def save_submission(self, db, actor, team, body):
+    def save_submission(self, db, actor, team, body, accepted_at=None):
         if set(body)!={"expectedVersion", "status", "materials"} or (not isinstance(body.get("status"), str) or body["status"] not in {"draft", "submitted"}):
             raise APIError(400, "提交字段或状态不正确")
         if type(body["expectedVersion"]) is not int or body["expectedVersion"]<0:
@@ -757,7 +761,7 @@ class EventService:
         submitted=body["status"]=="submitted"
         materials=self.check_materials(body["materials"], submitted)
         current=now_ms()
-        if not self.submission_window(db, current)["canEdit"]:
+        if not self.submission_window(db, current if accepted_at is None else accepted_at)["canEdit"]:
             raise APIError(409, "作品提交尚未开放或已截止，当前材料只读", "submission_closed")
         previous=self.submission(db, team["id"])
         if body["expectedVersion"]!=previous["version"]:
@@ -924,6 +928,7 @@ class EventHandler(BaseHTTPRequestHandler):
                 if self.command == "HEAD":
                     raise APIError(405, "接口不支持此方法")
                 body = {}
+                received_at = None
                 if self.command == "POST":
                     if self.headers.get("Origin") != service.origin or self.headers.get("Sec-Fetch-Site") not in {None, "same-origin", "none"}:
                         raise APIError(403, "仅允许本站发起操作，请从活动官网打开")
@@ -939,11 +944,16 @@ class EventHandler(BaseHTTPRequestHandler):
                     if self.headers.get_content_type() != "application/json":
                         raise APIError(415, "请使用JSON请求")
                     try:
-                        body = json.loads(self.rfile.read(length).decode("utf-8"), parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+                        raw = self.rfile.read(length)
+                        if len(raw) != length:
+                            raise ValueError('incomplete request')
+                        body = json.loads(raw.decode("utf-8"), parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
                     except (UnicodeError, ValueError):
                         raise APIError(400, "JSON格式不正确")
                     if not isinstance(body, dict):
                         raise APIError(400, "JSON内容必须是对象")
+                    if path == '/api/submission':
+                        received_at = now_ms()
                 peer = self.client_address[0]
                 if ipaddress.ip_address(peer).is_loopback:
                     proxy_ip = self.headers.get("X-Real-IP", "")
@@ -951,7 +961,7 @@ class EventHandler(BaseHTTPRequestHandler):
                         peer = str(ipaddress.ip_address(proxy_ip))
                     except ValueError:
                         pass
-                value, token, cookie_action = service.dispatch(self.command, path, body, self.headers.get("Cookie", ""), peer,query=query,expected_login_id=self.headers.get("X-GOTC-Login"))
+                value, token, cookie_action = service.dispatch(self.command, path, body, self.headers.get("Cookie", ""), peer,query=query,expected_login_id=self.headers.get("X-GOTC-Login"),server_received_at=received_at)
                 cookie = None
                 if cookie_action:
                     cookie = f"{COOKIE_NAME}={token or ''}; Path={service.base_path or '/'}; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS if cookie_action == 'set' else 0}"
