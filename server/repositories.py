@@ -208,6 +208,8 @@ class Provider:
 class Repositories:
     def __init__(self, service):
         self.s = service
+        from repository_seals import RepositorySeals
+        self.seals = RepositorySeals(self)
         self.operations = ProviderOperations()
         self.providers = {}
         for name, default in [('github', 'GOTC-AI-HACKATHON'), ('gitee', 'gotc-ai-hackathon')]:
@@ -221,6 +223,7 @@ class Repositories:
 
     def initialize(self, db):
         db.executescript(SCHEMA)
+        self.seals.initialize(db)
 
     def now(self):
         return self.s.judging.clock()
@@ -406,12 +409,12 @@ class Repositories:
         row = self.get(db, team_id)
         return row if row and row['external_id'] else None
 
-    def preview_row(self, db, team_id, session_hash, preview_id):
+    def preview_row(self, db, team_id, session_hash, preview_id, reference_time=None):
         if not isinstance(preview_id, str) or not re.fullmatch(r'[0-9a-f]{48}', preview_id):
             raise APIError(400, '请先读取绑定仓库的 SHA 预览', 'repository_preview_required')
         row = self.binding(db, team_id)
         preview = db.execute('SELECT * FROM repository_previews WHERE id=? AND team_id=? AND session_hash=?', (preview_id, team_id, session_hash)).fetchone()
-        if (not row or not preview or preview['expires_at'] <= self.now() or row['revision'] != preview['binding_revision']
+        if (not row or not preview or preview['expires_at'] <= (self.now() if reference_time is None else reference_time) or row['revision'] != preview['binding_revision']
                 or row['state'] not in {'invited', 'ready'}):
             raise APIError(409, 'SHA 预览已失效或不属于当前登录，请重新检查材料', 'repository_preview_expired')
         return row, preview
@@ -430,19 +433,25 @@ class Repositories:
         with self.operations.operation(p.name, team['id'], 'preview'):
             self.verify_repository(row, p.repository(row))
             sha = p.head(row)
+            seal = self.seals.ensure(p, row, sha) if self.seals.applies(row) else None
         with self.s.db() as db:
             db.execute('BEGIN IMMEDIATE')
             actor = self.identity(cookie, login_id, 'team', db)
             current_team = self.s.bound_submission_team(db, actor)
             current = self.binding(db, current_team['id'])
-            if current_team['id'] != team['id'] or not current or current['revision'] != row['revision']:
+            if current_team['id'] != team['id'] or not current or current['state'] not in {'invited', 'ready'} or any(
+                    current[k] != row[k] for k in ('revision','provider','external_id','organization','slug')):
                 raise APIError(409, '仓库绑定已变化，请重新读取')
             if not self.s.submission_window(db)['canEdit']:
                 raise APIError(409, '作品提交尚未开放或已截止', 'submission_closed')
             preview_id, expires = secrets.token_hex(24), self.now() + PREVIEW_MS
-            db.execute('DELETE FROM repository_previews WHERE expires_at<=?', (self.now(),))
+            # Retain expired rows through SQLite's writer queue so an on-time arrival
+            # still has evidence if another preview commits first.
+            db.execute('DELETE FROM repository_previews WHERE expires_at<=?', (self.now() - PREVIEW_MS,))
             db.execute('INSERT INTO repository_previews VALUES (?,?,?,?,?,?)', (preview_id, team['id'], login_id, row['revision'], sha, expires))
-            return {'previewId': preview_id, 'sha': sha, 'codeUrl': self.public(row)['codeUrl'], 'branch': row['branch'], 'expiresAt': expires, 'archived': False}
+            if seal:
+                db.execute('INSERT INTO repository_preview_seals VALUES (?,?)', (preview_id, seal['id']))
+            return {**({'repositorySeal': seal} if seal else {}), 'previewId': preview_id, 'sha': sha, 'codeUrl': self.public(row)['codeUrl'], 'branch': row['branch'], 'expiresAt': expires, 'archived': False}
 
     def preflight(self, body, cookie, login_id):
         """Read proof and upstream head before the receipt writer lock. Existing requests skip I/O."""
@@ -452,12 +461,23 @@ class Repositories:
             actor = self.s.account(db, cookie)
             self.s.require(actor, 'team')
             team = self.s.bound_submission_team(db, actor)
+            self.s.submission_records.validate_envelope(body)
             if isinstance(body.get('requestId'), str) and db.execute('SELECT 1 FROM submission_requests WHERE team_id=? AND request_id=?', (team['id'], body['requestId'])).fetchone():
                 return None
             row = self.binding(db, team['id'])
             if not row:
                 return None
             self.identity(cookie, login_id, 'team', db)
+            preview_id = body.get('repoPreviewId')
+            seal = self.seals.for_preview(db, preview_id) if isinstance(preview_id, str) else None
+            # Disabling new seals cannot change the promise made by an issued preview.
+            if seal or self.seals.applies(row):
+                self.provider(row)  # Check local configuration without contacting Gitee.
+                if not isinstance(preview_id, str):
+                    raise APIError(400, '请先封存绑定仓库的版本', 'repository_preview_required')
+                if not seal:
+                    raise APIError(409, '预览尚未封存或已失效，请重新检查材料', 'repository_preview_expired')
+                return {'previewId': preview_id, 'sha': seal['sha'], 'sessionHash': login_id, 'repositorySeal': seal}
             if not self.s.submission_window(db)['canEdit']:
                 raise APIError(409, '作品提交尚未开放或已截止', 'submission_closed')
             row, preview = self.preview_row(db, team['id'], login_id, body.get('repoPreviewId'))
@@ -482,7 +502,9 @@ class Repositories:
             return payload
         if not proof or proof.get('previewId') != preview_id:
             raise APIError(409, '仓库绑定已变化，请重新检查材料', 'repository_preview_required')
-        row, preview = self.preview_row(db, team['id'], proof['sessionHash'], preview_id)
+        row, preview = self.preview_row(db, team['id'], proof['sessionHash'], preview_id, proof.get('receivedAt'))
+        if self.seals.applies(row) or proof.get('repositorySeal'):
+            self.seals.verify_proof(db, row, preview, proof)
         if proof['sha'] != preview['sha']:
             raise APIError(409, '正式分支已有新提交，请重新预览', 'repository_head_changed')
         url = self.public(row)['codeUrl']

@@ -38,3 +38,11 @@ preserved. A concurrent Nginx edit is never overwritten automatically.
 The initial admin access file is transferred through SFTP to
 `.runtime/admin-access.txt`. It is never printed and must never be committed or
 shared publicly. Keep `.runtime/` ignored by Git.
+
+## Optional private source backup worker
+
+The sealed Gitee source worker additionally requires the system Git executable (production baseline: Git 2.43.0) and Python 3.12; no pip dependency is added. Configure `GOTC_REPO_GITEE_ENABLED=1`, the existing private Gitee organization/token settings, and `GOTC_REPO_GITEE_SEAL_ENABLED=1` for sealed previews. Set `GOTC_REPO_BACKUP_ENABLED=1` in the private service environment to start one worker from `main()` after HTTP server initialization. Any other value leaves the worker stopped; constructing EventService in tests starts no threads. The Gitee token's mandatory user_info scope supports validating its login via `/user`; no additional scope is requested here.
+
+Allow service writes beneath `GOTC_DATA_DIR`, including `repository-backups`, and outbound HTTPS to official Gitee. Never put credentials in command arguments, remotes, the release tree or logs. The worker uses a temporary private askpass helper and a restricted child environment; it resets system/global Git config, helpers, redirects and hooks, with `pack.threads=1` and `pack.windowMemory=32m` for the existing 512 MiB service budget. Source backups remain private and must not be exposed through Nginx aliases or copied into static releases.
+
+Limits: one worker, polling every 5 s, three attempts with 60/300 s delays, 180 s per task Git/creation wall time, 268435456 task bytes, 2147483648 total backup bytes, 134217728 source bytes and 20000 tracked files. Account for temporary files and retained artifacts in disk capacity and private host backups. Failure keeps the original submission and SHA; restart recovers interrupted jobs. Shutdown stops the worker and its active Git process group. LFS/submodules produce partial backups; PPT/video and runtime dependencies are outside this archive. See [repository provisioning](../docs/repository-provisioning.md) for private API and operator boundaries.

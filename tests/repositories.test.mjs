@@ -21,7 +21,7 @@ function fixture(){
   const context=vm.createContext({document:{getElementById:node},location:{href:'https://example.test/platform.html#team'},URL,TextEncoder,Intl,Date,setTimeout,clearTimeout,AbortController});
   context.transport=async(path,body)=>{
     calls.push({path,body});
-    if(path==='team')return structuredClone(latest);
+    if(path==='team')return context.teamResponse?await context.teamResponse():structuredClone(latest);
     if(path==='team/repository/preview')return context.previewResponse?await context.previewResponse():{previewId,sha,branch:'main',codeUrl:repository.codeUrl,archived:false};
     if(path==='submission'){
       if(context.submissionResponse)await context.submissionResponse(body);
@@ -35,7 +35,7 @@ function fixture(){
   vm.runInContext(source+`\napi=transport;session={role:'team',loginId:'synthetic-login'};routeVersion=1;route='team';
     installTeamRecovery=()=>({isAuthorized:()=>true,hasAuthorization:()=>true,sessionOwner:session,teamId:'T1',input(){},pending(){},acknowledge(){},result(sent,state){globalThis.recoveryStates.push(state);}});
     installTeamRepository=()=>{};installSubmissionHistory=()=>{};loadTeamKeys=()=>{};
-    globalThis.h={teamFormMarkup,teamRepositoryMarkup,repositoryAdminMarkup,repositoryStatusMarkup};globalThis.render=()=>renderTeam(1);`,context);
+    globalThis.h={teamFormMarkup,teamRepositoryMarkup,repositoryAdminMarkup,repositoryStatusMarkup,materialMarkup,requestReceiptMarkup,renderTeam};globalThis.render=()=>renderTeam(1);`,context);
   return {context,calls,node,root,h:context.h};
 }
 
@@ -82,6 +82,16 @@ test('bound team controller obtains full server SHA and sends preview id only af
   assert.match(f.root.innerHTML,/正式版 v1 已收到/);
 });
 
+test('sealed preview confirms its fixed SHA and keeps later pushes outside this confirmation',async()=>{
+  const f=fixture(),codeUrl='https://gitee.com/synthetic/project';
+  f.context.previewResponse=async()=>({previewId,sha,branch:'main',codeUrl,repositorySeal:{id:'seal',ref:'sealed-'+sha,sha,sealedAt:100,viewUrl:codeUrl+'/commit/'+sha}});
+  await f.context.render();await f.node('submission-form').onsubmit({preventDefault(){}});
+  const html=f.node('submission-preview').innerHTML;
+  assert.match(html,/版本已封存/);assert.match(html,/确认提交的是当前预览版本/);assert.match(html,/后续 push.*重新预览/);
+  assert.match(html,new RegExp('href="'+codeUrl+'/commit/'+sha+'"'));assert.match(html,/不是独立源码备份/);assert.doesNotMatch(html,/后台令牌/);
+  await f.node('confirm-submission').onclick();assert.equal(f.calls.find(call=>call.path==='submission').body.materials.codeVersion,sha);
+});
+
 test('input changed during SHA read invalidates preview without sending materials',async()=>{
   const f=fixture();let resolve;f.context.previewResponse=()=>new Promise(done=>{resolve=done;});await f.context.render();
   const pending=f.node('submission-form').onsubmit({preventDefault(){}});
@@ -96,6 +106,27 @@ test('upstream SHA failure preserves input and does not fabricate a preview or r
   await f.node('submission-form').onsubmit({preventDefault(){}});
   assert.match(f.node('form-error').textContent,/仓库服务暂不可用/);assert.equal(f.node('material-summary').value,'Summary');
   assert.equal(f.node('submission-preview').innerHTML,'');assert.equal(f.calls.filter(c=>c.path==='submission').length,0);
+});
+
+test('seal setup failure keeps unsaved materials editable for a new preview',async()=>{
+  const f=fixture();f.context.previewResponse=async()=>{const error=new Error('封存版本暂不可用');error.status=409;error.code='repository_seal_mismatch';throw error;};await f.context.render();
+  f.node('material-summary').value='UNSAVED SEAL FAILURE';f.node('submission-form').listeners.input();await f.node('submission-form').onsubmit({preventDefault(){}});
+  assert.equal(f.node('material-summary').value,'UNSAVED SEAL FAILURE');assert.equal(f.node('material-summary').readOnly,false);assert.equal(f.node('fieldset').disabled,false);assert.equal(f.node('submission-preview').innerHTML,'');assert.equal(f.calls.filter(call=>call.path==='submission').length,0);
+});
+
+test('an old replay receipt never inherits the latest formal version backup or seal',async()=>{
+  const f=fixture(),codeUrl='https://gitee.com/synthetic/project',newSha='d'.repeat(40),makeSeal=value=>({id:'seal-'+value,ref:'sealed-'+value,sha:value,sealedAt:100,receivedAt:110,viewUrl:codeUrl+'/commit/'+value});
+  const oldReceipt={requestId:'synthetic-old-request',status:'succeeded',action:'submitted',baseVersion:0,version:1,historyVersion:1,savedAt:120,receivedAt:110,repositorySeal:makeSeal(sha),materials:{...materials,codeUrl,codeVersion:sha}};
+  const data={team:{id:'T1',number:1,name:'Synthetic'},window:{canEdit:true,submissionDeadline:null},submission:{version:4,submittedVersion:2,submittedAt:200,draft:materials,submitted:{...materials,codeUrl,codeVersion:newSha}},repository:{...repository,codeUrl},repositoryProviders:providers,repositorySeal:makeSeal(newSha),repositoryBackup:{status:'queued',sha:newSha,attempts:0}};
+  await f.h.renderTeam(1,data,oldReceipt);
+  const receiptHtml=f.root.innerHTML.split('class="request-receipt"')[1].split('</section>')[0];
+  assert.match(receiptHtml,/正式版 v1 已收到/);assert.match(receiptHtml,new RegExp(sha));assert.doesNotMatch(receiptHtml,new RegExp(newSha));assert.doesNotMatch(receiptHtml,/排队中|下载源码/);
+  assert.match(f.root.innerHTML,/最新正式版 v2 · 封存与备份/);assert.match(f.root.innerHTML,/独立源码备份排队中/);
+  f.node('material-summary').value='DIRTY AFTER REPLAY';f.node('submission-form').listeners.input();
+  f.context.teamResponse=async()=>({...data,repositoryBackup:{...data.repositoryBackup,status:'running'}});
+  await f.node('team-repository-proof-refresh').onclick();
+  assert.equal(f.node('material-summary').value,'DIRTY AFTER REPLAY');assert.equal(f.node('fieldset').disabled,false);assert.match(f.node('team-repository-proof-backup').innerHTML,/独立源码备份处理中/);
+  assert.equal(f.root.innerHTML.split('class="request-receipt"')[1].split('</section>')[0],receiptHtml);
 });
 
 for(const code of ['repository_head_changed','repository_preview_expired','repository_preview_required']){
