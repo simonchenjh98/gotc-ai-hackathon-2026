@@ -172,5 +172,34 @@ class WriteConflictTests(unittest.TestCase):
         current=self.admin.get('/api/admin')[1]['config']
         self.assertTrue(current['submissionsOpen']);self.assertEqual(current['writeRevisions']['submissions'],1)
 
+    def test_judge_and_audience_read_release_and_scores_in_one_snapshot(self):
+        team=self.team()
+        judge,_=self.invitation()
+        audience,_=self.invitation('audience')
+        for client,path in [(judge,'/api/judge'),(audience,'/api/audience')]:
+            with self.subTest(path=path):
+                self.assertEqual(self.settings({'scoringOpen':True,'resultsPublished':True,'minJudges':1})[0],200)
+                self.assertEqual(judge.score({'teamId':team,'scores':[10]*6,'status':'submitted'})[0],200)
+                original=self.service.config
+                paused,release=threading.Event(),threading.Event()
+                def read_config(db):
+                    result=original(db)
+                    if not paused.is_set():
+                        paused.set()
+                        if not release.wait(5):raise RuntimeError('Synthetic roster reader was not released')
+                    return result
+                with patch.object(self.service,'config',side_effect=read_config):
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        pending=pool.submit(client.get,path)
+                        try:
+                            self.assertTrue(paused.wait(5))
+                            self.assertEqual(self.settings({'resultsPublished':False})[0],200)
+                            self.assertEqual(judge.score({'teamId':team,'scores':[0]*6,'status':'submitted'})[0],200)
+                        finally:release.set()
+                        response=pending.result(timeout=5)
+                self.assertEqual(response[0],200,response[1])
+                self.assertEqual(response[1]['teams'][0]['score'],60)
+                self.assertIsNone(client.get(path)[1]['teams'][0]['score'])
+
 
 if __name__=='__main__':unittest.main()

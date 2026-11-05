@@ -255,3 +255,32 @@ test('nonblank professional feedback requires fresh informed confirmation on eac
   await h.form.onsubmit({preventDefault(){}});
   assert.equal(requests.length,1,'A later formal submit needs renewed confirmation');
 });
+
+test('formal submission consumes sharing confirmation while delayed feedback edits survive',async()=>{
+  const gate=deferred(),requests=[];
+  const h=scoreHarness(async(_url,options)=>{
+    const body=JSON.parse(options.body);requests.push(body);
+    return requests.length===1?gate.promise:response({ok:true,score:{teamId:'T1',scores:body.scores,
+      feedback:body.feedback,status:'submitted',revision:body.expectedRevision+1}});
+  });
+  const saving=h.form.onsubmit({preventDefault(){}});
+  await wait();
+  assert.equal(requests[0].feedbackSharing,'team-anonymous-v1');
+  assert.equal(h.form.elements.shareFeedback.checked,false,'Confirmation is consumed at dispatch');
+  h.feedback.value='Edited while the formal score was pending';h.form.input();
+  gate.resolve(response({ok:true,score:{teamId:'T1',scores:requests[0].scores,
+    feedback:requests[0].feedback,status:'submitted',revision:5}}));
+  await saving;
+  assert.equal(h.feedback.value,'Edited while the formal score was pending');
+  assert.equal(vm.runInContext('scoreDirty',h.ctx),true);
+  assert.equal(h.form.elements.shareFeedback.checked,false);
+  await h.form.onsubmit({preventDefault(){}});
+  assert.equal(requests.length,1,'The next revision cannot reuse the previous confirmation');
+  assert.match(h.error.textContent,/确认.*匿名分享/);
+  h.form.elements.shareFeedback.checked=true;
+  await h.form.onsubmit({preventDefault(){}});
+  assert.equal(requests.length,2);
+  assert.equal(requests[1].expectedRevision,5);
+  assert.equal(requests[1].feedback,'Edited while the formal score was pending');
+  assert.equal(requests[1].feedbackSharing,'team-anonymous-v1');
+});

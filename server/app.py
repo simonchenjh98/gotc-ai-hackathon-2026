@@ -538,8 +538,8 @@ class EventService:
             # Resolve write identities only after the lock: revocation may have committed while queued.
             if method=="POST":
                 db.execute("BEGIN IMMEDIATE")
-            elif method=="GET" and path in {"/api/admin", "/api/team/score", "/api/board"}:
-                # Keep form values and their revision tokens in one read snapshot.
+            elif method=="GET" and path in {"/api/admin", "/api/team/score", "/api/board", "/api/judge", "/api/audience"}:
+                # Keep release settings, aggregates and editor revisions in one read snapshot.
                 db.execute("BEGIN")
             actor = self.account(db, cookie)
             if path == "/api/team/score":

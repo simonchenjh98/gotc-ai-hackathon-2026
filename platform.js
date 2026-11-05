@@ -324,7 +324,11 @@ function renderJudgeEditor(){
     if(status!=='recused' && !form.reportValidity())return;
     if(status==='submitted' && form.elements.feedback.value.trim() && !form.elements.shareFeedback?.checked){formError(form,'请确认将本次正式评语匿名分享给本队后再提交。');return;}
     const payload={teamId:team.id,scores:dimensions.map((_,i)=>Number(form.elements[`score${i}`].value)),feedback:form.elements.feedback.value,status,expectedRevision:revision};
-    if(status==='submitted' && form.elements.shareFeedback?.checked)payload.feedbackSharing='team-anonymous-v1';
+    if(status==='submitted' && form.elements.shareFeedback){
+      if(form.elements.shareFeedback.checked)payload.feedbackSharing='team-anonymous-v1';
+      // Confirmation belongs to this dispatched revision, including while input remains editable.
+      form.elements.shareFeedback.checked=false;
+    }
     const sentEditRevision=editRevision;saving=true;updateButtons();formError(form,'');
     try{
       const result=await api('score',payload,{loginId:owner.loginId});if(!alive())return;
@@ -336,7 +340,7 @@ function renderJudgeEditor(){
       const unchanged=editRevision===sentEditRevision;scoreDirty=!unchanged;
       if(unchanged){
         dimensions.forEach((_,i)=>{const value=String(record.scores?.[i] ?? 0);form.elements[`score${i}`].value=value;form.querySelector(`[data-slider="${i}"]`).value=value;});
-        form.elements.feedback.value=record.feedback || '';if(form.elements.shareFeedback)form.elements.shareFeedback.checked=false;updateTotal();
+        form.elements.feedback.value=record.feedback || '';updateTotal();
       }
       const statusNode=document.getElementById('score-status');if(statusNode)statusNode.textContent={submitted:'已正式提交，可修改后重新提交',draft:'草稿已保存，尚未计入成绩',recused:'已回避，可重新评分'}[record.status];
       updateScoreSummary(data);
