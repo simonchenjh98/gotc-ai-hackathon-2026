@@ -47,5 +47,15 @@ test('screen mode rotates eight teams and leaves full metrics intact', () => {
 test('unpublished scores and an empty event have explicit states', () => {
   const html = renderer()({teams:[team(1,{score:null,rank:null})],config:{...cfg,resultsPublished:false}});
   assert.match(html,/暂未发布/);
-  assert.match(renderer()({teams:[],config:cfg}),/本届队伍尚未录入/);
+  assert.match(renderer()({teams:[],stats:{teamCount:0},config:cfg}),/本届队伍尚未录入/);
+});
+
+test('top twelve board uses event-wide statistics and honest pending copy',()=>{
+  const data={teams:[team(1)],stats:{teamCount:17,submittedScores:70,audienceVotes:36},config:cfg};
+  const html=renderer()(data);
+  for(const value of [17,70,36])assert.ok(html.includes(`<strong>${value}</strong>`));
+  assert.match(html,/同分按队号升序.*不追加同分/);
+  const pending=renderer()({...data,teams:[]});
+  assert.match(pending,/尚无队伍达到/);assert.doesNotMatch(pending,/本届队伍尚未录入/);
+  assert.match(renderer()({...data,teams:[],config:{...cfg,resultsPublished:false}}),/暂未发布/);
 });

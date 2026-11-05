@@ -13,7 +13,7 @@ function scoreHarness(fetch,record={teamId:'T1',scores:[10,10,10,10,10,5],feedba
   const sliders=inputs.map((input,i)=>({...node(),value:input.value,dataset:{slider:String(i)}}));
   const elements={'platform-main':node(),'judge-editor':node(),'team-picker':node(),'score-total':node(),'platform-toast':node(),'save-draft':node(),recuse:node(),'score-conflict':node(),'preview-score':node(),'load-score':node(),'score-status':node(),'judge-score-count':node(),'judge-score-window':node()};
   const submit=node(),feedback={...node(),value:record?.feedback ?? ''},error=node(),listeners=[];
-  const form={...node(),elements:{feedback,...Object.fromEntries(inputs.map((input,i)=>[`score${i}`,input]))},
+  const form={...node(),elements:{feedback,shareFeedback:{checked:true},...Object.fromEntries(inputs.map((input,i)=>[`score${i}`,input]))},
     addEventListener(type,fn){if(type==='input')listeners.push(fn);},input(){listeners.forEach(fn=>fn());},reportValidity:()=>true,
     querySelector(selector){if(selector==='.form-error')return error;if(selector==='[type=submit]')return submit;return sliders[Number(selector.match(/\d+/)?.[0])];},
     querySelectorAll(selector){return selector==='[data-score]'?inputs:selector==='[data-slider]'?sliders:selector==='button'?[submit,elements['save-draft'],elements.recuse]:[...inputs,...sliders,feedback,submit,elements['save-draft'],elements.recuse];}};
@@ -236,4 +236,22 @@ test('a manual admin refresh cannot replace a pending or already committed setti
     read.resolve(response({teams:[],judges:[],audience:[],config:{writeRevisions:{submissions:8}}}));
     try{await refresh;}finally{reply();await saving;}
   }
+});
+
+test('nonblank professional feedback requires fresh informed confirmation on each formal submit',async()=>{
+  const requests=[];
+  const h=scoreHarness(async(_url,options)=>{
+    const body=JSON.parse(options.body);requests.push(body);
+    return response({ok:true,score:{teamId:'T1',scores:body.scores,feedback:body.feedback,status:body.status,revision:body.expectedRevision+1}});
+  });
+  h.form.elements.shareFeedback.checked=false;
+  await h.form.onsubmit({preventDefault(){}});
+  assert.equal(requests.length,0);assert.match(h.error.textContent,/确认.*匿名分享/);
+  assert.match(h.elements['judge-editor'].innerHTML,/请勿署名或填写联系方式/);
+  h.form.elements.shareFeedback.checked=true;
+  await h.form.onsubmit({preventDefault(){}});
+  assert.equal(requests[0].feedbackSharing,'team-anonymous-v1');
+  assert.equal(h.form.elements.shareFeedback.checked,false);
+  await h.form.onsubmit({preventDefault(){}});
+  assert.equal(requests.length,1,'A later formal submit needs renewed confirmation');
 });
