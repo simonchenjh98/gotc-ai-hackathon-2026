@@ -17,6 +17,7 @@ const loginOwnerKey=`gotc-login-owner:v1:${encodeURIComponent(base.pathname)}`;
 // A server-verified cookie may outlive a failed/quota-blocked owner publication.
 // Keep the request-time marker snapshot; a later login publication still invalidates it.
 let verifiedBrowserLogin=null;
+const teamLogoutKey=loginOwnerKey+':logout';
 function browserLoginOwner(){try{return localStorage.getItem(loginOwnerKey);}catch{return undefined;}}
 function publishLogin(login){if(!login.loginId)return;try{localStorage.setItem(loginOwnerKey,login.loginId);}catch{/* Server saving remains available without storage. */}}
 function ownsBrowserLogin(login){const owner=browserLoginOwner();return !owner || !login.loginId || owner===login.loginId || (verifiedBrowserLogin?.loginId===login.loginId && verifiedBrowserLogin.owner===owner);}
@@ -43,7 +44,11 @@ async function logoutAccount(event){
     try{let local=null,teamAtExit=null;
       if(session.role==='team'){teamAtExit=await api('team');if(!owned())return;if(currentTeamRecovery && currentTeamRecovery.teamId!==teamAtExit.team.id)currentTeamRecovery.lock('当前登录队伍已变化，本地副本需重新授权后查看。');const store=teamDraftStore(teamAtExit,undefined,teamAtExit.loginId ?? operation.owner.loginId ?? '');const captured=store?.capturePurge();local={purge:()=>store?.purge(captured) ?? false};}
       if(teamAtExit?!confirm(`退出当前登录的${teamAtExit.team.name}会清除本浏览器内本队当前及历史恢复副本，并停止旧标签编辑；退出期间重新登录后新建的副本会保留；服务器材料不受影响。确认退出？`):!confirmLeave())return;
-      await api('logout',{}, {loginId:teamAtExit?.loginId ?? operation.owner.loginId});let cleaned=true;if(local && (owned() || operation.owner.loginId))cleaned=local.purge();if(!owned())return;submissionDirty=false;reviewDirty=false;scoreDirty=false;dirtyAdminForms.clear();currentTeamRecovery?.lock('已退出。');session={role:null};await renderRoute();if(!cleaned)toast('已退出，但无法确认本队本地副本已清理，请在共享设备上清除此站点的浏览器数据。');
+      await api('logout',{}, {loginId:teamAtExit?.loginId ?? operation.owner.loginId});
+      if(operation.owner.role==='team' && operation.owner.loginId){
+        try{localStorage.setItem(teamLogoutKey,operation.owner.loginId);}catch{/* Revalidate on focus when storage is unavailable. */}
+      }
+      let cleaned=true;if(local && (owned() || operation.owner.loginId))cleaned=local.purge();if(!owned())return;submissionDirty=false;reviewDirty=false;scoreDirty=false;dirtyAdminForms.clear();currentTeamRecovery?.lock('已退出。');session={role:null};await renderRoute();if(!cleaned)toast('已退出，但无法确认本队本地副本已清理，请在共享设备上清除此站点的浏览器数据。');
     }catch(error){if(owned() || (logoutInFlight===operation && !session.role))toast('退出未确认，本地副本已保留。'+error.message);}
     finally{if(logoutInFlight===operation)logoutInFlight=null;if(button.isConnected)button.disabled=false;}
 }
@@ -181,6 +186,7 @@ function renderLogin(role) {
   const copy = {team:route==='team-score'?['本队查分','输入主办方发给本队的提交码，查看本队已发布的专业评分总分。']:['把作品准备好，<br>把创造的过程留下来。','使用主办方为本队提供的独立提交码。草稿仅本队和组织方可见，正式提交后评委才能查看材料。'],judge:route==='judge'?['专业评分<br>六维 100 分','使用主办方提供的评委码，选择自己的身份。评分可保存草稿，正式提交后计入专业均分。']:[`${stageName(stage)}记录`,'使用主办方提供的评委码，选择自己的身份。可查看本轮队伍、保存草稿、提交评语或回避；本阶段记录暂不计分。'],audience:['选出让你<br>眼前一亮的作品。','观众选择票独立于专业成绩。使用观众邀请码登录，每个邀请码最多支持 3 支不同队伍。'],admin:['组织方<br>活动管理','管理队伍、评委、评审窗口和作品材料。请使用主办方管理码登录。']}[role];
   root.innerHTML = `<div class="login-layout"><div class="login-story"><p class="eyebrow">GOTC 2026 / ${role.toUpperCase()}</p><h1>${copy[0]}</h1><p>${copy[1]}</p><span class="login-pixel" aria-hidden="true"></span></div><form class="login-card" id="login-form"><h2>${roleName[role]}登录</h2><p>邀请码仅用于本届活动，请妥善保管。<br>如未收到或无法登录，请联系现场主办方。</p><label class="field">${role === 'admin' ? '组织方管理码' : (role === 'judge' ? '评委登录码' : role === 'team' ? '队伍提交码' : '观众邀请码')}<input name="code" type="password" autocomplete="one-time-code" required maxlength="160" placeholder="输入你的${role === 'admin' ? '管理码' : '邀请码'}"></label><p class="form-error" role="alert"></p><button type="submit" class="btn">${route==='team-score'?'查看本队成绩':'进入'+roleName[role]+'工作台 ↗'}</button><p class="form-footnote">公众查看成绩和评审进度无需登录。<a href="${route==='judge' || route==='team-score'?'#board':stage==='roadshow'?'#board-roadshow':'#board-exhibition'}">查看公开看板 →</a></p></form></div>`;
   const form=document.getElementById('login-form');
+  const scoreLoginVersion=route==='team-score'?routeVersion:null;
   const identityField=document.createElement('label');
   identityField.className='field';identityField.hidden=true;
   identityField.innerHTML='选择自己的评委身份<select name="accountId"><option value="">请选择主办方分配的身份</option></select>';
@@ -199,7 +205,21 @@ function renderLogin(role) {
         formError(form,'登录码正确，请选择你自己的评委身份后继续。');
         return;
       }
-      publishLogin(result);session=await api('session');await renderRoute();
+      if(scoreLoginVersion!==null){
+        // Anchor the lookup to this code entry, even if another tab replaces the cookie.
+        const marker=browserLoginOwner();
+        const confirmed=await api('session');
+        if(routeVersion!==scoreLoginVersion || !form.isConnected)return;
+        if(confirmed.loginId!==result.loginId || confirmed.role!=='team' || browserLoginOwner()!==marker){
+          formError(form,'浏览器的登录身份已切换，请重新输入本队提交码。');
+          return;
+        }
+        publishLogin(result);
+        session=confirmed;
+      }else{
+        publishLogin(result);session=await api('session');
+      }
+      await renderRoute();
     }catch(error){formError(form,error.message);}finally{if(button.isConnected)button.disabled=false;}
   };
 }
@@ -981,10 +1001,25 @@ async function showKeyLogs(filter,title,errorsOnly=false,search={}){const box=do
     box.querySelectorAll('[data-log-id]').forEach(b=>b.onclick=()=>withBusy(b,async()=>{const row=document.getElementById('log-'+b.dataset.logId);if(!row.hidden){row.hidden=true;return;}const item=items.find(i=>String(i.id)===b.dataset.logId);const d=await api('admin/keys/log',{id:Number(b.dataset.logId)});row.firstElementChild.innerHTML=callContentMarkup(d,item.path);installCallContent(row.firstElementChild,d);row.hidden=false;}));}
   await load();if(!box.isConnected)return;render();box.scrollIntoView({block:'start'});}
 window.addEventListener('hashchange',()=>{if(restoreSubmissionRoute){restoreSubmissionRoute=false;return;}if(!confirmLeave()){restoreSubmissionRoute=true;location.hash=route;return;}submissionDirty=false;reviewDirty=false;scoreDirty=false;dirtyAdminForms.clear();renderRoute();});
-window.addEventListener('click',async event=>{const button=event.target.closest?.('[data-copy-value]');if(!button)return;try{await navigator.clipboard.writeText(button.dataset.copyValue);toast('已复制。');}catch{toast('复制不可用，请展开完整记录或哈希并手动复制。');}});
-window.addEventListener('storage',()=>{
+window.addEventListener('click',async event=>{
+  if(event.target.closest?.('.skip-link[href="#platform-main"]')){
+    event.preventDefault();
+    root.focus();
+    return;
+  }
+  const button=event.target.closest?.('[data-copy-value]');if(!button)return;try{await navigator.clipboard.writeText(button.dataset.copyValue);toast('已复制。');}catch{toast('复制不可用，请展开完整记录或哈希并手动复制。');}});
+window.addEventListener('storage',event=>{
+  if (route==='team-score' && event.key===teamLogoutKey && event.newValue===session.loginId) {
+    session={role:null};
+    renderRoute();
+  }
   if (route==='team-score' && session.role==='team' && !ownsBrowserLogin(session)) renderRoute();
   currentTeamKeys?.valid();currentTeamRecovery?.storageChanged();});
+function refreshVisibleTeamScore(){
+  if(route==='team-score' && session.role==='team')renderRoute();
+}
+window.addEventListener('focus',refreshVisibleTeamScore);
+window.addEventListener('pageshow',event=>{if(event.persisted)refreshVisibleTeamScore();});
 window.addEventListener('pagehide',()=>currentTeamRecovery?.flush());
 window.addEventListener('beforeunload',event=>{currentTeamRecovery?.flush();if(submissionDirty || reviewDirty || scoreDirty || dirtyAdminForms.size){event.preventDefault();event.returnValue='';}});
 (async()=>{try{session=await api('session');}catch{session={role:null};}await renderRoute();})();

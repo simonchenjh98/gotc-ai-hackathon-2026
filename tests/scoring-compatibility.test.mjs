@@ -136,3 +136,40 @@ test('team score route requires team login and only renders the fetched team res
   await old;
   assert.equal(elements['platform-main'].innerHTML,'NEXT_TEAM');
 });
+
+test('team score login refuses a shared cookie replaced between code entry and session read',async()=>{
+  const root={innerHTML:''},error={textContent:''},submit={},identity={addEventListener(){}};
+  const form={isConnected:true,elements:{code:{value:'fixture',addEventListener(){}},accountId:identity},
+    querySelector:selector=>selector==='button'?submit:{before(){},set textContent(value){error.textContent=value;}}};
+  const requests=[],published=[];
+  const ctx=vm.createContext({
+    document:{getElementById:id=>id==='platform-main'?root:form,createElement:()=>({})},
+    location:{href:'https://test.invalid/platform.html#team-score'},URL,
+    localStorage:{getItem:()=>null,setItem:(k,v)=>published.push(v)},
+    fetch:async url=>{requests.push(url.pathname);return {ok:true,json:async()=>({role:'team',loginId:url.pathname.endsWith('/login')?'A':'B'})};}
+  });
+  vm.runInContext(source+"\nroute='team-score';routeVersion=4;renderLogin('team');",ctx);
+  await form.onsubmit({preventDefault(){}});
+  assert.deepEqual(requests,['/api/login','/api/session']);
+  assert.deepEqual(published,[]);
+  assert.match(error.textContent,/重新输入本队提交码/);
+  assert.equal(vm.runInContext('session.role',ctx),null);
+});
+
+test('a logout notification removes the visible score and invalidates an in-flight lookup',async()=>{
+  const main={innerHTML:'score for A'},listeners={};let finish;
+  const full=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8').split('(async()=>{try{session=await api(\'session\');}')[0];
+  const ctx=vm.createContext({document:{getElementById:()=>main,querySelectorAll:()=>[],body:{classList:{remove(){}}}},
+    window:{addEventListener:(name,fn)=>listeners[name]=fn},location:{href:'https://test.invalid/platform.html#team-score',hash:'#team-score'},
+    URL,clearTimeout,fetch:async()=>({ok:true,json:()=>new Promise(resolve=>{finish=resolve;})})});
+  vm.runInContext(full+"\nroute='team-score';session={role:'team',loginId:'A'};account=()=>{};renderLogin=()=>{root.innerHTML='LOGIN'};",ctx);
+  const reading=vm.runInContext('renderTeamScore(routeVersion)',ctx);
+  await new Promise(resolve=>setImmediate(resolve));
+  const key=vm.runInContext('teamLogoutKey',ctx);
+  listeners.storage({key,newValue:'other-session'});
+  assert.equal(main.innerHTML,'score for A');
+  listeners.storage({key,newValue:'A'});
+  finish({state:'published',score:99,team:{number:1,name:'A'}});
+  await reading;
+  assert.equal(main.innerHTML,'LOGIN');
+});
