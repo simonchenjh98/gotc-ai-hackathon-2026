@@ -11,7 +11,7 @@
 - 离线验证：[测试报告](2026-11-05-test-report.md)，最后完整结果为服务端 208 项、Node 203 项通过；不是生产验收。报告中的“实现完成”只指已提交的功能实现，后续独立审查仍有两项待修。
 - 待修问题：[独立审查](2026-11-05-review.md)。
 - 主办方操作与归档：[赛前检查单](2026-11-05-organizer-checklist.md)。
-- 当前选手教学稿：[Markdown](../gitee-participant-guide.md)、[PDF](../../downloads/gotc-gitee-submission-guide.pdf)。两者仍为赛前教学版；真实上线后还需要更新状态和最终截图，不能当作已上线公告。
+- 当前选手教学稿：[Markdown](../gitee-participant-guide.md)、[PDF](../../downloads/gotc-gitee-submission-guide.pdf)。2026-11-05 已更新为 Gitee 待上线验收版，补充申请状态、5 分钟 SHA 预览、回执和异常处理，已逐页检查。真实上线后仍需复核状态和最终界面，不能当作已上线公告。
 - 可复制起步文件：[README 模板](../templates/gitee-starter/README.md)、[模板许可](../templates/gitee-starter/TEMPLATE-LICENSE.txt)。
 
 ## 当前真实验证边界
