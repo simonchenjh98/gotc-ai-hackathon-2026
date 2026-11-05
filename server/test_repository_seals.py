@@ -233,3 +233,21 @@ class SealedTests(unittest.TestCase):
         self.assertEqual(result['receipt']['receivedAt'], arrival)
         self.assertEqual(result['receipt']['savedAt'], preview['expiresAt'] + 1)
         self.assertEqual(result['submission']['submittedAt'], result['receipt']['savedAt'])
+
+    def test_sealed_preview_survives_generation_flag_off_and_new_previews_are_legacy(self):
+        selected=self.sealed_preview()
+        self.repos.seals.enabled=False
+        self.remote.sha='c'*40
+        calls=len(self.remote.calls)
+        status,result,_=self.formal_submit(selected)
+        self.assertEqual(status,200,result)
+        self.assertEqual(len(self.remote.calls),calls)
+        self.assertEqual(result['receipt']['repositorySeal']['sha'],selected['sha'])
+        self.assertEqual(result['receipt']['receivedAt'],result['repositorySeal']['receivedAt'])
+        self.assertEqual(result['repositoryBackup']['status'],'queued')
+        status,ordinary,_=self.preview()
+        self.assertEqual(status,200,ordinary);self.assertNotIn('repositorySeal',ordinary)
+        calls=len(self.remote.calls)
+        status,result,_=self.formal_submit(ordinary,version=1,request_id='legacy-after-switch')
+        self.assertEqual(status,200,result);self.assertGreater(len(self.remote.calls),calls)
+        self.assertNotIn('receivedAt',result['receipt']);self.assertIsNone(result['repositoryBackup'])

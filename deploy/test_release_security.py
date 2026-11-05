@@ -282,8 +282,8 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
                         # lookup as its real server/app.py process, not the source tree.
                         with patch.object(sys, 'path', [str(extract / 'server'), *sys.path]):
                             source_app = load_module('gotc_test_extracted_app', extract / 'server' / 'app.py')
-                        data = self.root / 'data'
-                        service = source_app.EventService(data_dir=data, origin='https://example.invalid')
+                            data = self.root / 'data'
+                            service = source_app.EventService(data_dir=data, origin='https://example.invalid')
                         with service.db() as db:
                             team_id = 'T-tar-synthetic'
                             db.execute("INSERT INTO teams VALUES (?,?,?,?,?,?)", (team_id, 1, 'Synthetic Team', '', '', 1))

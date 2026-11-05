@@ -468,12 +468,13 @@ class Repositories:
             if not row:
                 return None
             self.identity(cookie, login_id, 'team', db)
-            if self.seals.applies(row):
+            preview_id = body.get('repoPreviewId')
+            seal = self.seals.for_preview(db, preview_id) if isinstance(preview_id, str) else None
+            # Disabling new seals cannot change the promise made by an issued preview.
+            if seal or self.seals.applies(row):
                 self.provider(row)  # Check local configuration without contacting Gitee.
-                preview_id = body.get('repoPreviewId')
                 if not isinstance(preview_id, str):
                     raise APIError(400, '请先封存绑定仓库的版本', 'repository_preview_required')
-                seal = self.seals.for_preview(db, preview_id)
                 if not seal:
                     raise APIError(409, '预览尚未封存或已失效，请重新检查材料', 'repository_preview_expired')
                 return {'previewId': preview_id, 'sha': seal['sha'], 'sessionHash': login_id, 'repositorySeal': seal}

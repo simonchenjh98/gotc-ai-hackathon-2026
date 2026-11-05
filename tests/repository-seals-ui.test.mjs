@@ -49,6 +49,8 @@ test('backup statuses distinguish saved Git bytes, partial external assets and u
   }
   const html=h.backup(backup('partial',{missingAssets:[{path:'<img src=x>',kind:'lfs'},{path:'sub/module',kind:'submodule'}]}),materials,'T1',1);
   assert.match(html,/&lt;img src=x&gt;/);assert.match(html,/LFS/);assert.match(html,/子模块/);assert.doesNotMatch(html,/<img/);
+  const sample=h.backup(backup('partial',{missingAssets:[],missingAssetCount:5,missingAssetOmitted:5}),materials,'T1',1);
+  assert.match(sample,/共 5 项/);assert.match(sample,/5 项未列出/);
   assert.match(h.backup(null,materials,'T1',1),/本版未归档/);
   assert.doesNotMatch(h.backup(backup(),{...materials,codeVersion:'d'.repeat(40)},'T1',1),/下载源码/);
 });

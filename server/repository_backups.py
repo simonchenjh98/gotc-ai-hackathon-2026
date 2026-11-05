@@ -23,7 +23,8 @@ SCHEMA='''CREATE TABLE IF NOT EXISTS repository_backups (
  status TEXT NOT NULL,sha TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,
  next_at REAL NOT NULL DEFAULT 0,error TEXT,artifact_id TEXT,manifest_json TEXT,
  PRIMARY KEY(team_id,version),UNIQUE(team_id,request_id),
- FOREIGN KEY(team_id,version) REFERENCES repository_submission_seals(team_id,version));'''
+ FOREIGN KEY(team_id,version) REFERENCES repository_submission_seals(team_id,version));
+CREATE INDEX IF NOT EXISTS repository_backup_artifact ON repository_backups(artifact_id);'''
 
 
 class BackupFailure(Exception):
@@ -47,6 +48,8 @@ class RepositoryBackups:
     TOTAL_BYTES=2147483648
     SOURCE_BYTES=134217728
     FILE_COUNT=20000
+    SAMPLE_COUNT=16
+    SAMPLE_BYTES=4096  # JSON-encoded missingAssets array, including escapes and separators.
 
     def __init__(self,service):
         self.s=service
@@ -57,6 +60,7 @@ class RepositoryBackups:
         self.process_lock=threading.Lock()
         self.process=None
         self.thread=None
+        self.pending_finish=None
         self.username=None
         self.git_binary=shutil.which('git')
 
@@ -74,7 +78,30 @@ class RepositoryBackups:
 
     def initialize(self,db):
         db.executescript(SCHEMA)
+        if not db.execute("SELECT 1 FROM submission_records_meta WHERE key='repositoryBackupSummaryV1'").fetchone():
+            self.compact_prior_manifests(db)
+            db.execute("INSERT INTO submission_records_meta VALUES ('repositoryBackupSummaryV1','1')")
         db.execute("UPDATE repository_backups SET status=CASE WHEN attempts>=? THEN 'failed' ELSE 'queued' END,error='worker_interrupted' WHERE status='running'",(self.MAX_ATTEMPTS,))
+
+    def compact_prior_manifests(self,db):
+        # Pre-release archives used a complete path list in each version row. SQLite
+        # projects a small result before we take the writer; never read the large
+        # array into Python. The original private manifest and hashes stay intact.
+        after=0
+        while True:
+            row=db.execute("""SELECT rowid,artifact_id,json_remove(manifest_json,'$.missingAssets') AS fields,
+                    json_array_length(manifest_json,'$.missingAssets') AS total,
+                    CASE WHEN length(CAST(manifest_json AS BLOB))<=8192 THEN json_extract(manifest_json,'$.missingAssets') END AS sample
+                FROM repository_backups WHERE rowid>? AND manifest_json IS NOT NULL
+                  AND json_type(manifest_json,'$.missingAssetCount') IS NULL ORDER BY rowid LIMIT 1""",(after,)).fetchone()
+            if not row:return
+            after=row['rowid']
+            sample=json.loads(row['sample']) if row['sample'] else []
+            if len(sample)>self.SAMPLE_COUNT or len(json.dumps(sample))>self.SAMPLE_BYTES:sample=[]
+            summary={**json.loads(row['fields']),'missingAssets':sample,'missingAssetCount':row['total'],'missingAssetOmitted':row['total']-len(sample)}
+            db.execute('UPDATE repository_backups SET manifest_json=? WHERE rowid=? OR artifact_id=?',
+                       (json.dumps(summary),after,row['artifact_id']))
+            db.commit()
 
     def enqueue(self,db,team_id,version,request_id):
         seal=self.s.repositories.seals.source_for_version(db,team_id,version)
@@ -110,7 +137,7 @@ class RepositoryBackups:
     def for_version(self,db,team_id,version):
         row=db.execute('SELECT * FROM repository_backups WHERE team_id=? AND version=?',(team_id,version)).fetchone()
         if not row:return None
-        result=dict(status=row['status'],sha=row['sha'],attempts=row['attempts'],error=row['error'],sourceZipSha256=None,bundleSha256=None,missingAssets=[],downloadUrl=None,bundleUrl=None)
+        result=dict(status=row['status'],sha=row['sha'],attempts=row['attempts'],error=row['error'],sourceZipSha256=None,bundleSha256=None,missingAssets=[],missingAssetCount=0,missingAssetOmitted=0,downloadUrl=None,bundleUrl=None)
         if row['status'] in {'ready','partial'}:
             try:
                 manifest=json.loads(row['manifest_json'])
@@ -125,7 +152,9 @@ class RepositoryBackups:
                             or not isinstance(item['sha256'],str)
                             or not re.fullmatch('[0-9a-f]{64}',item['sha256'])):
                         raise BackupFailure('artifact_unavailable')
-                result.update(sourceZipSha256=manifest['files']['source.zip']['sha256'],bundleSha256=manifest['files']['repo.bundle']['sha256'],missingAssets=manifest['missingAssets'])
+                result.update(sourceZipSha256=manifest['files']['source.zip']['sha256'],bundleSha256=manifest['files']['repo.bundle']['sha256'],missingAssets=manifest['missingAssets'],
+                              missingAssetCount=manifest.get('missingAssetCount',len(manifest['missingAssets'])),
+                              missingAssetOmitted=manifest.get('missingAssetOmitted',0))
                 base=self.s.base_path+'/api/submission/backups/'+quote(team_id,safe='')+'/'+str(version)
                 result.update(downloadUrl=base+'/source.zip',bundleUrl=base+'/repo.bundle')
             except (OSError,ValueError,KeyError,BackupFailure):
@@ -200,10 +229,8 @@ class RepositoryBackups:
             return output
         except OSError:raise BackupFailure('git_unavailable') from None
 
-    def fetch_source(self,repo,source,env,ctx):
+    def fetch_source(self,repo,source,env,ctx,provider):
         # Source identity is immutable local seal evidence; no user URL or branch input.
-        provider=self.s.repositories.providers['gitee']
-        if provider.name!='gitee' or provider.origin!='https://gitee.com/api/v5' or not provider.enabled:raise BackupFailure('provider_unavailable')
         if self.username is None:
             status,user=provider.request('GET','/user')
             login=user.get('login') if isinstance(user,dict) else None
@@ -235,9 +262,11 @@ class RepositoryBackups:
         ctx={'scratch':scratch,'deadline':time.monotonic()+self.GIT_SECONDS,'env':env}
         repo=self.directory(scratch/'repo')
         self._git(repo,['init','--template=','--bare','-q','.'],ctx)
-        provider=self.s.repositories.providers['gitee']
+        try:provider=self.s.repositories.provider(source)
+        except APIError:raise BackupFailure('provider_unavailable') from None
+        if provider.name!='gitee' or provider.origin!='https://gitee.com/api/v5':raise BackupFailure('provider_unavailable')
         self.s.repositories.verify_repository(source,provider.repository(source))
-        self.fetch_source(repo,source,env,ctx)
+        self.fetch_source(repo,source,env,ctx,provider)
         sha=source['sha']
         exists=self._git(repo,['rev-parse','--verify',sha+'^{commit}'],ctx).read_text().strip()
         if exists!=sha:raise BackupFailure('selected_commit_missing')
@@ -250,20 +279,46 @@ class RepositoryBackups:
         empty=self.directory(scratch/'verify')
         self._git(empty,['init','--template=','--bare','-q','.'],ctx)
         self._git(empty,['bundle','verify',str(bundle)],ctx)
+        # Keep the complete path listing only in the private artifact. Stream one JSON
+        # entry at a time; even a tree of long gitlink names never becomes a DB payload.
+        manifest_path=publish/'manifest.json'
+        with manifest_path.open('x',encoding='ascii') as listing:
+            listing.write('{"missingAssets":[')
+            sample=[];sample_bytes=2;total=0
+            def record_missing(path,kind):
+                nonlocal sample_bytes,total
+                asset={'path':path,'kind':kind}
+                encoded=json.dumps(asset,ensure_ascii=True)
+                listing.write((',' if total else '')+encoded)
+                total+=1
+                size=len(encoded)+(2 if sample else 0)
+                if len(sample)<self.SAMPLE_COUNT and sample_bytes+size<=self.SAMPLE_BYTES:
+                    sample.append(asset);sample_bytes+=size
+            source_bytes,files=self.write_zip(repo,sha,publish,ctx,record_missing)
+            manifest={'sha':sha,'repositoryId':source['external_id'],'organization':source['organization'],'slug':source['slug'],'ref':source['ref'],
+                      'sourceBytes':source_bytes,'fileCount':files,'missingAssetCount':total,'files':{}}
+            self.hash_files(publish,ctx,manifest)
+            listing.write('],'+json.dumps(manifest,sort_keys=True)[1:])
+        manifest_path.chmod(0o600)
+        self.check(ctx)
+        return publish,{**manifest,'missingAssets':sample,'missingAssetOmitted':total-len(sample)}
+
+    def write_zip(self,repo,sha,publish,ctx,record_missing):
         tree=self._git(repo,['ls-tree','-r','-l','-z',sha],ctx)
-        entries=[];missing=[];source_bytes=0
+        entries=[];source_bytes=0;tree_count=0
         for raw in self.tree_records(tree,ctx):
             header,raw_path=raw.split(b'\t',1)
             mode,kind,oid,size=header.split()
             path=raw_path.decode('utf-8')
             if len(raw_path)>4096 or path.startswith('/') or ':' in path or '\\' in path or any(ord(c)<32 for c in path) or any(p in {'.','..','.git',''} for p in path.split('/')) or PurePosixPath(path).is_absolute():raise BackupFailure('unsafe_path')
-            if len(entries)+len(missing)>=self.FILE_COUNT:raise BackupFailure('file_count_limit')
-            if mode==b'160000':missing.append({'path':path,'kind':'submodule'});continue
+            tree_count+=1
+            if tree_count>self.FILE_COUNT:raise BackupFailure('file_count_limit')
+            if mode==b'160000':record_missing(path,'submodule');continue
             if kind!=b'blob' or mode not in {b'100644',b'100755',b'120000'}:raise BackupFailure('unsafe_path')
             size=int(size);source_bytes+=size
             if source_bytes>self.SOURCE_BYTES:raise BackupFailure('source_limit')
             entries.append((path,mode,oid,size))
-        request=scratch/'blob-request'
+        request=ctx['scratch']/'blob-request'
         request.write_bytes(b''.join(oid+b'\n' for _,_,oid,_ in entries))
         blobs=self._git(repo,['cat-file','--batch'],ctx,input_path=request)
         with blobs.open('rb') as content,zipfile.ZipFile(publish/'source.zip','w',zipfile.ZIP_DEFLATED,allowZip64=False) as archive:
@@ -284,38 +339,56 @@ class RepositoryBackups:
                         raise BackupFailure('unsafe_path')
                 if content.read(1)!=b'\n':raise BackupFailure('object_invalid')
                 if prefix.startswith(b'version https://git-lfs.github.com/spec/v1\n'):
-                    missing.append({'path':path,'kind':'lfs'})
-        manifest={'sha':sha,'repositoryId':source['external_id'],'organization':source['organization'],'slug':source['slug'],'ref':source['ref'],'sourceBytes':source_bytes,'fileCount':len(entries),'missingAssets':missing,'files':{}}
+                    record_missing(path,'lfs')
+        return source_bytes,len(entries)
+
+    def hash_files(self,publish,ctx,manifest):
         for name in ('source.zip','repo.bundle'):
             path=publish/name;digest=hashlib.sha256()
             with path.open('rb') as stream:
                 while chunk:=stream.read(65536):self.check(ctx);digest.update(chunk)
             path.chmod(0o600)
             manifest['files'][name]={'bytes':path.stat().st_size,'sha256':digest.hexdigest()}
-        (publish/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=True,sort_keys=True))
-        (publish/'manifest.json').chmod(0o600)
-        self.check(ctx)
-        return publish,manifest
 
     def reusable(self,source):
-        with self.s.db() as db:
-            candidates=db.execute("SELECT b.* FROM repository_backups b JOIN repository_submission_seals v ON v.team_id=b.team_id AND v.version=b.version JOIN repository_seals s ON s.id=v.seal_id JOIN repository_seal_namespaces n USING(prefix) WHERE b.status IN ('ready','partial') AND s.sha=? AND n.external_id=? AND n.organization=? AND n.slug=? AND s.prefix=?",(source['sha'],source['external_id'],source['organization'],source['slug'],source['prefix'])).fetchall()
-        for row in candidates:
+        # Advance by physical artifact, not submission version. Read one small candidate
+        # at a time and release the SQLite reader before hashing any file bytes.
+        after=''
+        while True:
+            with self.s.db() as db:
+                row=db.execute("""SELECT b.artifact_id,b.manifest_json FROM repository_backups b
+                    JOIN repository_submission_seals v ON v.team_id=b.team_id AND v.version=b.version
+                    JOIN repository_seals s ON s.id=v.seal_id JOIN repository_seal_namespaces n USING(prefix)
+                    WHERE b.status IN ('ready','partial') AND s.sha=? AND n.external_id=? AND n.organization=?
+                      AND n.slug=? AND s.prefix=? AND b.artifact_id>? ORDER BY b.artifact_id LIMIT 1""",
+                    (source['sha'],source['external_id'],source['organization'],source['slug'],source['prefix'],after)).fetchone()
+            if not row:return None,None
+            after=row['artifact_id']
             try:
                 manifest=json.loads(row['manifest_json'])
                 if any(manifest[key]!=source[field] for key,field in (('sha','sha'),('repositoryId','external_id'),('organization','organization'),('slug','slug'),('ref','ref'))):continue
                 for name in ('source.zip','repo.bundle'):
                     stream,_=self.open_verified(row,name)
                     stream.close()
-                return row['artifact_id'],manifest
+                return after,manifest
             except (OSError,ValueError,KeyError,BackupFailure):continue
-        return None,None
+
+    def finish(self):
+        # Clear only after the transaction commits. A busy SQLite writer/commit
+        # leaves this exact publication queued in memory for the next worker poll.
+        with self.s.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('UPDATE repository_backups SET status=?,next_at=?,error=?,artifact_id=?,manifest_json=? WHERE team_id=? AND version=?',
+                       self.pending_finish)
+        self.pending_finish=None
+        return True
 
     def run_once(self):
         if not self.lock.acquire(blocking=False):return False
         scratch=None
         try:
             if self.stopping.is_set():return False
+            if self.pending_finish is not None:return self.finish()
             with self.s.db() as db:
                 db.execute('BEGIN IMMEDIATE')
                 row=db.execute("SELECT * FROM repository_backups WHERE status='queued' AND next_at<=? AND attempts<? ORDER BY next_at,team_id,version LIMIT 1",(self.clock(),self.MAX_ATTEMPTS)).fetchone()
@@ -332,19 +405,16 @@ class RepositoryBackups:
                     publish,manifest=self.build(source,scratch)
                     artifact_id=secrets.token_hex(24)
                     os.replace(publish,self.root/'artifacts'/artifact_id)
-                status='partial' if manifest['missingAssets'] else 'ready'
+                status='partial' if manifest.get('missingAssetCount',len(manifest['missingAssets'])) else 'ready'
             except Exception as failure:
                 allowed={'artifact_unavailable','worker_interrupted','git_timeout','task_limit','storage_limit','git_unavailable','git_failed','provider_unavailable','provider_identity','source_identity','selected_commit_missing','unsafe_path','file_count_limit','source_limit','object_invalid'}
                 error=str(failure) if isinstance(failure,BackupFailure) and str(failure) in allowed else 'backup_failed'
                 status='queued' if job['attempts']<self.MAX_ATTEMPTS else 'failed'
             finally:
                 if scratch and not scratch.is_symlink():shutil.rmtree(scratch,ignore_errors=True)
-            with self.s.db() as db:
-                db.execute('BEGIN IMMEDIATE')
-                delay=self.RETRY_SECONDS[min(job['attempts']-1,len(self.RETRY_SECONDS)-1)] if status=='queued' else 0
-                db.execute('UPDATE repository_backups SET status=?,next_at=?,error=?,artifact_id=?,manifest_json=? WHERE team_id=? AND version=?',
-                           (status,self.clock()+delay,error,artifact_id,json.dumps(manifest) if manifest else None,job['team_id'],job['version']))
-            return True
+            delay=self.RETRY_SECONDS[min(job['attempts']-1,len(self.RETRY_SECONDS)-1)] if status=='queued' else 0
+            self.pending_finish=(status,self.clock()+delay,error,artifact_id,json.dumps(manifest) if manifest else None,job['team_id'],job['version'])
+            return self.finish()
         finally:self.lock.release()
 
     def start(self):
@@ -352,7 +422,8 @@ class RepositoryBackups:
         self.stopping.clear()
         # Recover uncommitted private publications and interrupted scratch only at startup.
         self.directory(self.root/'scratch');self.directory(self.root/'artifacts')
-        with self.s.db() as db:known={r[0] for r in db.execute('SELECT artifact_id FROM repository_backups WHERE artifact_id IS NOT NULL')}
+        with self.s.db() as db:known={r[0] for r in db.execute('SELECT DISTINCT artifact_id FROM repository_backups WHERE artifact_id IS NOT NULL')}
+        if self.pending_finish:known.add(self.pending_finish[3])
         for parent in (self.root/'scratch',self.root/'artifacts'):
             for child in parent.iterdir():
                 if parent.name=='scratch' or child.name not in known:

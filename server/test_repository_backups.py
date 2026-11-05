@@ -38,7 +38,7 @@ class BackupTests(unittest.TestCase):
             if path=='/user':return 200,{'login':'Synthetic'}
             return original(method,path,body)
         self.repos.providers['gitee'].request=provider
-        def local_fetch(repo,source,env,ctx):
+        def local_fetch(repo,source,env,ctx,provider):
             self.backups._git(repo,['-c','protocol.file.allow=always','fetch','--no-tags','--no-recurse-submodules',str(self.source),'+HEAD:refs/heads/fetched'],ctx,env)
         self.backups.fetch_source=local_fetch
 
@@ -172,7 +172,7 @@ class BackupTests(unittest.TestCase):
 
     def test_git_wall_clock_timeout_and_shutdown_kill(self):
         self.enqueue_selected(self.sha_a)
-        def slow(repo,source,env,ctx):
+        def slow(repo,source,env,ctx,provider):
             self.backups._git(repo,['-c','alias.wait=!sleep 10','wait'],ctx)
         self.backups.fetch_source=slow
         start=time.monotonic()
@@ -260,7 +260,7 @@ class BackupTests(unittest.TestCase):
     def test_shutdown_interrupts_active_git_process_group(self):
         import threading
         self.enqueue_selected(self.sha_a)
-        def slow(repo,source,env,ctx):self.backups._git(repo,['-c','alias.wait=!sleep 20','wait'],ctx)
+        def slow(repo,source,env,ctx,provider):self.backups._git(repo,['-c','alias.wait=!sleep 20','wait'],ctx)
         self.backups.fetch_source=slow
         thread=threading.Thread(target=self.backups.run_once);thread.start()
         deadline=time.monotonic()+3
@@ -335,7 +335,7 @@ class BackupTests(unittest.TestCase):
 
     def test_mid_process_disk_growth_is_terminated_and_removed(self):
         self.enqueue_selected(self.sha_a)
-        def grow(repo,source,env,ctx):
+        def grow(repo,source,env,ctx,provider):
             self.backups._git(repo,['-c','alias.grow=!dd if=/dev/zero of=growth bs=1024 count=10000 2>/dev/null','grow'],ctx)
         self.backups.fetch_source=grow
         with patch.object(self.backups,'TASK_BYTES',65536):self.backups.run_once()
@@ -407,3 +407,119 @@ class BackupTests(unittest.TestCase):
             artifact=db.execute('SELECT artifact_id FROM repository_backups WHERE version=2').fetchone()[0]
         self.assertEqual(second['status'],'queued')
         self.assertIsNone(artifact)
+
+    def test_partial_path_summary_is_bounded_on_replay_draft_and_reuse(self):
+        prefix='共享目录'*7+'/'
+        paths=[prefix+str(n) for n in range(12)]
+        for name in paths:
+            self.git('-C',str(self.source),'update-index','--add','--cacheinfo','160000,'+self.sha_a+','+name)
+        self.git('-C',str(self.source),'commit','-qm','shared prefix')
+        sha=self.git('-C',str(self.source),'rev-parse','HEAD').strip()
+        self.enqueue_selected(sha)
+        # Enough bytes for one escaped path but not two; separate count budget allows three.
+        self.backups.SAMPLE_BYTES=330
+        self.backups.SAMPLE_COUNT=3
+        self.backups.run_once()
+        receipt=self.result['receipt']
+        def bounded(value):
+            self.assertEqual(value['status'],'partial')
+            self.assertLessEqual(len(json.dumps(value['missingAssets'])),self.backups.SAMPLE_BYTES)
+            self.assertEqual(len(value['missingAssets']),1)
+            self.assertEqual(value['missingAssetCount'],len(paths))
+            self.assertEqual(value['missingAssetOmitted'],len(paths)-1)
+        bounded(self.record())
+        replay=self.formal_submit(self.selected)[1]
+        self.assertEqual(replay['receipt'],receipt);bounded(replay['repositoryBackup'])
+        status,draft,_=self.request(self.client,'/api/submission',{'requestId':'partial-draft-metadata','expectedVersion':1,'status':'draft','materials':receipt['materials']})
+        self.assertEqual(status,200,draft);bounded(draft['repositoryBackup'])
+        preview=self.sealed_preview()
+        with patch.object(self.backups,'fetch_source',side_effect=AssertionError('reuse must not fetch')) as fetch:
+            for version in (2,3):
+                status,result,_=self.formal_submit(preview,version=version,request_id='partial-same-source-'+str(version))
+                self.assertEqual(status,200,result);self.backups.run_once()
+                bounded(self.request(self.client,'/api/submission/history/'+str(version+1))[1]['repositoryBackup'])
+            fetch.assert_not_called()
+        with self.service.db() as db:
+            rows=db.execute('SELECT artifact_id,manifest_json FROM repository_backups').fetchall()
+            self.assertEqual(len(rows),3)
+            self.assertEqual(len({r['artifact_id'] for r in rows}),1)
+            for r in rows:
+                self.assertLess(len(r['manifest_json']),1500)
+                self.assertEqual(json.loads(r['manifest_json'])['missingAssetCount'],len(paths))
+            manifest=self.backups.artifact(rows[0]['artifact_id'],'manifest.json')
+            self.assertCountEqual([x['path'] for x in json.loads(manifest.read_text())['missingAssets']],paths)
+            source=self.repos.seals.source_for_version(db,self.team_id,1)
+        # Three corrupt references to one physical artifact are checked once.
+        from repository_backups import BackupFailure
+        with patch.object(self.backups,'open_verified',side_effect=BackupFailure('artifact_unavailable')) as verify:
+            self.assertEqual(self.backups.reusable(source),(None,None))
+            self.assertEqual(verify.call_count,1)
+
+    def test_queued_source_rejects_changed_organization_before_any_network(self):
+        self.enqueue_selected(self.sha_a)
+        provider=self.repos.providers['gitee']
+        provider.organization='another-org'
+        with patch.object(provider,'request',side_effect=AssertionError('must not request')) as request, patch.object(self.backups,'fetch_source') as fetch:
+            self.backups.run_once()
+            request.assert_not_called();fetch.assert_not_called()
+        record=self.record()
+        self.assertEqual((record['status'],record['error'],record['sha']),('queued','provider_unavailable',self.sha_a))
+
+    def test_busy_completion_retries_published_result_without_refetch_or_attempt(self):
+        from contextlib import contextmanager
+        import sqlite3
+        self.enqueue_selected(self.sha_a)
+        receipt=self.result['receipt']
+        original=self.service.db
+        busy=[]
+        @contextmanager
+        def busy_once_after_publish():
+            published=self.backups.root/'artifacts'
+            if not busy and published.exists() and any(published.iterdir()):
+                busy.append(True)
+                raise sqlite3.OperationalError('database is locked')
+            with original() as db:yield db
+        with patch.object(self.service,'db',busy_once_after_publish),patch.object(self.backups,'fetch_source',wraps=self.backups.fetch_source) as fetch:
+            for _ in range(2):
+                try:self.backups.run_once()
+                except sqlite3.OperationalError:pass  # same polling loop survives a busy finish
+            self.assertEqual(busy,[True]);fetch.assert_called_once()
+        self.assertEqual((self.record()['status'],self.record()['attempts']),('ready',1))
+        self.assertEqual(len(list((self.backups.root/'artifacts').iterdir())),1)
+        self.assertEqual(self.formal_submit(self.selected)[1]['receipt'],receipt)
+
+    def test_prior_full_manifest_is_compacted_once_without_losing_private_download(self):
+        self.enqueue_selected(self.sha_a);self.backups.run_once()
+        with self.service.db() as db:
+            row=db.execute('SELECT * FROM repository_backups').fetchone()
+            old=json.loads(row['manifest_json'])
+            paths=[{'path':'x'*900+str(i),'kind':'submodule'} for i in range(20)]
+            old.pop('missingAssetCount',None);old.pop('missingAssetOmitted',None)
+            old['missingAssets']=paths
+            self.backups.artifact(row['artifact_id'],'manifest.json').write_text(json.dumps(old))
+            db.execute("UPDATE repository_backups SET status='partial',manifest_json=?",(json.dumps(old),))
+            db.execute("DELETE FROM submission_records_meta WHERE key='repositoryBackupSummaryV1'")
+        with self.service.db() as db:self.backups.initialize(db)
+        result=self.record()
+        self.assertEqual((result['status'],result['missingAssetCount'],result['missingAssetOmitted']),('partial',20,20))
+        self.assertEqual(result['missingAssets'],[])
+        self.assertEqual(self.read_zip_file(result,'version.txt'),'A')
+        with self.service.db() as db:
+            self.assertLess(db.execute('SELECT length(manifest_json) FROM repository_backups').fetchone()[0],1500)
+            self.assertEqual(json.loads(self.backups.artifact(row['artifact_id'],'manifest.json').read_text())['missingAssets'],paths)
+
+    def test_sample_count_cap_and_empty_sample_preserve_partial_status(self):
+        for path in ('module-a','module-b','module-c'):
+            self.git('-C',str(self.source),'update-index','--add','--cacheinfo','160000,'+self.sha_a+','+path)
+        self.git('-C',str(self.source),'commit','-qm','three gitlinks')
+        self.enqueue_selected(self.git('-C',str(self.source),'rev-parse','HEAD').strip())
+        with patch.object(self.backups,'SAMPLE_COUNT',1):self.backups.run_once()
+        first=self.record()
+        self.assertEqual((first['status'],len(first['missingAssets']),first['missingAssetOmitted']),('partial',1,2))
+        self.git('-C',str(self.source),'commit','--allow-empty','-qm','same tree, new SHA')
+        self.remote.sha=self.git('-C',str(self.source),'rev-parse','HEAD').strip()
+        status,second,_=self.formal_submit(self.sealed_preview(),version=1,request_id='empty-sample-version')
+        self.assertEqual(status,200,second)
+        with patch.object(self.backups,'SAMPLE_BYTES',2):self.backups.run_once()
+        value=self.request(self.client,'/api/submission/history/2')[1]['repositoryBackup']
+        self.assertEqual((value['status'],value['missingAssets'],value['missingAssetCount'],value['missingAssetOmitted']),('partial',[],3,3))
