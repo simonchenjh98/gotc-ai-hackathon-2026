@@ -20,3 +20,17 @@
   .checklist label strong,.faq-list summary{font-size:14px}
   .organizers dt{font-size:11px}.organizers dd{font-size:12px}.organizers .small-note{font-size:10px}
 }
+
+/* Participant entry and the organizer-confirmed November 7–8 schedule. */
+.participant-section{padding-block:72px;border-bottom:1px solid var(--line)}
+.participant-section .section-heading{margin-bottom:24px}
+.submission-deadline{display:flex;flex-wrap:wrap;align-items:center;gap:10px 24px;background:#fff5e8;border-left:4px solid var(--orange);padding:20px 24px;margin-bottom:30px;color:var(--ink)}
+.submission-deadline>span{font-size:13px;font-weight:700}.submission-deadline strong{font-size:24px;line-height:1.5}.submission-deadline small{flex-basis:100%;font-size:13px;color:#6b573e}
+.participant-steps{list-style:none;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;margin:0;padding:0}
+.participant-steps li{display:flex;flex-direction:column;align-items:flex-start;border:1px solid var(--line);padding:26px;min-width:0;background:#f8fbff}
+.step-number{font:700 13px Consolas,monospace;color:var(--blue);margin-bottom:18px}.participant-steps h3{font-size:21px;margin-bottom:13px;letter-spacing:0}.participant-steps p{font-size:14px;color:var(--muted);margin-bottom:24px;line-height:1.9}.participant-steps a{margin-top:auto}.participant-steps .button{padding-inline:18px;gap:10px}
+.participant-help{font-size:13px;color:var(--muted);margin-top:22px;line-height:1.9}.participant-help a{color:var(--blue);text-decoration:underline;text-underline-offset:3px}
+.schedule-actions{display:flex;gap:14px 24px;flex-wrap:wrap}.schedule-update{font-size:13px;color:var(--muted);margin-bottom:20px}.deadline-row{background:#fff7ec;border-left:4px solid var(--orange);padding-left:20px}.deadline-row time,.deadline-row h4{color:#8b4700}
+@media(max-width:950px){.participant-steps{gap:14px}.participant-steps li{padding:20px}.participant-steps h3{font-size:18px}.participant-steps .button{font-size:12px;padding-inline:14px}}
+@media(max-width:720px){.participant-section{padding-block:46px}.participant-section h2{font-size:28px}.participant-section .section-heading>.text-link{margin-top:16px}.submission-deadline{padding:16px 18px;gap:6px}.submission-deadline>span{flex-basis:100%}.submission-deadline strong{font-size:23px}.submission-deadline small{font-size:12px}.participant-steps{grid-template-columns:1fr;gap:14px}.participant-steps li{padding:22px}.participant-steps h3{font-size:20px}.participant-steps p{margin-bottom:18px}.step-number{margin-bottom:12px}.participant-steps .button{font-size:14px}.participant-help{font-size:12px}.schedule-actions{margin-top:18px;gap:12px 20px}.schedule-actions .text-link{font-size:12px}.deadline-row{padding-left:14px}.schedule-update{font-size:12px}}
+@media print{.participant-section{padding-block:22px}.participant-steps{gap:12px}.participant-steps li{padding:14px;break-inside:avoid}.participant-steps a,.participant-section .section-heading>a,.schedule-actions{display:none}.submission-deadline{background:#fff;border:1px solid #888;padding:12px}.submission-deadline strong{font-size:16pt}.participant-help,.participant-steps p{font-size:10pt}.deadline-row{border-left:2px solid #555}.deadline-row time,.deadline-row h4{color:#111}}

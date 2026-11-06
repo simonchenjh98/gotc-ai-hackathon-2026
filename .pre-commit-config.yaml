@@ -13,4 +13,5 @@ repos:
       - id: end-of-file-fixer
       - id: mixed-line-ending
         args: [--fix=lf]
+        exclude: '\.ics$'
       - id: trailing-whitespace
