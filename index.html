@@ -13,13 +13,15 @@
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="styles.css">
   <script src="app.js" defer></script>
+  <link rel="stylesheet" href="team-registration.css">
+  <script src="team-registration.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">跳到主要内容</a>
   <header class="site-header">
     <a class="brand" href="#" aria-label="GOTC黑客松首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span><strong>GOTC <span class="brand-year">2026</span></strong><small>开源 AI 黑客松</small></span></a>
     <button class="menu-toggle" aria-expanded="false" aria-controls="main-nav">菜单 <span>＋</span></button>
-    <nav id="main-nav" aria-label="主导航"><a href="#about">关于活动</a><a href="#schedule">活动日程</a><a href="#judging">评分细则</a><a href="#submission">作品提交</a><a href="https://8.141.114.201/gotc/platform.html#board" class="nav-live"><span class="status-dot"></span>实时看板 ↗</a></nav>
+    <nav id="main-nav" aria-label="主导航"><a href="#about">关于活动</a><a href="#teams">组队登记</a><a href="#schedule">活动日程</a><a href="#judging">评分细则</a><a href="#submission">作品提交</a><a href="https://8.141.114.201/gotc/platform.html#board" class="nav-live"><span class="status-dot"></span>实时看板 ↗</a></nav>
     <a class="header-cta" href="#join">参与活动 <span>↗</span></a>
   </header>
 
@@ -85,6 +87,13 @@
     <section class="section wrap faq-section"><div><p class="eyebrow">BEFORE YOU COME</p><h2>你可能还想知道。</h2></div><div class="faq-list"><details><summary>不会编程，也可以参加吗？</summary><p>可以。活动不要求编程基础或竞赛经历。你可以参与问题研究、交互设计、AI 工具使用、用户测试与展示，和队友共同完成原型。</p></details><details><summary>还没有队友，怎么办？</summary><p>可以个人报名，现场会协助组队。每队 3—5 人，也欢迎以团队或学校为单位报名。</p></details><details><summary>需要准备什么？</summary><p>自带电脑与充电器，提前整理你关心的问题和可使用的公开资料。活动提供导师指导及模型 API、算力等支持，具体接入方式现场说明。午餐、交通及住宿自行安排。</p></details><details><summary>活动会通宵吗？</summary><p>不会。两天均为日间活动。未成年人须履行监护人知情同意及签到签退要求，京外团队建议由学校或机构组织并安排成人领队。</p></details><details><summary>所有团队都会去 GOTC 吗？</summary><p>黑客松优秀项目与公开征集项目共同参加遴选。入选项目应能稳定演示，完成开源与来源说明，并由青少年承担主要创作和讲解任务。具体名额与会场安排另行通知。</p></details><details><summary>评委和观众如何使用评分平台？</summary><p>专业评委使用主办方提供的登录码，按分配的身份登录，可保存草稿、正式提交、修改评分或回避。观众使用独立观众码投票。成绩看板公开展示汇总数据，不显示评委身份、单份评分或评语。展示评审记录另有独立入口，其进度暂不计分。</p></details></div></section>
 
     <section class="organizers wrap"><p class="eyebrow">BUILT TOGETHER / 组织机构</p><dl><div><dt>指导单位</dt><dd>北京经济技术开发区信息产业局</dd></div><div><dt>主办单位</dt><dd>开源中国（OSCHINA）<br>北京亦庄少年人工智能学院</dd></div><div><dt>承办单位</dt><dd>北京亦庄实验中学</dd></div><div><dt>平台与算力支持</dt><dd>Gitee AI、模力方舟</dd></div><div><dt>学术支持</dt><dd>北京大学计算机学院<br>情感与认知智能机器人实验室</dd></div><div><dt>媒体支持</dt><dd>得到 AI 学习圈<br>WaytoAGI 教育版</dd></div></dl><p class="small-note">组织架构及具体安排以各单位最终确认为准。</p></section>
+    <section class="section wrap" id="teams" aria-labelledby="registration-title">
+      <div class="section-heading"><div><p class="eyebrow">FIND YOUR TEAM / 组队登记</p><h2 id="registration-title">从一个名字，到一支队伍。</h2></div><a class="text-link" href="https://8.141.114.201/gotc/teams.html">单独打开登记页 ↗</a></div>
+      <p class="registration-intro">队长填一行即可，队员不用重复登记。每队 3–5 人；还没找齐队友，也可以先创建队伍。先在下方搜索，看看本队是否已经登记。</p>
+      <div data-team-registration data-api="https://8.141.114.201/gotc/api/registration"><p>正在读取队伍名单…</p></div>
+      <noscript><a href="https://8.141.114.201/gotc/teams.html">打开组队登记（需要 JavaScript）</a></noscript>
+    </section>
+
   </main>
   <footer class="site-footer wrap"><a class="footer-title" href="#">百格成城<span>■</span></a><p>GOTC 2026 开源 AI 黑客松<br><small>活动信息更新：2026.10.28</small></p><div><button class="text-link" id="share-button">复制官网链接 ↗</button><a href="https://github.com/simonchenjh98/gotc-ai-hackathon-2026" target="_blank" rel="noopener noreferrer">GitHub 源码 ↗</a></div></footer>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>

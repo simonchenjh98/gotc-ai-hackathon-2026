@@ -57,7 +57,7 @@ jobs:
       - name: Stage public files
         run: |
           mkdir _site
-          cp index.html styles.css app.js favicon.svg _site/
+          cp index.html styles.css app.js favicon.svg team-registration.js team-registration.css _site/
           cp -r assets downloads _site/
           touch _site/.nojekyll
       - uses: actions/upload-pages-artifact@v4
