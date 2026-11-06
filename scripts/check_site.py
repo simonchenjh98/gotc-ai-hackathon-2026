@@ -32,7 +32,7 @@ for file in ('index.html', 'platform.html', 'teams.html'):
             continue
         target = ROOT / unquote(url.path) if url.path else ROOT / file
         assert target.is_file(), f'Missing resource: {ref} in {file}'
-        if target == ROOT / 'platform.html' and url.fragment in {'board','claim','team','team-score','judge','board-exhibition','judge-exhibition','board-roadshow','judge-roadshow','audience','admin','judge-finals','admin-finals','board-finals'}:
+        if target == ROOT / 'platform.html' and url.fragment in {'board','claim','team','team-score','judge','board-exhibition','judge-exhibition','board-roadshow','judge-roadshow','audience','admin','judge-finals','admin-finals','board-finals','admin-roadshow'}:
             continue
         if url.fragment:
             destination = page

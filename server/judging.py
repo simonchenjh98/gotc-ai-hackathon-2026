@@ -60,14 +60,16 @@ class JudgingService:
     def state(self, db, stage):
         if stage not in STAGES:
             raise APIError(404,"评审阶段不存在")
+        numeric = "(SELECT COUNT(*) FROM roadshow_scores n WHERE n.run_id=s.run_id)" if stage == 'roadshow' and db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadshow_scores'").fetchone() else "0"
         return db.execute("""SELECT s.*,r.frozen_at,
-          (SELECT COUNT(*) FROM judging_reviews v WHERE v.run_id=s.run_id) AS review_count
+          (SELECT COUNT(*) FROM judging_reviews v WHERE v.run_id=s.run_id) AS review_count,""" + numeric + """ AS numeric_count
           FROM judging_stages s JOIN judging_runs r ON r.id=s.run_id WHERE s.stage=?""",(stage,)).fetchone()
 
     def stage_view(self, state):
         return {"id":state["stage"],"name":STAGES[state["stage"]],"runId":state["run_id"],"revision":state["revision"],"frozenAt":state["frozen_at"],
                 "rulesStatus":"unconfigured","rosterSource":"manual_worklist","advancementStatus":"unimplemented",
-                "rosterEditable":not state["open"] and state["frozen_at"] is None and state["review_count"]==0,"dimensions":[{"id":key,"name":name,"max":None} for key,name in DIMENSION_NAMES],
+                "rosterEditable":not state["open"] and state["frozen_at"] is None and state["review_count"]==0 and state["numeric_count"]==0,"dimensions":[{"id":key,"name":name,"max":None} for key,name in DIMENSION_NAMES],
                 "minValidJudges":None,"aggregation":None,"advancementQuota":None,
                 "capabilities":{"reviewRecords":True,"numericScoring":False,"aggregation":False,"ranking":False,"publication":False}}
 
@@ -169,7 +171,7 @@ class JudgingService:
         self.exact_fields(body,("expectedRevision","teamIds","judgeIds"))
         self.expected_revision(body,state)
         frozen=db.execute("SELECT frozen_at FROM judging_runs WHERE id=?",(state["run_id"],)).fetchone()[0]
-        if state["open"] or frozen is not None or db.execute("SELECT 1 FROM judging_reviews WHERE run_id=? LIMIT 1",(state["run_id"],)).fetchone():
+        if state["open"] or frozen is not None or state["numeric_count"] or db.execute("SELECT 1 FROM judging_reviews WHERE run_id=? LIMIT 1",(state["run_id"],)).fetchone():
             raise APIError(409,"本轮已开放冻结或已有评审记录，不能改写名单；请填写理由创建新轮次")
         team_ids=self.identifier_list(body["teamIds"],"队伍名单")
         judge_ids=self.identifier_list(body["judgeIds"],"评委名单")

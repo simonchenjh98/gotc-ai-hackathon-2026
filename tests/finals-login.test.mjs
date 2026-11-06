@@ -26,18 +26,18 @@ test('finals admin login names the finals console and published finals results',
   assert.match(html,/管理8位决赛评委/);assert.match(html,/公众查看已发布的决赛结果无需登录/);assert.match(html,/href="#board-finals"/);
 });
 
-test('legacy numeric and qualitative review logins retain their own descriptions and board links',()=>{
+test('numeric roadshow and unchanged qualitative exhibition logins show the appropriate descriptions',()=>{
   const professional=loginPage('judge','judge'),exhibition=loginPage('judge-exhibition','judge'),roadshow=loginPage('judge-roadshow','judge'),admin=loginPage('admin','admin');
   assert.match(professional,/专业评分<br>六维 100 分/);assert.match(professional,/href="#board"/);
   assert.match(exhibition,/展示评审记录/);assert.match(exhibition,/暂不计分/);assert.match(exhibition,/href="#board-exhibition"/);
-  assert.match(roadshow,/路演评审记录/);assert.match(roadshow,/暂不计分/);assert.match(roadshow,/href="#board-roadshow"/);
+  assert.match(roadshow,/路演评分<br>六维 100 分/);assert.match(roadshow,/完整姓名领取专属邀请码/);assert.ok(!roadshow.includes('暂不计分'));assert.match(roadshow,/href="#board-roadshow"/);
   assert.match(admin,/组织方<br>活动管理/);assert.ok(!admin.includes('决赛管理员登录'));
 });
 
 test('all three finals navigation labels remain valid Chinese after the operations navigation merge',()=>{
-  const html=fs.readFileSync(new URL('../platform.html',import.meta.url),'utf8');
+  const html=fs.readFileSync(new URL('../site-header.js',import.meta.url),'utf8');
   for(const [route,label] of [['judge-finals','决赛评分与提名'],['board-finals','决赛结果'],['admin-finals','决赛后台']]){
-    assert.ok(html.includes(`<a href="#${route}" data-route="${route}">${label}</a>`));
+    assert.ok(html.includes(`link('${label}', entry('${route}'), '${route}', '${route}')`));
   }
   assert.ok(!html.includes('\uFFFD'));
 });
