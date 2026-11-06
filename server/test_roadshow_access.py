@@ -63,7 +63,7 @@ class RoadshowAccessTests(unittest.TestCase):
     def test_empty_roster_is_explicit_and_never_creates_arbitrary_accounts(self):
         status, public, headers = self.public.get('/api/roadshow/access')
         self.assertEqual(status, 200)
-        self.assertEqual(set(public), {'configured', 'claimAvailable', 'message'})
+        self.assertEqual(set(public), {'configured', 'claimAvailable', 'nameLoginAvailable', 'message'})
         self.assertFalse(public['configured'])
         self.assertFalse(public['claimAvailable'])
         self.assertNotIn('Set-Cookie', headers)
