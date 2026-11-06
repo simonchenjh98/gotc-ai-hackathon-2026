@@ -595,6 +595,12 @@ class EventService:
                 raise APIError(403, '此邀请码仅用于路演评审，请从路演入口进入')
             if self.finals.supports(path):
                 return self.finals.dispatch(db,actor,method,path,body,query or {},expected_login_id,cookie,finals_judge_id),None,None
+            if path == "/api/admin/judging/roadshow/window":
+                self.require(actor, "admin")
+                if not expected_login_id:
+                    raise APIError(428, "请刷新路演窗口页面并核对登录身份", "login_required")
+                if expected_login_id != self.login_id(cookie):
+                    raise APIError(401, "管理员登录身份已变化，请重新进入路演窗口")
             page_role = ("audience" if path in {"/api/audience", "/api/vote"} else
                          "judge" if path in {"/api/judging/exhibition", "/api/judging/exhibition/", "/api/judging/exhibition/review",
                                               "/api/judging/roadshow", "/api/judging/roadshow/", "/api/judging/roadshow/review"} else None)

@@ -9,8 +9,8 @@ const platform=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8')
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};};
 const dimensions=[['creativity',20],['social',15],['technical',20],['application',20],['crossdisciplinary',15],['opensource',10]].map(([id,max])=>({id,name:id,max}));
-const team=(id='a',number=1)=>({id,number,name:'Team '+number,project:'Synthetic',eligible:true,rank:1,score:100,scoreCount:2,recusedCount:0,complete:true});
-const snapshot=(revision=4,published=false)=>({config:{runId:'run-a',revision,open:false,canEdit:false,published},dimensions,summary:{teams:[team()],expectedJudges:2,activeJudges:2,final:true,blockers:[]}});
+const team=(id='a',number=1)=>({id,number,name:'Team '+number,project:'Synthetic',eligible:true,rank:1,score:100,scoreCount:3,recusedCount:0,valid:true,complete:true});
+const snapshot=(revision=4,published=false)=>({config:{runId:'run-a',revision,open:false,canEdit:false,published},dimensions,summary:{teams:[team()],expectedJudges:8,activeJudges:8,minimumScores:3,qualifiedCount:1,canPublish:true,final:true,blockers:[]}});
 function runtime(extra={}){
   const ctx=vm.createContext({AbortController,Map,Set,Number,Object,Date,esc,setTimeout,clearTimeout,confirm:()=>true,
     metrics:items=>items.map(([value,label])=>`<span>${esc(value)} ${esc(label)}</span>`).join(''),
@@ -38,7 +38,24 @@ test('unpublished public board suppresses any supplied team data and uses no awa
 test('roadshow summaries escape team text and distinguish missing, zero, and recused scores',()=>{
   const ctx=runtime(),data=snapshot();data.summary.teams=[{...team(),name:'<img onerror=evil()>',score:0,scoreCount:1,recusedCount:1},{...team('b',2),score:null,scoreCount:0,complete:false}];
   const html=ctx.roadshowScoreSummaryMarkup(data);
-  assert.match(html,/暂定路演成绩/);assert.match(html,/>0\.00</);assert.match(html,/1 \/ 2/);assert.match(html,/1 人回避/);assert.match(html,/尚未收齐/);assert.ok(!html.includes('<img'));assert.match(html,/&lt;img/);
+  assert.match(html,/暂定路演成绩/);assert.match(html,/>0\.00</);assert.match(html,/已收 1 \/ 至少 3/);assert.match(html,/1 人回避/);assert.match(html,/评分不足/);assert.ok(!html.includes('<img'));assert.match(html,/&lt;img/);
+});
+
+test('two formal scores plus recusals stay unranked and hidden publicly, while three formal scores qualify',()=>{
+  const ctx=runtime(),data=snapshot(4,true);data.summary.teams=[{...team('a',1),score:93.25,scoreCount:2,recusedCount:6,rank:1},{...team('b',2),score:88.5,scoreCount:3,rank:2}];
+  const publicHtml=ctx.roadshowScoreSummaryMarkup(data,true),adminHtml=ctx.roadshowScoreSummaryMarkup(data);
+  assert.ok(!publicHtml.includes('93.25'));assert.match(publicHtml,/88\.50/);assert.match(publicHtml,/已收 2 \/ 至少 3/);assert.match(publicHtml,/评分不足/);
+  assert.match(adminHtml,/93\.25/);assert.match(adminHtml,/暂定均分 · 不参与排名/);assert.match(adminHtml,/平均分纳入所有已交正式评分/);
+  assert.ok(publicHtml.indexOf('02 · Team 2')<publicHtml.indexOf('01 · Team 1'));
+});
+
+test('countdown follows server time, expires locally, and cancels on departure without changing any score input',()=>{
+  const ctx=runtime(),tasks=new Map(),applied=[];let local=700000,seq=0,active=true;
+  const clock=ctx.makeRoadshowCountdown({alive:()=>active,apply:(text,canEdit)=>applied.push({text,canEdit}),clock:()=>local,schedule:fn=>{tasks.set(++seq,fn);return seq;},cancel:id=>tasks.delete(id)});
+  clock.update({open:true,canEdit:true,serverTime:1000,deadline:5401000});assert.match(applied.at(-1).text,/90:00/);
+  local+=5399000;let [id,fn]=[...tasks][0];tasks.delete(id);fn();assert.match(applied.at(-1).text,/00:01/);assert.equal(applied.at(-1).canEdit,true);
+  local+=1000;[id,fn]=[...tasks][0];tasks.delete(id);fn();assert.equal(applied.at(-1).canEdit,false);assert.match(applied.at(-1).text,/已截止/);assert.equal(tasks.size,0);
+  clock.update({open:true,canEdit:true,serverTime:1000,deadline:5401000});active=false;[id,fn]=[...tasks][0];tasks.delete(id);const count=applied.length;fn();assert.equal(applied.length,count);clock.stop();assert.equal(tasks.size,0);
 });
 
 test('roadshow form sends six values totaling 100 with its captured ordinary login, run, and score revision',async()=>{
@@ -99,17 +116,45 @@ test('admin live stats preserve the roster form and publication uses latest run 
   h.apply(snapshot(4));assert.match(h.publish.textContent,/撤回/);h.ctx.disposeFinalsView();
 });
 
-test('publication requires complete scores and close, and conflicts require explicit reread',async()=>{
+test('publication requires an ended window and one qualified team, and conflicts require explicit reread',async()=>{
   let writes=0;const h=adminFixture(async(_path,payload)=>{if(payload){writes++;throw Object.assign(new Error('revision mismatch'),{status:409});}return snapshot();});
-  await h.ctx.mountRoadshowScoringAdmin(1,h.parent);h.apply({...snapshot(5),config:{...snapshot(5).config,open:true}});assert.equal(h.publish.disabled,true);
-  const incomplete=snapshot(6);incomplete.summary.teams[0].complete=false;h.apply(incomplete);assert.equal(h.publish.disabled,true);
+  await h.ctx.mountRoadshowScoringAdmin(1,h.parent);h.apply({...snapshot(5),config:{...snapshot(5).config,open:true,canEdit:true},summary:{...snapshot(5).summary,canPublish:false}});assert.equal(h.publish.disabled,true);
+  const incomplete=snapshot(6);incomplete.summary.teams[0].scoreCount=2;incomplete.summary.teams[0].valid=false;incomplete.summary.canPublish=false;h.apply(incomplete);assert.equal(h.publish.disabled,true);
   h.apply(snapshot(7));await h.publish.onclick();await h.publish.onclick();assert.equal(writes,1);assert.equal(h.publish.disabled,true);assert.match(h.message.textContent,/没有自动重发/);h.apply(snapshot(8));assert.equal(h.publish.disabled,true);h.ctx.disposeFinalsView();
+});
+
+test('an expired open flag and other insufficient teams do not block publication of a qualified team',async()=>{
+  const h=adminFixture(async()=>snapshot());await h.ctx.mountRoadshowScoringAdmin(1,h.parent);
+  const data=snapshot(8);data.config.open=true;data.config.canEdit=false;data.summary.teams.push({...team('b',2),scoreCount:1,valid:false,complete:false,rank:null});
+  h.apply(data);assert.equal(h.publish.disabled,false);assert.match(h.summary.innerHTML,/评分不足/);h.ctx.disposeFinalsView();
+});
+
+function windowFixture(api,extra={}){
+  const start={},close={},error={},notice={},nodes={'[data-roadshow-start]':start,'[data-roadshow-close]':close,'.form-error':error,'[data-roadshow-window-countdown]':notice};
+  const form={isConnected:true,querySelector:selector=>nodes[selector]},ctx=runtime({route:'admin',adminStage:'roadshow',session:{role:'admin',loginId:'admin-a'},api,patchSubmissionStageCards(){},toast(){},stageHasUnsavedInputs:()=>false,loadAdminJudging:async()=>{},...extra});
+  ctx.makeFinalsPoller=()=>({start(){},stop(){},kick(){}});
+  ctx.installRoadshowWindowControls(form,{runId:'run-a',revision:7},{open:false,canEdit:false,deadline:null,serverTime:Date.now()},1);
+  return {ctx,start,close,error,notice,form};
+}
+
+test('90-minute start is explicit, single flight, server-timed and closes using the acknowledged revision',async()=>{
+  const sent=[],gate=deferred(),h=windowFixture(async(path,payload,options)=>{sent.push({path,payload,options});return sent.length===1?gate.promise:{stage:{revision:9},window:{open:false,canEdit:false,deadline:null,serverTime:Date.now()}};});
+  assert.equal(sent.length,0);assert.equal(h.start.disabled,false);assert.equal(h.close.disabled,true);const running=h.start.onclick();await h.start.onclick();assert.equal(sent.length,1);
+  assert.deepEqual(JSON.parse(JSON.stringify(sent[0].payload)),{expectedRevision:7,open:true,start90Minutes:true});assert.equal(sent[0].options.loginId,'admin-a');assert.equal(sent[0].path,'admin/judging/roadshow/window');
+  const now=Date.now();gate.resolve({stage:{revision:8},window:{open:true,canEdit:true,deadline:now+5400000,serverTime:now}});await running;assert.equal(h.start.disabled,true);assert.match(h.notice.textContent,/90:00/);
+  await h.close.onclick();assert.deepEqual(JSON.parse(JSON.stringify(sent[1].payload)),{expectedRevision:8,open:false,deadline:null});h.ctx.disposeRoadshowWindow();
+});
+
+test('90-minute controls reject unsaved setup and block retry after a conflict',async()=>{
+  let writes=0;const h=windowFixture(async()=>{writes++;throw Object.assign(new Error('window changed'),{status:409});},{stageHasUnsavedInputs:()=>true});
+  await h.start.onclick();assert.equal(writes,0);assert.match(h.error.textContent,/请先保存/);h.ctx.stageHasUnsavedInputs=()=>false;
+  await h.start.onclick();await h.start.onclick();assert.equal(writes,1);assert.equal(h.start.disabled,true);assert.match(h.error.textContent,/没有自动重发/);h.ctx.disposeRoadshowWindow();
 });
 
 test('private roadshow endpoints carry X-GOTC-Login and routes select numeric renderers',async()=>{
   const requests=[],main={innerHTML:''},ctx=vm.createContext({document:{getElementById:()=>main,querySelectorAll:()=>[],body:{classList:{remove(){},add(){}}}},location:{href:'https://example.test/platform.html',hash:'#judge-roadshow'},URL,setTimeout,clearTimeout,fetch:async(url,options)=>{requests.push({url,options});return {ok:true,json:async()=>({})};}});
   vm.runInContext(platform+"\nsession={role:'judge',loginId:'ordinary-login'};account=()=>{};globalThis.calls=[];renderRoadshowJudge=async()=>calls.push('numeric-judge');renderRoadshowBoard=async()=>calls.push('numeric-board');renderExhibitionJudge=async()=>calls.push('legacy');",ctx);
-  for(const path of ['roadshow/scoring','roadshow/score','admin/roadshow/scoring','admin/roadshow/publish'])await vm.runInContext(`api(${JSON.stringify(path)})`,ctx);
+  for(const path of ['roadshow/scoring','roadshow/score','admin/roadshow/scoring','admin/roadshow/publish','admin/judging/roadshow/window'])await vm.runInContext(`api(${JSON.stringify(path)})`,ctx);
   assert.ok(requests.every(item=>item.options.headers['X-GOTC-Login']==='ordinary-login'));
   await vm.runInContext('renderRoute()',ctx);ctx.location.hash='#board-roadshow';await vm.runInContext('renderRoute()',ctx);assert.deepEqual([...ctx.calls],['numeric-judge','numeric-board']);
 });

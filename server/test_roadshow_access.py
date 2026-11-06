@@ -186,7 +186,7 @@ class RoadshowAccessTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM accounts WHERE role='judge'").fetchone()[0], 2)
 
     def test_open_frozen_reviewed_rosters_lock_and_reset_rejects_old_editor(self):
-        self.configure(['张三'])
+        self.configure(['张三', '李四', '王五'])
         judge, _ = self.judge()
         team_id = self.add_team()
         before = self.view()

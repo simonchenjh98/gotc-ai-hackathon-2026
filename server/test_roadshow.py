@@ -19,6 +19,10 @@ class RoadshowIsolationTests(unittest.TestCase):
         return data
 
     def roster(self, stage, teams, judges):
+        if stage=='roadshow':
+            judges=list(judges)
+            while len(judges)<3:
+                judges.append(self.invitation(name='Roadshow judge '+str(len(judges)))[1]['id'])
         status,data,_=self.admin.post('/api/admin/judging/'+stage+'/roster',{
             'expectedRevision':self.stage(stage)['stage']['revision'],'teamIds':teams,'judgeIds':judges})
         self.assertEqual(status,200,data)
@@ -133,6 +137,7 @@ class RoadshowIsolationTests(unittest.TestCase):
         self.assertEqual(self.review(r_judge,'roadshow',second)[0],409)
         self.assertEqual(self.review(e_judge,'exhibition',first)[0],200)
         self.window('exhibition',False)
+        self.window('roadshow',False)
         self.window('roadshow')
         self.assertEqual(self.review(e_judge,'exhibition',first,1)[0],409)
         self.assertEqual(self.review(r_judge,'roadshow',second)[0],200)

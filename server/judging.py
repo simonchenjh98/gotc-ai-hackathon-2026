@@ -7,6 +7,7 @@ import secrets
 from errors import APIError
 
 STAGES={"exhibition":"展示评审","roadshow":"路演评审"}
+ROADSHOW_DURATION_MS=90*60*1000
 DIMENSION_NAMES=[("problem","问题价值与理解"),("ai","方案与AI使用"),("prototype","原型完成度"),
                  ("testing","测试与改进"),("opensource","开源与责任"),("teamwork","团队协作与表达")]
 BLOCKER="评分数值与计算规则尚未实现，不能发布成绩、排名或晋级"
@@ -75,8 +76,9 @@ class JudgingService:
 
     def window(self, state, current=None):
         current=self.clock() if current is None else current
+        timed=state["stage"]!="roadshow" or state["deadline"] is not None
         return {"open":bool(state["open"]),"deadline":state["deadline"],
-                "canEdit":bool(state["open"]) and (state["deadline"] is None or current<state["deadline"]),"serverTime":current}
+                "canEdit":bool(state["open"]) and timed and (state["deadline"] is None or current<state["deadline"]),"serverTime":current}
 
     def teams(self, db, run_id):
         records=[json.loads(row["snapshot_json"]) for row in db.execute("SELECT snapshot_json FROM judging_roster WHERE run_id=?",(run_id,))]
@@ -190,17 +192,34 @@ class JudgingService:
                           'after':{'teamIds':team_ids,'judgeIds':judge_ids}})
 
     def set_window(self, db, actor, state, body):
-        self.exact_fields(body,("expectedRevision","open","deadline"))
+        start_roadshow=state["stage"]=="roadshow" and "start90Minutes" in body
+        self.exact_fields(body,("expectedRevision","open","start90Minutes") if start_roadshow else ("expectedRevision","open","deadline"))
         self.expected_revision(body,state)
         if type(body["open"]) is not bool:
             raise APIError(400,"评审开放状态必须为布尔值")
-        deadline=body["deadline"]
+        if start_roadshow and (body["start90Minutes"] is not True or body["open"] is not True):
+            raise APIError(400,"开始90分钟路演必须明确开启评审")
+        deadline=body.get("deadline")
         if deadline is not None and (type(deadline) is not int or not 0<=deadline<=253402300799999):
             raise APIError(400,"评审截止时间必须是有效毫秒时间戳或空值")
         current=self.clock()
+        if state["stage"]=="roadshow" and body["open"]:
+            if start_roadshow and state["open"]:
+                raise APIError(409,"本轮路演已启动，请先明确关闭，再重新开始90分钟计时")
+            if deadline is None:
+                # Saving an already-open window must never silently renew its timer.
+                deadline=state["deadline"] if state["open"] and state["deadline"] is not None else current+ROADSHOW_DURATION_MS
+            if deadline>current+ROADSHOW_DURATION_MS:
+                raise APIError(400,"路演评审时间不能超过90分钟")
+            if state["open"] and state["deadline"] is not None and deadline>state["deadline"]:
+                raise APIError(409,"路演已开始，不能延长当前截止时间；请先明确关闭再重新开始")
         if body["open"]:
             if not db.execute("SELECT 1 FROM judging_roster WHERE run_id=?",(state["run_id"],)).fetchone() or not db.execute("SELECT 1 FROM judging_grants WHERE run_id=?",(state["run_id"],)).fetchone():
-                raise APIError(409,"请先选择本轮队伍和评委，再开放定性评审记录")
+                raise APIError(409,"请先选择本轮队伍和评委，再开放评审")
+            if state["stage"]=="roadshow" and db.execute("""SELECT COUNT(*) FROM judging_grants g
+              JOIN accounts a ON a.id=g.judge_id WHERE g.run_id=? AND a.role='judge' AND a.active=1""",
+              (state["run_id"],)).fetchone()[0]<3:
+                raise APIError(409,"路演至少需要3位已启用并获授权的评委，请先补全评委名单")
             frozen=db.execute("SELECT frozen_at FROM judging_runs WHERE id=?",(state["run_id"],)).fetchone()[0]
             if frozen is None:
                 for team in self.teams(db,state["run_id"]):

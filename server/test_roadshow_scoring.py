@@ -36,7 +36,7 @@ class RoadshowScoringTests(unittest.TestCase):
         return self.admin.post('/api/admin/judging/roadshow/window', {
             'expectedRevision': self.stage()['stage']['revision'], 'open': opened, 'deadline': deadline})
 
-    def configure(self, team_count=1, judge_count=2):
+    def configure(self, team_count=1, judge_count=3):
         self.teams = [self.team(number, 'Roadshow Team ' + str(number)) for number in range(1, team_count + 1)]
         entries = [self.invitation(name='PRIVATE_ROADSHOW_JUDGE_' + str(index)) for index in range(judge_count)]
         self.judges, self.invites = [item[0] for item in entries], [item[1] for item in entries]
@@ -111,23 +111,28 @@ class RoadshowScoringTests(unittest.TestCase):
         self.assertEqual(self.score(revision=1, status='draft')[0], 409)
         self.assertEqual(self.score(revision=0)[0], 409)
 
-    def test_drafts_recusal_replacement_average_and_separate_tables(self):
-        self.configure()
+    def test_drafts_recusal_replacement_average_and_three_distinct_judges(self):
+        self.configure(judge_count=4)
         self.assertEqual(self.score(status='draft', values=[0] * 6)[0], 200)
         self.assertIsNone(self.admin_view()['summary']['teams'][0]['score'])
         self.assertEqual(self.score(revision=1)[0], 200)
         self.assertEqual(self.score(self.judges[1], values=[10, 5, 10, 10, 5, 10])[0], 200)
         row = self.admin_view()['summary']['teams'][0]
-        self.assertEqual((row['score'], row['scoreCount'], row['complete']), (75, 2, True))
+        self.assertEqual((row['score'], row['scoreCount'], row['valid'], row['missing'], row['rank']), (75, 2, False, 1, None))
+        self.assertEqual(self.score(self.judges[2], values=[10, 15, 20, 20, 15, 10])[0], 200)
+        self.assertEqual(self.score(self.judges[3], status='recused', values=[])[0], 200)
+        row = self.admin_view()['summary']['teams'][0]
+        self.assertEqual((row['score'], row['scoreCount'], row['recusedCount'], row['valid'], row['rank']), (80, 3, 1, True, 1))
         self.assertEqual(self.score(revision=2, values=[10, 15, 20, 20, 15, 10])[0], 200)
-        self.assertEqual(self.admin_view()['summary']['teams'][0]['score'], 70)
+        row = self.admin_view()['summary']['teams'][0]
+        self.assertEqual((row['score'], row['scoreCount']), (76.67, 3))
         self.assertEqual(self.score(self.judges[1], revision=1, status='recused', values=[])[0], 200)
         row = self.admin_view()['summary']['teams'][0]
-        self.assertEqual((row['score'], row['scoreCount'], row['recusedCount'], row['complete']), (90, 1, 1, True))
-        self.assertEqual(self.score(revision=3, status='recused', values=[])[0], 200)
-        self.assertFalse(self.admin_view()['summary']['complete'])
+        self.assertEqual((row['score'], row['scoreCount'], row['recusedCount'], row['valid']), (90, 2, 2, False))
+        self.assertEqual(self.window(False)[0], 200)
+        self.assertEqual(self.publish()[0], 409)
         with self.service.db() as db:
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM roadshow_scores').fetchone()[0], 2)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM roadshow_scores').fetchone()[0], 4)
             for table in ('scores', 'finals_scores', 'finals_nominations', 'judging_reviews'):
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0], 0)
 
@@ -146,6 +151,7 @@ class RoadshowScoringTests(unittest.TestCase):
         self.assertEqual(self.score()[0], 409)
         self.assertEqual(self.window(True, int(time.time() * 1000) - 1)[0], 200)
         self.assertEqual(self.score()[0], 409)
+        self.assertEqual(self.window(False)[0], 200)
         self.assertEqual(self.window(True)[0], 200)
         self.assertEqual(self.score(team='missing')[0], 403)
         self.assertEqual(self.score(runId='old-run')[0], 409)
@@ -158,7 +164,7 @@ class RoadshowScoringTests(unittest.TestCase):
         self.assertEqual(self.score()[0], 401)
         self.assertEqual(self.request(self.judges[0], 'GET', '/api/roadshow/scoring')[0], 401)
 
-    def test_publish_requires_closed_complete_and_public_matches_internal(self):
+    def test_publish_requires_three_scores_and_public_matches_valid_internal_results(self):
         self.configure(team_count=2)
         self.assertEqual(self.publish()[0], 409)
         self.assertEqual(self.window(False)[0], 200)
@@ -179,6 +185,45 @@ class RoadshowScoringTests(unittest.TestCase):
         self.assertEqual([row['rank'] for row in public['summary']['teams']], [1, 1])
         self.assertEqual(self.publish(False)[0], 200)
         self.assertIsNone(self.board()['summary'])
+
+    def test_expired_window_publishes_qualified_teams_and_hides_insufficient_scores(self):
+        self.configure(team_count=3, judge_count=5)
+        for client in self.judges[:3]:
+            self.assertEqual(self.score(client, self.teams[0], values=[10, 15, 20, 20, 15, 10])[0], 200)
+        self.assertEqual(self.score(self.judges[3], self.teams[0], values=[0] * 6)[0], 200)
+        # All four submitted scores count, not only the first three.
+        self.assertEqual(self.score(self.judges[0], self.teams[1])[0], 200)
+        self.assertEqual(self.score(self.judges[1], self.teams[1])[0], 200)
+        self.assertEqual(self.score(self.judges[2], self.teams[1], status='draft')[0], 200)
+        self.assertEqual(self.score(self.judges[3], self.teams[1], status='recused', values=[])[0], 200)
+        internal = self.admin_view()
+        self.assertEqual(internal['config']['minimumScores'], 3)
+        self.assertEqual(internal['summary']['minimumScores'], 3)
+        self.assertEqual(internal['summary']['qualifiedCount'], 1)
+        self.assertFalse(internal['summary']['canPublish'])
+        self.assertEqual([row['id'] for row in internal['summary']['teams']], self.teams)
+        self.assertEqual(internal['summary']['teams'][0]['score'], 67.5)
+        self.assertEqual(internal['summary']['teams'][1]['score'], 100)
+        self.assertEqual(internal['summary']['teams'][1]['missing'], 1)
+        self.assertIsNone(internal['summary']['teams'][1]['rank'])
+        self.assertEqual(self.publish()[0], 409)
+        deadline = self.stage()['window']['deadline']
+        self.assertIsNotNone(deadline)
+        with patch('app.now_ms', return_value=deadline):
+            expired = self.admin_view()
+            self.assertTrue(expired['config']['open'])
+            self.assertFalse(expired['config']['canEdit'])
+            self.assertTrue(expired['summary']['canPublish'])
+            self.assertEqual(self.score(self.judges[4], self.teams[0])[0], 409)
+            self.assertEqual(self.publish()[0], 200)
+            public = self.board()
+            self.assertTrue(public['config']['published'])
+            valid, insufficient, empty = public['summary']['teams']
+            self.assertEqual((valid['score'], valid['scoreCount'], valid['rank']), (67.5, 4, 1))
+            self.assertEqual((insufficient['score'], insufficient['rank'], insufficient['valid']), (None, None, False))
+            self.assertEqual(insufficient['dimensions'], [None] * 6)
+            self.assertEqual((empty['score'], empty['rank'], empty['missing']), (None, None, 3))
+            self.assertEqual(public['summary']['qualifiedCount'], 1)
 
     def test_restore_of_team_judge_metadata_or_status_does_not_resurrect_publication(self):
         self.configure()
@@ -240,7 +285,7 @@ class RoadshowScoringTests(unittest.TestCase):
         self.assertEqual(self.window(True)[0], 200)
         self.assertEqual(self.score(revision=1, runId=old_run)[0], 409)
         with self.service.db() as db:
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM roadshow_scores WHERE run_id=?', (old_run,)).fetchone()[0], 2)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM roadshow_scores WHERE run_id=?', (old_run,)).fetchone()[0], 3)
 
     def test_numeric_records_lock_both_roster_editors_even_without_frozen_marker(self):
         self.configure()
@@ -290,6 +335,21 @@ class RoadshowScoringTests(unittest.TestCase):
                 with original_db() as db:
                     self.assertEqual(db.execute('SELECT COUNT(*) FROM roadshow_scores').fetchone()[0], 0)
 
+    def test_prethreshold_snapshot_requires_explicit_republication(self):
+        self.configure()
+        self.fill()
+        self.assertEqual(self.window(False)[0], 200)
+        self.assertEqual(self.publish()[0], 200)
+        with self.service.db() as db:
+            saved = json.loads(db.execute('SELECT publication_json FROM roadshow_scoring_config WHERE id=1').fetchone()[0])
+            saved.pop('minimumScores')
+            db.execute('UPDATE roadshow_scoring_config SET publication_json=? WHERE id=1', (json.dumps(saved),))
+        self.assertFalse(self.board()['config']['published'])
+        self.assertIsNone(self.board()['summary'])
+        self.assertTrue(self.admin_view()['config']['publicationStale'])
+        self.assertEqual(self.publish()[0], 200)
+        self.assertTrue(self.board()['config']['published'])
+
     def test_restart_and_missing_invalidation_trigger_upgrade_are_idempotent(self):
         self.configure()
         self.fill()
@@ -308,7 +368,7 @@ class RoadshowScoringTests(unittest.TestCase):
         self.server.service = self.service
         self.assertFalse(self.board()['config']['published'])
         with self.service.db() as db:
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM roadshow_scores').fetchone()[0], 2)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM roadshow_scores').fetchone()[0], 3)
             self.assertTrue({'roadshow_scoring_' + item[0] for item in TRIGGERS} <=
                             {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='trigger'")})
 

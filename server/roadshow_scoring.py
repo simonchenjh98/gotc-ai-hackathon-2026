@@ -7,6 +7,7 @@ from errors import APIError
 from finals import DIMENSIONS as FINALS_DIMENSIONS, MAX_REVISION
 
 DIMENSIONS = [{key: value for key, value in item.items() if key != 'award'} for item in FINALS_DIMENSIONS]
+MINIMUM_SCORES = 3
 DDL = [
     """CREATE TABLE IF NOT EXISTS roadshow_scoring_config (
        id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL DEFAULT 0,
@@ -19,8 +20,7 @@ DDL = [
        FOREIGN KEY(run_id,judge_id) REFERENCES judging_grants(run_id,judge_id),
        FOREIGN KEY(run_id,team_id) REFERENCES judging_roster(run_id,team_id))""",
 ]
-# A monotonic epoch prevents revoke/restore, rename/restore or reopen/close from
-# resurrecting an old publication. Only the current roadshow run affects it.
+# An epoch prevents restore/reopen from resurrecting an old publication.
 TRIGGERS = [
     ('stage', 'AFTER UPDATE OF revision,run_id,open,deadline ON judging_stages',
      "NEW.stage='roadshow' AND (OLD.revision IS NOT NEW.revision OR OLD.run_id IS NOT NEW.run_id OR OLD.open IS NOT NEW.open OR OLD.deadline IS NOT NEW.deadline)"),
@@ -57,9 +57,7 @@ class RoadshowScoring:
             db.execute(statement)
         db.execute('INSERT OR IGNORE INTO roadshow_scoring_config(id) VALUES (1)')
         existing = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
-        missing = any('roadshow_scoring_' + name not in existing for name, _, _ in TRIGGERS)
-        if missing:
-            # Upgrading a database whose invalidation guards were absent must fail closed.
+        if any('roadshow_scoring_' + name not in existing for name, _, _ in TRIGGERS):
             db.execute('UPDATE roadshow_scoring_config SET revision=revision+1 WHERE id=1')
         for name, event, condition in TRIGGERS:
             db.execute(f'''CREATE TRIGGER IF NOT EXISTS roadshow_scoring_{name} {event} WHEN {condition}
@@ -71,15 +69,16 @@ class RoadshowScoring:
 
     def published(self, db, state):
         saved = self.publication_state(db)
-        return bool(not state['open'] and saved['publication_json']
-                    and saved['publication_run_id'] == state['run_id']
-                    and saved['publication_revision'] == saved['revision'])
+        matches = bool(not self.s.judging.window(state)['canEdit'] and saved['publication_json']
+                       and saved['publication_run_id'] == state['run_id']
+                       and saved['publication_revision'] == saved['revision'])
+        return matches and json.loads(saved['publication_json']).get('minimumScores') == MINIMUM_SCORES
 
     def config(self, db, state, public=False):
         saved = self.publication_state(db)
         published = self.published(db, state)
-        result = {'runId': state['run_id'], 'published': published,
-                  'publishedAt': saved['published_at'] if published else None}
+        result = {'runId': state['run_id'], 'published': published, 'minimumScores': MINIMUM_SCORES,
+                  'durationMinutes': 90, 'publishedAt': saved['published_at'] if published else None}
         if not public:
             result.update(revision=saved['revision'], stageRevision=state['revision'],
                           publicationStale=bool(saved['publication_json']) and not published,
@@ -138,40 +137,50 @@ class RoadshowScoring:
     def summary(self, db, state):
         teams, judges = self.teams(db, state), self.judges(db, state)
         active_ids = {judge['id'] for judge in judges if judge['active']}
-        expected = len(judges)
         scores = [row for row in db.execute('SELECT * FROM roadshow_scores WHERE run_id=?', (state['run_id'],))
                   if row['judge_id'] in active_ids]
-        blockers = []
-        if not teams:
-            blockers.append('尚未配置路演队伍')
-        if not expected or len(active_ids) != expected:
-            blockers.append('本轮路演须有至少1位评委，且名单内评委均须有效')
         rows, exact_scores = [], {}
         for team in teams:
             submitted = [row for row in scores if row['team_id'] == team['id'] and row['status'] == 'submitted'] if team['eligible'] else []
             recused = sum(row['team_id'] == team['id'] and row['status'] == 'recused' for row in scores) if team['eligible'] else 0
             count = len(submitted)
-            complete = bool(team['eligible'] and expected and len(active_ids) == expected and count + recused == expected and count)
+            valid = bool(team['eligible'] and count >= MINIMUM_SCORES)
             exact = Fraction(sum(row['total_tenths'] for row in submitted), 10 * count) if count else None
             dimensions = [round(sum(json.loads(row['scores_json'])[i] for row in submitted) / count, 2) if count else None for i in range(6)]
             rows.append({**team, 'score': round(float(exact), 2) if exact is not None else None,
-                         'scoreCount': count, 'recusedCount': recused, 'complete': complete, 'rank': None, 'dimensions': dimensions})
-            if exact is not None:
+                         'scoreCount': count, 'recusedCount': recused, 'valid': valid, 'complete': valid,
+                         'missing': max(0, MINIMUM_SCORES - count), 'rank': None, 'dimensions': dimensions})
+            if valid:
                 exact_scores[team['id']] = exact
-            if not team['eligible']:
-                blockers.append(f"队伍{team['number']}已退出或被取消资格，请先由组织方处理本轮名单")
-            elif not complete:
-                blockers.append(f"队伍{team['number']}的评分尚未完成（评分{count}，回避{recused}，需合计{expected}位且至少1份评分）")
-        ranked = sorted((row for row in rows if row['id'] in exact_scores), key=lambda row: (-exact_scores[row['id']], row['number']))
+        ranked = sorted((row for row in rows if row['valid']), key=lambda row: (-exact_scores[row['id']], row['number']))
         previous, rank = None, 0
         for position, row in enumerate(ranked, 1):
             value = exact_scores[row['id']]
             if value != previous:
                 rank = position
             row['rank'], previous = rank, value
-        return {'teams': sorted(rows, key=lambda row: (row['rank'] is None, row['rank'] or 0, row['number'])),
-                'expectedJudges': expected, 'activeJudges': len(active_ids), 'complete': not blockers,
-                'final': not blockers and not state['open'], 'blockers': blockers}
+        qualified = len(ranked)
+        can_edit = self.s.judging.window(state)['canEdit']
+        blockers = []
+        if can_edit:
+            blockers.append('路演评分窗口尚未关闭或截止')
+        if not qualified:
+            blockers.append('尚无队伍获得至少3位不同评委的有效正式评分')
+        can_publish = not can_edit and qualified > 0
+        return {'teams': sorted(rows, key=lambda row: (not row['valid'], row['rank'] or 0, row['number'])),
+                'expectedJudges': len(judges), 'activeJudges': len(active_ids), 'minimumScores': MINIMUM_SCORES,
+                'qualifiedCount': qualified, 'complete': bool(rows) and all(row['valid'] for row in rows),
+                'canPublish': can_publish, 'final': can_publish, 'blockers': blockers}
+
+    @staticmethod
+    def public_summary(summary):
+        result = {**summary, 'teams': []}
+        for row in summary['teams']:
+            public = dict(row)
+            if not row['valid']:
+                public.update(score=None, rank=None, dimensions=[None] * len(DIMENSIONS))
+            result['teams'].append(public)
+        return result
 
     def admin_view(self, db, state):
         return {'config': self.config(db, state), 'dimensions': DIMENSIONS, 'summary': self.summary(db, state)}
@@ -232,12 +241,12 @@ class RoadshowScoring:
             raise APIError(400, '发布状态须为布尔值')
         snapshot, published_at = None, None
         if body['published']:
-            if state['open']:
-                raise APIError(409, '请先关闭路演评分，再发布成绩')
+            if self.s.judging.window(state)['canEdit']:
+                raise APIError(409, '请等待路演评分截止或先关闭窗口，再发布成绩')
             summary = self.summary(db, state)
-            if not summary['complete']:
-                raise APIError(409, '路演成绩未收齐或名单无效，暂不能发布')
-            snapshot, published_at = json.dumps(summary, ensure_ascii=False), self.clock()
+            if not summary['qualifiedCount']:
+                raise APIError(409, '至少一支队伍须有3位不同评委正式评分后才能发布')
+            snapshot, published_at = json.dumps(self.public_summary(summary), ensure_ascii=False), self.clock()
         db.execute('''UPDATE roadshow_scoring_config SET revision=?,publication_json=?,publication_run_id=?,
                       publication_revision=?,published_at=? WHERE id=1''',
                    (revision, snapshot, state['run_id'] if snapshot else None, revision if snapshot else None, published_at))

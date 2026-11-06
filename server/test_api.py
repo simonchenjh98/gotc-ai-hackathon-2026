@@ -25,7 +25,7 @@ class Client:
         body = raw if raw is not None else (json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None)
         request_headers = {"Cookie": self.cookie}
         if self.login_id and path in {"/api/audience", "/api/vote", "/api/judging/exhibition", "/api/judging/exhibition/review",
-                                     "/api/judging/roadshow", "/api/judging/roadshow/review"}:
+                                     "/api/judging/roadshow", "/api/judging/roadshow/review", "/api/admin/judging/roadshow/window"}:
             request_headers["X-GOTC-Login"] = self.login_id
         if method == "POST":
             request_headers["Content-Type"] = "application/json"
