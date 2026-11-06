@@ -1,14 +1,3 @@
-const menu = document.querySelector('.menu-toggle');
-const nav = document.querySelector('#main-nav');
-menu?.addEventListener('click', () => {
-  const open = menu.getAttribute('aria-expanded') !== 'true';
-  menu.setAttribute('aria-expanded', String(open));
-  nav.classList.toggle('is-open', open);
-});
-nav?.querySelectorAll('a').forEach(a => a.addEventListener('click', () => {
-  menu.setAttribute('aria-expanded', 'false');
-  nav.classList.remove('is-open');
-}));
 const tabs = [...document.querySelectorAll('[data-day]')];
 const panels = [...document.querySelectorAll('.schedule-panel')];
 const tablist = document.querySelector('.schedule-tabs');
