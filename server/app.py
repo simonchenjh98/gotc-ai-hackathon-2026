@@ -29,6 +29,7 @@ from repository_backups import RepositoryBackups, ArchiveDownload
 from repositories import Repositories
 from write_conflicts import WriteConflicts
 from judging import JudgingService
+from finals import FinalsService
 from admin_data import AdminDataService, TRACK_OPTIONS
 from keys import KeyService, load_config
 
@@ -49,7 +50,7 @@ SESSION_SECONDS = 12 * 3600
 LOGIN_KDF_CONCURRENCY = 4
 VOTE_LIMIT = 3
 COOKIE_NAME = "gotc_session"
-STATIC_FILES = {"downloads/gotc-gitee-submission-guide.pdf", "index.html", "styles.css", "app.js", "platform.html", "platform.js", "platform-admin.js", "platform-claims.js", "platform-draft-recovery.js", "platform.css", "favicon.svg"}
+STATIC_FILES = {"downloads/gotc-gitee-submission-guide.pdf", "index.html", "styles.css", "app.js", "platform.html", "platform.js", "platform-admin.js", "platform-claims.js", "platform-draft-recovery.js", "platform-finals.js", "platform-finals.css", "platform.css", "favicon.svg"}
 ASSET_EXTENSIONS = {".webp", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".woff2"}
 DOWNLOAD_EXTENSIONS = {".ics", ".txt"}
 SCHEMA = """
@@ -242,6 +243,7 @@ class EventService:
         self.repositories=Repositories(self)
         self.repository_backups=RepositoryBackups(self)
         self.write_conflicts=WriteConflicts(self)
+        self.finals=FinalsService(self,now_ms,text_field)
         self.write_conflicts.backup_before_upgrade()
         self.admin_data.backup_before_upgrade()
         self.keys=KeyService(self, load_config(self.data_dir / "gateway.json"), text_field)
@@ -290,6 +292,7 @@ class EventService:
         self.submission_records.initialize(backup=database_existed)
         with self.db() as db:self.repository_backups.initialize(db)
         self.write_conflicts.initialize()
+        self.finals.initialize()
 
     def migrate_accounts(self):
         """Rebuild only the legacy role CHECK; preserve IDs and referencing tables."""
@@ -544,10 +547,12 @@ class EventService:
             # Resolve write identities only after the lock: revocation may have committed while queued.
             if method=="POST":
                 db.execute("BEGIN IMMEDIATE")
-            elif method=="GET" and path in {"/api/admin", "/api/team/score", "/api/board", "/api/judge", "/api/audience"}:
+            elif method=="GET" and (self.finals.supports(path) or path in {"/api/admin", "/api/team/score", "/api/board", "/api/judge", "/api/audience"}):
                 # Keep release settings, aggregates and editor revisions in one read snapshot.
                 db.execute("BEGIN")
             actor = self.account(db, cookie)
+            if self.finals.supports(path):
+                return self.finals.dispatch(db,actor,method,path,body,query or {},expected_login_id,cookie),None,None
             if path == "/api/team/score":
                 self.require(actor, "team")
                 if method != "GET":
