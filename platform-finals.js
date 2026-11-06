@@ -258,14 +258,15 @@ function finalsInstallAdmin(view){
   const roster=view.container.querySelector('[data-finals-roster]'),settings=view.container.querySelector('[data-finals-settings]'),create=view.container.querySelector('[data-finals-create-judges]');
   for(const form of [roster,settings,create]){finalsTrack(view,form);form.finalsRevision=view.config.revision;}
   function buttons(){
-    for(const form of [roster,settings,create]){const button=form.querySelector('[data-finals-save]');button.disabled=form.finalsBusy || form.finalsBlocked || (form!==settings && view.config.rosterLocked) || (form===create && !!view.config.judgeIds?.length);}
+    roster.querySelector('fieldset').disabled=!!view.config.rosterLocked || !!view.judgesGenerating;
+    for(const form of [roster,settings,create]){const button=form.querySelector('[data-finals-save]');button.disabled=form.finalsBusy || form.finalsBlocked || (form!==settings && view.config.rosterLocked) || (form===roster && view.judgesGenerating) || (form===create && !!view.config.judgeIds?.length);}
   }
   for(const form of [roster,settings,create])form.finalsRefreshButtons=buttons;
   function saved(form,result){
     const cfg=result.config;form.finalsRevision=cfg.revision;view.config=cfg;
     // Clean sibling controls can adopt this successful write's revision; dirty forms keep theirs.
     for(const other of [roster,settings,create])if(other!==form && !dirtyAdminForms.has(other) && !other.finalsBusy)other.finalsRevision=cfg.revision;
-    roster.querySelector('fieldset').disabled=cfg.rosterLocked;buttons();view.poller?.kick();
+    buttons();view.poller?.kick();
   }
   roster.onsubmit=event=>{
     event.preventDefault();if(!view.valid())return;
@@ -279,15 +280,18 @@ function finalsInstallAdmin(view){
     finalsSave(view,settings,'admin/finals/settings',{expectedRevision:settings.finalsRevision,open,published},result=>saved(settings,result));
   };
   create.onsubmit=event=>{
-    event.preventDefault();if(!view.valid() || view.config.judgeIds?.length)return;
+    event.preventDefault();if(!view.valid() || view.config.rosterLocked || view.config.judgeIds?.length || create.finalsBusy || roster.finalsBusy || view.judgesGenerating)return;
     if(dirtyAdminForms.has(roster)){finalsMessage(create,'请先保存或复制名单中的未保存输入，再重新载入后生成账号。');return;}
-    finalsSave(view,create,'admin/finals/judges',{expectedRevision:create.finalsRevision},result=>{
+    // Replacing the judge list is safe only while its whole roster is held read-only.
+    // Team selections remain in the same DOM, and the independent settings form stays editable.
+    view.judgesGenerating=true;buttons();
+    return finalsSave(view,create,'admin/finals/judges',{expectedRevision:create.finalsRevision},result=>{
       saved(create,result);
       const credentials=result.credentials || [],box=view.container.querySelector('[data-finals-secret]');
       box.innerHTML='<div class="code-output"><strong>8位决赛评委专属登录码 · 仅显示一次</strong><p>请逐人单独发放，不要将整张码表发给所有评委。离开或刷新页面后隐藏。</p>'+credentials.map(item=>`<p><strong>${esc(item.name)}</strong><code>${esc(item.code)}</code></p>`).join('')+'</div>';
       view.container.querySelector('[data-finals-judge-list]').innerHTML=finalsJudgeChecks(credentials.map(item=>({...item,active:true})),result.config.judgeIds || []);
       roster.finalsRevision=result.config.revision;
-    });
+    }).finally(()=>{view.judgesGenerating=false;if(view.valid() && roster.isConnected)buttons();});
   };
   buttons();
 }

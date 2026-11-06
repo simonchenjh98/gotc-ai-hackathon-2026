@@ -11,7 +11,7 @@ function runtime(extra={}){
     metrics:items=>items.map(([value,label])=>`<span>${esc(value)} ${esc(label)}</span>`).join(''),
     dirtyAdminForms:new Set(),window:{addEventListener(){},removeEventListener(){}},document:{addEventListener(){},removeEventListener(){},hidden:false},
     session:{role:'judge',loginId:'owner-a',name:'Judge A'},route:'judge-finals',routeVersion:1,ownsBrowserLogin:()=>true,...extra});
-  vm.runInContext(source+'\nglobalThis.testHelpers={makeFinalsPoller,finalsSummaryMarkup,finalsSave,finalsTrack,createFinalsView,disposeFinalsView,finalsRequest,finalsRenderScore,finalsRenderNominations,finalsPatchSummary};',ctx);
+  vm.runInContext(source+'\nglobalThis.testHelpers={makeFinalsPoller,finalsSummaryMarkup,finalsSave,finalsTrack,createFinalsView,disposeFinalsView,finalsRequest,finalsRenderScore,finalsRenderNominations,finalsPatchSummary,finalsInstallAdmin};',ctx);
   return ctx;
 }
 const team=(id,number,name='Team '+number)=>({id,number,name,project:'Synthetic',eligible:true,score:81.25,scoreCount:8,recusedCount:0,complete:true,rank:number,dimensions:[16,12,17,16,12,8.25]});
@@ -181,4 +181,32 @@ test('unchanged statistics still re-enable award confirmation after an explicitl
   ctx.testHelpers.finalsPatchSummary(view,data);assert.equal(button.disabled,true);
   view.awardBusy=false;view.awardMessage='请求未完成';ctx.testHelpers.finalsPatchSummary(view,{...data,config:{...data.config,revision:4}});
   assert.equal(button.disabled,false);assert.equal(message.textContent,'请求未完成');assert.equal(host.finalsData.config.revision,4);
+});
+
+test('creating eight judge accounts locks the roster until response and preserves team selections and independent settings',async()=>{
+  for(const succeed of [true,false]){
+    const gate=deferred();let posts=0;
+    const ctx=runtime({route:'admin-finals',session:{role:'admin',loginId:'admin-a'},api:()=>{posts++;return gate.promise;}}),view=ctx.testHelpers.createFinalsView(1,'admin');
+    const fieldset={disabled:false},teamInput={value:'a',checked:true},oldJudgeInput={value:'old',checked:false};
+    const makeForm=()=>{
+      const button={disabled:false},error={textContent:''};
+      const form={isConnected:true,addEventListener(){},querySelector:selector=>selector==='[data-finals-save]'?button:selector==='fieldset'?fieldset:selector==='.form-error'?error:{innerHTML:'',querySelector:()=>({})},querySelectorAll:selector=>selector==='[data-finals-save]'?[button]:selector.includes('teamIds')?[teamInput]:[oldJudgeInput]};
+      return {form,button,error};
+    };
+    const roster=makeForm(),settings=makeForm(),create=makeForm();settings.form.elements={open:{checked:true},published:{checked:false}};
+    const judgeList={innerHTML:'old judge list'},secrets={innerHTML:'',replaceChildren(){this.innerHTML='';}};
+    const nodes={'[data-finals-roster]':roster.form,'[data-finals-settings]':settings.form,'[data-finals-create-judges]':create.form,'[data-finals-judge-list]':judgeList,'[data-finals-secret]':secrets};
+    view.container={isConnected:true,querySelector:selector=>nodes[selector],querySelectorAll:selector=>selector==='[data-finals-secret]'?[secrets]:[]};
+    view.config={runId:'r',revision:0,rosterLocked:false,judgeIds:[],teamIds:['a']};
+    ctx.testHelpers.finalsInstallAdmin(view);
+    const saving=create.form.onsubmit({preventDefault(){}});
+    assert.equal(fieldset.disabled,true);assert.equal(roster.button.disabled,true);assert.equal(settings.button.disabled,false);assert.equal(settings.form.elements.open.checked,true);
+    create.form.onsubmit({preventDefault(){}});assert.equal(posts,1,'the pending generation cannot be duplicated');
+    if(succeed)gate.resolve({config:{...view.config,revision:1,judgeIds:Array.from({length:8},(_,i)=>'j'+i)},credentials:Array.from({length:8},(_,i)=>({id:'j'+i,name:'Judge '+i,code:'synthetic-code-'+i}))});
+    else gate.reject(new Error('Temporary failure'));
+    await saving;
+    assert.equal(fieldset.disabled,false);assert.equal(roster.button.disabled,false);assert.equal(teamInput.checked,true);assert.equal(settings.form.elements.open.checked,true);assert.equal(settings.button.disabled,false);
+    if(succeed){assert.match(judgeList.innerHTML,/Judge 7/);assert.equal(create.button.disabled,true);}else assert.equal(judgeList.innerHTML,'old judge list');
+    ctx.testHelpers.disposeFinalsView();
+  }
 });
