@@ -67,10 +67,11 @@ test('admin guard rejects changed route, identity, role, stale browser owner and
   state={...initial};assert.equal(guard(),true);
 });
 
-test('review markup shows both schools, revision, explicit in-person/resolution controls and no issued code',()=>{
+test('legacy pending review requests applicant completion and never requires imported records',()=>{
   const request={id:'fixture',name:'Fixture Captain',school:'Submitted School',status:'pending',revision:4};
-  const html=context.claimsReviewMarkup(request,{teams:[{id:'T1',number:1,name:'Fixture'}],people:[{id:'P1',name:'Fixture Captain',school:'Roster School',needsReview:true},{id:'P2',name:'Assigned Person',school:'Other',teamId:'T2'}]});
-  assert.match(html,/Submitted School/);assert.match(html,/Roster School/);assert.match(html,/修订 4/);assert.match(html,/inPersonVerified/);assert.match(html,/resolvedIdentity/);assert.ok(!html.includes('Assigned Person'));assert.ok(!html.includes('data-copy-value'));
+  const html=context.claimsReviewMarkup(request,{teams:[],people:[]});
+  assert.match(html,/Submitted School/);assert.match(html,/修订 4/);assert.match(html,/补充全体组员/);
+  assert.ok(!html.includes('name="teamId"'));assert.ok(!html.includes('name="captainId"'));assert.ok(!html.includes('type="submit"'));
 });
 
 test('API and route wiring protects admin reads/writes and logout clears tab claim receipt',()=>{
@@ -81,25 +82,6 @@ test('API and route wiring protects admin reads/writes and logout clears tab cla
   assert.match(source,/if\(revision!==edit\)/);assert.match(source,/button\.dataset\.stale='true'/);
   const installer=source.slice(source.indexOf('function installClaimsAdmin'));
   assert.match(installer,/onclick=load/);assert.ok(!/\n\s*load\(\);/.test(installer));
-});
-
-test('real approval handler submits exact selected revisions from displayed model, including a stale same-panel selection',()=>{
-  const people=[{id:'p1',name:'Captain',revision:2},{id:'p2',name:'Bob',revision:7},{id:'unselected',name:'Other',revision:9}];
-  const request={id:'request-fixture',revision:1,status:'pending'};
-  const selected=[{value:'p1'},{value:'p2'}],posts=[];
-  const form={elements:{teamId:{value:'T1'},captainId:{value:'p1'},pin:{value:'123456'},note:{value:'Verified Bob onsite'},inPersonVerified:{checked:true},resolvedIdentity:{checked:false}},querySelectorAll:()=>selected};
-  const nodes={'claim-review':{innerHTML:''},'claim-review-form':form,'claim-member-search':{},'claim-team-search':{},'claim-reject':{}};
-  const scope=vm.createContext({Map,Object,model:{requests:[request],people},document:{getElementById:id=>nodes[id]},busy:false,live:()=>true,replaceEditor:()=>true,trackAdminForm:()=>{},claimsReviewMarkup:()=>'',mutate:(f,path,body)=>posts.push({form:f,path,body})});
-  const helper=source.slice(source.indexOf('function claimMemberSnapshot'),source.indexOf('function claimsReviewMarkup'));
-  const handler=source.slice(source.indexOf('  function selectRequest(id){'),source.indexOf("  document.getElementById('claims-admin-load').onclick=load;"));
-  vm.runInContext(helper+'\n'+handler+'\nselectRequest("request-fixture");',scope);
-  // A successful person-editor write does not refresh the displayed roster model.
-  const nowSavedPerson={...people[1],name:'Charlie',revision:8};assert.equal(nowSavedPerson.revision,8);
-  form.onsubmit({preventDefault(){}});
-  assert.equal(posts.length,1);assert.equal(posts[0].path,'admin/claims/review');
-  assert.deepEqual({...posts[0].body.memberRevisions},{p1:2,p2:7});assert.deepEqual([...posts[0].body.memberIds],['p1','p2']);
-  assert.equal(posts[0].body.note,'Verified Bob onsite');assert.equal(posts[0].body.expectedRevision,1);
-  assert.ok(!Object.hasOwn(posts[0].body.memberRevisions,'unselected'));
 });
 
 test('real admin mutation handler retains selected members, PIN and notes after roster revision conflict',async()=>{
@@ -167,7 +149,8 @@ function claimPageFixture(transport){
   const root={html:''};Object.defineProperty(root,'innerHTML',{get(){return this.html;},set(html){
     this.html=html;nodes.clear();for(const match of html.matchAll(/id="([^"]+)"/g))node(match[1]);
     const form=nodes.get('claim-request-form')??nodes.get('claim-update-form');if(!form)return;
-    form.elements={};for(const name of ['name','school']){const field=html.match(new RegExp('<input name="'+name+'"[^>]*value="([^"]*)"'));if(field)form.elements[name]={value:decode(field[1])};}
+    form.elements={};for(const name of ['name','school','teamName']){const field=html.match(new RegExp('<input name="'+name+'"[^>]*value="([^"]*)"'));if(field)form.elements[name]={value:decode(field[1])};}
+    const track=html.match(/<select name="track"[^>]*>([\s\S]*?)<\/select>/);if(track)form.elements.track={value:decode(track[1].match(/value="([^"]*)" selected/)?.[1]??'')};
     const rows=[...html.matchAll(/<fieldset class="claim-member-row"[\s\S]*?<\/fieldset>/g)].map(match=>{
       const fields={};for(const name of ['memberName','memberSchool'])fields[name]={value:decode(match[0].match(new RegExp('name="'+name+'"[^>]*value="([^"]*)"'))[1])};
       return {querySelector:selector=>fields[selector.match(/name="([^"]+)"/)[1]]};
@@ -177,7 +160,7 @@ function claimPageFixture(transport){
     form.rows=rows;form.remove=remove;
   }});
   const scope=vm.createContext({JSON,Number,Error,Set,encodeURIComponent,esc,heading:()=>'',beijingTime:String,teamLabel:t=>t.name,base:{pathname:'/test/'},sessionStorage:storage,root,document:{getElementById:id=>nodes.get(id)??null},api:transport,route:'claim',routeVersion:1,confirm:()=>true});vm.runInContext(source,scope);
-  return {scope,root,storage,nodes,render:()=>vm.runInContext('renderClaim(1)',scope),form:()=>nodes.get('claim-request-form')??nodes.get('claim-update-form'),fill(){const f=this.form();if(f.elements.name)f.elements.name.value=declaredCaptain.name;if(f.elements.school)f.elements.school.value=declaredCaptain.school;f.rows.forEach((row,i)=>{row.querySelector('[name="memberName"]').value='Teammate '+i;row.querySelector('[name="memberSchool"]').value='School '+i;});f.oninput();}};
+  return {scope,root,storage,nodes,render:()=>vm.runInContext('renderClaim(1)',scope),form:()=>nodes.get('claim-request-form')??nodes.get('claim-update-form'),fill(){const f=this.form();if(f.elements.name)f.elements.name.value=declaredCaptain.name;if(f.elements.school)f.elements.school.value=declaredCaptain.school;if(f.elements.teamName)f.elements.teamName.value='Fixture Team';f.rows.forEach((row,i)=>{row.querySelector('[name="memberName"]').value='Teammate '+i;row.querySelector('[name="memberSchool"]').value='School '+i;});f.oninput();}};
 }
 
 test('real public form locks the first application and restores its submitted values after failure',async()=>{
@@ -208,18 +191,21 @@ test('real receipt form recovers after refresh, edits teammates and submits expe
   assert.equal(calls.at(-1).path,'claims/update');assert.equal(calls.at(-1).body.expectedRevision,1);assert.equal(calls.at(-1).body.secret,receipt.secret);assert.match(page.root.innerHTML,/Edited On Receipt/);assert.ok(!page.nodes.has('claim-update-form'));
 });
 
-test('declared staff mapping uses one selector per declaration and submits displayed revisions in declared order',()=>{
-  const request={id:'declared-fixture',name:declaredCaptain.name,school:declaredCaptain.school,revision:3,status:'pending',declaration:declaredResponse.declaration};
-  const people=[{id:'p1',...declaredCaptain,revision:4},{id:'p2',...declaredMembers[0],revision:5},{id:'p3',...declaredMembers[1],revision:6}];
-  const html=context.claimsReviewMarkup(request,{people,teams:[]});assert.equal([...html.matchAll(/data-claim-map="\d+"/g)].length,3);assert.ok(!html.includes('name="memberIds"'));assert.match(html,/First Teammate · First School/);
-  const selects=[{value:'p1'},{value:'p3'},{value:'p2'}],posts=[];
-  const form={elements:{teamId:{value:'T1'},captainId:selects[0],pin:{value:'123456'},note:{value:'Check exact school aliases'},inPersonVerified:{checked:true},resolvedIdentity:{checked:true}},querySelectorAll:selector=>selector==='[data-claim-map]'?selects:[]};
-  const nodes={'claim-review':{innerHTML:''},'claim-review-form':form,'claim-team-search':{},'claim-reject':{}};
-  const scope=vm.createContext({Map,Object,model:{requests:[request],people},document:{getElementById:id=>nodes[id]},busy:false,live:()=>true,replaceEditor:()=>true,trackAdminForm:()=>{},claimsReviewMarkup:()=>'',mutate:(f,path,body)=>posts.push({path,body})});
-  const helper=source.slice(source.indexOf('function claimMemberSnapshot'),source.indexOf('function claimsReviewMarkup'));
+test('direct staff review shows private duplicate references and posts only reviewed team plus scoped context',()=>{
+  const request={id:'declared-fixture',name:declaredCaptain.name,school:declaredCaptain.school,revision:3,status:'pending',reviewContext:'opaque-context',declaration:declaredResponse.declaration,
+    references:[{id:'reference',name:declaredCaptain.name,school:'Other School',teamId:'assigned',notes:'Reference note',needsReview:true}]};
+  const html=context.claimsReviewMarkup(request,{people:[],teams:[]});
+  assert.match(html,/First Teammate · First School/);assert.match(html,/可能重复/);assert.match(html,/Other School/);assert.match(html,/inPersonVerified/);
+  assert.ok(!html.includes('name="teamId"'));assert.ok(!html.includes('data-claim-map'));assert.ok(!html.includes('data-copy-value'));
+  const posts=[];
+  const form={elements:{teamName:{value:'Reviewed Team'},track:{value:''},pin:{value:'123456'},note:{value:'Distinct people verified'},inPersonVerified:{checked:true},resolvedIdentity:{checked:true}}};
+  const nodes={'claim-review':{innerHTML:''},'claim-review-form':form,'claim-reject':{}};
+  const scope=vm.createContext({model:{requests:[request]},document:{getElementById:id=>nodes[id]},busy:false,live:()=>true,replaceEditor:()=>true,trackAdminForm:()=>{},claimsReviewMarkup:()=>'',mutate:(f,path,body)=>posts.push({path,body})});
   const handler=source.slice(source.indexOf('  function selectRequest(id){'),source.indexOf("  document.getElementById('claims-admin-load').onclick=load;"));
-  vm.runInContext(helper+'\n'+handler+'\nselectRequest("declared-fixture");',scope);form.onsubmit({preventDefault(){}});
-  assert.deepEqual([...posts[0].body.declaredMemberIds],['p1','p3','p2']);assert.deepEqual({...posts[0].body.memberRevisions},{p1:4,p3:6,p2:5});assert.equal(posts[0].body.expectedRevision,3);
+  vm.runInContext(handler+'\nselectRequest("declared-fixture");',scope);form.onsubmit({preventDefault(){}});
+  assert.equal(posts[0].path,'admin/claims/approve');assert.equal(posts[0].body.reviewContext,'opaque-context');assert.equal(posts[0].body.expectedRevision,3);
+  assert.equal(posts[0].body.teamName,'Reviewed Team');assert.equal(posts[0].body.track,'');assert.equal(posts[0].body.resolvedIdentity,true);
+  assert.ok(!Object.hasOwn(posts[0].body,'memberIds'));
 });
 
 test('successful first application cannot discard changes from enabled inputs because the entire draft is frozen',async()=>{
@@ -303,4 +289,51 @@ test('late explicit review cannot revive cleared credentials or an abandoned edi
     assert.ok(states.every(state=>state.reviewRevision!==99));
     if(action==='clear'){assert.equal(states.at(-1).receipt,null);assert.equal(storage.map.size,0);}
   }
+});
+
+test('team metadata uses public form values, survives refresh and requires explicit conflict confirmation',async()=>{
+  const calls=[];let revision=1,teamName='Original Team',track='AI for Science';
+  const page=claimPageFixture(async(path,body)=>{
+    calls.push({path,body});
+    if(path.endsWith('request')){teamName=body.teamName;track=body.track;}
+    if(path.endsWith('update')){
+      if(body.expectedRevision!==revision){const error=new Error('申请已变化');error.status=409;throw error;}
+      teamName=body.teamName;track=body.track;revision++;
+    }
+    return {...declaredResponse,requestRevision:revision,declaration:{...declaredResponse.declaration,teamName,track}};
+  });
+  await page.render();page.fill();page.form().elements.teamName.value='My New Team';page.form().elements.track.value='未来学习样态';page.form().oninput();
+  page.form().onsubmit({preventDefault(){}});await flush();assert.equal(calls[0].body.teamName,'My New Team');assert.equal(calls[0].body.track,'未来学习样态');
+  await page.render();assert.match(page.root.innerHTML,/My New Team/);page.nodes.get('claim-edit').onclick();
+  assert.equal(page.form().elements.teamName.value,'My New Team');assert.equal(page.form().elements.track.value,'未来学习样态');
+  page.form().elements.teamName.value='My Draft';page.form().elements.track.value='';page.form().oninput();
+  revision=2;teamName='Concurrent Team';track='城市与社区问题';
+  page.form().onsubmit({preventDefault(){}});await flush();assert.equal(page.form().elements.teamName.value,'My Draft');
+  await page.nodes.get('claim-edit-reload').onclick();assert.match(page.root.innerHTML,/Concurrent Team/);assert.equal(page.form().elements.teamName.value,'My Draft');
+  assert.equal(page.form().elements.track.value,'');const before=calls.length;
+  page.form().onsubmit({preventDefault(){}});await flush();assert.equal(calls.length,before);
+  page.nodes.get('claim-edit-confirm').onclick();page.form().onsubmit({preventDefault(){}});await flush();
+  assert.equal(calls.at(-1).body.expectedRevision,2);assert.equal(teamName,'My Draft');assert.equal(track,'');
+  assert.ok(![...page.storage.map.values()].join('').includes('My Draft'));
+});
+
+test('typing only team metadata during a pending save is retained as unsaved draft',async()=>{
+  const storage=new Storage();store(storage).write(receipt);let finish;let saving=false;
+  const response={...declaredResponse,declaration:{...declaredResponse.declaration,teamName:'Initial',track:''}};
+  const {client,states}=controller(storage,()=>saving?new Promise(resolve=>{finish=resolve;}):Promise.resolve(response));
+  await client.start();client.edit();saving=true;
+  const pending=client.update(declaredMembers,{teamName:'Sent',track:''});
+  client.setDraft({...declaredCaptain,members:declaredMembers,teamName:'Typed while saving',track:'AI for Science'});
+  finish({...response,requestRevision:2,declaration:{...response.declaration,teamName:'Sent'}});await pending;
+  assert.equal(states.at(-1).editing,true);assert.equal(states.at(-1).draft.teamName,'Typed while saving');
+  assert.equal(states.at(-1).draft.track,'AI for Science');assert.equal(states.at(-1).declaration.teamName,'Sent');
+});
+
+test('public and admin track choices match existing server tracks while blank remains allowed',()=>{
+  const backend=fs.readFileSync(new URL('../server/admin_data.py',import.meta.url),'utf8');
+  const tracks=JSON.parse(backend.match(/TRACK_OPTIONS=(\[[^\n]+\])/)[1]);
+  const html=context.claimTeamMarkup({teamName:'A < B',track:''});
+  for(const track of tracks)assert.ok(html.includes('value="'+track+'"'));
+  assert.match(html,/待定（现场确认）/);assert.match(html,/A &lt; B/);assert.ok(!html.includes('<select name="track" required'));
+  assert.match(html,/<input name="teamName" required/);
 });
