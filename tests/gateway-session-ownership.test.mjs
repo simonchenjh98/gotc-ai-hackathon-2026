@@ -157,3 +157,34 @@ for(const marker of ['login-a',null])for(const storageDelivered of [true,false])
     assert.equal(h.get('submission-fieldset').disabled,true);assert.match(h.get('team-keys').innerHTML,/刷新/);
   });
 }
+
+test('created key survives transient validation only in memory and retry reveals exact result without another create',async()=>{
+  let created=false,fail=true;
+  const h=harness(request=>{if(request.method==='POST' && request.path==='team/keys')created=true;else if(created && request.path==='team/keys' && fail){fail=false;return response({error:'Temporary validation unavailable'},503);}});
+  await h.load();await h.submit();
+  assert.equal(h.get('new-api-key').innerHTML,'');assert.equal(h.copied.length,0);assert.match(h.get('team-keys').innerHTML,/密钥已创建.*等待身份验证/);
+  assert.equal(vm.runInContext('currentTeamKeys.pendingKey.key',h.ctx),'gk-SYNTHETIC-A');assert.equal(vm.runInContext('currentTeamKeys.key',h.ctx),'');
+  await h.get('retry-team-keys').onclick();assert.match(h.get('new-api-key').innerHTML,/gk-SYNTHETIC-A/);
+  assert.equal(h.requests.filter(r=>r.method==='POST' && r.path==='team/keys').length,1);
+  assert.equal(vm.runInContext('currentTeamKeys.pendingKey',h.ctx),null);
+  await h.get('copy-api-key').onclick();assert.deepEqual(h.copied,['gk-SYNTHETIC-A']);
+});
+
+for(const change of ['401','403','428','switch','dispose'])test(`pending key is wiped without display after ${change}`,async()=>{
+  let created=false,read=0;
+  const h=harness(request=>{
+    if(request.method==='POST' && request.path==='team/keys')created=true;
+    else if(created && request.path==='team/keys')return response({error:'Validation unavailable'},++read===1?503:Number(change)||200);
+  });
+  await h.load();await h.submit();const retry=h.get('retry-team-keys');
+  if(change==='switch')h.setMarker('different-login');
+  if(change==='dispose')vm.runInContext('currentTeamKeys.dispose()',h.ctx);
+  await retry.onclick();assert.equal(h.get('new-api-key').innerHTML,'');assert.equal(vm.runInContext('currentTeamKeys.pendingKey',h.ctx),null);assert.equal(h.copied.length,0);
+  assert.equal(h.requests.filter(r=>r.method==='POST' && r.path==='team/keys').length,1);
+});
+
+test('initial transient key loading failure offers a protected read retry',async()=>{
+  let once=true;const h=harness(request=>{if(request.path==='team/keys' && once){once=false;return response({error:'Try again'},503);}});
+  await h.load();assert.match(h.get('team-keys').innerHTML,/重试读取/);await h.get('retry-team-keys').onclick();
+  assert.ok(h.get('key-form').isConnected);assert.equal(h.requests.filter(r=>r.method==='POST').length,0);
+});

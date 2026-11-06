@@ -44,7 +44,7 @@ class ClaimsTests(unittest.TestCase):
         body=self.approval(claim,team,**changes);result=self.admin_call('/review',body);self.assertEqual(result[0],200,result[1]);return body
 
     def test_private_roster_auth_marker_import_size_and_no_silent_rewrites(self):
-        self.assertEqual(self.public.post('/api/claims/request',{'name':'x','school':'y'})[0],503)
+        self.assertEqual(self.public.post('/api/claims/request',{'name':'x','school':'y'})[0],200)
         self.assertEqual(self.public.get('/api/admin/claims')[0],401)
         self.assertEqual(self.admin.get('/api/admin/claims')[0],428)
         self.assertEqual(self.admin_call('',login_id='wrong')[0],401)
@@ -252,7 +252,7 @@ class ClaimsTests(unittest.TestCase):
         for _ in range(2):self.service=EventService(old.data_dir,base_path=old.base_path,origin=old.origin,static_root=old.root)
         self.server.service=self.service
         self.assertEqual(self.admin_call('')[1]['people'],[]);self.assertEqual(self.admin_call('')[1]['teams'][0]['id'],team)
-        self.assertEqual(self.public.post('/api/claims/request',{'name':'a','school':'b'})[0],503)
+        self.assertEqual(self.public.post('/api/claims/request',{'name':'a','school':'b'})[0],200)
 
 
     def declared_group(self,count=3):
