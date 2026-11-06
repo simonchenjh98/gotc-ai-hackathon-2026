@@ -168,7 +168,7 @@ Claude Code 会按自己的默认模型名请求（如 `claude-opus-…`、`clau
 - 后台设置每队密钥上限、统一到期时间、每队每分钟请求上限（默认60，0为不限）、屏蔽词和队伍公告。每队最多 4 个并发请求，超出时排队最多 30 秒再返回 429。
 - 每次请求在排队取得并发名额后会再次校验密钥、队伍状态与到期时间。上游调用按实际 token 用量统计费用；缺少用量时进行估算。Anthropic 请求未设置输出上限时补 `max_tokens: 8192`，显式输出上限最多 128000。
 - 后台管理参照 sub2api：
-  - 模型上游可“测试连接”（用已保存的地址与密钥向第一个模型发送 1 个 token 的请求）与“获取上游模型列表”（读取上游 `/models`），密钥不会发到浏览器。
+  - 模型上游可“测试已保存的连接”（向第一个模型发送 1 个 token 的请求）与“自动拉取模型列表”。拉取使用当前表单的地址和密钥，无需先保存或填写模型；密钥留空时，只能在地址主机和端口未变化时沿用已保存的密钥。读取上游 `/models` 后可选择模型加入配置，已有模型和价格保留，新模型须补全价格后再保存。拉取不修改配置，也不占用数据库写锁；上游不支持列举模型时仍可手动填写。
   - 今日概况另显示近5分钟每分钟请求数与 tokens、今日成功请求 P95 耗时与平均首字耗时；用量详情可按日或按小时查看；调用记录可按模型（请求名或实际模型）与请求 ID 筛选。
   - 调用内容（请求与回复）默认保留 72 小时、总容量上限 2048MB，超出后从最早的内容开始自动删除（每 10 分钟检查一次），后台可随时一键清空；用量与费用记录始终保留。sub2api 完全不保存请求内容。
 - Responses API 安全：所有队伍共用同一个上游账号，因此 `/v1/responses` 一律以 `store: false` 转发，上游不保存任何状态；`previous_response_id`、`item_reference`、`conversation`、预存 `prompt` 与 `background` 一律拒绝（后台任务会在本次调用结束后才计费，无法在当前调用中统计完整费用）。客户端需在 `input` 中提供完整上下文（Codex 使用 API 密钥时即如此）。OpenAI 兼容接口未设置输出上限时，以 128000 个输出 token 作为缺少用量时的估算值（不向上游注入字段），正常调用按实际用量统计费用。
@@ -222,6 +222,7 @@ Claude Code 会按自己的默认模型名请求（如 `claude-opus-…`、`clau
 | GET `/api/admin/keys` | 管理员 | `{enabled,settings,models,overview,changes,teams:[{teamId,active,keyCount,inflight,used24h,usedTotal}]}` |
 | POST `/api/admin/keys/settings` | 管理员 | `maxKeys` 1–20、`expiresAt` 毫秒或 null、`logContent` 布尔、`teamRpm` 0–10000、`announcement` ≤500字、`blockedWords` ≤200个，可单独更新 |
 | POST `/api/admin/keys/upstreams` | 管理员 | `{upstreams:{openai?,anthropic?:{url,key,models,aliases?}}}`，整体替换；`key` 留空沿用原值；`{}` 关闭网关 |
+| POST `/api/admin/keys/upstreams/models` | 管理员 | 携带页面的 `X-GOTC-Login`，`{kind:"openai"或"anthropic",url,key}` → `{ok,status,latencyMs,models?,message}`；读取当前表单的模型列表，不保存配置；密钥留空按同主机、同端口规则沿用 |
 | POST `/api/admin/keys/stats` | 管理员 | `{teamId?,keyId?,days:1–90}` → `{totals,byKey,byModel,byClient,daily}`，按北京时间分日 |
 | POST `/api/admin/keys/logs` | 管理员 | `{teamId?,keyId?,errorsOnly?,beforeId?}` → `{items,more}`，每页50条，按时间倒序 |
 | POST `/api/admin/keys/log` | 管理员 | `{id}` → `{headers,request,response,requestBytes,responseBytes,responseTruncated}`，记录查看操作 |

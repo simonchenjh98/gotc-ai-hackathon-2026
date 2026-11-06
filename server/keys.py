@@ -961,30 +961,63 @@ class KeyService:
             return {"ok": True}
         raise APIError(404, "接口不存在")
 
-    def probe_upstream(self, kind, models_only=False):
-        """sub2api's account test: a 1-token request to the first model, or the upstream's own model list, with the saved key."""
-        upstream = self.config[kind]
+    def detect_models(self, body, cookie, expected_login_id):
+        """Read a draft upstream's catalog without saving configuration or holding the writer lock."""
+        with self.service.db() as db:
+            self.service.require(self.service.account(db, cookie), "admin")
+            if not expected_login_id:
+                raise APIError(428, "请刷新页面并核对管理员登录身份")
+            if expected_login_id != self.service.login_id(cookie):
+                raise APIError(401, "登录身份已变化，请重新登录后操作")
+            if set(body) != {"kind", "url", "key"} or not isinstance(body["kind"], str) or body["kind"] not in {"openai", "anthropic"}:
+                raise APIError(400, "模型列表请求字段不正确")
+            kind, key = body["kind"], body["key"]
+            try:
+                url = check_url(body["url"])
+                parts = urlsplit(url)
+                if parts.username is not None or parts.password is not None:
+                    raise ValueError("credentials in URL")
+                parts.port  # Validate explicit ports before constructing an upstream request.
+            except (ValueError, TypeError):
+                raise APIError(400, "接口地址应为 HTTPS Base URL（本机地址可用 HTTP），不能含查询参数或账号密码") from None
+            if not isinstance(key, str) or len(key) > 4096 or any(ord(c) < 32 or ord(c) > 126 for c in key):
+                raise APIError(400, "API Key 格式不正确")
+            key = key.strip()
+            if not key:
+                saved = self.raw_config(db).get(kind)
+                if not saved:
+                    raise APIError(400, "请先填写 API Key")
+                if urlsplit(url).netloc.lower() != urlsplit(saved["url"]).netloc.lower():
+                    raise APIError(400, "上游地址已更改，请重新填写 API Key")
+                key = saved["key"]
+        return self.probe_upstream(kind, models_only=True, upstream={"url": url, "key": key})
+
+    def probe_upstream(self, kind, models_only=False, upstream=None):
+        """Probe a saved or draft upstream: generate one token or read its model catalog."""
+        upstream = upstream if upstream is not None else self.config[kind]
         headers = {"Content-Type": "application/json", "User-Agent": "gotc-gateway/1.0"}
         if kind == "openai":
             headers["Authorization"] = "Bearer " + upstream["key"]
         else:
             headers["x-api-key"], headers["anthropic-version"] = upstream["key"], "2023-06-01"
-        model = next(iter(upstream["models"]))
         if models_only:
             request = urllib.request.Request(upstream["url"] + "/models", headers=headers, method="GET")
         else:
+            model = next(iter(upstream["models"]))
             body = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
             request = urllib.request.Request(upstream["url"] + ("/chat/completions" if kind == "openai" else "/messages"),
                                              data=gateway_json(body), headers=headers, method="POST")
         started = time.monotonic()
         try:
             with self.opener.open(request, timeout=30) as response:
-                status, payload = response.status, response.read(2_000_000)
+                status, payload = response.status, response.read(2_000_001)
         except urllib.error.HTTPError as error:
             status, payload = error.code, error.read(100_000) if error.fp else b""
         except (OSError, http.client.HTTPException) as error:
             return {"ok": False, "status": None, "latencyMs": int((time.monotonic() - started) * 1000), "message": failure_reason(error)}
         latency = int((time.monotonic() - started) * 1000)
+        if len(payload) > 2_000_000:
+            return {"ok": False, "status": status, "latencyMs": latency, "message": "上游返回内容过大，请手动填写模型"}
         if status >= 400:
             return {"ok": False, "status": status, "latencyMs": latency,
                     "message": upstream_message(payload, self.error_secrets() + (upstream["key"],))}
@@ -992,9 +1025,10 @@ class KeyService:
             return {"ok": True, "status": status, "latencyMs": latency, "model": model, "message": "连接正常，上游已返回回复"}
         try:
             listed = json.loads(payload).get("data")
-        except (ValueError, AttributeError):
+        except (ValueError, AttributeError, RecursionError):
             listed = None
-        ids = sorted({str(m.get("id"))[:100] for m in listed if isinstance(m, dict) and m.get("id")}) if isinstance(listed, list) else []
+        ids = sorted({m["id"] for m in listed if isinstance(m, dict) and isinstance(m.get("id"), str)
+                      and 0 < len(m["id"]) <= 100 and not any(c.isspace() or ord(c) < 32 for c in m["id"])}) if isinstance(listed, list) else []
         return {"ok": bool(ids), "status": status, "latencyMs": latency, "models": ids[:500],
                 "message": f"上游提供 {len(ids)} 个模型" if ids else "上游未返回模型列表"}
 
