@@ -246,3 +246,42 @@ class OpenClaimsTests(unittest.TestCase):
         self.assertEqual(self.counts()['claim_memberships'],3);self.assertEqual(self.counts()['team_accounts'],1)
         winner=bodies[0] if results[0][0]==200 else bodies[1]
         self.assertEqual(self.admin_call('/approve',winner)[0],200)
+
+    def test_verified_same_name_people_allow_metadata_edits_without_losing_any_identity(self):
+        for prefix,captain,members in [('DuplicateMembers','Captain',['Alex','Alex']),('DuplicateCaptain','Alex',['Alex','Member'])]:
+            with self.subTest(prefix=prefix):
+                code,registered,value=self.registration(prefix,captain=captain,members=members[:1],school=prefix+' School')
+                claim=self.application(prefix,name=captain,school=prefix+' School',members=[{'name':name,'school':prefix+' School '+str(index)} for index,name in enumerate(members)])
+                body=self.selected_approval(claim,registered['id'],resolvedIdentity=True,note='Distinct people from different schools verified')
+                self.assertEqual(self.admin_call('/approve',body)[0],200)
+                stored=[captain,*members]
+                current=self.public.post('/api/registration/open',{'code':code})[1]['team']
+                self.assertEqual(current['members'],stored)
+                with self.service.db() as db:
+                    before=[tuple(row) for row in db.execute('SELECT person_id,team_id,request_id FROM claim_memberships WHERE team_id=? ORDER BY person_id',(registered['id'],))]
+                for submitted in [members,stored]:  # Browser tail and compatible full-list clients.
+                    result=self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],
+                        'team':{**value,'members':submitted,'phone':'13900000002','project':'Editable project after identity review'}})
+                    self.assertEqual(result[0],200,result[1]);current=result[1]['team']
+                    self.assertEqual(current['members'],stored);self.assertEqual(current['phone'],'13900000002')
+                    self.assertEqual(current['project'],'Editable project after identity review')
+                for changed in [members[:-1],['Replacement',members[1]],list(reversed(stored))]:
+                    result=self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],
+                        'team':{**value,'members':changed}})
+                    self.assertEqual(result[0],409,result[1])
+                with self.service.db() as db:
+                    self.assertEqual(json.loads(db.execute('SELECT members_json FROM team_registrations WHERE team_id=?',(registered['id'],)).fetchone()[0]),stored)
+                    self.assertEqual([tuple(row) for row in db.execute('SELECT person_id,team_id,request_id FROM claim_memberships WHERE team_id=? ORDER BY person_id',(registered['id'],))],before)
+                self.assertEqual(len(before),3)
+
+    def test_verified_duplicate_names_reject_reordering_and_target_below_full_member_count(self):
+        code,registered,value=self.registration(targetSize=4)
+        members=[{'name':name,'school':'School '+str(index)} for index,name in enumerate(['Alex','Alex','Bob'])]
+        claim=self.application(members=members);self.assertEqual(self.admin_call('/approve',self.selected_approval(claim,registered['id']))[0],200)
+        current=self.public.post('/api/registration/open',{'code':code})[1]['team']
+        for names,target,status in [(['Alex','Bob','Alex'],4,409),(['Alex','Alex','Bob'],3,400),(['Alex','Bob'],4,409)]:
+            result=self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],'team':{**value,'members':names,'targetSize':target}})
+            self.assertEqual(result[0],status,result[1])
+        result=self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],
+            'team':{**value,'members':['Alex','Alex','Bob'],'phone':'13900000002'}})
+        self.assertEqual(result[0],200,result[1]);self.assertEqual(result[1]['team']['members'],['Open Captain','Alex','Alex','Bob'])

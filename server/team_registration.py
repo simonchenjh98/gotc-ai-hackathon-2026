@@ -178,10 +178,16 @@ class TeamRegistration:
         if type(body['expectedRevision']) is not int or body['expectedRevision'] != row['revision']:
             raise APIError(409, '队伍资料已变化，本次未保存。请复制当前输入，再重新读取本队资料')
         value = self.clean(body['team'])
-        self.check_duplicates(db, value, row['team_id'])
         if db.execute('SELECT 1 FROM claim_memberships WHERE team_id=?', (row['team_id'],)).fetchone():
-            if value['captain'] != row['captain'] or value['school'] != row['school'] or value['members'] != json.loads(row['members_json']):
+            confirmed=json.loads(row['members_json'])
+            # A name-only registration editor cannot collapse distinct verified people.
+            # Accept its ordered tail or a compatible full-list payload, then keep the authoritative roster.
+            if value['captain'] != row['captain'] or value['school'] != row['school'] or body['team']['members'] not in (confirmed,confirmed[1:]):
                 raise APIError(409, '本队已完成现场身份核验，成员变化请交由组织方处理')
+            if value['targetSize']<len(confirmed):
+                raise APIError(400, '目标人数不能少于已现场核实的完整成员人数')
+            value['members']=confirmed
+        self.check_duplicates(db, value, row['team_id'])
         # A registration edit must not overwrite an already submitted project title.
         if db.execute('SELECT 1 FROM submissions WHERE team_id=? AND submitted_json IS NOT NULL', (row['team_id'],)).fetchone() and value['project'] != row['project']:
             raise APIError(409, '已正式提交的项目名称请在选手工作台更新')
