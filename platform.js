@@ -424,6 +424,7 @@ async function renderAdmin(version,expectedElement=null,discardedEdits=null){
   document.querySelectorAll('[data-revoke]').forEach(b=>b.onclick=()=>withBusy(b,async()=>{await api('admin/revoke',{role:b.dataset.role,id:b.dataset.revoke});toast('邀请码已停用，对应登录会话已失效。');if(route==='admin' && b.isConnected && !dirtyAdminForms.size)await renderAdmin(routeVersion,b);}));
   installSubmissionAdmin(data);
   if(typeof installClaimsAdmin==='function')installClaimsAdmin(version);
+  if(typeof installRegistrationAdmin==='function')installRegistrationAdmin(version);
   root.insertAdjacentHTML('beforeend','<div class="admin-section-title"><h2>AI API 管理</h2><span class="small-note">每队开通一次；各队可自行创建密钥并查看用量。</span></div><section class="surface" id="key-admin"><p class="small-note">读取中…</p></section>');loadKeyAdmin(teams,version);
   root.querySelectorAll('form').forEach(form=>{if(!form.closest('#judging-admin'))trackAdminForm(form);});
   if(typeof installAdminData==='function')installAdminData(data,version);

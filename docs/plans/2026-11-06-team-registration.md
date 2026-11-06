@@ -1,0 +1,5 @@
+# Student team registration
+
+Homepage form and live roster, backed by SQLite. A captain can register 1–5 named members and choose a target of 3–5. Separate random management code authorizes only roster edits; server stores its hash. Public names and schools; private phone and original source records. No automatic submission credentials or model access. Preserve source rows, flag missing names and count mismatches, remove placeholders and repeated captain names from the displayed roster. Imported teams get private management codes for organizer distribution.
+
+Exact-origin CORS is restricted to the public registration API. Organizer endpoints retain login/session checks. Creation retries are idempotent by a client-generated random code. Edits require revision comparison. No edits to verified membership or overwrites of submitted project names. Import source keys are idempotent and never overwrite later student edits. Test public/private boundaries, duplicate/conflicting edits, import, mobile layout and existing regression suites. Integrate current main before deployment to retain concurrent operations and maintenance changes.
