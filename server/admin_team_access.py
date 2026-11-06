@@ -88,6 +88,7 @@ class AdminTeamAccess:
             if set(body) != {'teamId'}:
                 raise APIError(400, '请选择一支队伍')
             team_id = self.s.team_exists(db, body['teamId'])
+            self.s.team_lifecycle.require_available(db,team_id)
             if db.execute("SELECT 1 FROM team_details WHERE team_id=? AND status!='active'", (team_id,)).fetchone():
                 raise APIError(409, '该队伍已退出或被取消资格，不能进入选手工作台', 'team_ineligible')
             return self.rotate(db, actor, cookie, team_id)

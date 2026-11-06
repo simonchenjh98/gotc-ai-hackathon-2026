@@ -310,7 +310,7 @@ class FinalsService:
     def admin_view(self, db, state):
         return {'config': self.config(db, state), 'dimensions': DIMENSIONS,
                 'teams': self.teams(db, state['run_id']), 'judges': self.judges(db, state['run_id']),
-                'availableTeams': self.teams(db), 'availableJudges': self.judges(db), 'summary': self.summary(db, state)}
+                'availableTeams': [team for team in self.teams(db) if not self.s.team_lifecycle.is_recycled(db,team['id'])], 'availableJudges': self.judges(db), 'summary': self.summary(db, state)}
 
     def save_roster(self, db, actor, state, body):
         self.fields(body, {'expectedRevision', 'teamIds', 'judgeIds'})
@@ -323,6 +323,8 @@ class FinalsService:
                 raise APIError(400, '名单必须是无重复的身份列表')
         if not team_ids or len(team_ids) > 999 or len(judge_ids) != 8:
             raise APIError(400, '请选择至少一支队伍和恰好8位不同评委')
+        for team_id in team_ids:
+            self.s.team_lifecycle.require_available(db,team_id)
         valid_teams = {t['id'] for t in self.teams(db) if t['eligible']}
         valid_judges = {j['id'] for j in self.judges(db) if j['active']}
         if not set(team_ids) <= valid_teams or not set(judge_ids) <= valid_judges:
@@ -365,6 +367,7 @@ class FinalsService:
                 raise APIError(409, '评审尚未完成：' + '；'.join(summary['blockers']), 'finals_incomplete')
             if not summary['awardsConfirmed']:
                 raise APIError(409, '请先关闭决赛并核对、确认六项专项奖名单', 'finals_awards_unconfirmed')
+            summary={**summary,'teams':[team for team in summary['teams'] if not self.s.team_lifecycle.is_recycled(db,team['id'])]}
             summary['final'] = True
             snapshot, fingerprint, published_at = json.dumps(summary, ensure_ascii=False), self.fingerprint(db, state), self.clock()
         db.execute('''UPDATE finals_config SET revision=?,open=?,roster_locked=?,publication_json=?,
@@ -514,8 +517,9 @@ class FinalsService:
             return self.admin_view(db, state)
         if method == 'GET' and path == '/api/finals/judge':
             self.require_judge(db, actor, state)
-            return {'config': self.config(db, state), 'dimensions': DIMENSIONS, 'teams': self.teams(db, state['run_id']),
-                    'myScores': [self.score_view(r) for r in db.execute('SELECT * FROM finals_scores WHERE run_id=? AND judge_id=? ORDER BY team_id', (state['run_id'], actor['id']))],
+            return {'config': self.config(db, state), 'dimensions': DIMENSIONS,
+                    'teams': [team for team in self.teams(db, state['run_id']) if not self.s.team_lifecycle.is_recycled(db,team['id'])],
+                    'myScores': [self.score_view(r) for r in db.execute('SELECT * FROM finals_scores WHERE run_id=? AND judge_id=? ORDER BY team_id', (state['run_id'], actor['id'])) if not self.s.team_lifecycle.is_recycled(db,r['team_id'])],
                     'myNominations': self.nomination_view(db.execute('SELECT * FROM finals_nominations WHERE run_id=? AND judge_id=?', (state['run_id'], actor['id'])).fetchone())}
         routes = {'/api/admin/finals/roster': self.save_roster, '/api/admin/finals/settings': self.save_settings,
                   '/api/admin/finals/awards': self.confirm_awards,

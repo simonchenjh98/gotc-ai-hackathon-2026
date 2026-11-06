@@ -372,3 +372,13 @@ test('admin tools retain professional settings and use an independent audience s
   assert.equal(professional.elements.minJudges.value,'5');assert.equal(professional.elements.scoringOpen.checked,true);
   assert.match(audience.innerHTML,/name="votingOpen"/);assert.match(audience.innerHTML,/name="votingDeadline"/);assert(!audience.innerHTML.includes('name="scoringOpen"'));
 });
+
+for(const change of ['session','browser owner'])test(`a late admin save does not update a changed ${change}`,async()=>{
+  const pending=deferred(),entry=form({reason:'Submitted reason'});let marker='LOGIN1';
+  const context=environment({},()=>pending.promise,{entry,localStorage:{getItem:()=>marker}});
+  vm.runInContext("session={role:'admin',loginId:'LOGIN1'};trackAdminForm(entry);entry.input();",context);
+  const saving=vm.runInContext("adminSaveForm(entry,'admin/teams',{},()=>{entry.saved=true})",context);
+  if(change==='session')vm.runInContext("session={role:'admin',loginId:'LOGIN2'}",context);else marker='LOGIN2';
+  pending.resolve(ok({ok:true}));await saving;
+  assert.equal(entry.saved,undefined);assert.equal(vm.runInContext('dirtyAdminForms.has(entry)',context),true);
+});

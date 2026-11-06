@@ -42,9 +42,10 @@ CREATE TABLE IF NOT EXISTS judging_reviews (
 
 
 class JudgingService:
-    def __init__(self, *, clock, text, audit, touch, history=None, enrich_team=None):
+    def __init__(self, *, clock, text, audit, touch, history=None, enrich_team=None, is_team_recycled=None):
         self.clock,self.text,self.audit,self.touch=clock,text,audit,touch
         self.history,self.enrich_team=history,enrich_team
+        self.is_team_recycled=is_team_recycled or (lambda db,team_id:False)
 
     def initialize(self, db):
         db.executescript(SCHEMA)
@@ -119,8 +120,8 @@ class JudgingService:
 
     def judge_view(self, db, actor, state):
         self.require_grant(db,actor,state)
-        return {"stage":self.stage_view(state),"teams":self.teams(db,state["run_id"]),
-                "myReviews":self.reviews(db,state["run_id"],actor["id"]),"window":self.window(state)}
+        return {"stage":self.stage_view(state),"teams":[team for team in self.teams(db,state["run_id"]) if not self.is_team_recycled(db,team["id"])],
+                "myReviews":[row for row in self.reviews(db,state["run_id"],actor["id"]) if not self.is_team_recycled(db,row["teamId"])],"window":self.window(state)}
 
     def admin_view(self, db, state):
         teams=self.teams(db,state["run_id"])
@@ -134,7 +135,7 @@ class JudgingService:
           LEFT JOIN judging_review_validity v ON v.run_id=r.run_id AND v.judge_id=r.judge_id AND v.team_id=r.team_id
           WHERE r.run_id=? AND r.submitted_feedback IS NOT NULL AND r.recused=0 AND COALESCE(v.invalidated,0)=0 GROUP BY r.team_id""",(state["run_id"],))}
         teams=[{key:team[key] for key in ("id","number","name","project","track")} |
-               {"reviewCount":counts.get(team["id"],0),"score":None,"rank":None} for team in self.teams(db,state["run_id"])]
+               {"reviewCount":counts.get(team["id"],0),"score":None,"rank":None} for team in self.teams(db,state["run_id"]) if not self.is_team_recycled(db,team["id"])]
         return {"stage":self.stage_view(state),"window":self.window(state),"teams":teams,
                 "publication":{"status":"unavailable","blockers":[BLOCKER]}}
 
@@ -177,6 +178,9 @@ class JudgingService:
             raise APIError(409,"本轮已开放冻结或已有评审记录，不能改写名单；请填写理由创建新轮次")
         team_ids=self.identifier_list(body["teamIds"],"队伍名单")
         judge_ids=self.identifier_list(body["judgeIds"],"评委名单")
+        for team_id in team_ids:
+            if self.is_team_recycled(db,team_id):
+                raise APIError(409,"队伍已移入回收站，请先恢复后再操作","team_recycled")
         teams=[self.capture_team(db,team_id) for team_id in team_ids]
         before={'teamIds':[team['id'] for team in self.teams(db,state['run_id'])],
                 'judgeIds':[row[0] for row in db.execute('SELECT judge_id FROM judging_grants WHERE run_id=? ORDER BY judge_id',(state['run_id'],))]}
@@ -214,6 +218,8 @@ class JudgingService:
             if state["open"] and state["deadline"] is not None and deadline>state["deadline"]:
                 raise APIError(409,"路演已开始，不能延长当前截止时间；请先明确关闭再重新开始")
         if body["open"]:
+            if not any(not self.is_team_recycled(db,team["id"]) for team in self.teams(db,state["run_id"])):
+                raise APIError(409,"本轮没有可参与评审的队伍，请先调整名单","judging_no_available_teams")
             if not db.execute("SELECT 1 FROM judging_roster WHERE run_id=?",(state["run_id"],)).fetchone() or not db.execute("SELECT 1 FROM judging_grants WHERE run_id=?",(state["run_id"],)).fetchone():
                 raise APIError(409,"请先选择本轮队伍和评委，再开放评审")
             if state["stage"]=="roadshow" and db.execute("""SELECT COUNT(*) FROM judging_grants g
@@ -223,6 +229,7 @@ class JudgingService:
             frozen=db.execute("SELECT frozen_at FROM judging_runs WHERE id=?",(state["run_id"],)).fetchone()[0]
             if frozen is None:
                 for team in self.teams(db,state["run_id"]):
+                    if self.is_team_recycled(db,team["id"]):continue
                     snapshot=self.capture_team(db,team["id"],materials=True,current=current)
                     db.execute("UPDATE judging_roster SET snapshot_json=? WHERE run_id=? AND team_id=?",(json.dumps(snapshot,ensure_ascii=False),state["run_id"],team["id"]))
                 db.execute("UPDATE judging_runs SET frozen_at=? WHERE id=?",(current,state["run_id"]))
@@ -238,6 +245,7 @@ class JudgingService:
         reason=self.text(body["reason"],"创建新轮次理由",2000,True)
         new_id=self.new_run(db,state["stage"],reason)
         for team in self.teams(db,state["run_id"]):
+            if self.is_team_recycled(db,team["id"]):continue
             current=self.capture_team(db,team["id"])
             db.execute("INSERT INTO judging_roster VALUES (?,?,?)",(new_id,team["id"],json.dumps(current,ensure_ascii=False)))
         db.execute("INSERT INTO judging_grants SELECT ?,judge_id FROM judging_grants WHERE run_id=?",(new_id,state["run_id"]))
@@ -269,6 +277,8 @@ class JudgingService:
             raise APIError(400,"队伍标识不正确")
         if not db.execute("SELECT 1 FROM judging_roster WHERE run_id=? AND team_id=?",(state["run_id"],team_id)).fetchone():
             raise APIError(403,"该队伍不在本轮评审名单中")
+        if self.is_team_recycled(db,team_id):
+            raise APIError(409,"队伍已移入回收站，请先恢复后再操作","team_recycled")
         feedback=self.text(body["feedback"],"评审意见",2000,status=="submitted")
         current=self.clock()
         if not self.window(state,current)["canEdit"]:

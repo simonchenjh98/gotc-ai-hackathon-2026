@@ -184,7 +184,7 @@ class RoadshowScoring:
 
     def admin_view(self, db, state):
         return {'config': self.config(db, state), 'dimensions': DIMENSIONS, 'summary': self.summary(db, state),
-                'availableTeams': self.s.finals.teams(db),
+                'availableTeams': [team for team in self.s.finals.teams(db) if not self.s.team_lifecycle.is_recycled(db,team['id'])],
                 'roster': {'teamIds': [team['id'] for team in self.teams(db, state)],
                            'editable': self.s.judging.stage_view(state)['rosterEditable']}}
 
@@ -194,6 +194,8 @@ class RoadshowScoring:
             raise APIError(409, '路演轮次已更新，请核对最新页面', 'roadshow_run_conflict')
         self.next_revision(body, state['revision'])
         team_ids = self.s.judging.identifier_list(body['teamIds'], '路演队伍名单')
+        for team_id in team_ids:
+            self.s.team_lifecycle.require_available(db,team_id)
         eligible = {team['id'] for team in self.s.finals.teams(db) if team['eligible']}
         if not set(team_ids) <= eligible:
             raise APIError(400, '路演名单包含不存在或已失去参赛资格的队伍')
@@ -264,7 +266,9 @@ class RoadshowScoring:
             summary = self.summary(db, state)
             if not summary['qualifiedCount']:
                 raise APIError(409, '至少一支队伍须有3位不同评委正式评分后才能发布')
-            snapshot, published_at = json.dumps(self.public_summary(summary), ensure_ascii=False), self.clock()
+            public=self.public_summary(summary)
+            public['teams']=[team for team in public['teams'] if not self.s.team_lifecycle.is_recycled(db,team['id'])]
+            snapshot, published_at = json.dumps(public, ensure_ascii=False), self.clock()
         db.execute('''UPDATE roadshow_scoring_config SET revision=?,publication_json=?,publication_run_id=?,
                       publication_revision=?,published_at=? WHERE id=1''',
                    (revision, snapshot, state['run_id'] if snapshot else None, revision if snapshot else None, published_at))
@@ -301,8 +305,8 @@ class RoadshowScoring:
                 return self.publish(db, actor, state, body)
             self.require_judge(db, actor, state)
             if method == 'GET' and path == '/api/roadshow/scoring':
-                return {'config': self.config(db, state), 'dimensions': DIMENSIONS, 'teams': self.teams(db, state, materials=True),
-                        'myScores': [self.score_view(row) for row in db.execute('SELECT * FROM roadshow_scores WHERE run_id=? AND judge_id=? ORDER BY team_id', (state['run_id'], actor['id']))]}
+                return {'config': self.config(db, state), 'dimensions': DIMENSIONS, 'teams': [team for team in self.teams(db, state, materials=True) if not self.s.team_lifecycle.is_recycled(db,team['id'])],
+                        'myScores': [self.score_view(row) for row in db.execute('SELECT * FROM roadshow_scores WHERE run_id=? AND judge_id=? ORDER BY team_id', (state['run_id'], actor['id'])) if not self.s.team_lifecycle.is_recycled(db,row['team_id'])]}
             if method == 'POST' and path == '/api/roadshow/score':
                 return self.save_score(db, actor, state, body)
             raise APIError(404, '路演评分接口不存在')

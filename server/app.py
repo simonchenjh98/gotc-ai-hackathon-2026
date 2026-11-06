@@ -36,6 +36,7 @@ from roadshow_scoring import RoadshowScoring
 from admin_data import AdminDataService, TRACK_OPTIONS
 from admin_team_access import AdminTeamAccess, PATHS as ADMIN_TEAM_PATHS, operator_for
 from keys import KeyService, load_config
+from team_lifecycle import TeamLifecycle, PATHS as TEAM_LIFECYCLE_PATHS
 
 DIMENSIONS = [
     {"id": "problem", "name": "问题价值与理解", "max": 20},
@@ -262,8 +263,10 @@ class EventService:
         self.login_kdf_slots = threading.BoundedSemaphore(LOGIN_KDF_CONCURRENCY)
         self.judging=JudgingService(clock=lambda:now_ms(),text=text_field,audit=self.audit,touch=self.touch,
             history=lambda *args,**kwargs:self.admin_data.record_review_change(*args,**kwargs),
-            enrich_team=lambda db,team:self.admin_data.enrich_team(db,team))
+            enrich_team=lambda db,team:self.admin_data.enrich_team(db,team),
+            is_team_recycled=lambda db,team_id:self.team_lifecycle.is_recycled(db,team_id))
         self.admin_data=AdminDataService(self)
+        self.team_lifecycle=TeamLifecycle(self)
         self.admin_team_access=AdminTeamAccess(self,COOKIE_NAME)
         self.claims=Claims(self,now_ms,text_field,scrypt_hash)
         self.registration=TeamRegistration(self,now_ms,text_field)
@@ -327,6 +330,7 @@ class EventService:
         with self.db() as db:self.repository_backups.initialize(db)
         self.write_conflicts.initialize()
         self.finals.initialize()
+        with self.db() as db:self.team_lifecycle.initialize(db)
 
     def migrate_accounts(self):
         """Rebuild only the legacy role CHECK; preserve IDs and referencing tables."""
@@ -615,10 +619,12 @@ class EventService:
             # Resolve write identities only after the lock: revocation may have committed while queued.
             if method=="POST":
                 db.execute("BEGIN IMMEDIATE")
-            elif method=="GET" and (self.finals.supports(path) or path in {"/api/admin", "/api/team/score", "/api/board", "/api/judge", "/api/audience"}):
+            elif method=="GET" and (self.finals.supports(path) or path in TEAM_LIFECYCLE_PATHS or path in {"/api/admin", "/api/team/score", "/api/board", "/api/judge", "/api/audience"}):
                 # Keep release settings, aggregates and editor revisions in one read snapshot.
                 db.execute("BEGIN")
             actor = self.account(db, cookie)
+            if path in TEAM_LIFECYCLE_PATHS:
+                return self.team_lifecycle.dispatch(db,actor,method,path,body,query or {},cookie,expected_login_id),None,None
             if path in ADMIN_TEAM_PATHS:
                 return self.admin_team_access.dispatch(db,actor,method,path,body,cookie,expected_login_id,query or {})
             if operator_for(actor) and (path in {'/api/team','/api/submission','/api/logout'} or path.startswith('/api/submission/')) and not expected_login_id:
@@ -688,7 +694,8 @@ class EventService:
             if method == "GET" and path == "/api/board":
                 config = self.config(db)
                 teams = sorted((team for team in self.teams(db) if team["rank"] is not None), key=lambda team: team["rank"])
-                stats = {"teamCount": db.execute("SELECT COUNT(*) FROM teams").fetchone()[0],
+                stats = {"teamCount": db.execute("""SELECT COUNT(*) FROM teams t WHERE NOT EXISTS
+                    (SELECT 1 FROM team_recycle_events e WHERE e.team_id=t.id AND e.restored_at IS NULL)""").fetchone()[0],
                          "submittedScores": db.execute("SELECT COUNT(*) FROM scores WHERE status='submitted'").fetchone()[0],
                          "audienceVotes": db.execute("SELECT COUNT(*) FROM votes").fetchone()[0]}
                 return {"teams": teams, "stats": stats, "config": config, "updatedAt": config["updatedAt"], "serverTime": now_ms()}, None, None
@@ -772,8 +779,11 @@ class EventService:
                     audience = [{"id": r["id"], "name": r["name"], "active": bool(r["active"])} for r in db.execute("SELECT id,name,active FROM accounts WHERE role='audience' ORDER BY created_at")]
                     for person in judges:person['credentialMode']=self.admin_data.credential_mode(db,person['id'],'judge')
                     for person in audience:person['credentialMode']=self.admin_data.credential_mode(db,person['id'],'audience')
-                    stats = {"teamCount": db.execute("SELECT COUNT(*) FROM teams").fetchone()[0], "submittedScores": db.execute("SELECT COUNT(*) FROM scores WHERE status='submitted'").fetchone()[0], "audienceVotes": db.execute("SELECT COUNT(*) FROM votes").fetchone()[0]}
-                    return {"teams": self.teams(db, public=False), "judges": judges, "audience": audience, "config": self.write_conflicts.admin_config(db), "stats": stats, "submissions": self.admin_submissions(db),'trackOptions':TRACK_OPTIONS}, None, None
+                    teams=[team for team in self.teams(db, public=False) if not self.team_lifecycle.is_recycled(db,team['id'])]
+                    stats = {"teamCount":len(teams), "submittedScores": db.execute("SELECT COUNT(*) FROM scores WHERE status='submitted'").fetchone()[0], "audienceVotes": db.execute("SELECT COUNT(*) FROM votes").fetchone()[0]}
+                    submissions=[row for row in self.admin_submissions(db) if not self.team_lifecycle.is_recycled(db,row['teamId'])]
+                    recycle_count=db.execute('SELECT COUNT(*) FROM team_recycle_events WHERE restored_at IS NULL').fetchone()[0]
+                    return {"teams":teams,"recycleCount":recycle_count, "judges": judges, "audience": audience, "config": self.write_conflicts.admin_config(db), "stats": stats, "submissions":submissions,'trackOptions':TRACK_OPTIONS}, None, None
                 if method == "POST" and path == "/api/admin/settings":
                     changes,groups=self.write_conflicts.check_settings(db,body)
                     before={key:self.config(db).get(key) for key in changes}
@@ -827,6 +837,7 @@ class EventService:
         else:
             team=db.execute('SELECT t.* FROM teams t JOIN team_accounts b ON b.team_id=t.id WHERE b.account_id=?',(actor['id'],)).fetchone()
         if not team:raise APIError(403,'本账号未绑定队伍，请联系组织方')
+        self.team_lifecycle.require_available(db,team['id'])
         return team
 
     def dispatch_submission(self,body,cookie,expected_login_id=None,server_received_at=None):
@@ -896,6 +907,7 @@ class EventService:
             raise APIError(400, "提交码操作不正确")
         team_id=self.team_exists(db, body["teamId"])
         action=body["action"]
+        if action!='revoke':self.team_lifecycle.require_available(db,team_id)
         account=db.execute("SELECT a.* FROM accounts a JOIN team_accounts t ON t.account_id=a.id WHERE t.team_id=?", (team_id,)).fetchone()
         before={'id':account['id'],'active':bool(account['active'])} if account else None
         if action=="issue":
@@ -1013,7 +1025,8 @@ class EventService:
     def judge_submissions(self, db):
         return [{"teamId": row["team_id"], "materials": json.loads(row["submitted_json"]), "version": row["submitted_version"],
                  "firstSubmittedAt": row["first_submitted_at"], "submittedAt": row["submitted_at"]}
-                for row in db.execute("SELECT * FROM submissions WHERE submitted_json IS NOT NULL ORDER BY team_id")]
+                for row in db.execute("""SELECT s.* FROM submissions s WHERE submitted_json IS NOT NULL AND NOT EXISTS
+                    (SELECT 1 FROM team_recycle_events e WHERE e.team_id=s.team_id AND e.restored_at IS NULL) ORDER BY team_id""")]
 
     def admin_submissions(self, db):
         rows=db.execute("""SELECT t.id AS team_id,a.id AS account_id,a.active FROM teams t

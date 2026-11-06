@@ -243,7 +243,7 @@ class Claims:
 
     def eligible_team(self,db,team_id,*,reissue_revoked=False):
         team=self.s.admin_data.team(db,team_id)
-        if not team or team['status']!='active':return None
+        if not team or self.s.team_lifecycle.is_recycled(db,team_id) or team['status']!='active':return None
         account=None
         if reissue_revoked:
             account=db.execute('SELECT a.* FROM accounts a JOIN team_accounts t ON t.account_id=a.id WHERE t.team_id=?',(team_id,)).fetchone()
@@ -317,13 +317,13 @@ class Claims:
         self.validate_declaration(row['name'],row['school'],declaration['members'])
         context,references=self.review_context(db,row['id'],row['revision'],declaration)
         if not hmac.compare_digest(context,body['reviewContext']):raise APIError(409,'相关身份或申请已变化，请保留核实备注并刷新，重新核对后批准')
+        if 'teamId' in body:self.s.team_lifecycle.require_available(db,body['teamId'])
         selected=self.eligible_team(db,body['teamId'],reissue_revoked=reissue) if 'teamId' in body else None
         if 'teamId' in body and (not selected or not hmac.compare_digest(selected['teamContext'],body['teamContext'])):
             raise APIError(409,'所选队伍或登记资料已变化、已发码或已归队，请保留输入并刷新核对')
         if reissue and (metadata['teamName']!=selected['name'] or metadata['track']!=selected['track']):
             raise APIError(409,'停用身份重新发码须保留原队名和赛道，请刷新核对')
-        if any(normalize(t['name'])==normalize(metadata['teamName']) and (not selected or t['id']!=selected['id'])
-               for t in db.execute('SELECT id,name FROM teams')):
+        if self.s.team_lifecycle.name_collisions(db,metadata['teamName'],selected['id'] if selected else None):
             raise APIError(409,'这个队名已存在，请明确选择已有队伍进行核验，或填写可区分的队名')
         if not online:self.verify_pin(db,actor,row,body['pin'])
         people=[declaration['captain']]+declaration['members'];matches=[]
@@ -417,6 +417,7 @@ class Claims:
                 if normalize(declared['name'])!=normalize(people[person_id]['name']):raise APIError(409,'申报姓名与所选名单不一致，请逐人核对')
                 school_difference|=normalize(declared['school'])!=normalize(people[person_id]['school'])
         if (school_difference or any(people[p]['needsReview'] for p in members)) and (not body['resolvedIdentity'] or not note):raise APIError(400,'学校差异或待核实条目需明确确认并填写核实说明')
+        self.s.team_lifecycle.require_available(db,body['teamId'])
         team=db.execute("SELECT t.id FROM teams t LEFT JOIN team_details d ON d.team_id=t.id WHERE t.id=? AND COALESCE(d.status,'active')='active'",(body['teamId'],)).fetchone()
         if not team:raise APIError(409,'请选择现有有效队伍')
         try:
