@@ -14,37 +14,51 @@ function emptyClaimMembers(){return [{name:'',school:''},{name:'',school:''}];}
 function makeClaimController({store,request,isCurrent,onChange}){
   const saved=store.read();let storageError=saved.error,receipt=saved.receipt,generation=0,busy=false;
   let draft={name:'',school:'',members:emptyClaimMembers()},editRevision=null;
-  let state={status:receipt?'pending':'new',team:null,code:null,error:saved.error,declaration:null,captain:null,requestRevision:null,editing:false};
+  let state={status:receipt?'pending':'new',team:null,code:null,error:saved.error,declaration:null,captain:null,requestRevision:null,editing:false,needsReview:false,reviewRevision:null};
   const publish=()=>{if(isCurrent())onChange({...state,draft,error:[storageError,state.error].filter((value,index,array)=>value && array.indexOf(value)===index).join(' '),receipt,busy});};
   const copyDraft=value=>({name:value.name,school:value.school,members:value.members.map(p=>({...p}))});
-  async function run(action,body){
+  async function run(action,body,reviewLatest=false){
     if(busy || !isCurrent())return;const operation=++generation;busy=true;state.error='';publish();
     try{
       const result=await request('claims/'+action,body);
       if(operation!==generation || !isCurrent())return;
       if(action==='request'){
         receipt={requestId:result.requestId,secret:result.secret,pin:result.pin,expiresAt:result.expiresAt};storageError=store.write(receipt);
-        state={...state,...result,code:null,error:'',editing:false};
+        state={...state,...result,code:null,error:'',editing:false,needsReview:false,reviewRevision:null};
       }else{
         const keepEditing=result.status==='pending' && ((action==='update' && JSON.stringify(draft.members)!==JSON.stringify(body.members)) || (action==='status' && state.editing));
         if(action==='update' && keepEditing)editRevision=result.requestRevision;
-        state={...state,...result,error:'',editing:keepEditing};
+        const needsReview=keepEditing && action==='status' && (reviewLatest || state.needsReview || result.requestRevision!==editRevision);
+        state={...state,...result,error:'',editing:keepEditing,needsReview,
+          reviewRevision:needsReview && reviewLatest && Number.isSafeInteger(result.requestRevision)?result.requestRevision:null};
       }
-    }catch(error){if(operation===generation && isCurrent())state.error=error.message;}
+    }catch(error){if(operation===generation && isCurrent()){
+      state.error=error.message;
+      if(action==='update' || reviewLatest){state.needsReview=true;state.reviewRevision=null;}
+    }}
     finally{if(operation===generation){busy=false;publish();}}
   }
   return {
     start(){publish();if(receipt)return this.status();},
-    setDraft(value){draft=copyDraft(value);},
-    addMember(){if(draft.members.length<4){draft={...draft,members:[...draft.members,{name:'',school:''}]};publish();}},
-    removeMember(index){if(draft.members.length>2){draft={...draft,members:draft.members.filter((_,i)=>i!==index)};publish();}},
-    apply(name,school,members){draft=copyDraft({name,school,members:members??emptyClaimMembers()});return run('request',{name,school,...(members===undefined?{}:{members:draft.members})});},
-    edit(){if(busy || state.status!=='pending' || !state.captain || !Number.isSafeInteger(state.requestRevision))return;draft=copyDraft({...state.captain,members:state.declaration?.members??emptyClaimMembers()});editRevision=state.requestRevision;state.editing=true;state.error='';publish();},
-    update(members){draft=copyDraft({...draft,members});if(receipt)return run('update',{requestId:receipt.requestId,secret:receipt.secret,expectedRevision:editRevision,members:draft.members});},
-    cancelEdit(){generation++;busy=false;state.editing=false;state.error='';publish();return this.status();},
+    setDraft(value){if(!isCurrent() || (busy && !receipt))return;draft=copyDraft(value);},
+    addMember(){if(!isCurrent() || (busy && !receipt))return;if(draft.members.length<4){draft={...draft,members:[...draft.members,{name:'',school:''}]};publish();}},
+    removeMember(index){if(!isCurrent() || (busy && !receipt))return;if(draft.members.length>2){draft={...draft,members:draft.members.filter((_,i)=>i!==index)};publish();}},
+    apply(name,school,members){if(busy || !isCurrent())return;draft=copyDraft({name,school,members:members??emptyClaimMembers()});return run('request',{name,school,...(members===undefined?{}:{members:draft.members})});},
+    edit(){if(busy || !isCurrent() || state.status!=='pending' || !state.captain || !Number.isSafeInteger(state.requestRevision))return;draft=copyDraft({...state.captain,members:state.declaration?.members??emptyClaimMembers()});editRevision=state.requestRevision;state.editing=true;state.error='';state.needsReview=false;state.reviewRevision=null;publish();},
+    update(members){
+      if(busy || !isCurrent() || !state.editing)return;draft=copyDraft({...draft,members});
+      if(state.needsReview){state.error='草稿已保留，请先读取最新已保存名单并逐人核对，再继续保存。';publish();return;}
+      if(receipt)return run('update',{requestId:receipt.requestId,secret:receipt.secret,expectedRevision:editRevision,members:draft.members});
+    },
+    reviewLatest(){if(receipt && state.editing)return run('status',{requestId:receipt.requestId,secret:receipt.secret},true);},
+    confirmReview(){
+      if(busy || !isCurrent() || !state.editing || state.status!=='pending' || !Number.isSafeInteger(state.reviewRevision) || state.reviewRevision!==state.requestRevision)return;
+      editRevision=state.reviewRevision;state.needsReview=false;state.reviewRevision=null;state.error='';publish();
+    },
+    cancelEdit(){generation++;busy=false;state.editing=false;state.error='';state.needsReview=false;state.reviewRevision=null;publish();return this.status();},
     status(){if(receipt)return run('status',{requestId:receipt.requestId,secret:receipt.secret});},
     redeem(){if(receipt)return run('redeem',{requestId:receipt.requestId,secret:receipt.secret});},
-    clear(){generation++;busy=false;receipt=null;storageError=store.clear();draft={name:'',school:'',members:emptyClaimMembers()};state={status:'new',team:null,code:null,error:'',declaration:null,captain:null,requestRevision:null,editing:false};publish();},
+    clear(){generation++;busy=false;receipt=null;storageError=store.clear();draft={name:'',school:'',members:emptyClaimMembers()};state={status:'new',team:null,code:null,error:'',declaration:null,captain:null,requestRevision:null,editing:false,needsReview:false,reviewRevision:null};publish();},
     dispose(){generation++;busy=false;state.code=null;}
   };
 }
@@ -58,14 +72,22 @@ function claimDeclarationMarkup(declaration){
   if(!declaration)return '<p class="small-note">此为旧版申请，尚未申报组员；可在批准前补充。</p>';
   return `<section class="claim-declaration"><h3>已提交的队伍成员（${declaration.members.length+1} 人）</h3><ol>${[declaration.captain,...declaration.members].map((p,i)=>`<li>${i===0?'队长':'组员'}：${esc(p.name)} · ${esc(p.school)}</li>`).join('')}</ol></section>`;
 }
+function claimUpdateMarkup(state,draft){
+  if(!state.editing)return '';
+  const reviewed=Number.isSafeInteger(state.reviewRevision);
+  return `<form id="claim-update-form"><h3>我的待保存组员草稿</h3><p>队长：${esc(state.captain.name)} · ${esc(state.captain.school)}</p>${claimMembersMarkup(draft.members)}`+
+    `${state.needsReview?`<p class="info-banner warning" role="status">${reviewed?'“已提交的队伍成员”是刚读取的名单，本表单中的草稿已保留。保存会用草稿替换已保存名单，请逐人核对并合并需要保留的修改，再确认继续。':'草稿已保留。请先读取最新已保存名单并核对；核对完成前不会再次提交。'}</p>`:''}`+
+    `<div class="actions"><button class="btn secondary" type="button" id="claim-edit-reload" ${state.busy?'disabled':''}>读取最新已保存名单并核对</button>${reviewed?`<button class="btn secondary" type="button" id="claim-edit-confirm" ${state.busy?'disabled':''}>已逐人核对，继续编辑草稿</button>`:''}</div>`+
+    `<div class="actions"><button class="btn" ${state.busy || state.needsReview?'disabled':''}>保存组员修改</button><button class="btn secondary" type="button" id="claim-edit-cancel">取消修改</button></div></form>`;
+}
 function claimStateMarkup(state){
   const labels={pending:'等待现场核验',approved:'现场核验已通过',issued:'提交码已领取',rejected:'申请未通过，请联系现场组织方',expired:'申请已过期，请重新申请',invalid:'领取凭据无效或已过期，请重新申请',unavailable:'提交码已由组织方变更或停用，请联系现场组织方恢复'};
   const receipt=state.receipt,draft=state.draft??{name:'',school:'',members:emptyClaimMembers()};
   let body;
   if(!receipt){
-    body=`<form id="claim-request-form"><label class="field">队长姓名<input name="name" required maxlength="100" autocomplete="name" value="${esc(draft.name)}"></label><label class="field">队长学校<input name="school" required maxlength="200" autocomplete="organization" value="${esc(draft.school)}"></label>${claimMembersMarkup(draft.members)}<button class="btn" ${state.busy?'disabled':''}>提交领取申请</button></form>`;
+    body=`<form id="claim-request-form"><fieldset ${state.busy?'disabled':''}><label class="field">队长姓名<input name="name" required maxlength="100" autocomplete="name" value="${esc(draft.name)}"></label><label class="field">队长学校<input name="school" required maxlength="200" autocomplete="organization" value="${esc(draft.school)}"></label>${claimMembersMarkup(draft.members)}<button class="btn" ${state.busy?'disabled':''}>提交领取申请</button></fieldset></form>`;
   }else{
-    body=`<h2>${esc(labels[state.status] || '等待核验')}</h2><p>请在现场向组织方出示本页核验码。</p><p class="claim-pin" aria-label="现场核验码">${esc(receipt.pin)}</p><p class="small-note">申请编号：<code>${esc(receipt.requestId)}</code><br>有效期至 ${esc(beijingTime(receipt.expiresAt))}（北京时间）<br>凭据只保存在此标签页，请勿转发或共享设备。</p>${claimDeclarationMarkup(state.declaration)}${state.editing?`<form id="claim-update-form"><h3>修改待核验组员</h3><p>队长：${esc(state.captain.name)} · ${esc(state.captain.school)}</p>${claimMembersMarkup(draft.members)}<div class="actions"><button class="btn" ${state.busy?'disabled':''}>保存组员修改</button><button class="btn secondary" type="button" id="claim-edit-cancel">取消修改</button></div></form>`:''}${state.team?`<p>已核实队伍：<strong>${esc(teamLabel(state.team))}</strong></p>`:''}<div class="actions"><button class="btn secondary" id="claim-status" ${state.busy?'disabled':''}>查询审核状态</button>${state.status==='pending' && !state.editing && state.captain && Number.isSafeInteger(state.requestRevision)?`<button class="btn secondary" id="claim-edit" ${state.busy?'disabled':''}>${state.declaration?'修改组员':'补充组员'}</button>`:''}${['approved','issued'].includes(state.status)?`<button class="btn" id="claim-redeem" ${state.busy?'disabled':''}>${state.status==='issued'?'再次显示本队提交码':'领取本队提交码'}</button>`:''}</div>${state.code?`<div class="code-output"><strong>本队提交码</strong><code>${esc(state.code)}</code><p>请队长保存，只与本队成员共享。</p><button class="btn secondary small" type="button" data-copy-value="${esc(state.code)}">复制提交码</button> <a href="#team">前往作品提交 ↗</a></div>`:''}<button class="btn secondary small" id="claim-clear" type="button">清除此设备上的领取凭据</button>`;
+    body=`<h2>${esc(labels[state.status] || '等待核验')}</h2><p>请在现场向组织方出示本页核验码。</p><p class="claim-pin" aria-label="现场核验码">${esc(receipt.pin)}</p><p class="small-note">申请编号：<code>${esc(receipt.requestId)}</code><br>有效期至 ${esc(beijingTime(receipt.expiresAt))}（北京时间）<br>凭据只保存在此标签页，请勿转发或共享设备。</p>${claimDeclarationMarkup(state.declaration)}${claimUpdateMarkup(state,draft)}${state.team?`<p>已核实队伍：<strong>${esc(teamLabel(state.team))}</strong></p>`:''}<div class="actions"><button class="btn secondary" id="claim-status" ${state.busy?'disabled':''}>查询审核状态</button>${state.status==='pending' && !state.editing && state.captain && Number.isSafeInteger(state.requestRevision)?`<button class="btn secondary" id="claim-edit" ${state.busy?'disabled':''}>${state.declaration?'修改组员':'补充组员'}</button>`:''}${['approved','issued'].includes(state.status)?`<button class="btn" id="claim-redeem" ${state.busy?'disabled':''}>${state.status==='issued'?'再次显示本队提交码':'领取本队提交码'}</button>`:''}</div>${state.code?`<div class="code-output"><strong>本队提交码</strong><code>${esc(state.code)}</code><p>请队长保存，只与本队成员共享。</p><button class="btn secondary small" type="button" data-copy-value="${esc(state.code)}">复制提交码</button> <a href="#team">前往作品提交 ↗</a></div>`:''}<button class="btn secondary small" id="claim-clear" type="button">清除此设备上的领取凭据</button>`;
   }
   return heading('TEAM / 现场领取','领取队伍提交码','填写队长及全体组员的姓名和学校后，请队长携全体组员到组织方处核实身份。每人只参加一个队，每队一个提交码。')+`<section class="surface claim-panel"><p class="form-error" role="alert">${esc(state.error)}</p>${body}</section>`;
 }
@@ -83,6 +105,8 @@ async function renderClaim(version){
       form.querySelectorAll('[data-claim-remove]').forEach(button=>button.onclick=()=>{controller.setDraft(read());controller.removeMember(Number(button.dataset.claimRemove));});
     }
     const edit=document.getElementById('claim-edit');if(edit)edit.onclick=()=>controller.edit();
+    const reload=document.getElementById('claim-edit-reload');if(reload)reload.onclick=()=>controller.reviewLatest();
+    const confirmEdit=document.getElementById('claim-edit-confirm');if(confirmEdit)confirmEdit.onclick=()=>controller.confirmReview();
     const cancel=document.getElementById('claim-edit-cancel');if(cancel)cancel.onclick=()=>controller.cancelEdit();
     const refresh=document.getElementById('claim-status');if(refresh)refresh.onclick=()=>controller.status();
     const redeem=document.getElementById('claim-redeem');if(redeem)redeem.onclick=()=>controller.redeem();

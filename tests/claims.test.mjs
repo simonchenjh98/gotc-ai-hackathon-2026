@@ -126,7 +126,9 @@ test('declared application and pending edits persist only capability, recover ex
   const saved=JSON.parse([...storage.map.values()][0]);assert.deepEqual(saved,receipt);
   first.client.edit();const changed=[{...declaredMembers[0],school:'Edited School'},declaredMembers[1]];
   fail=true;await first.client.update(changed);assert.match(first.states.at(-1).error,/申报冲突/);assert.equal(first.states.at(-1).editing,true);assert.equal(first.states.at(-1).draft.members[0].school,'Edited School');
-  assert.equal(calls.at(-1).body.expectedRevision,1);fail=false;await first.client.update(changed);
+  assert.equal(calls.at(-1).body.expectedRevision,1);assert.equal(first.states.at(-1).needsReview,true);
+  fail=false;await first.client.reviewLatest();assert.equal(first.states.at(-1).draft.members[0].school,'Edited School');
+  first.client.confirmReview();await first.client.update(changed);
   assert.equal(first.states.at(-1).editing,false);assert.equal(first.states.at(-1).requestRevision,2);
   const fresh=controller(storage,async()=>({...declaredResponse,requestRevision:2,declaration:{captain:declaredCaptain,members:changed}}));await fresh.client.start();
   assert.equal(fresh.states.at(-1).declaration.members[0].school,'Edited School');assert.equal(fresh.states.at(-1).requestRevision,2);
@@ -144,12 +146,16 @@ test('cancel edit, clear receipt and route disposal suppress stale update respon
   }
 });
 
-test('legacy receipt can supplement teammates while edits retain their base revision across status refresh',async()=>{
+test('legacy receipt preserves its draft until a changed saved version is explicitly reviewed',async()=>{
   const storage=new Storage();store(storage).write(receipt);const calls=[];let revision=1;
   const {client,states}=controller(storage,async(path,body)=>{calls.push({path,body});return {...declaredResponse,requestRevision:revision,declaration:null};});
   await client.start();client.edit();assert.equal(states.at(-1).draft.members.length,2);
-  revision=2;await client.status();assert.equal(states.at(-1).editing,true);await client.update(declaredMembers);
-  assert.equal(calls.at(-1).body.expectedRevision,1);
+  revision=2;await client.status();assert.equal(states.at(-1).editing,true);assert.equal(states.at(-1).needsReview,true);
+  const before=calls.length;await client.update(declaredMembers);assert.equal(calls.length,before);
+  client.confirmReview();await client.update(declaredMembers);assert.equal(calls.length,before,'ordinary status cannot confirm a new edit base');
+  await client.reviewLatest();assert.equal(states.at(-1).draft.members[0].name,declaredMembers[0].name);
+  client.confirmReview();assert.equal(calls.length,before+1,'confirmation does not write');await client.update(declaredMembers);
+  assert.equal(calls.at(-1).body.expectedRevision,2);
 });
 
 // A small DOM fixture runs the actual public render/event handlers. Browser E2E
@@ -174,7 +180,7 @@ function claimPageFixture(transport){
   return {scope,root,storage,nodes,render:()=>vm.runInContext('renderClaim(1)',scope),form:()=>nodes.get('claim-request-form')??nodes.get('claim-update-form'),fill(){const f=this.form();if(f.elements.name)f.elements.name.value=declaredCaptain.name;if(f.elements.school)f.elements.school.value=declaredCaptain.school;f.rows.forEach((row,i)=>{row.querySelector('[name="memberName"]').value='Teammate '+i;row.querySelector('[name="memberSchool"]').value='School '+i;});f.oninput();}};
 }
 
-test('real public form adds/removes dynamic rows, submits every entered person and retains failed/busy values',async()=>{
+test('real public form locks the first application and restores its submitted values after failure',async()=>{
   const calls=[];let reject;const page=claimPageFixture((path,body)=>{calls.push({path,body});return new Promise((_,no)=>{reject=no;});});
   await page.render();page.fill();assert.equal(page.form().rows.length,2);
   page.nodes.get('claim-member-add').onclick();assert.equal(page.form().rows.length,3);assert.equal(page.form().rows[0].querySelector('[name="memberName"]').value,'Teammate 0');
@@ -182,9 +188,15 @@ test('real public form adds/removes dynamic rows, submits every entered person a
   page.fill();page.form().remove[1].onclick();assert.equal(page.form().rows.length,3);assert.equal(page.form().rows[1].querySelector('[name="memberName"]').value,'Teammate 2');
   page.form().onsubmit({preventDefault(){}});assert.equal(calls.length,1);assert.equal(calls[0].body.members.length,3);assert.equal(calls[0].body.members[1].name,'Teammate 2');
   assert.equal(page.form().elements.name.value,declaredCaptain.name);
+  assert.match(page.root.innerHTML,/<form id="claim-request-form"><fieldset disabled>/);
+  // A delayed input/click from the old form cannot change the frozen request draft either.
   page.form().rows[0].querySelector('[name="memberSchool"]').value='Typed While Busy';page.form().oninput();reject(new Error('重复成员'));await flush();
-  assert.match(page.root.innerHTML,/重复成员/);assert.equal(page.form().rows[0].querySelector('[name="memberSchool"]').value,'Typed While Busy');
+  assert.match(page.root.innerHTML,/重复成员/);assert.equal(page.form().rows[0].querySelector('[name="memberSchool"]').value,'School 0');
+  assert.doesNotMatch(page.root.innerHTML,/<form id="claim-request-form"><fieldset disabled>/);
   assert.equal(page.form().rows.length,3);
+  page.form().rows[0].querySelector('[name="memberSchool"]').value='Corrected After Failure';page.form().oninput();
+  page.form().onsubmit({preventDefault(){}});assert.equal(calls[1].body.members[0].school,'Corrected After Failure');
+  reject(new Error('fixture retry failed'));await flush();
 });
 
 test('real receipt form recovers after refresh, edits teammates and submits expected revision with the same capability',async()=>{
@@ -208,4 +220,87 @@ test('declared staff mapping uses one selector per declaration and submits displ
   const handler=source.slice(source.indexOf('  function selectRequest(id){'),source.indexOf("  document.getElementById('claims-admin-load').onclick=load;"));
   vm.runInContext(helper+'\n'+handler+'\nselectRequest("declared-fixture");',scope);form.onsubmit({preventDefault(){}});
   assert.deepEqual([...posts[0].body.declaredMemberIds],['p1','p3','p2']);assert.deepEqual({...posts[0].body.memberRevisions},{p1:4,p3:6,p2:5});assert.equal(posts[0].body.expectedRevision,3);
+});
+
+test('successful first application cannot discard changes from enabled inputs because the entire draft is frozen',async()=>{
+  const storage=new Storage();let resolve;const calls=[];
+  const members=[...declaredMembers,{name:'Third Teammate',school:'Third School'}];
+  const {client,states}=controller(storage,(path,body)=>{calls.push({path,body});return new Promise(done=>{resolve=done;});});
+  client.start();const pending=client.apply(declaredCaptain.name,declaredCaptain.school,members);
+  const frozen=context.claimStateMarkup(states.at(-1));
+  assert.match(frozen,/<form id="claim-request-form"><fieldset disabled>/);
+  assert.match(frozen,/<button[^>]+data-claim-remove=/);assert.match(frozen,/id="claim-member-add"/);
+  assert.ok(frozen.indexOf('name="name"')>frozen.indexOf('<fieldset disabled>'));
+  assert.ok(frozen.indexOf('id="claim-member-add"')<frozen.lastIndexOf('</fieldset></form>'));
+  client.setDraft({name:'Later Captain',school:'Later School',members:declaredMembers});
+  client.addMember();client.removeMember(0);await client.apply('Later Captain','Later School',declaredMembers);
+  assert.equal(calls.length,1);assert.equal(states.at(-1).draft.name,declaredCaptain.name);
+  assert.equal(states.at(-1).draft.members.length,3);
+  resolve({...declaredResponse,declaration:{captain:declaredCaptain,members}});await pending;client.edit();
+  assert.equal(states.at(-1).draft.name,declaredCaptain.name);
+  assert.equal(JSON.stringify(states.at(-1).draft.members),JSON.stringify(members));
+});
+
+test('real form recovers a committed update whose response was lost without overwriting newer typing or auto-saving',async()=>{
+  let revision=1,members=declaredMembers,dropReply=true;const calls=[];
+  const page=claimPageFixture(async(path,body)=>{
+    calls.push({path,body});
+    if(path.endsWith('update')){
+      if(body.expectedRevision!==revision){const error=new Error('申请已变化，请查询最新状态后重新核对');error.status=409;throw error;}
+      members=body.members;revision++;
+      if(dropReply){dropReply=false;throw new Error('网络中断，未收到保存结果');}
+    }
+    return {...declaredResponse,requestRevision:revision,declaration:{captain:declaredCaptain,members}};
+  });
+  page.scope.savedReceipt=receipt;vm.runInContext('claimReceiptStore().write(savedReceipt)',page.scope);
+  await page.render();page.nodes.get('claim-edit').onclick();
+  page.form().rows[0].querySelector('[name="memberSchool"]').value='Saved Before Response Was Lost';page.form().oninput();
+  page.form().onsubmit({preventDefault(){}});await flush();assert.equal(revision,2);
+  assert.match(page.root.innerHTML,/网络中断/);assert.match(page.root.innerHTML,/草稿已保留/);
+  page.form().rows[0].querySelector('[name="memberSchool"]').value='Newer Unsaved Draft';page.form().oninput();
+  await page.nodes.get('claim-status').onclick();
+  page.form().onsubmit({preventDefault(){}});await flush();
+  assert.equal(calls.filter(call=>call.path.endsWith('update')).length,1,'ordinary refresh must not silently rebase or retry');
+  assert.equal(page.form().rows[0].querySelector('[name="memberSchool"]').value,'Newer Unsaved Draft');
+  await page.nodes.get('claim-edit-reload').onclick();
+  assert.match(page.root.innerHTML,/Saved Before Response Was Lost/);assert.match(page.root.innerHTML,/Newer Unsaved Draft/);
+  assert.match(page.root.innerHTML,/保存会用草稿替换已保存名单/);
+  const reads=calls.length;page.nodes.get('claim-edit-confirm').onclick();assert.equal(calls.length,reads,'confirmation only changes the edit base');
+  assert.equal(page.form().rows[0].querySelector('[name="memberSchool"]').value,'Newer Unsaved Draft');
+  page.form().onsubmit({preventDefault(){}});await flush();
+  assert.equal(calls.at(-1).body.expectedRevision,2);assert.equal(members[0].school,'Newer Unsaved Draft');assert.equal(revision,3);
+  assert.ok(!page.nodes.has('claim-update-form'));assert.ok(![...page.storage.map.values()].join('').includes('Newer Unsaved Draft'));
+});
+
+test('explicit review preserves both drafts and still rejects a concurrent change after confirmation',async()=>{
+  const storage=new Storage();store(storage).write(receipt);let revision=1,members=declaredMembers;const calls=[];
+  const {client,states}=controller(storage,async(path,body)=>{
+    calls.push({path,body});
+    if(path.endsWith('update')){
+      if(body.expectedRevision!==revision){const error=new Error('申请已变化');error.status=409;throw error;}
+      members=body.members;revision++;
+    }
+    return {...declaredResponse,requestRevision:revision,declaration:{captain:declaredCaptain,members}};
+  });
+  await client.start();client.edit();const mine=[{...declaredMembers[0],school:'My Draft'},declaredMembers[1]];
+  revision=2;members=[{...declaredMembers[0],school:'Other Tab'},declaredMembers[1]];
+  await client.update(mine);assert.equal(states.at(-1).needsReview,true);
+  await client.reviewLatest();assert.equal(states.at(-1).declaration.members[0].school,'Other Tab');assert.equal(states.at(-1).draft.members[0].school,'My Draft');
+  const before=calls.length;await client.update(mine);assert.equal(calls.length,before,'loading does not authorize a write');
+  client.confirmReview();assert.equal(calls.length,before);
+  revision=3;members=[{...declaredMembers[0],school:'Even Newer Other Tab'},declaredMembers[1]];
+  await client.update(mine);assert.equal(calls.at(-1).body.expectedRevision,2);
+  assert.equal(members[0].school,'Even Newer Other Tab');assert.equal(states.at(-1).draft.members[0].school,'My Draft');assert.equal(states.at(-1).needsReview,true);
+  assert.equal(states.at(-1).reviewRevision,null);
+});
+
+test('late explicit review cannot revive cleared credentials or an abandoned editor',async()=>{
+  for(const action of ['clear','cancelEdit','dispose']){
+    const storage=new Storage();store(storage).write(receipt);let resolve;let defer=false;
+    const {client,states}=controller(storage,()=>defer?new Promise(done=>{resolve=done;defer=false;}):Promise.resolve(declaredResponse));
+    await client.start();client.edit();defer=true;const pending=client.reviewLatest();await client[action]();
+    resolve({...declaredResponse,requestRevision:99});await pending;client.confirmReview();
+    assert.ok(states.every(state=>state.reviewRevision!==99));
+    if(action==='clear'){assert.equal(states.at(-1).receipt,null);assert.equal(storage.map.size,0);}
+  }
 });
