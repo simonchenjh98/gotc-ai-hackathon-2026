@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS api_logs (
 );
 """
 DEFAULTS = {"keys.dailyBudget": 5, "keys.totalBudget": 50, "keys.maxKeys": 5, "keys.expiresAt": None,
-            "keys.logContent": True, "keys.clientRules": [], "keys.teamRpm": 60, "keys.announcement": "", "keys.blockedWords": [],
+            "keys.logContent": True, "keys.teamRpm": 60, "keys.announcement": "", "keys.blockedWords": [],
             "keys.logRetentionHours": 72, "keys.logMaxMB": 2048}  # request content is bounded (sub2api keeps no bodies at all)
 # Public path -> (upstream name, path appended to that upstream's base URL)
 ROUTES = {"/v1/chat/completions": ("openai", "/chat/completions"), "/v1/messages": ("anthropic", "/messages"),
@@ -575,28 +575,6 @@ def unpack(blob):
     return zlib.decompress(blob).decode("utf-8", "replace")
 
 
-def check_rules(rules):
-    if not isinstance(rules, list) or len(rules) > 30:
-        raise APIError(400, "客户端规则最多30条")
-    for rule in rules:
-        if not isinstance(rule, dict) or set(rule) != {"action", "header", "contains"} or rule["action"] not in {"allow", "deny"} \
-                or not isinstance(rule["header"], str) or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", rule["header"]) \
-                or rule["header"].lower() in SECRET_HEADERS or not isinstance(rule["contains"], str) or not 1 <= len(rule["contains"]) <= 200:
-            raise APIError(400, "客户端规则格式不正确：动作 allow/deny、请求头名称、包含的文字（1–200字），不能针对密钥类请求头")
-
-
-def blocked_by(rules, headers):
-    """Return an admin-facing detail when request headers break the rules: any deny match blocks; allow rules must match."""
-    hit = lambda r: r["contains"].lower() in (headers.get(r["header"]) or "").lower()
-    for rule in rules:
-        if rule["action"] == "deny" and hit(rule):
-            return f"命中禁止规则：{rule['header']} 含 {rule['contains']}（实际：{(headers.get(rule['header']) or '')[:200]}）"
-    allows = [r for r in rules if r["action"] == "allow"]
-    if allows and not any(hit(r) for r in allows):
-        return "未命中任何允许规则：" + "；".join(f"{r['header']}={(headers.get(r['header']) or '（无）')[:200]}" for r in allows[:5])
-    return None
-
-
 ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))
 
 
@@ -722,7 +700,8 @@ class KeyService:
         return {"ok": True, "upstreams": self.public_config(db), "models": self.models()}
 
     def settings(self, db):
-        return {r["key"][5:]: json.loads(r["value"]) for r in db.execute("SELECT key,value FROM settings WHERE key LIKE 'keys.%'")}
+        return {r["key"][5:]: json.loads(r["value"])
+                for r in db.execute("SELECT key,value FROM settings WHERE key LIKE 'keys.%'") if r["key"] in DEFAULTS}
 
     def models(self):
         # Config order is kept: the first model of each upstream is the default shown in setup snippets.
@@ -780,7 +759,7 @@ class KeyService:
                       GROUP BY k.id ORDER BY k.created_at""", (since, team_id))]
             return {"enabled": True, "baseUrl": self.service.origin + self.service.base_path, "models": self.models(),
                     "maxKeys": settings["maxKeys"], "keys": keys, "logContent": settings["logContent"],
-                    "clientRules": settings["clientRules"], "announcement": settings["announcement"],
+                    "announcement": settings["announcement"],
                     "budget": {"used24h": self.spend(db, team_id, since), "dailyLimit": daily_limit, "dailyResetAt": self.daily_reset_at(db, team_id, daily_limit),
                                "usedTotal": self.spend(db, team_id), "totalLimit": total_limit, "expiresAt": settings["expiresAt"]}}
         if not enabled:
@@ -857,15 +836,12 @@ class KeyService:
             self.service.audit(db, actor, "api-usage.export")
             return self.export(db)
         if method == "POST" and path == "/api/admin/keys/settings":
-            if not body or not set(body).issubset({"dailyBudget", "totalBudget", "maxKeys", "expiresAt", "logContent", "clientRules", "teamRpm",
+            if not body or not set(body).issubset({"dailyBudget", "totalBudget", "maxKeys", "expiresAt", "logContent", "teamRpm",
                                                    "announcement", "blockedWords", "logRetentionHours", "logMaxMB"}):
                 raise APIError(400, "API 设置字段不正确")
             before = dict(settings)
             for key, value in body.items():
-                if key == "clientRules":
-                    check_rules(value)
-                    ok = True
-                elif key == "logRetentionHours":
+                if key == "logRetentionHours":
                     ok = type(value) is int and 1 <= value <= 8760
                 elif key == "logMaxMB":
                     ok = type(value) is int and 50 <= value <= 102400
@@ -1364,9 +1340,6 @@ class KeyService:
             settings = self.settings(db)
             if call is not None:
                 call["key"], call["log"], call["settings"] = row, settings["logContent"], settings
-            detail = blocked_by(settings["clientRules"], handler.headers)
-            if detail:  # generic to the client so a fake client learns nothing (sub2api does the same)
-                raise GatewayError("forbidden", "当前应用或客户端不在本活动允许范围内，请使用组织方指定的客户端", detail=detail)
             if call is not None:
                 current = now_ms()
                 if settings["expiresAt"] is not None and current >= settings["expiresAt"]:
@@ -1421,7 +1394,7 @@ class KeyService:
         if self.config is None:
             raise APIError(404, "接口不存在")
         if (path == "/v1/models" or path.startswith("/v1/models/")) and handler.command == "GET":
-            self.authenticate(handler)  # client rules apply; not metered or logged
+            self.authenticate(handler)  # not metered or logged
             # Fields of both APIs, so OpenAI and Anthropic SDKs can each parse the list (sub2api answers per platform).
             data = [{"id": m, "object": "model", "owned_by": name, "created": 0, "type": "model", "display_name": m,
                      "created_at": "2024-01-01T00:00:00Z"} for name, models in self.models().items() for m in models]
@@ -1434,7 +1407,7 @@ class KeyService:
                        "first_id": data[0]["id"] if data else None, "last_id": data[-1]["id"] if data else None}
             return self.send(handler, call, 200, "application/json", gateway_json(listing))
         if path == "/v1/messages/count_tokens" and handler.command == "POST" and "anthropic" in self.config:
-            key = self.authenticate(handler, call)  # expiry, budget and client rules
+            key = self.authenticate(handler, call)  # expiry and budget
             call["log"] = False  # metadata row only, zero cost
             team = key["team_id"]
             self.admit(team, call["settings"]["teamRpm"] or COUNT_TOKENS_RPM, slot=False)  # no team slot, as sub2api
