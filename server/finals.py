@@ -1,17 +1,21 @@
-"""Independent eight-seat finals: open seat selection, scores, ballots and publication."""
+"""Independent eight-seat finals: invitation access, seat selection and publication."""
 from contextlib import closing
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import secrets
 import sqlite3
+import re
 
 from errors import APIError
 
 MAX_REVISION = 9007199254740991
+FINALS_ACCESS_TTL_MS = 12 * 3600 * 1000
+FINALS_ACCESS_PATHS = {'/api/finals/entry', '/api/finals/judge', '/api/finals/score', '/api/finals/nominations'}
 DIMENSIONS = [
     {"id": "creativity", "name": "创意", "max": 20, "award": "最佳创意奖"},
     {"id": "social", "name": "社会关怀", "max": 15, "award": "最具社会关怀奖"},
@@ -64,6 +68,9 @@ DDL = [
     """CREATE TRIGGER IF NOT EXISTS finals_judge_name_update AFTER UPDATE OF name ON accounts
        WHEN OLD.name IS NOT NEW.name AND EXISTS(SELECT 1 FROM finals_judges WHERE judge_id=NEW.id)
        BEGIN UPDATE finals_config SET eligibility_revision=eligibility_revision+1 WHERE id=1; END""",
+    """CREATE TABLE IF NOT EXISTS finals_access_tokens (
+       token_hash TEXT PRIMARY KEY, code_tag TEXT NOT NULL, expires_at INTEGER NOT NULL)""",
+    """CREATE INDEX IF NOT EXISTS finals_access_expiry ON finals_access_tokens(expires_at)""",
 ]
 
 
@@ -78,6 +85,7 @@ class FinalsService:
     @staticmethod
     def initialized(db):
         return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='finals_config'").fetchone()
+                    and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='finals_access_tokens'").fetchone()
                     and {'awards_json', 'eligibility_revision'} <= {r[1] for r in db.execute('PRAGMA table_info(finals_config)')}
                     and {'finals_team_status_update', 'finals_team_status_insert', 'finals_team_status_delete',
                          'finals_judge_active_update', 'finals_team_metadata_update', 'finals_judge_name_update'}
@@ -112,6 +120,41 @@ class FinalsService:
 
     def state(self, db):
         return db.execute('SELECT * FROM finals_config WHERE id=1').fetchone()
+
+    def access_code(self):
+        code = self.s.shared_login_codes.get('admin')
+        if not isinstance(code, str) or not code:
+            raise APIError(503, '决赛邀请入口尚未配置，请联系组织方', 'finals_access_unavailable')
+        return code
+
+    @staticmethod
+    def access_tag(code, token):
+        return hmac.new(code.encode('utf-8'), b'gotc-finals-access-v1\0'+token.encode('ascii'), hashlib.sha256).hexdigest()
+
+    def grant_access(self, db, body, ip):
+        # This independent invitation never calls login() or creates an accounts/sessions row.
+        self.s.rate_limit(ip, 'finals-access')
+        configured = self.access_code()
+        if not isinstance(body, dict) or set(body) != {'code'}:
+            raise APIError(400, '请填写决赛邀请码')
+        code = self.text(body['code'], '决赛邀请码', 160, True)
+        if not hmac.compare_digest(code.encode('utf-8'), configured.encode('utf-8')):
+            raise APIError(401, '决赛邀请码不正确，请核对后重试', 'finals_access_required')
+        token = secrets.token_urlsafe(32)
+        expires = self.clock() + FINALS_ACCESS_TTL_MS
+        db.execute('DELETE FROM finals_access_tokens WHERE expires_at<=?', (self.clock(),))
+        db.execute('INSERT INTO finals_access_tokens VALUES (?,?,?)',
+                   (hashlib.sha256(token.encode('ascii')).hexdigest(), self.access_tag(configured, token), expires))
+        return {'accessToken': token, 'expiresAt': expires}
+
+    def require_access(self, db, token):
+        code = self.access_code()
+        if not isinstance(token, str) or not re.fullmatch(r'[A-Za-z0-9_-]{43}', token):
+            raise APIError(401, '请先输入决赛邀请码', 'finals_access_required')
+        row = db.execute('SELECT code_tag,expires_at FROM finals_access_tokens WHERE token_hash=?',
+                         (hashlib.sha256(token.encode('ascii')).hexdigest(),)).fetchone()
+        if row is None or row['expires_at'] <= self.clock() or not hmac.compare_digest(row['code_tag'], self.access_tag(code, token)):
+            raise APIError(401, '决赛邀请验证已失效，请重新输入邀请码', 'finals_access_required')
 
     def teams(self, db, run_id=None):
         sql = """SELECT t.id,t.number,t.name,t.project,COALESCE(d.status,'active') AS status
@@ -427,11 +470,17 @@ class FinalsService:
         self.s.audit(db, actor, 'finals.nominations.' + status, state['run_id'], {'revision': revision, 'nominatedAwards': sum(v is not None for v in nominations.values())})
         return {'nominations': {'revision': revision, 'status': status, 'nominations': nominations, 'updatedAt': now}}
 
-    def dispatch(self, db, actor, method, path, body, query, expected_login_id, cookie, finals_judge_id=None):
+    def dispatch(self, db, actor, method, path, body, query, expected_login_id, cookie, finals_judge_id=None, access_token=None, ip=''):
         if query:
             raise APIError(400, '决赛接口不接受查询参数')
         if path.endswith('/'):
             raise APIError(404, '决赛接口不存在')
+        if path == '/api/finals/access':
+            if method != 'POST':
+                raise APIError(404, '决赛接口不存在')
+            return self.grant_access(db, body, ip)
+        if path in FINALS_ACCESS_PATHS:
+            self.require_access(db, access_token)
         state = self.state(db)
         if path == '/api/finals/entry' and method == 'GET':
             judges = [j for j in self.judges(db, state['run_id']) if j['active']]
@@ -450,8 +499,8 @@ class FinalsService:
             if expected_login_id != self.s.login_id(cookie):
                 raise APIError(401, '登录身份已变化，请重新登录后操作')
         elif path in {'/api/finals/judge', '/api/finals/score', '/api/finals/nominations'}:
-            # A selected seat identifies attribution only. It does not authenticate a user,
-            # and it never grants permissions to the ordinary judge or administrator APIs.
+            # Invitation access is checked independently before seat selection. The seat
+            # identifies attribution only and grants no ordinary judge/admin API access.
             if not isinstance(finals_judge_id, str) or not finals_judge_id:
                 raise APIError(400, '请先选择你的决赛评委姓名或席位', 'finals_seat_required')
             actor = db.execute('''SELECT a.* FROM accounts a JOIN finals_judges j ON j.judge_id=a.id

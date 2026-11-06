@@ -10,7 +10,6 @@ Roadshow and finals use the same stable team IDs as the organizer team directory
 - Judge pages poll every two seconds for their saved stage roster and scoring-window state. Clean pages refresh team numbers, names, eligibility and selection. Unsaved or in-flight scores and nominations are preserved, with a visible notice when reloading is needed.
 - Current-run IDs, edit revisions and login ownership guard writes. A stale request must not update another round or overwrite concurrent organizer work.
 - Closed/frozen rosters and existing records cannot be cleared by directory loading. No score formula, nomination rule or award order changes.
-- Finals restores the organizer-approved direct seat selection. The later shared-invitation gate reused the administrator secret and is removed; seat selection never creates an administrator session. Historical token rows remain inert.
 
 ## Implementation and verification
 
