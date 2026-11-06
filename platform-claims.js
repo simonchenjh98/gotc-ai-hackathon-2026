@@ -136,7 +136,7 @@ function claimsPersonForm(person={id:'',name:'',school:'',notes:'',needsReview:f
 function claimExistingTeamMarkup(team){
   if(!team)return '<p class="small-note">默认批准后创建新队伍；如本队已登记，请主动选择对应队伍，系统不会按队名自动绑定。</p>';
   const registration=team.registration;
-  return `<section class="info-banner"><strong>将审核已有队伍：${esc(teamLabel(team))}</strong><p>项目：${esc(team.project || '未填写')}（保留）</p>${registration?`<p>登记队长：${esc(registration.captain)} · ${esc(registration.school)}<br>登记成员：${registration.members.map(esc).join('、')}<br>登记修订：${Number(registration.revision)}</p><p>批准即确认该登记属于本申请，并以本次审核通过的队长、学校和全体成员更新登记；原项目与联系方式保留。</p>`:'<p>批准即确认此队属于本申请；保留队号和项目，并绑定本次审核通过的全体成员。</p>'}</section>`;
+  return `<section class="info-banner"><strong>将审核已有队伍：${esc(teamLabel(team))}</strong><p>项目：${esc(team.project || '未填写')}（保留）</p>${registration?`<p>登记队长：${esc(registration.captain)} · ${esc(registration.school)}<br>登记成员：${registration.members.map(esc).join('、')}<br>登记修订：${Number(registration.revision)}</p><p>批准即确认该登记属于本申请，并以本次审核通过的队长、学校和全体成员更新登记；原项目保留；队长或学校变更时不沿用旧联系电话。</p>`:'<p>批准即确认此队属于本申请；保留队号和项目，并绑定本次审核通过的全体成员。</p>'}</section>`;
 }
 function claimTeamSelectionMarkup(data){
   return `<label class="field">归队方式（可选已有登记）<select name="teamId"><option value="">创建新队伍（默认）</option>${(data.teams??[]).map(team=>`<option value="${esc(team.id)}">${esc(teamLabel(team))}${team.registration?' · 已登记':''}</option>`).join('')}</select></label><div id="claim-existing-summary">${claimExistingTeamMarkup(null)}</div>`;

@@ -43,6 +43,13 @@ CREATE TABLE IF NOT EXISTS claim_memberships (
 );
 '''
 INVALID={'status':'invalid','team':None,'code':None,'expiresAt':None}
+MAX_CLAIM_PEOPLE=500
+
+
+def ensure_roster_capacity(db, additional):
+    # No-op imports must remain usable even if an older writer exceeded the cap.
+    if additional and db.execute('SELECT COUNT(*) FROM claim_people').fetchone()[0]+additional>MAX_CLAIM_PEOPLE:
+        raise APIError(409,f'名单最多 {MAX_CLAIM_PEOPLE} 人')
 
 
 def normalize(value):
@@ -85,13 +92,13 @@ class Claims:
             p.revision,m.team_id AS teamId FROM claim_people p LEFT JOIN claim_memberships m ON m.person_id=p.id ORDER BY p.id''')]
 
     def import_roster(self,db,actor,body):
-        if set(body)!={'people'} or not isinstance(body['people'],list) or not 1<=len(body['people'])<=500:
-            raise APIError(400,'一次导入 1–500 名参赛者')
+        if set(body)!={'people'} or not isinstance(body['people'],list) or not 1<=len(body['people'])<=MAX_CLAIM_PEOPLE:
+            raise APIError(400,f'一次导入 1–{MAX_CLAIM_PEOPLE} 名参赛者')
         people=[self.person(p) for p in body['people']]
         ids=[p['id'] for p in people];identities=[(normalize(p['name']),normalize(p['school'])) for p in people]
         if len(set(ids))!=len(ids) or len(set(identities))!=len(identities):raise APIError(409,'名单有重复编号或同名同校记录，请先人工核实')
         current={p['id']:p for p in self.roster(db)}
-        if len(set(current)|set(ids))>500:raise APIError(409,'名单最多 500 人')
+        ensure_roster_capacity(db,len(set(ids)-set(current)))
         added=0
         try:
             for p in people:
@@ -108,7 +115,7 @@ class Claims:
         if set(body)!={'person','expectedRevision'} or type(body['expectedRevision']) is not int:raise APIError(400,'需要名单修订号')
         p=self.person(body['person']);old=db.execute('SELECT * FROM claim_people WHERE id=?',(p['id'],)).fetchone()
         if body['expectedRevision']!=(old['revision'] if old else 0):raise APIError(409,'名单已变化，请重新读取后核对')
-        if not old and db.execute('SELECT COUNT(*) FROM claim_people').fetchone()[0]>=500:raise APIError(409,'名单最多 500 人')
+        if not old:ensure_roster_capacity(db,1)
         if old and db.execute('SELECT 1 FROM claim_memberships WHERE person_id=?',(p['id'],)).fetchone() and (p['name']!=old['name'] or p['school']!=old['school']):
             raise APIError(409,'已归队人员的身份不可改写，请联系组织方处理归队记录')
         try:
@@ -300,6 +307,7 @@ class Claims:
             possible=[p for p in references if p['normalized_name']==identity[0] and p['normalized_school']!=identity[1] and p['teamId']]
             if possible and (not body['resolvedIdentity'] or not note):raise APIError(400,'存在其他学校的同名已归队人员，请明确区分本人并填写核实说明')
             matches.append(exact)
+        ensure_roster_capacity(db,sum(person is None for person in matches))
         if selected:
             team_values={'id':selected['id'],'expectedRevision':selected['revision']}
         else:
@@ -309,12 +317,6 @@ class Claims:
             team_values={'number':number,'status':'active'}
         try:
             team=self.s.admin_data.save_team(db,actor,{**team_values,'name':metadata['teamName'],'track':metadata['track']})
-            if selected and selected['registration']:
-                names=[person['name'] for person in people]
-                registration_value={'name':metadata['teamName'],'members':names,'targetSize':selected['registration']['targetSize']}
-                db.execute('''UPDATE team_registrations SET captain=?,school=?,members_json=?,flags_json=?,revision=revision+1
-                    WHERE team_id=?''',(declaration['captain']['name'],declaration['captain']['school'],json.dumps(names,ensure_ascii=False),
-                    json.dumps(self.s.registration.flags(registration_value),ensure_ascii=False),team['id']))
             member_ids=[]
             for person,exact in zip(people,matches):
                 person_id=exact['id'] if exact else 'P'+secrets.token_hex(16)
@@ -323,6 +325,7 @@ class Claims:
                         (person_id,person['name'],person['school'],normalize(person['name']),normalize(person['school'])))
                 db.execute('INSERT INTO claim_memberships VALUES (?,?,?)',(person_id,team['id'],row['id']))
                 member_ids.append(person_id)
+            self.s.registration.sync_verified_members(db,actor,team['id'],member_ids[0],member_ids)
             access=self.s.team_access(db,actor,{'teamId':team['id'],'action':'issue'})
             account=db.execute('SELECT * FROM accounts WHERE id=?',(access['id'],)).fetchone()
             reviewed={**declaration,**metadata}
@@ -349,7 +352,7 @@ class Claims:
         approval=None
         if body['action']=='approve':
             members=body['memberIds']
-            if not isinstance(members,list) or not 1<=len(members)<=500 or any(not isinstance(p,str) or len(p)>100 for p in members) or len(set(members))!=len(members):raise APIError(400,'成员名单不正确')
+            if not isinstance(members,list) or not 1<=len(members)<=MAX_CLAIM_PEOPLE or any(not isinstance(p,str) or len(p)>100 for p in members) or len(set(members))!=len(members):raise APIError(400,'成员名单不正确')
             member_revisions=body['memberRevisions']
             if not isinstance(member_revisions,dict) or set(member_revisions)!=set(members) or any(type(revision) is not int or not 1<=revision<=9007199254740991 for revision in member_revisions.values()):
                 raise APIError(400,'请提交每位所选成员的准确名单修订号')
@@ -395,6 +398,8 @@ class Claims:
             access=self.s.team_access(db,actor,{'teamId':body['teamId'],'action':'issue'})
             account=db.execute('SELECT * FROM accounts WHERE id=?',(access['id'],)).fetchone()
             db.execute('UPDATE claim_requests SET account_id=?,account_fingerprint=? WHERE id=?',(account['id'],fingerprint(account),row['id']))
+            ordered_ids=mapping if declaration else [body['captainId']]+[person for person in members if person!=body['captainId']]
+            self.s.registration.sync_verified_members(db,actor,body['teamId'],body['captainId'],ordered_ids)
         except sqlite3.IntegrityError:raise APIError(409,'成员或队伍已经分配，请重新读取并核对')
         metadata={'verificationMethod':'onsite','inPersonVerified':True,'teamId':body['teamId'],'captainId':body['captainId'],'memberIds':sorted(members),'memberRevisions':member_revisions,'note':note,'resolvedIdentity':body['resolvedIdentity']}
         if declaration:metadata.update(declaration=declaration,declaredMemberIds=mapping,requestRevision=body['expectedRevision'])

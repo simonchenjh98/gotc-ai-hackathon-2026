@@ -116,6 +116,8 @@ class FakeUpstream(BaseHTTPRequestHandler):
                 if "type" in event:  # Anthropic SSE names each event
                     self.wfile.write(b"event: " + event["type"].encode() + b"\n")
                 self.wfile.write(b"data: " + json.dumps(event).encode() + b"\n\n")
+            if not self.path.endswith("/messages"):
+                self.wfile.write(b"data: [DONE]\n\n")
             return
         usage = FakeUpstream.usage or ({"input_tokens": 2000, "output_tokens": 1000} if self.path.endswith("/messages") else {"prompt_tokens": 2000, "completion_tokens": 1000})
         payload = json.dumps({"id": "x", "type": "message", "role": "assistant", "model": body["model"], "content": [{"type": "text", "text": "hi"}],
@@ -246,6 +248,8 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"data:", content)
         self.assertEqual(FakeUpstream.calls[-1][2]["stream_options"], {"include_usage": True})
+        streamed = self.admin.post("/api/admin/keys/logs", {})[1]["items"][0]
+        self.assertEqual((streamed["status"], streamed["incomplete"], streamed["estimated"], streamed["errorType"]), (200, 0, 0, ""))
 
         status, content = self.call("/v1/messages", {"model": "claude-x", "stream": True}, headers={"x-api-key": key})
         self.assertEqual(status, 200)

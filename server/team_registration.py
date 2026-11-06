@@ -4,7 +4,7 @@ import json
 import re
 import secrets
 
-from claims import normalize
+from claims import normalize, ensure_roster_capacity
 from errors import APIError
 
 PUBLIC_PATHS = {'/api/registration', '/api/registration/create', '/api/registration/open', '/api/registration/save'}
@@ -113,10 +113,12 @@ class TeamRegistration:
         return {'teams': [self.private(r) if admin else self.public(r) for r in sorted(rows, key=lambda r: r['number'])
                           if admin or r['status'] == 'active']}
 
-    def check_duplicates(self, db, value, team_id=None):
+    def check_duplicates(self, db, value, team_id=None, *, check_members=True):
         for row in db.execute('SELECT id,name FROM teams'):
             if row['id'] != team_id and normalize(row['name']) == normalize(value['name']):
                 raise APIError(409, '这个队名已登记，请在名单中查找；如是本队，请用管理码修改')
+        if not check_members:
+            return
         names = {normalize(n) for n in value['members']}
         for row in db.execute('SELECT team_id,school,members_json FROM team_registrations'):
             if row['team_id'] != team_id and normalize(row['school']) == normalize(value['school']) and names.intersection(normalize(n) for n in json.loads(row['members_json'])):
@@ -124,14 +126,42 @@ class TeamRegistration:
 
     def sync_people(self, db, value):
         # Registration is not identity verification. Never change verified membership.
+        pending = []
         for name in value['members']:
             if db.execute('SELECT 1 FROM claim_people WHERE normalized_name=?', (normalize(name),)).fetchone():
                 continue  # Keep the existing registration's school/identity; do not guess aliases.
             school = value['school'] if name == value['captain'] else '待核对'
+            pending.append((name, school))
+        ensure_roster_capacity(db, len(pending))
+        for name, school in pending:
             db.execute('''INSERT OR IGNORE INTO claim_people
                 (id,name,school,normalized_name,normalized_school,notes,needs_review)
                 VALUES (?,?,?,?,?,?,1)''', ('R'+secrets.token_hex(12), name, school, normalize(name),
                                          normalize(school), '来源：组队登记；队员学校未提供，须核对本人、学校和归属。'))
+
+    def sync_verified_members(self, db, actor, team_id, captain_id, member_ids):
+        row = self.row(db, team_id)
+        if not row:
+            return
+        # Read the identities that were actually assigned, never infer people from names.
+        people = {person['id']: person for person in db.execute('''SELECT p.id,p.name,p.school
+            FROM claim_memberships m JOIN claim_people p ON p.id=m.person_id WHERE m.team_id=?''', (team_id,))}
+        if set(member_ids) != set(people) or captain_id not in people:
+            raise APIError(409, '已核验成员已变化，请重新核对')
+        captain = people[captain_id]
+        members = [people[person_id]['name'] for person_id in member_ids]
+        same_captain = (normalize(row['captain']), normalize(row['school'])) == (normalize(captain['name']), normalize(captain['school']))
+        phone = row['phone'] if same_captain else ''
+        target = len(members) if 3 <= len(members) <= 5 else row['target_size']
+        flags = self.flags({'name': row['name'], 'members': members, 'targetSize': target})
+        db.execute('''UPDATE team_registrations SET captain=?,school=?,phone=?,target_size=?,members_json=?,
+            flags_json=?,revision=revision+1 WHERE team_id=?''',
+            (captain['name'],captain['school'],phone,target,json.dumps(members,ensure_ascii=False),
+             json.dumps(flags,ensure_ascii=False),team_id))
+        metadata = {'captainId': captain_id, 'memberIds': member_ids, 'revision': row['revision']+1}
+        if not same_captain and row['phone']:
+            metadata['previousContact'] = {key: row[key] for key in ('captain','school','phone')}
+        self.s.audit(db, actor, 'registration.verified-members', team_id, metadata)
 
     def insert(self, db, value, secret, source_key=None, raw=None):
         if db.execute('SELECT COUNT(*) FROM teams').fetchone()[0] >= 200:
@@ -178,16 +208,18 @@ class TeamRegistration:
         if type(body['expectedRevision']) is not int or body['expectedRevision'] != row['revision']:
             raise APIError(409, '队伍资料已变化，本次未保存。请复制当前输入，再重新读取本队资料')
         value = self.clean(body['team'])
-        if db.execute('SELECT 1 FROM claim_memberships WHERE team_id=?', (row['team_id'],)).fetchone():
+        verified = db.execute('SELECT 1 FROM claim_memberships WHERE team_id=?', (row['team_id'],)).fetchone() is not None
+        if verified:
             confirmed=json.loads(row['members_json'])
-            # A name-only registration editor cannot collapse distinct verified people.
-            # Accept its ordered tail or a compatible full-list payload, then keep the authoritative roster.
+            # Keep every approved identity; name-only edits accept the exact full list or ordered tail.
             if value['captain'] != row['captain'] or value['school'] != row['school'] or body['team']['members'] not in (confirmed,confirmed[1:]):
                 raise APIError(409, '本队成员已获组织方批准，成员变化请交由组织方处理')
             if value['targetSize']<len(confirmed):
                 raise APIError(400, '目标人数不能少于已批准的完整成员人数')
+            if value['targetSize'] != row['target_size']:
+                raise APIError(409, '本队人数已由组织方确认，人数变化请交由组织方处理')
             value['members']=confirmed
-        self.check_duplicates(db, value, row['team_id'])
+        self.check_duplicates(db, value, row['team_id'], check_members=not verified)
         # A registration edit must not overwrite an already submitted project title.
         if db.execute('SELECT 1 FROM submissions WHERE team_id=? AND submitted_json IS NOT NULL', (row['team_id'],)).fetchone() and value['project'] != row['project']:
             raise APIError(409, '已正式提交的项目名称请在选手工作台更新')
@@ -195,7 +227,8 @@ class TeamRegistration:
         db.execute('''UPDATE team_registrations SET captain=?,school=?,phone=?,target_size=?,members_json=?,summary=?,
             flags_json=?,revision=revision+1 WHERE team_id=?''', (value['captain'],value['school'],value['phone'],value['targetSize'],
               json.dumps(value['members'],ensure_ascii=False),value['summary'],json.dumps(self.flags(value),ensure_ascii=False),row['team_id']))
-        self.sync_people(db, value)
+        if not verified:
+            self.sync_people(db, value)
         saved = self.row(db, row['team_id'])
         self.s.audit(db, None, 'registration.save', row['team_id'], {'revision': saved['revision']})
         return {'ok': True, 'team': self.private(saved)}

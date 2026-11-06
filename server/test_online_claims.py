@@ -58,3 +58,55 @@ class OnlineClaimsTests(unittest.TestCase):
         self.bearer(claim,'redeem');self.assertEqual(self.admin_call('/approve',body)[0],200)
         legacy=test_open_claims.OpenClaimsTests.approval(self,claim)
         self.assertEqual(self.admin_call('/approve',legacy)[0],409)
+
+    def fill_roster_to(self,count):
+        with self.service.db() as db:
+            current=db.execute('SELECT COUNT(*) FROM claim_people').fetchone()[0]
+            db.executemany('INSERT INTO claim_people(id,name,school,normalized_name,normalized_school) VALUES (?,?,?,?,?)',
+                [(f'capacity-{i}',f'Capacity Person {i}','Reference School',f'capacity person {i}','reference school') for i in range(current,count)])
+
+    def test_open_capacity_failure_leaves_new_and_registered_teams_unchanged(self):
+        code,registered,_=self.registration();claim=self.application()
+        self.fill_roster_to(499)
+        body=self.selected_approval(claim,registered['id'],teamName='Would rename')
+        with self.service.db() as db:original=dict(db.execute('SELECT * FROM team_registrations WHERE team_id=?',(registered['id'],)).fetchone())
+        before=self.counts();self.assertEqual(self.admin_call('/approve',body)[0],409);self.assertEqual(self.counts(),before)
+        with self.service.db() as db:self.assertEqual(dict(db.execute('SELECT * FROM team_registrations WHERE team_id=?',(registered['id'],)).fetchone()),original)
+        newcomer=self.application('New people');before=self.counts()
+        self.assertEqual(self.admin_call('/approve',self.approval(newcomer))[0],409);self.assertEqual(self.counts(),before)
+        self.assertEqual(self.bearer(claim)[1]['status'],'pending');self.assertEqual(self.bearer(newcomer)[1]['status'],'pending')
+
+    def test_open_existing_people_can_be_approved_without_growth_on_legacy_over_capacity_roster(self):
+        self.roster([{'id':'known-'+str(i),'name':name,'school':school,'notes':'','needsReview':False}
+            for i,(name,school) in enumerate([('Open Captain','School A'),('Open One','School B'),('Open Two','School C')])])
+        self.fill_roster_to(501);claim=self.application();self.assertEqual(self.admin_call('/approve',self.approval(claim))[0],200)
+        self.assertEqual(self.counts()['claim_people'],501);self.assertEqual(self.counts()['claim_memberships'],3)
+
+    def test_online_sync_uses_assigned_members_final_count_and_allows_metadata_despite_public_homonym(self):
+        code,registered,value=self.registration(targetSize=5);claim=self.application()
+        self.assertEqual(self.admin_call('/approve',self.selected_approval(claim,registered['id']))[0],200)
+        current=self.public.post('/api/registration/open',{'code':code})[1]['team']
+        self.assertEqual(current['targetSize'],3);self.assertFalse(current['recruiting']);self.assertEqual(current['phone'],value['phone'])
+        with self.service.db() as db:
+            db.execute("INSERT INTO teams(id,number,name,project,track,updated_at) VALUES ('homonym',2,'Other team','','',1)")
+            db.execute("INSERT INTO team_registrations(team_id,captain,school,phone,target_size,members_json,secret_hash,created_at) VALUES ('homonym','Other Captain','School A','',3,?,'homonym-secret',1)",
+                (json.dumps(['Other Captain','Open One']),))
+        saved={**value,'targetSize':3,'members':current['members'][1:],'phone':'13900000002','project':'Metadata edit'}
+        result=self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],'team':saved})
+        self.assertEqual(result[0],200,result[1]);self.assertEqual(result[1]['team']['members'],current['members'])
+        current=result[1]['team']
+        self.assertEqual(self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],'team':{**saved,'targetSize':4}})[0],409)
+        self.assertEqual(self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],'team':{**saved,'members':['Open One']}})[0],409)
+
+    def test_online_changed_captain_clears_stale_contact_and_keeps_private_audit(self):
+        code,registered,value=self.registration();claim=self.application(name='Replacement Captain',school='Replacement School')
+        body=self.selected_approval(claim,registered['id']);self.assertEqual(self.admin_call('/approve',body)[0],200)
+        current=self.public.post('/api/registration/open',{'code':code})[1]['team']
+        self.assertEqual(current['captain'],'Replacement Captain');self.assertEqual(current['phone'],'')
+        self.assertEqual(current['members'],['Replacement Captain','Open One','Open Two']);self.assertEqual(current['targetSize'],3)
+        with self.service.db() as db:
+            audit=json.loads(db.execute("SELECT metadata FROM audit WHERE action='registration.verified-members'").fetchone()[0])
+            self.assertEqual(audit['previousContact'],{'captain':value['captain'],'school':value['school'],'phone':value['phone']})
+        self.assertNotIn(value['phone'],json.dumps(self.public.get('/api/registration')[1]))
+        before=current['revision'];self.assertEqual(self.admin_call('/approve',body)[0],200)
+        self.assertEqual(self.public.post('/api/registration/open',{'code':code})[1]['team']['revision'],before)
