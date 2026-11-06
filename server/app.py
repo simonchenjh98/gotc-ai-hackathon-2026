@@ -34,6 +34,7 @@ from finals import FinalsService
 from roadshow_access import RoadshowAccess
 from roadshow_scoring import RoadshowScoring
 from admin_data import AdminDataService, TRACK_OPTIONS
+from admin_team_access import AdminTeamAccess, PATHS as ADMIN_TEAM_PATHS, operator_for
 from keys import KeyService, load_config
 
 DIMENSIONS = [
@@ -263,6 +264,7 @@ class EventService:
             history=lambda *args,**kwargs:self.admin_data.record_review_change(*args,**kwargs),
             enrich_team=lambda db,team:self.admin_data.enrich_team(db,team))
         self.admin_data=AdminDataService(self)
+        self.admin_team_access=AdminTeamAccess(self,COOKIE_NAME)
         self.claims=Claims(self,now_ms,text_field,scrypt_hash)
         self.registration=TeamRegistration(self,now_ms,text_field)
         self.submission_records=SubmissionRecords(self)
@@ -279,6 +281,7 @@ class EventService:
         self.migrate_accounts()
         with self.db() as db:
             db.executescript(SCHEMA)
+            self.admin_team_access.initialize(db)
             self.judging.initialize(db)
             self.admin_data.initialize(db)
             self.roadshow_scoring.initialize(db)
@@ -405,8 +408,11 @@ class EventService:
         db.execute("UPDATE settings SET value=? WHERE key='updatedAt'", (json.dumps(now_ms()),))
 
     def audit(self, db, actor, action, target="", metadata=None):
+        operator = operator_for(actor)
+        if operator:
+            metadata = {**(metadata or {}), 'operator': operator}
         db.execute("INSERT INTO audit(at,actor_id,role,action,target,metadata) VALUES (?,?,?,?,?,?)",
-                   (now_ms(), actor["id"] if actor else None, actor["role"] if actor else None,
+                   (now_ms(), actor["id"] if actor else None, 'admin' if operator else actor["role"] if actor else None,
                     action, target, json.dumps(metadata or {}, ensure_ascii=False)))
 
     def create_account(self, db, role, name):
@@ -453,8 +459,20 @@ class EventService:
                 return None
         except (KeyError, ValueError, CookieError):
             return None
-        return db.execute("SELECT a.* FROM sessions s JOIN accounts a ON a.id=s.account_id WHERE s.token_hash=? AND s.expires_at>? AND a.active=1",
-                          (hashlib.sha256(token.encode()).hexdigest(), now_ms())).fetchone()
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        # Read identity and delegation in one SQLite snapshot. A concurrent return
+        # must never make an old delegated cookie appear to be an unrestricted admin.
+        row = db.execute('''SELECT a.*,c.team_id AS delegated_team_id,t.name AS delegated_team_name
+            FROM sessions s JOIN accounts a ON a.id=s.account_id
+            LEFT JOIN admin_team_sessions c ON c.token_hash=s.token_hash
+            LEFT JOIN teams t ON t.id=c.team_id
+            WHERE s.token_hash=? AND s.expires_at>? AND a.active=1''', (token_hash, now_ms())).fetchone()
+        if row is None:
+            return None
+        actor = dict(row)
+        team_id, team_name = actor.pop('delegated_team_id'), actor.pop('delegated_team_name')
+        context = {'team_id':team_id,'name':team_name} if team_id else None
+        return self.admin_team_access.effective_account(actor,context)
 
     @staticmethod
     def professional_score(average, judge_count, config, public=True):
@@ -536,7 +554,7 @@ class EventService:
         db.execute("DELETE FROM sessions WHERE expires_at<=?", (now_ms(),))
         db.execute("INSERT INTO sessions VALUES (?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), account["id"], now_ms() + SESSION_SECONDS * 1000))
         self.audit(db, account, "login")
-        return {"ok": True, "role": account["role"], "name": account["name"], "loginId": self.login_id(f"{COOKIE_NAME}={token}")}, token, "set"
+        return {"ok": True, **self.admin_team_access.session_view(account, f"{COOKIE_NAME}={token}")}, token, "set"
 
     def login(self, body, ip):
         """Verify outside the writer lock, then recheck the proof before issuing a session."""
@@ -545,6 +563,9 @@ class EventService:
             raise APIError(400, "登录身份不正确")
         self.rate_limit(ip, role)
         code = text_field(body.get("code"), "邀请码", 160, True)
+        admin_code = self.shared_login_codes.get('admin')
+        if role == 'team' and admin_code and hmac.compare_digest(code.encode(), admin_code.encode()):
+            role = 'admin'
         selector = body.get("accountId")
         if selector is not None and (not isinstance(selector, str) or len(selector) > 80):
             raise APIError(400, "登录身份不正确")
@@ -598,6 +619,10 @@ class EventService:
                 # Keep release settings, aggregates and editor revisions in one read snapshot.
                 db.execute("BEGIN")
             actor = self.account(db, cookie)
+            if path in ADMIN_TEAM_PATHS:
+                return self.admin_team_access.dispatch(db,actor,method,path,body,cookie,expected_login_id,query or {})
+            if operator_for(actor) and (path in {'/api/team','/api/submission','/api/logout'} or path.startswith('/api/submission/')) and not expected_login_id:
+                raise APIError(428,'请刷新页面并核对当前代管队伍','login_required')
             if actor and path in {'/api/judge', '/api/score', '/api/judging/exhibition', '/api/judging/exhibition/', '/api/judging/exhibition/review'} and self.roadshow_access.owns_account(db,actor['id']):
                 raise APIError(403, '此邀请码仅用于路演评审，请从路演入口进入')
             if self.finals.supports(path):
@@ -651,7 +676,7 @@ class EventService:
             if path.startswith(("/api/team/keys", "/api/admin/keys")):
                 return self.keys.dispatch(db, actor, method, path, body), None, None
             if method == "GET" and path == "/api/session":
-                return {"role": actor["role"] if actor else None, "name": actor["name"] if actor else "", "loginId": self.login_id(cookie) if actor else None}, None, None
+                return self.admin_team_access.session_view(actor,cookie), None, None
             if method == "GET" and path == "/api/board":
                 config = self.config(db)
                 teams = sorted((team for team in self.teams(db) if team["rank"] is not None), key=lambda team: team["rank"])
@@ -726,11 +751,9 @@ class EventService:
                 return {"ok": True, "alreadyVoted": bool(already)}, None, None
             if path in {"/api/team", "/api/submission"}:
                 self.require(actor, "team")
-                bound=db.execute("SELECT t.* FROM teams t JOIN team_accounts a ON a.team_id=t.id WHERE a.account_id=?", (actor["id"],)).fetchone()
-                if not bound:
-                    raise APIError(403, "队伍身份未绑定")
+                bound=self.bound_submission_team(db,actor)
                 if method=="GET" and path=="/api/team":
-                    return {**self.team_submission_response(db, bound), "loginId": self.login_id(cookie)}, None, None
+                    return {**self.team_submission_response(db, bound), "loginId": self.login_id(cookie), 'operator':operator_for(actor)}, None, None
                 if method=="POST" and path=="/api/submission":
                     return self.save_submission(db, actor, bound, body), None, None
             if path.startswith("/api/admin"):
@@ -787,7 +810,14 @@ class EventService:
             raise APIError(404, "接口不存在")
 
     def bound_submission_team(self,db,actor):
-        team=db.execute('SELECT t.* FROM teams t JOIN team_accounts b ON b.team_id=t.id WHERE b.account_id=?',(actor['id'],)).fetchone()
+        self.require(actor,'team')
+        operator=operator_for(actor)
+        if operator:
+            team=db.execute('SELECT * FROM teams WHERE id=?',(operator['teamId'],)).fetchone()
+            if db.execute("SELECT 1 FROM team_details WHERE team_id=? AND status!='active'",(operator['teamId'],)).fetchone():
+                raise APIError(409,'该队伍已退出或被取消资格，不能继续代管','team_ineligible')
+        else:
+            team=db.execute('SELECT t.* FROM teams t JOIN team_accounts b ON b.team_id=t.id WHERE b.account_id=?',(actor['id'],)).fetchone()
         if not team:raise APIError(403,'本账号未绑定队伍，请联系组织方')
         return team
 
@@ -806,6 +836,7 @@ class EventService:
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
             actor=self.account(db,cookie);self.require(actor,'team')
+            if operator_for(actor) and not expected_login_id:raise APIError(428,'请刷新页面并核对当前代管队伍','login_required')
             if expected_login_id is not None and expected_login_id!=self.login_id(cookie):raise APIError(401,'登录身份已变化，请重新登录后操作')
             team=self.bound_submission_team(db,actor)
             if proof and proof.get('repositorySeal'):

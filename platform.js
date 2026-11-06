@@ -23,7 +23,7 @@ function publishLogin(login){if(!login.loginId)return;try{localStorage.setItem(l
 function ownsBrowserLogin(login){const owner=browserLoginOwner();return !owner || !login.loginId || owner===login.loginId || (verifiedBrowserLogin?.loginId===login.loginId && verifiedBrowserLogin.owner===owner);}
 async function api(path, data, options={}) {
   const recoveryAtStart=currentTeamRecovery,sessionAtStart=session,ownerAtStart=path==='session'?browserLoginOwner():null;
-  const res = await fetch(new URL(`api/${path}`, base), {credentials:'same-origin',cache:'no-store',method:data === undefined ? 'GET' : 'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json'}),...((['team','team/score','submission','logout','judge','score','admin','admin/settings','admin/keys/upstreams/models','audience','vote','judging/exhibition','judging/exhibition/review','judging/roadshow','judging/roadshow/review'].includes(path) || path.startsWith('submission/') || path==='team/keys' || path.startsWith('team/keys/') || path.startsWith('team/repository') || path.startsWith('admin/repositories') || path==='admin/claims' || path.startsWith('admin/claims/') || path==='admin/roadshow-access' || ['roadshow/scoring','roadshow/score','admin/roadshow/scoring','admin/roadshow/publish','admin/judging/roadshow/window'].includes(path) || path.startsWith('finals/') || path.startsWith('admin/finals')) && (options.loginId ?? session.loginId)?{'X-GOTC-Login':options.loginId ?? session.loginId}:{})},body:data === undefined ? undefined : JSON.stringify(data),signal:options.signal});
+  const res = await fetch(new URL(`api/${path}`, base), {credentials:'same-origin',cache:'no-store',method:data === undefined ? 'GET' : 'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json'}),...((['team','team/score','submission','logout','judge','score','admin','admin/settings','admin/keys/upstreams/models','admin/team-workbench','team/workbench/return','audience','vote','judging/exhibition','judging/exhibition/review','judging/roadshow','judging/roadshow/review'].includes(path) || path.startsWith('submission/') || path==='team/keys' || path.startsWith('team/keys/') || path.startsWith('team/repository') || path.startsWith('admin/repositories') || path==='admin/claims' || path.startsWith('admin/claims/') || path==='admin/roadshow-access' || ['roadshow/scoring','roadshow/score','admin/roadshow/scoring','admin/roadshow/publish','admin/judging/roadshow/window'].includes(path) || path.startsWith('finals/') || path.startsWith('admin/finals')) && (options.loginId ?? session.loginId)?{'X-GOTC-Login':options.loginId ?? session.loginId}:{})},body:data === undefined ? undefined : JSON.stringify(data),signal:options.signal});
   let body; try { body = await res.json(); } catch { throw new Error('服务暂时不可用，请稍后重试。'); }
   if (!res.ok) { if((res.status===401 || res.status===403) && recoveryAtStart && currentTeamRecovery===recoveryAtStart)recoveryAtStart.lock();if(res.status===401 && session===sessionAtStart && (!recoveryAtStart || currentTeamRecovery===recoveryAtStart))session={role:null}; const error = new Error(body.error || '操作未成功，请重试。'); error.status = res.status; error.code=body.code; throw error; }
   if(path==='session')verifiedBrowserLogin={loginId:body.loginId,owner:ownerAtStart};
@@ -35,8 +35,9 @@ function clearStageUnsavedInputs(){for(const form of dirtyAdminForms)if(!form.is
 function claimNavigationState(){return typeof currentClaimController!=='undefined'?currentClaimController?.navigationState?.()??{}:{};}
 function confirmLeave(){const claim=claimNavigationState();if(claim.pendingInitial){toast('申请正在提交，请等待领取凭据保存后再离开。');return false;}return !(claim.dirty || submissionDirty || reviewDirty || scoreDirty || dirtyAdminForms.size) || confirm(submissionDirty?'有尚未保存服务器的作品输入。离开不会自动提交；只有成功保存的本机副本可在重新登录本队后找回，未备份输入可能丢失。确认离开？':'有尚未保存的输入，确认离开并放弃这些输入？');}
 function account(){
-  const el=document.getElementById('account');el.innerHTML=session.role?`<span>${esc(session.name || roleName[session.role])}</span><button id="logout">退出</button>`:'';
+  const el=document.getElementById('account');el.innerHTML=session.role?`<span>${session.operator?'管理员代管 · ':''}${esc(session.name || roleName[session.role])}</span>${session.operator?'<button type="button" id="switch-team-workbench">切换队伍</button>':''}<button id="logout">退出</button>`:'';
   document.getElementById('logout')?.addEventListener('click',logoutAccount);
+  document.getElementById('switch-team-workbench')?.addEventListener('click',returnAdminTeamWorkbench);
 }
 async function logoutAccount(event,{preserveClaim=false}={}){
     if(claimNavigationState().pendingInitial){toast('申请正在提交，请等待领取凭据保存后再退出。');return false;}
@@ -203,12 +204,13 @@ function renderLogin(role) {
   const loginRoleName=route==='admin-finals'?'决赛管理员':route==='admin-roadshow'?'路演管理员':roleName[role];
   const publicBoard=finalsLogin?'#board-finals':route==='judge' || route==='team-score'?'#board':stage==='roadshow'?'#board-roadshow':'#board-exhibition';
   const copy = {team:route==='team-score'?['本队查分','输入主办方发给本队的提交码，查看本队已发布的总分、六维均分及评委同意分享的匿名评语。']:['选手工作台<br>AI 工具 · 作品提交','用本队提交码登录，在同一工作台查看 AI 工具、准备代码仓库和提交作品。没有提交码，请先提交队伍申请。'],judge:route==='judge'?['专业评分<br>六维 100 分','使用主办方提供的评委码，选择自己的身份。评分可保存草稿，正式提交后计入专业均分。']:route==='judge-roadshow'?['路演评分<br>六维 100 分','邀请码就是你的真实姓名，输入名单中的完整姓名即可验证登录。创意20、社会关怀15、技术呈现20、应用潜力20、AI跨界探索15、开源贡献10分；正式评分计入路演均分。']:[`${stageName(stage)}记录`,'使用主办方提供的评委码，选择自己的身份。可查看本轮队伍、保存草稿、提交评语或回避；本阶段记录暂不计分。'],audience:['选出让你<br>眼前一亮的作品。','观众选择票独立于专业成绩。使用观众邀请码登录，每个邀请码最多支持 3 支不同队伍。'],admin:route==='admin-finals'?['决赛管理<br>评分 · 提名 · 颁奖','管理8位决赛评委和决赛队伍，实时核对六维评分与提名票数，确认专项奖归属后发布结果。请使用组织方管理码登录。']:route==='admin-roadshow'?['路演管理<br>名单 · 实时成绩','配置路演评委名单，查看姓名登录资格与实时六维评分，核对后发布路演成绩。请使用组织方管理码登录。']:['组织方<br>活动管理','管理队伍、评委、评审窗口和作品材料。请使用主办方管理码登录。']}[role];
-  root.innerHTML = `<div class="login-layout"><div class="login-story"><p class="eyebrow">GOTC 2026 / ${roleLabel}</p><h1>${copy[0].split('<br>').map(esc).join('<br>')}</h1><p>${esc(copy[1])}</p><span class="login-pixel" aria-hidden="true"></span></div><form class="login-card" id="login-form"><h2>${esc(loginRoleName)}登录</h2>${role==='team'?'<p><a href="#claim">尚无提交码？提交队伍申请并领取 ↗</a></p>':''}<p>邀请码仅用于本届活动，请妥善保管。<br>如无法登录，请核对审核状态或联系主办方。</p><label class="field">${role === 'admin' ? '组织方管理码' : (role === 'judge' ? '评委登录码' : role === 'team' ? '队伍提交码' : '观众邀请码')}<input name="code" type="password" autocomplete="one-time-code" required maxlength="160" placeholder="输入你的${role === 'admin' ? '管理码' : '邀请码'}"></label><p class="form-error" role="alert"></p><button type="submit" class="btn">${route==='team-score'?'查看本队成绩':'进入'+esc(loginRoleName)+'工作台 ↗'}</button><p class="form-footnote">${finalsLogin?'公众查看已发布的决赛结果无需登录。':'公众查看成绩和评审进度无需登录。'}<a href="${publicBoard}">查看公开看板 →</a></p></form></div>`;
+  root.innerHTML = `<div class="login-layout"><div class="login-story"><p class="eyebrow">GOTC 2026 / ${roleLabel}</p><h1>${copy[0].split('<br>').map(esc).join('<br>')}</h1><p>${esc(copy[1])}</p><span class="login-pixel" aria-hidden="true"></span></div><form class="login-card" id="login-form"><h2>${esc(loginRoleName)}登录</h2>${role==='team'?'<p><a href="#claim">尚无提交码？提交队伍申请并领取 ↗</a></p><p class="small-note">组织方可使用管理码登录，再选择需要代管的队伍。</p>':''}<p>邀请码仅用于本届活动，请妥善保管。<br>如无法登录，请核对审核状态或联系主办方。</p><label class="field">${role === 'admin' ? '组织方管理码' : (role === 'judge' ? '评委登录码' : role === 'team' ? '队伍提交码' : '观众邀请码')}<input name="code" type="password" autocomplete="one-time-code" required maxlength="160" placeholder="输入你的${role === 'admin' ? '管理码' : '邀请码'}"></label><p class="form-error" role="alert"></p><button type="submit" class="btn">${route==='team-score'?'查看本队成绩':'进入'+esc(loginRoleName)+'工作台 ↗'}</button><p class="form-footnote">${finalsLogin?'公众查看已发布的决赛结果无需登录。':'公众查看成绩和评审进度无需登录。'}<a href="${publicBoard}">查看公开看板 →</a></p></form></div>`;
   const form=document.getElementById('login-form');
   const scoreLoginVersion=route==='team-score'?routeVersion:null;
   const identityField=document.createElement('label');
   identityField.className='field';identityField.hidden=true;
-  identityField.innerHTML='选择自己的评委身份<select name="accountId"><option value="">请选择主办方分配的身份</option></select>';
+  const identityName=role==='judge'?'评委':'管理员';
+  identityField.innerHTML=`选择自己的${identityName}身份<select name="accountId"><option value="">请选择主办方分配的身份</option></select>`;
   form.querySelector('.form-error').before(identityField);
   const identity=form.elements.accountId;
   form.elements.code.addEventListener('input',()=>{identityField.hidden=true;identity.required=false;identity.innerHTML='<option value="">请选择主办方分配的身份</option>';});
@@ -221,7 +223,7 @@ function renderLogin(role) {
       if(result.selectAccount){
         identity.innerHTML='<option value="">请选择主办方分配的身份</option>'+result.accounts.map(a=>`<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('');
         identityField.hidden=false;identity.required=true;identity.focus();
-        formError(form,'登录码正确，请选择你自己的评委身份后继续。');
+        formError(form,`登录码正确，请选择你自己的${identityName}身份后继续。`);
         return;
       }
       if(scoreLoginVersion!==null){
@@ -229,7 +231,7 @@ function renderLogin(role) {
         const marker=browserLoginOwner();
         const confirmed=await api('session');
         if(routeVersion!==scoreLoginVersion || !form.isConnected)return;
-        if(confirmed.loginId!==result.loginId || confirmed.role!=='team' || browserLoginOwner()!==marker){
+        if(confirmed.loginId!==result.loginId || !['team','admin'].includes(confirmed.role) || confirmed.role!==result.role || browserLoginOwner()!==marker){
           formError(form,'浏览器的登录身份已切换，请重新输入本队提交码。');
           return;
         }
@@ -243,6 +245,59 @@ function renderLogin(role) {
   };
 }
 function renderWrongRole(role) { root.innerHTML = heading('ACCESS / 登录身份','请使用对应的邀请码',`当前身份为${esc(roleName[session.role] || session.role)}，此入口需要${roleName[role]}身份。`) + empty('切换登录身份','切换后使用此入口的专属邀请码登录；独立的队伍申请凭据会保留，可返回申请页领取提交码。','<button class="btn" id="switch-role">切换身份（保留申请）</button>');document.getElementById('switch-role').onclick=event=>logoutAccount(event,{preserveClaim:true}); }
+function adminTeamWorkbenchNotice(data){
+  const operator=session.operator;
+  if(!operator || operator.teamId!==data.team.id)return '';
+  return `<section class="info-banner warning" role="status"><strong>管理员代管 · ${esc(data.team.name)}</strong><p>你正在操作这支队伍的工作台，修改会写入该队记录，并标记为组织方代操作。可使用页头的“切换队伍”返回选择。</p></section>`;
+}
+async function adoptTeamWorkbenchSession(result,owner,expected,isCurrent,destination){
+  if(!isCurrent() || session!==owner)return false;
+  const marker=browserLoginOwner();
+  const next=await api('session');
+  if(!isCurrent() || session!==owner || browserLoginOwner()!==marker)return false;
+  if(!result.loginId || next.loginId!==result.loginId || next.role!==expected.role ||
+     (expected.teamId ? next.operator?.teamId!==expected.teamId : !!next.operator)){
+    throw new Error('浏览器登录身份已变化，请刷新后重新选择队伍。');
+  }
+  currentTeamRecovery?.flush();currentTeamRecovery?.lock('已切换工作台，请重新核对登录队伍。');currentTeamKeys?.dispose();
+  submissionDirty=false;reviewDirty=false;scoreDirty=false;dirtyAdminForms.clear();
+  publishLogin(next);session=next;
+  if(location.hash.slice(1)!==destination)location.hash=destination;
+  else await renderRoute();
+  return true;
+}
+async function renderAdminTeamWorkbench(version){
+  const owner=session,page=route;
+  const valid=()=>session===owner && owner.role==='admin' && version===routeVersion && route===page && ownsBrowserLogin(owner);
+  const data=await api('admin/team-workbench',undefined,{loginId:owner.loginId});
+  if(!valid())return;
+  root.innerHTML=heading('ADMIN / 队伍代管','选择要进入的队伍','管理员身份已验证。选择一支队伍进入选手工作台，操作会记入组织方记录。')+
+    (data.teams.length?`<form class="surface" id="admin-team-workbench"><label class="field">选择队伍<select name="teamId" required><option value="">请选择队伍</option>${data.teams.map(team=>`<option value="${esc(team.id)}">${esc(teamLabel(team))}</option>`).join('')}</select></label><button class="btn" type="submit">进入这支队伍的工作台 ↗</button><p class="form-error" role="alert"></p></form>`:empty('还没有队伍','请先在组织方后台创建队伍，或审核队伍申请。'))+
+    '<p><a class="text-link" href="#admin">返回组织方后台 →</a></p>';
+  const form=document.getElementById('admin-team-workbench');if(!form)return;
+  let busy=false;
+  const live=()=>valid() && form.isConnected && document.getElementById('admin-team-workbench')===form;
+  form.onsubmit=async event=>{
+    event.preventDefault();if(busy || !live() || !confirmLeave())return;
+    const teamId=form.elements.teamId.value;
+    if(!data.teams.some(team=>team.id===teamId)){formError(form,'请选择需要进入的队伍。');return;}
+    const button=form.querySelector('button');busy=true;button.disabled=true;formError(form,'');
+    try{
+      const result=await api('admin/team-workbench',{teamId},{loginId:owner.loginId});
+      await adoptTeamWorkbenchSession(result,owner,{role:'team',teamId},live,page);
+    }catch(error){if(form.isConnected && version===routeVersion && (session===owner || !session.role))formError(form,error.message);}
+    finally{busy=false;if(form.isConnected)button.disabled=false;}
+  };
+}
+async function returnAdminTeamWorkbench(event){
+  const owner=session,version=routeVersion,page=route,button=event?.currentTarget;
+  const live=()=>session===owner && !!owner.operator && version===routeVersion && route===page && ownsBrowserLogin(owner);
+  if(!live() || !confirmLeave())return;
+  return withBusy(button,async()=>{
+    const result=await api('team/workbench/return',{}, {loginId:owner.loginId});
+    await adoptTeamWorkbenchSession(result,owner,{role:'admin'},live,page==='team-score'?'team-score':'team');
+  });
+}
 function reviewState(record){return record?.invalidated?'已作废':record?.recused?'已回避':record?.submitted?(record.hasUnsubmittedChanges?'已正式提交 · 有草稿修改':'已正式提交（未计分）'):record?.draft?'草稿已保存':'待评审';}
 function reviewMaterialMarkup(snapshot,stage=null){return `<section class="surface submitted-materials"><h2>本轮正式材料快照</h2>${stage?`<p class="small-note">轮次 ${esc(stage.runId)} · 冻结时间 ${esc(beijingTime(stage.frozenAt))}（北京时间）</p>`:''}${snapshot?`<p class="small-note">队伍提交版本 ${Number(snapshot.submissionVersion)} · 正式提交 ${esc(beijingTime(snapshot.submittedAt))}<br>本轮截取 ${esc(beijingTime(snapshot.capturedAt))}（北京时间）</p>${materialMarkup(snapshot.materials)}`:!stage?'<p class="small-note">本轮没有正式材料快照。</p>':stage.frozenAt===null?'<p class="small-note">尚未生成材料快照；首次开放时截取当时的正式材料。</p>':'<p class="small-note">本轮冻结时无正式材料；可根据现场演示记录观察。后续提交材料不会自动替换本轮快照。</p>'}</section>`;}
 async function renderExhibitionJudge(version,expectedForm=null,stage=stageForRoute()){
@@ -762,7 +817,7 @@ async function renderTeam(version,provided=null,received=false,owner=null){
   const sessionAtStart=session,authorization=owner || (currentTeamRecovery?.sessionOwner===sessionAtStart?currentTeamRecovery:null),epochs=teamRecoveryEpochs();
   if(authorization && !authorization.hasAuthorization())return;
   const data=provided || await api('team');if(version!==routeVersion || session!==sessionAtStart || !ownsBrowserLogin(sessionAtStart) || (authorization && !authorization.hasAuthorization()))return;if(authorization && authorization.teamId!==data.team.id){authorization.lock('当前登录队伍已变化，请重新登录本队后编辑。');return;}const expectedEpoch=authorization?.store?.epoch ?? epochs(data.team.id,sessionAtStart.loginId),s=data.submission;
-  root.innerHTML=heading('TEAM / 选手工作台',esc(teamLabel(data.team)),`${esc(data.team.track || '方向待完善')} · 队伍编号、名称及赛道由组织方维护。`)+participantGuideMarkup()+windowMarkup(data.window)+`<section class="surface submission-overview"><h2 id="submission-status">${submissionState(s)}</h2><div>草稿编辑版 v${s.version} · 最新正式版 ${s.submittedVersion?'v'+s.submittedVersion:'尚未提交'}${s.submitted?.codeVersion?` · commit ${commitMarkup(s.submitted.codeVersion,s.submitted.codeUrl,data.repositorySeal)}`:''}</div><p class="small-note" id="submission-edit-state">${s.hasUnsubmittedChanges?'草稿修改尚未正式提交；评审继续使用正式材料。':'更新时间（北京时间）：'+esc(beijingTime(s.updatedAt))}</p><a href="#submitted-summary" id="view-formal-materials">查看最近正式材料</a></section>`+(received && typeof received==='object'?requestReceiptMarkup(received,received.requestId,true):submissionReceiptMarkup(data,received))+teamRepositoryMarkup(data)+localRecoveryMarkup()+teamFormMarkup(data)+'<div id="submission-preview" aria-live="polite"></div><div id="submission-conflict" aria-live="polite"></div>'+`<section class="surface" id="submitted-summary"><h2>最近正式材料</h2>${s.submitted?`<p class="small-note">正式版本 ${s.submittedVersion} · 最近提交 ${esc(beijingTime(s.submittedAt))}（北京时间）</p>${materialMarkup(s.submitted,data.repositorySeal)}${repositoryVersionMarkup(data,s.submitted,data.team.id,s.submittedVersion,'team-repository-proof','最新正式版')}`:'<p class="small-note">尚未正式提交；草稿不会发送给评委。</p>'}</section>`+`<details class="team-reference"><summary>查看本轮评审采用的材料</summary>${judgingMaterialsMarkup(data.judgingMaterials,s.submittedVersion)}</details>`+submissionHistoryMarkup()+'<div id="new-api-key" aria-live="polite"></div><section class="surface" id="team-keys"><h2>AI API 密钥</h2><p class="small-note">读取中…</p></section>';
+  root.innerHTML=adminTeamWorkbenchNotice(data)+heading('TEAM / 选手工作台',esc(teamLabel(data.team)),`${esc(data.team.track || '方向待完善')} · 队伍编号、名称及赛道由组织方维护。`)+participantGuideMarkup()+windowMarkup(data.window)+`<section class="surface submission-overview"><h2 id="submission-status">${submissionState(s)}</h2><div>草稿编辑版 v${s.version} · 最新正式版 ${s.submittedVersion?'v'+s.submittedVersion:'尚未提交'}${s.submitted?.codeVersion?` · commit ${commitMarkup(s.submitted.codeVersion,s.submitted.codeUrl,data.repositorySeal)}`:''}</div><p class="small-note" id="submission-edit-state">${s.hasUnsubmittedChanges?'草稿修改尚未正式提交；评审继续使用正式材料。':'更新时间（北京时间）：'+esc(beijingTime(s.updatedAt))}</p><a href="#submitted-summary" id="view-formal-materials">查看最近正式材料</a></section>`+(received && typeof received==='object'?requestReceiptMarkup(received,received.requestId,true):submissionReceiptMarkup(data,received))+teamRepositoryMarkup(data)+localRecoveryMarkup()+teamFormMarkup(data)+'<div id="submission-preview" aria-live="polite"></div><div id="submission-conflict" aria-live="polite"></div>'+`<section class="surface" id="submitted-summary"><h2>最近正式材料</h2>${s.submitted?`<p class="small-note">正式版本 ${s.submittedVersion} · 最近提交 ${esc(beijingTime(s.submittedAt))}（北京时间）</p>${materialMarkup(s.submitted,data.repositorySeal)}${repositoryVersionMarkup(data,s.submitted,data.team.id,s.submittedVersion,'team-repository-proof','最新正式版')}`:'<p class="small-note">尚未正式提交；草稿不会发送给评委。</p>'}</section>`+`<details class="team-reference"><summary>查看本轮评审采用的材料</summary>${judgingMaterialsMarkup(data.judgingMaterials,s.submittedVersion)}</details>`+submissionHistoryMarkup()+'<div id="new-api-key" aria-live="polite"></div><section class="surface" id="team-keys"><h2>AI API 密钥</h2><p class="small-note">读取中…</p></section>';
   installParticipantShortcuts();
   document.getElementById('view-formal-materials').onclick=e=>{e.preventDefault();document.getElementById('submitted-summary').scrollIntoView({block:'start'});};
   const form=document.getElementById('submission-form'),preview=document.getElementById('submission-preview');let currentVersion=s.version,blocked=!data.window.canEdit,inputRevision=0;
@@ -894,7 +949,7 @@ async function renderRoute(){
   document.title=`${{'judge-finals':'决赛评分与专项奖提名','admin-finals':'决赛实时控制台','admin-roadshow':'路演名单与实时成绩','board-finals':'决赛成绩与专项奖',claim:'领取队伍提交码',board:'成绩看板','board-exhibition':'展示评审进度（未计分）','board-roadshow':'路演成绩看板','judge-roadshow':'路演评分（六维100分）',team:'选手工作台','team-score':'本队查分',judge:'专业评分（六维100分）','judge-exhibition':'展示评审记录',audience:'观众投票',admin:'组织方后台'}[route]} · GOTC 2026`;
   account();root.innerHTML='<div class="loading-state">正在读取活动数据…</div>';
   const requiredRole=['admin-finals','admin-roadshow'].includes(route)?'admin':route==='team-score'?'team':route.startsWith('judge-')?'judge':route;
-  try{if(route==='judge-finals')return await renderFinalsJudge(version);if(route==='board-finals')return await renderFinalsBoard(version);if(route==='claim')return await renderClaim(version);if(route==='board')return await renderBoard(version);if(route==='board-roadshow')return await renderRoadshowBoard(version);if(route==='board-exhibition')return await renderExhibitionBoard(version);if(!session.role){renderLogin(requiredRole);return;}if(session.role!==requiredRole){renderWrongRole(requiredRole);return;}if(route==='admin-roadshow')return await renderRoadshowAccessAdmin(version);if(route==='admin-finals')return await renderFinalsAdmin(version);if(route==='team-score')return await renderTeamScore(version);if(route==='team')await renderTeam(version);if(route==='judge')await renderJudge(version);if(route==='judge-roadshow')await renderRoadshowJudge(version);if(route==='judge-exhibition')await renderExhibitionJudge(version);if(route==='audience')await renderAudience(version);if(route==='admin')await renderAdmin(version);}
+  try{if(route==='judge-finals')return await renderFinalsJudge(version);if(route==='board-finals')return await renderFinalsBoard(version);if(route==='claim')return await renderClaim(version);if(route==='board')return await renderBoard(version);if(route==='board-roadshow')return await renderRoadshowBoard(version);if(route==='board-exhibition')return await renderExhibitionBoard(version);if(!session.role){renderLogin(requiredRole);return;}if(['team','team-score'].includes(route) && session.role==='admin')return await renderAdminTeamWorkbench(version);if(session.role!==requiredRole){renderWrongRole(requiredRole);return;}if(route==='admin-roadshow')return await renderRoadshowAccessAdmin(version);if(route==='admin-finals')return await renderFinalsAdmin(version);if(route==='team-score')return await renderTeamScore(version);if(route==='team')await renderTeam(version);if(route==='judge')await renderJudge(version);if(route==='judge-roadshow')await renderRoadshowJudge(version);if(route==='judge-exhibition')await renderExhibitionJudge(version);if(route==='audience')await renderAudience(version);if(route==='admin')await renderAdmin(version);}
   catch(e){if(version===routeVersion){if(e.status===401 && !['board','board-exhibition','board-roadshow','board-finals','judge-finals'].includes(route)){account();renderLogin(requiredRole);}else showConnectionError(e);}}
 }
 // Cheap models cost fractions of a cent per call, so small amounts keep 4 decimals.
