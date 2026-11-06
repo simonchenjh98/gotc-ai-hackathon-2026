@@ -63,3 +63,6 @@
 .own-score-dimensions dd span {color:var(--muted);font-weight:400;font-size:12px;}
 .own-score-feedback {padding-left:24px;margin:16px 0 24px;}
 .own-score-feedback li {padding:12px 14px;margin-bottom:12px;background:var(--paper,#f7f7f2);border:1px solid var(--line);}
+
+/* In-person registration: private roster is rendered only after an admin read. */
+.claim-panel{max-width:760px}.claim-pin{font-size:2.5rem;font-weight:800;letter-spacing:.25em;font-variant-numeric:tabular-nums}.claim-columns{display:grid;grid-template-columns:1fr 1fr;gap:24px}.claim-scroll,.claim-members{max-height:360px;overflow:auto}.claim-members{border:1px solid var(--line,#ddd);padding:16px;margin:16px 0}.claim-notes{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}.claim-columns details{padding:10px 0}.claim-panel .code-output code{overflow-wrap:anywhere}.claim-panel .actions{margin-bottom:20px}[data-claim-member][hidden],[data-claim-search][hidden]{display:none}@media(max-width:700px){.claim-columns{grid-template-columns:1fr}.claim-panel .actions{display:flex;flex-wrap:wrap;gap:8px}}

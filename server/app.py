@@ -23,6 +23,7 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 from errors import APIError
+from claims import Claims
 from submission_records import SubmissionRecords, query_path
 from repository_backups import RepositoryBackups, ArchiveDownload
 from repositories import Repositories
@@ -42,12 +43,13 @@ DIMENSIONS = [
 BODY_LIMIT = 16384
 SUBMISSION_BODY_LIMIT = 32768
 IMPORT_BODY_LIMIT = 2 * 1024 * 1024
+CLAIM_REVIEW_BODY_LIMIT = 128 * 1024
 SESSION_SECONDS = 12 * 3600
 # Bound password-check CPU/memory without holding the database writer lock.
 LOGIN_KDF_CONCURRENCY = 4
 VOTE_LIMIT = 3
 COOKIE_NAME = "gotc_session"
-STATIC_FILES = {"downloads/gotc-gitee-submission-guide.pdf", "index.html", "styles.css", "app.js", "platform.html", "platform.js", "platform-admin.js", "platform-draft-recovery.js", "platform.css", "favicon.svg"}
+STATIC_FILES = {"downloads/gotc-gitee-submission-guide.pdf", "index.html", "styles.css", "app.js", "platform.html", "platform.js", "platform-admin.js", "platform-claims.js", "platform-draft-recovery.js", "platform.css", "favicon.svg"}
 ASSET_EXTENSIONS = {".webp", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".woff2"}
 DOWNLOAD_EXTENSIONS = {".ics", ".txt"}
 SCHEMA = """
@@ -235,6 +237,7 @@ class EventService:
             history=lambda *args,**kwargs:self.admin_data.record_review_change(*args,**kwargs),
             enrich_team=lambda db,team:self.admin_data.enrich_team(db,team))
         self.admin_data=AdminDataService(self)
+        self.claims=Claims(self,now_ms,text_field,scrypt_hash)
         self.submission_records=SubmissionRecords(self)
         self.repositories=Repositories(self)
         self.repository_backups=RepositoryBackups(self)
@@ -248,6 +251,7 @@ class EventService:
             db.executescript(SCHEMA)
             self.judging.initialize(db)
             self.admin_data.initialize(db)
+            self.claims.initialize(db)
             self.keys.initialize(db)
             self.repositories.initialize(db)
             for key, value in {"scoringOpen": False, "resultsPublished": True, "minJudges": 5, "submissionsOpen": False, "submissionDeadline": None, "updatedAt": now_ms()}.items():
@@ -529,6 +533,8 @@ class EventService:
 
     def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None, server_received_at=None):
         """Return (JSON object or CSV bytes, optional session token, cookie action)."""
+        if path.startswith(("/api/claims/","/api/admin/claims")):
+            return self.claims.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
         if method == "POST" and path == "/api/login":
             return self.login(body, ip)
         if method=='POST' and path=='/api/submission':return self.dispatch_submission(body,cookie,expected_login_id,server_received_at)
@@ -1049,7 +1055,7 @@ class EventHandler(BaseHTTPRequestHandler):
                         length = int(self.headers.get("Content-Length", "-1"))
                     except ValueError:
                         raise APIError(400, "请求长度不正确")
-                    limit=SUBMISSION_BODY_LIMIT if path=='/api/submission' else IMPORT_BODY_LIMIT if path=='/api/admin/data/import/preview' else BODY_LIMIT
+                    limit=CLAIM_REVIEW_BODY_LIMIT if path=='/api/admin/claims/review' else SUBMISSION_BODY_LIMIT if path=='/api/submission' else IMPORT_BODY_LIMIT if path in {'/api/admin/data/import/preview','/api/admin/claims/roster'} else BODY_LIMIT
                     if length < 0 or length > limit:
                         raise APIError(413,'请求内容超过端点大小限制')
                     if self.headers.get_content_type() != "application/json":

@@ -42,10 +42,9 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 class UpstreamError(APIError):
-    def __init__(self, upstream_status=None, membership_required=False):
+    def __init__(self, upstream_status=None):
         super().__init__(502, '仓库服务未能确认操作结果，请由管理员核对后重试', 'repository_upstream')
         self.upstream_status = upstream_status
-        self.membership_required = membership_required
 
 
 class ProviderOperations:
@@ -101,24 +100,6 @@ class Provider:
         self.origin = 'https://api.github.com' if name == 'github' else 'https://gitee.com/api/v5'
         self.web = 'https://github.com' if name == 'github' else 'https://gitee.com'
 
-    @staticmethod
-    def requires_enterprise_membership(raw):
-        # Keep only a boolean classification, never an upstream body, URL or username.
-        # The official schema does not specify error wording: narrowly recognize an
-        # explicit prerequisite, and leave all other errors to manual reconciliation.
-        try:
-            data=json.loads(raw)
-        except (ValueError, UnicodeError):
-            return False
-        message=data.get('message') if isinstance(data,dict) else None
-        if not isinstance(message,str) or len(message)>300:
-            return False
-        return bool(re.fullmatch(
-            r'(?:user must (?:first )?be a member of (?:the|this) enterprise[.!]?'
-            r'|(?:该)?用户必须先加入(?:该|此)?企业[。！]?'
-            r'|(?:该)?用户不是(?:该|此)?企业成员[，,]请先(?:添加为企业成员|加入企业)[。！]?)',
-            message.strip().lower()))
-
     def request(self, method, path, body=None):
         if not self.enabled:
             raise APIError(503, '该组织仓库渠道尚未配置或未启用，请联系组织方', 'repository_disabled')
@@ -142,17 +123,8 @@ class Provider:
                 return response.status, json.loads(raw) if raw else {}
         except HTTPError as error:
             status=error.code
-            required=False
-            try:
-                if (self.name=='gitee' and method=='PUT' and status in {400,403,422}
-                        and re.fullmatch(r'/repos/[^/]+/[^/]+/collaborators/[^/]+',path)):
-                    raw=error.read(8193)
-                    required=len(raw)<=8192 and self.requires_enterprise_membership(raw)
-            except (OSError,ValueError):
-                pass
-            finally:
-                error.close()
-            raise UpstreamError(status,required) from None
+            error.close()
+            raise UpstreamError(status) from None
         except (URLError, TimeoutError, socket.timeout, ValueError, OSError):
             raise UpstreamError() from None
 
@@ -426,7 +398,7 @@ class Repositories:
             for username in json.loads(row['usernames_json']):
                 if self.invite(p,row,username) == 'invited':
                     state = 'invited'
-            message = ('仓库已创建；Gitee 企业普通成员邀请已发送或成员尚未激活，请开发者检查邀请，管理员核对恢复后确认仓库写权限' if p.name=='gitee' else '仓库已创建，等待开发者接受邀请；管理员可核对恢复') if state == 'invited' else '仓库写权限已确认'
+            message = ('仓库已创建；Gitee 企业成员邀请待确认或账号尚未激活，请开发者检查邀请，管理员核对恢复后确认仓库写权限' if p.name=='gitee' else '仓库已创建，等待开发者接受邀请；管理员可核对恢复') if state == 'invited' else '仓库写权限已确认'
         except APIError as error:
             state, protection, message = 'reconcile', row['protection'], error.message
         with self.s.db() as db:
@@ -438,11 +410,10 @@ class Repositories:
             return {'repository': self.public(result)}
 
     def invite(self,p,row,username):
-        try:
+        if p.name!='gitee':
             return p.invite(row,username)
-        except UpstreamError as error:
-            if p.name!='gitee' or not error.membership_required:
-                raise
+        # Provisioning has already verified and persisted the enterprise repository.
+        # Check this account directly before any repository permission mutation.
         path='/enterprises/'+quote(row['organization'],safe='')+'/members'
         with self.s.db() as db:
             prior=db.execute('SELECT state FROM repository_enterprise_invites WHERE organization=? AND username=?',
@@ -483,20 +454,16 @@ class Repositories:
         enterprise=member.get('enterprise') if isinstance(member,dict) else None
         if (status!=200 or not isinstance(user,dict) or type(user.get('id')) is not int or user['id']<=0
                 or not isinstance(user.get('login'),str) or user['login'].lower()!=username.lower()
-                or member.get('role')!='member' or type(member.get('active')) is not bool
+                or not isinstance(member.get('role'),str) or member['role'] not in {'member','outsourced','admin'}
+                or type(member.get('active')) is not bool
                 or (isinstance(enterprise,dict) and 'path' in enterprise
                     and (not isinstance(enterprise['path'],str) or enterprise['path'].lower()!=row['organization'].lower()))):
             raise APIError(409,'企业成员身份、角色或激活状态未能确认，请主办方人工核对；平台不会修改已有企业角色','repository_membership_unknown')
         if member['active'] is False:
             return 'invited'
-        try:
-            # Existing enterprise roles are never edited. Effective repository push
-            # must still be independently verified for exactly this member's id.
-            return p.invite(row,username,expected_user_id=user['id'])
-        except UpstreamError as error:
-            if error.membership_required:
-                raise APIError(409,'企业普通成员已激活，但仓库写权限仍未确认，请主办方人工核对','repository_membership_unknown')
-            raise
+        # Preserve existing member/outsourced/admin roles; the separately verified
+        # effective repository permission must still be exactly push for this user id.
+        return p.invite(row,username,expected_user_id=user['id'])
 
     def binding(self, db, team_id):
         row = self.get(db, team_id)

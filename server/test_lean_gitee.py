@@ -1,6 +1,4 @@
 """Offline least-privilege enterprise membership and bound Gitee submission regressions."""
-import io
-import json
 import os
 import unittest
 from unittest.mock import patch
@@ -33,20 +31,13 @@ class LeanGiteeTests(unittest.TestCase):
         original=self.remote
         self.member=None
         self.invites=0
-        self.allow_once=False
         self.lose_invite=False
         def upstream(method,path,body=None):
-            if '/collaborators/' in path and method=='PUT':
-                if self.allow_once:
-                    self.allow_once=False
-                else:
-                    self.remote.calls.append((method,path,body))
-                    raise error or UpstreamError(403,membership_required=True)
             if path.startswith('/enterprises/') and '/members' in path:
                 self.remote.calls.append((method,path,body))
                 if method=='GET':
+                    if error is not None:raise error
                     if self.member is None:raise UpstreamError(404)
-                    self.allow_once=self.member.get('active') is True
                     return 200,self.member
                 self.invites+=1
                 if self.lose_invite:raise UpstreamError()
@@ -58,16 +49,20 @@ class LeanGiteeTests(unittest.TestCase):
     def member_data(self,**values):
         return {'user':{'id':456,'login':'Developer'},'role':'member','active':True,**values}
 
-    def test_direct_push_never_requests_enterprise_membership(self):
+    def test_single_member_query_precedes_grant_without_reinviting_known_member(self):
         result=self.admin_action(self.application())[1]['repository']
         self.assertEqual(result['state'],'ready')
-        self.assertFalse(any('/members' in path for _,path,_ in self.remote.calls))
+        membership=next(i for i,(method,path,_) in enumerate(self.remote.calls) if method=='GET' and path.endswith('/members/Developer'))
+        grant=next(i for i,(method,path,_) in enumerate(self.remote.calls) if method=='PUT' and '/collaborators/' in path)
+        self.assertLess(membership,grant)
+        self.assertFalse(any(method=='POST' and '/members' in path for method,path,_ in self.remote.calls))
 
-    def test_explicit_requirement_sends_one_member_invite_and_acceptance_still_verifies_push(self):
+    def test_absent_member_is_invited_once_before_grant_and_acceptance_still_verifies_push(self):
         self.membership_fixture()
         row=self.admin_action(self.application())[1]['repository']
         self.assertEqual(row['state'],'invited')
-        self.assertIn('普通成员邀请',row['message'])
+        self.assertIn('企业成员邀请待确认',row['message'])
+        self.assertFalse(any('/collaborators/' in path for _,path,_ in self.remote.calls))
         self.assertEqual(self.invites,1)
         self.open_submissions()
         self.assertEqual(self.preview()[0],409)
@@ -85,7 +80,29 @@ class LeanGiteeTests(unittest.TestCase):
         row=self.admin_action(row,'reconcile')[1]['repository']
         self.assertEqual(row['state'],'ready')
         self.assertEqual(self.invites,1)
+        grant=next(i for i,(method,path,_) in enumerate(self.remote.calls) if method=='PUT' and '/collaborators/' in path)
+        self.assertTrue(any(method=='GET' and path.endswith('/members/Developer') for method,path,_ in self.remote.calls[:grant]))
         self.assertFalse(any(m in {'PATCH','DELETE'} or m=='PUT' and '/members' in p for m,p,_ in self.remote.calls))
+
+    def test_existing_supported_roles_are_preserved_but_effective_admin_is_not_ready(self):
+        self.membership_fixture()
+        self.member=self.member_data(role='outsourced',active=False)
+        row=self.admin_action(self.application())[1]['repository']
+        self.assertEqual(row['state'],'invited')
+        self.assertEqual(self.invites,0)
+        self.assertFalse(any('/collaborators/' in path for _,path,_ in self.remote.calls))
+        for role in ('member','outsourced','admin'):
+            with self.subTest(role=role):
+                self.member=self.member_data(role=role)
+                row=self.admin_action(row,'approve' if row['state']=='requested' else 'reconcile')[1]['repository']
+                self.assertEqual(row['state'],'ready')
+                self.assertEqual(self.member['role'],role)
+                self.assertEqual(self.invites,0)
+        self.remote.gitee_permission='admin'
+        row=self.admin_action(row,'reconcile')[1]['repository']
+        self.assertEqual(row['state'],'reconcile')
+        self.assertIn('仓库管理权限',row['message'])
+        self.assertFalse(any(method!='GET' and '/members' in path for method,path,_ in self.remote.calls))
 
     def test_enterprise_invite_intent_is_shared_across_teams_and_casing(self):
         self.membership_fixture()
@@ -106,7 +123,7 @@ class LeanGiteeTests(unittest.TestCase):
             with self.service.db() as db:
                 db.execute('INSERT INTO repository_enterprise_invites VALUES (?,?,?)',('gotc-ai-hackathon','developer','attempted'))
             raise UpstreamError(404)
-        with patch.object(provider,'invite',side_effect=UpstreamError(403,membership_required=True)),patch.object(provider,'request',side_effect=raced) as request:
+        with patch.object(provider,'request',side_effect=raced) as request:
             with self.assertRaises(APIError) as error:self.repos.invite(provider,row,'Developer')
             self.assertEqual(error.exception.code,'repository_membership_unknown')
             self.assertEqual(request.call_count,1)
@@ -128,22 +145,23 @@ class LeanGiteeTests(unittest.TestCase):
         self.assertEqual(self.invites,1)
 
     def test_generic_failures_never_invite(self):
-        for error in [UpstreamError(403),UpstreamError(404),UpstreamError(429),UpstreamError()]:
+        for error in [UpstreamError(401),UpstreamError(403),UpstreamError(429),UpstreamError(500),UpstreamError()]:
             with self.subTest(error=error.upstream_status):
                 self.membership_fixture(error=error)
                 row=self.admin_action(self.application())[1]['repository'] if self.invites==0 and not self.remote.repo else self.admin_action(row,'reconcile')[1]['repository']
                 self.assertEqual(row['state'],'reconcile')
                 self.assertEqual(self.invites,0)
-                self.assertFalse(any('/members' in path for _,path,_ in self.remote.calls))
+                self.assertFalse(any('/collaborators/' in path or method=='POST' and '/members' in path for method,path,_ in self.remote.calls))
+                with self.service.db() as db:
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM repository_enterprise_invites').fetchone()[0],0)
 
     def test_existing_membership_identity_role_and_effective_permission_fail_closed(self):
         self.membership_fixture()
         row=self.application()
-        for member in [self.member_data(role='admin'),self.member_data(user={'id':456,'login':'other'}),
+        for member in [self.member_data(role='unknown'),self.member_data(role=[]),self.member_data(user={'id':456,'login':'other'}),
                        self.member_data(user={'id':789,'login':'Developer'}),self.member_data(active=None),self.member_data(enterprise={'path':'other-enterprise'}),{}]:
             with self.subTest(member=member):
                 self.member=member
-                self.allow_once=False
                 row=self.admin_action(row,'approve' if row['state']=='requested' else 'reconcile')[1]['repository']
                 self.assertEqual(row['state'],'reconcile')
                 self.assertEqual(self.invites,0)
@@ -231,23 +249,15 @@ class LeanGiteeTests(unittest.TestCase):
         with self.assertRaises(APIError):self.service.check_materials(forged,True,lean_gitee=True)
 
 
-class MembershipClassifierTests(unittest.TestCase):
-    def test_bounded_explicit_prerequisite_only_on_gitee_collaborator_mutation(self):
+class ProviderErrorRedactionTests(unittest.TestCase):
+    def test_upstream_errors_discard_bodies_instead_of_inferencing_membership(self):
         provider=Provider('gitee','org','never-live','main',True)
-        cases=[('User must first be a member of the enterprise',True),('该用户必须先加入企业',True),
-               ('Forbidden',False),('user is not a member',False),('enterprise quota exceeded',False),
-               ('User must be a member of the enterprise. access_token=secret',False),('x'*9000,False)]
-        for message,expected in cases:
-            raw=json.dumps({'message':message}).encode()
-            def fail(*args,**kwargs):raise HTTPError('https://gitee.com/redacted',403,'Forbidden',{},io.BytesIO(raw))
-            with self.subTest(message=message[:60]),patch('repositories.build_opener') as opener:
-                opener.return_value.open.side_effect=fail
-                with self.assertRaises(UpstreamError) as caught:provider.request('PUT','/repos/org/repo/collaborators/Developer',{'permission':'push'})
-                self.assertIs(caught.exception.membership_required,expected)
-                self.assertNotIn('access_token',caught.exception.message)
-        raw=json.dumps({'message':'User must be a member of the enterprise'}).encode()
-        for method,path,status in [('GET','/repos/org/repo/collaborators/Developer/permission',403),('PUT','/repos/org/repo/collaborators/Developer',429),('POST','/enterprises/org/members',403)]:
-            with patch('repositories.build_opener') as opener:
-                opener.return_value.open.side_effect=HTTPError('redacted',status,'Forbidden',{},io.BytesIO(raw))
-                with self.assertRaises(UpstreamError) as caught:provider.request(method,path)
-                self.assertFalse(caught.exception.membership_required)
+        for status in (400,403,404,422,429):
+            with self.subTest(status=status),patch('repositories.build_opener') as opener:
+                error=HTTPError('https://gitee.com/redacted',status,'Forbidden',{},None)
+                error.read=lambda *args: self.fail('HTTP error bodies must not be inspected')
+                opener.return_value.open.side_effect=error
+                with self.assertRaises(UpstreamError) as caught:
+                    provider.request('GET','/enterprises/org/members/Developer')
+                self.assertEqual(caught.exception.upstream_status,status)
+                self.assertNotIn('redacted',caught.exception.message)
