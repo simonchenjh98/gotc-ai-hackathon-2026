@@ -371,11 +371,16 @@ def full_price(p):
     return p
 
 
+def valid_price(p, lengths):
+    return isinstance(p, list) and len(p) in lengths and all(type(x) in (int, float) and 0 <= x <= 10000 for x in p)
+
+
 def parse_config(data):
-    """Validate {"openai"|"anthropic": {"url", "key", "models": {name: price}, "aliases"?: {name|prefix*: model}}}.
+    """Validate {"openai"|"anthropic": {"url", "key", "models": {name: price}, "aliases"?: {name|prefix*: model}, "defaultPrice"?: price}}.
 
     price is [input, output] or [input, output, cacheWrite, cacheRead] USD per million tokens;
     the short form bills cache writes at 1.25x and cache reads at 0.1x the input price.
+    A model with price [] uses the upstream's defaultPrice, or bills $0 without one (as sub2api does for unpriced models).
     Returns the runtime form, or None when no upstream is configured.
     """
     if data in (None, {}):
@@ -384,19 +389,22 @@ def parse_config(data):
         raise ValueError("gateway.json supports openai and anthropic upstreams")
     result = {}
     for name, item in data.items():
-        if not isinstance(item, dict) or not {"url", "key", "models"} <= set(item) <= {"url", "key", "models", "aliases"} \
+        if not isinstance(item, dict) or not {"url", "key", "models"} <= set(item) <= {"name", "url", "key", "models", "aliases", "defaultPrice"} \
                 or not isinstance(item["key"], str) or not item["key"]:
             raise ValueError(f"{name} upstream needs url, key and models")
-        models = item["models"]
-        if not isinstance(models, dict) or not models or len(models) > 200 or not all(
-                isinstance(m, str) and 0 < len(m) <= 100 and isinstance(p, list) and len(p) in (2, 4, 5) and all(type(x) in (int, float) and 0 <= x <= 10000 for x in p)
-                for m, p in models.items()):
-            raise ValueError(f"{name} models must map a model name to [input, output(, cacheWrite5m, cacheRead(, cacheWrite1h))] USD per million tokens")
+        models, default = item["models"], item.get("defaultPrice", [0, 0])
+        if not isinstance(item.get("name", ""), str) or len(item.get("name", "")) > 60:
+            raise ValueError(f"{name} name must be at most 60 characters")
+        if not valid_price(default, (2, 4, 5)):
+            raise ValueError(f"{name} defaultPrice must be [input, output(, cacheWrite5m, cacheRead(, cacheWrite1h))] USD per million tokens")
+        if not isinstance(models, dict) or not models or len(models) > 500 or not all(
+                isinstance(m, str) and 0 < len(m) <= 100 and valid_price(p, (0, 2, 4, 5)) for m, p in models.items()):
+            raise ValueError(f"{name} models must map a model name to [] (default price) or [input, output(, cacheWrite5m, cacheRead(, cacheWrite1h))] USD per million tokens")
         aliases = item.get("aliases", {})
         if not isinstance(aliases, dict) or not all(isinstance(a, str) and a and target in models for a, target in aliases.items()):
             raise ValueError(f"{name} aliases must map a name (or prefix ending in *) to one of its models")
         result[name] = {"url": check_url(item["url"]), "key": item["key"], "aliases": aliases,
-                        "models": {m: full_price(p) for m, p in models.items()}}
+                        "models": {m: full_price(p or default) for m, p in models.items()}}
     return result
 
 
@@ -744,8 +752,9 @@ class KeyService:
                 if not isinstance(item.get("url"), str) or urlsplit(item["url"]).netloc.lower() != urlsplit(old[name]["url"]).netloc.lower():
                     raise APIError(400, f"{name} 上游地址已更改，请重新填写 API Key")
                 item["key"] = old[name]["key"]
-            if not item.get("aliases"):
-                item.pop("aliases", None)
+            for optional in ("name", "aliases", "defaultPrice"):
+                if not item.get(optional):
+                    item.pop(optional, None)
             new[name] = item
         try:
             config = parse_config(new)

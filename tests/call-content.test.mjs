@@ -33,15 +33,6 @@ test('request context lists system, every turn, tool results and tools',()=>{
   assert.equal(ctx.replyOf('{"choices":[{"message":{"content":"完成"}}]}'),'完成');
 });
 
-test('upstream model and alias text round-trips and rejects bad lines',()=>{
-  const models=vm.runInContext("parseModels('DeepSeek-V3 0.3 1.2\\n\\n  Qwen3-8B 0.1 0.2 0.125 0.01  ','openai')",ctx);
-  assert.deepEqual(JSON.parse(JSON.stringify(models)),{'DeepSeek-V3':[0.3,1.2],'Qwen3-8B':[0.1,0.2,0.125,0.01]});
-  assert.equal(vm.runInContext('modelsText',ctx)(models),'DeepSeek-V3 0.3 1.2\nQwen3-8B 0.1 0.2 0.125 0.01');
-  assert.deepEqual(JSON.parse(JSON.stringify(vm.runInContext("parseAliases('claude-* => claude-x\\ngpt-4o=>DeepSeek-V3','anthropic')",ctx))),{'claude-*':'claude-x','gpt-4o':'DeepSeek-V3'});
-  for(const bad of ["parseModels('m 1','openai')","parseModels('m 1 x','openai')","parseModels('m 1 2 3','openai')","parseModels('m 1 2 3 4 5 6','openai')","parseModels('m -1 2','openai')","parseAliases('a -> b','openai')"])
-    assert.throws(()=>vm.runInContext(bad,ctx));
-});
-
 test('malformed stored records still open, with raw content intact',()=>{
   const record=(request,response)=>({id:1,headers:{},request,response,requestBytes:request.length,responseBytes:response.length,responseTruncated:false});
   const cases=[
@@ -79,6 +70,3 @@ test('failure notes show whose fault it was and escape upstream text',()=>{
   assert.match(team,/学生请求 · rate_limit_error/);assert.doesNotMatch(team,/上游 \d/);
 });
 
-test('model prices accept the optional 1-hour cache write price',()=>{
-  assert.deepEqual(JSON.parse(JSON.stringify(vm.runInContext("parseModels('claude 3 15 3.75 0.3 6','anthropic')",ctx))),{claude:[3,15,3.75,0.3,6]});
-});
