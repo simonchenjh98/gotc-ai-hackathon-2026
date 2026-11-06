@@ -69,4 +69,3 @@ test('failure notes show whose fault it was and escape upstream text',()=>{
   const team=ctx.failureNote({errorType:'rate_limit_error',errorOwner:'client'});  // team view: no upstream detail
   assert.match(team,/学生请求 · rate_limit_error/);assert.doesNotMatch(team,/上游 \d/);
 });
-

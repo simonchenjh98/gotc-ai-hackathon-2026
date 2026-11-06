@@ -24,6 +24,8 @@ class Client:
         conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=20)
         body = raw if raw is not None else (json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None)
         request_headers = {"Cookie": self.cookie}
+        if self.login_id and (path == "/api/admin/keys" or path.startswith("/api/admin/keys/")):
+            request_headers["X-GOTC-Login"] = self.login_id
         if self.login_id and path in {"/api/audience", "/api/vote", "/api/judging/exhibition", "/api/judging/exhibition/review",
                                      "/api/judging/roadshow", "/api/judging/roadshow/review", "/api/admin/judging/roadshow/window"}:
             request_headers["X-GOTC-Login"] = self.login_id

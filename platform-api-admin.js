@@ -14,6 +14,13 @@ const apiTable=(head,rows,empty='暂无数据')=>`<div class="table-wrap"><table
 const apiCards=cards=>`<div class="api-cards">${cards.map(([label,value,sub])=>`<div class="api-stat"><span>${label}</span><strong>${value}</strong><small>${sub}</small></div>`).join('')}</div>`;
 const apiBadge=(text,tone='gray')=>`<span class="api-badge ${tone}">${esc(text)}</span>`;
 const apiAccountName=(kind,u)=>u.name || apiPresets.find(([,k,url])=>k===kind && url===u.url)?.[0] || (()=>{try{return new URL(u.url).host;}catch{return u.url;}})();
+let currentApiAdmin=null;
+const apiAdminDialogs=new Set();
+function disposeApiAdmin(){
+  if(currentApiAdmin)currentApiAdmin.active=false;
+  currentApiAdmin=null;
+  for(const dialog of [...apiAdminDialogs])dialog.dispose();
+}
 
 // Price cells -> [] (default price) or [input, output(, write5m, read(, write1h))]; blanks are only allowed at the end.
 function apiPriceRow(cells,model){
@@ -39,13 +46,23 @@ function apiAccountPayload(saved,kind,draft){
 function apiOtherAccounts(saved,kind){return Object.fromEntries(Object.entries(saved).filter(([k])=>k!==kind).map(([k,u])=>[k,{name:u.name,url:u.url,key:'',models:u.models,aliases:u.aliases,defaultPrice:u.defaultPrice}]));}
 
 async function renderApiAdmin(version){
+  disposeApiAdmin();
+  const owner=session;
   const sub=location.hash.split('/')[1],page=apiPages.find(p=>p[0]===sub) || apiPages[0];
-  const [event,data]=await Promise.all([api('admin'),api('admin/keys')]);
-  if(route!=='admin-api' || version!==routeVersion)return;
+  const [event,data]=await Promise.all([api('admin',undefined,{loginId:owner.loginId}),api('admin/keys',undefined,{loginId:owner.loginId})]);
+  if(route!=='admin-api' || version!==routeVersion || session!==owner || !ownsBrowserLogin(owner))return;
   data.upstreams ||= {};
   root.innerHTML=`<div class="api-console"><nav class="api-sidebar" aria-label="AI API 管理"><div class="api-brand"><strong>AI API</strong><small>GOTC 2026 内置网关</small></div>${apiPages.map(([id,name])=>`<a href="#admin-api/${id}" ${id===page[0]?'aria-current="page"':''}>${name}</a>`).join('')}<a class="api-back" href="#admin">← 返回活动后台</a></nav><div class="api-main"><header class="api-header"><div><h1>${page[1]}</h1><p>${page[2]}</p></div><div class="form-actions" id="api-actions"></div></header><div id="api-page"></div></div></div>`;
-  const c={version,data,teams:event.teams || [],box:document.getElementById('api-page'),actions:document.getElementById('api-actions')};
-  c.alive=()=>route==='admin-api' && version===routeVersion && c.box.isConnected;
+  const c={version,data,owner,active:true,teams:event.teams || [],box:document.getElementById('api-page'),actions:document.getElementById('api-actions')};
+  currentApiAdmin=c;
+  c.alive=()=>{
+    let loggedOut=false;try{loggedOut=!!owner.loginId && localStorage.getItem(teamLogoutKey)===owner.loginId;}catch{/* Cookie proof remains mandatory. */}
+    if(c.active && !loggedOut && route==='admin-api' && version===routeVersion && c.box.isConnected && session===owner && ownsBrowserLogin(owner))return true;
+    if(currentApiAdmin===c){disposeApiAdmin();if(c.box.isConnected){c.actions.innerHTML='';c.box.innerHTML='<p class="info-banner warning">登录身份已变化，请刷新页面并核对管理员身份后继续。</p>';}}
+    return false;
+  };
+  c.request=(path,body)=>{if(!c.alive())return Promise.reject(new Error('登录身份已变化，请刷新页面后重试。'));return api(path,body,{loginId:owner.loginId}).catch(error=>{c.alive();throw error;});};
+  currentIdentityPage={valid:c.alive};
   c.reload=()=>{if(c.alive())return renderApiAdmin(version);};
   c.team=id=>{const t=c.teams.find(x=>x.id===id);return t?teamLabel(t):id;};
   apiPageRenderers[page[0]](c);
@@ -64,7 +81,7 @@ const apiPageRenderers={
       apiCards([['已开通队伍',c.data.teams.filter(t=>t.active).length,`共 ${c.teams.length} 支队伍`],['账号',Object.keys(c.data.upstreams).length,`${models} 个可用模型`],['今日请求',Number(o.requests),`失败 ${Number(o.errors)}`],['今日费用',usd(o.cost),`${Number(o.teams)} 支队伍调用`]])+
       apiCards([['今日 Token',tokens(Number(o.input)+Number(o.output)),`输入 ${tokens(o.input)} · 输出 ${tokens(o.output)}`],['性能指标',`${o.rpm ?? 0} RPM`,`${tokens(o.tpm ?? 0)} TPM（近5分钟）`],['平均响应',msText(o.avgMs),`P95 ${msText(o.p95Ms)}`],['首字耗时',msText(o.avgFirstTokenMs),'今日平均']])+
       `<section class="api-card"><h2>近24小时消耗排行</h2>${apiRanking(c)}</section><section class="api-card"><h2>今日模型分布（北京时间）</h2><div id="api-models"><p class="small-note">读取中…</p></div></section>`;
-    api('admin/keys/stats',{days:1,granularity:'day'}).then(s=>{if(c.alive())document.getElementById('api-models').innerHTML=apiTable(['模型','请求','输入 / 输出 tokens','费用'],s.byModel.map(r=>[esc(r.model || '（被拦截，未到达模型）'),Number(r.requests),`${tokens(r.input)} / ${tokens(r.output)}`,usd(r.cost)]));})
+    c.request('admin/keys/stats',{days:1,granularity:'day'}).then(s=>{if(c.alive())document.getElementById('api-models').innerHTML=apiTable(['模型','请求','输入 / 输出 tokens','费用'],s.byModel.map(r=>[esc(r.model || '（被拦截，未到达模型）'),Number(r.requests),`${tokens(r.input)} / ${tokens(r.output)}`,usd(r.cost)]));})
       .catch(e=>{if(c.alive())document.getElementById('api-models').innerHTML=`<p class="small-note">${esc(e.message)}</p>`;});
   },
   ops(c){
@@ -72,7 +89,7 @@ const apiPageRenderers={
     c.box.innerHTML=apiCards([['请求',`${o.rpm ?? 0} RPM`,`${tokens(o.tpm ?? 0)} TPM（近5分钟）`],['请求时长',msText(o.p95Ms),`P95 · 平均 ${msText(o.avgMs)}`],['首 Token 延迟',msText(o.avgFirstTokenMs),'今日平均'],['并发 / 排队',`${inflight} / ${waiting}`,'每队最多 4 并发，排队最多 30 秒']])+
       (o.authFailuresHour?`<div class="info-banner warning">近1小时有 ${Number(o.authFailuresHour)} 次无效密钥尝试${o.blockedClients?`，${Number(o.blockedClients)} 个来源地址已被临时封禁（每个地址每分钟错误超过 120 次即封禁 60 秒）`:''}。</div>`:'')+
       '<section class="api-card"><h2>今日失败原因</h2><div id="api-failures"><p class="small-note">读取中…</p></div></section><div id="key-detail"></div>';
-    api('admin/keys/stats',{days:1,granularity:'day'}).then(s=>{if(c.alive())document.getElementById('api-failures').innerHTML=apiTable(['责任方','阶段','类型','上游状态','请求'],(s.byFailure || []).map(r=>[esc(ownerName[r.owner] || r.owner || '—'),esc(phaseName[r.phase] || r.phase || '—'),esc(r.type || '—'),r.upstreamStatus===null || r.upstreamStatus===undefined?'—':Number(r.upstreamStatus),Number(r.requests)]),'今日没有失败请求');}).catch(e=>toast(e.message));
+    c.request('admin/keys/stats',{days:1,granularity:'day'}).then(s=>{if(c.alive())document.getElementById('api-failures').innerHTML=apiTable(['责任方','阶段','类型','上游状态','请求'],(s.byFailure || []).map(r=>[esc(ownerName[r.owner] || r.owner || '—'),esc(phaseName[r.phase] || r.phase || '—'),esc(r.type || '—'),r.upstreamStatus===null || r.upstreamStatus===undefined?'—':Number(r.upstreamStatus),Number(r.requests)]),'今日没有失败请求');}).catch(e=>toast(e.message));
     showKeyLogs({teamId:null},'失败请求',true).catch(e=>toast(e.message));
   },
   teams(c){
@@ -80,9 +97,9 @@ const apiPageRenderers={
     const rows=c.teams.map(t=>{const r=c.data.teams.find(x=>x.teamId===t.id);return `<tr data-team-row="${esc(teamLabel(t).toLowerCase())}"><td>${esc(teamLabel(t))}</td><td>${r?r.active?apiBadge('已开通','success'):apiBadge('已停用','danger'):apiBadge('未开通')}</td><td>${r?Number(r.keyCount):'—'}</td><td>${r?usd(r.used24h):'—'}</td><td>${r?usd(r.usedTotal):'—'}</td><td>${r?`${Number(r.inflight)} / ${Number(r.waiting || 0)}`:'—'}</td><td class="api-row-actions">${r?`<button type="button" class="link-button" data-key-stats="${esc(t.id)}">用量</button><button type="button" class="link-button" data-key-logs="${esc(t.id)}">调用记录</button>`:''}${r?.active?`<button type="button" class="link-button danger" data-key-revoke="${esc(t.id)}">停用 API</button>`:`<button type="button" class="link-button" data-key-provision="${esc(t.id)}">${r?'重新开通':'开通 API'}</button>`}</td></tr>`;}).join('');
     c.box.innerHTML=`${c.data.enabled?'':'<div class="info-banner warning">尚未配置模型账号：开通后队伍可以创建密钥，但调用会失败。</div>'}<section class="api-card flush"><div class="table-wrap"><table class="board-table api-table"><thead><tr><th>队伍</th><th>状态</th><th>密钥</th><th>近24小时</th><th>累计</th><th>进行中 / 排队</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="7">录入队伍后可开通。</td></tr>'}</tbody></table></div></section><div id="key-detail" aria-live="polite"></div>`;
     c.actions.querySelector('input').oninput=e=>{const q=e.target.value.trim().toLowerCase();c.box.querySelectorAll('[data-team-row]').forEach(row=>row.hidden=!!q && !row.dataset.teamRow.includes(q));};
-    c.box.querySelectorAll('[data-key-stats]').forEach(b=>b.onclick=()=>withBusy(b,()=>showKeyStats({teamId:b.dataset.keyStats},c.team(b.dataset.keyStats),7)));
-    c.box.querySelectorAll('[data-key-logs]').forEach(b=>b.onclick=()=>withBusy(b,()=>showKeyLogs({teamId:b.dataset.keyLogs},c.team(b.dataset.keyLogs))));
-    c.box.querySelectorAll('[data-key-provision],[data-key-revoke]').forEach(b=>b.onclick=()=>withBusy(b,async()=>{const revoke='keyRevoke' in b.dataset;if(revoke && !confirm('停用后该队全部密钥立即无法调用，确认停用？'))return;await api(revoke?'admin/keys/revoke':'admin/keys/provision',{teamId:b.dataset.keyRevoke || b.dataset.keyProvision});toast(revoke?'该队 API 访问权限已停用。':'该队 API 访问权限已开通，队伍可自行创建密钥。');await c.reload();}));
+    c.box.querySelectorAll('[data-key-stats]').forEach(b=>b.onclick=()=>withBusy(b,()=>c.alive() && showKeyStats({teamId:b.dataset.keyStats},c.team(b.dataset.keyStats),7)));
+    c.box.querySelectorAll('[data-key-logs]').forEach(b=>b.onclick=()=>withBusy(b,()=>c.alive() && showKeyLogs({teamId:b.dataset.keyLogs},c.team(b.dataset.keyLogs))));
+    c.box.querySelectorAll('[data-key-provision],[data-key-revoke]').forEach(b=>b.onclick=()=>withBusy(b,async()=>{const revoke='keyRevoke' in b.dataset;if(revoke && !confirm('停用后该队全部密钥立即无法调用，确认停用？'))return;await c.request(revoke?'admin/keys/revoke':'admin/keys/provision',{teamId:b.dataset.keyRevoke || b.dataset.keyProvision});toast(revoke?'该队 API 访问权限已停用。':'该队 API 访问权限已开通，队伍可自行创建密钥。');await c.reload();}));
   },
   accounts(c){
     const saved=c.data.upstreams,free=Object.keys(apiPlatforms).filter(k=>!saved[k]);
@@ -98,14 +115,14 @@ const apiPageRenderers={
     c.box.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>apiTestDialog(c,b.dataset.test));
     c.box.querySelectorAll('[data-delete]').forEach(b=>b.onclick=()=>withBusy(b,async()=>{
       const kind=b.dataset.delete;if(!confirm(`删除账号「${apiAccountName(kind,saved[kind])}」？${apiPlatforms[kind].label} 接口的请求会立即失败。`))return;
-      await api('admin/keys/upstreams',{upstreams:apiOtherAccounts(saved,kind)});toast('账号已删除。');await c.reload();}));
+      await c.request('admin/keys/upstreams',{upstreams:apiOtherAccounts(saved,kind)});toast('账号已删除。');await c.reload();}));
   },
   usage(c){
     const opened=c.teams.filter(t=>c.data.teams.some(r=>r.teamId===t.id));
     c.actions.innerHTML=`<label class="api-inline">队伍<select data-team><option value="">全部队伍</option>${opened.map(t=>`<option value="${esc(t.id)}">${esc(teamLabel(t))}</option>`).join('')}</select></label><a class="btn secondary small" href="api/admin/keys/export" download>导出 CSV ↓</a>`;
     c.box.innerHTML='<div class="api-tabs" role="tablist"><button type="button" role="tab" data-tab="stats" aria-selected="true">用量统计</button><button type="button" role="tab" data-tab="logs" aria-selected="false">调用记录</button><button type="button" role="tab" data-tab="errors" aria-selected="false">错误请求</button></div><div id="key-detail" aria-live="polite"></div>';
     const select=c.actions.querySelector('[data-team]');let tab='stats';
-    const show=()=>{const teamId=select.value || null,title=teamId?c.team(teamId):'全部队伍';c.box.querySelectorAll('[data-tab]').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.tab===tab)));
+    const show=()=>{if(!c.alive())return;const teamId=select.value || null,title=teamId?c.team(teamId):'全部队伍';c.box.querySelectorAll('[data-tab]').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.tab===tab)));
       (tab==='stats'?showKeyStats({teamId},title,7):showKeyLogs({teamId},title,tab==='errors')).catch(e=>toast(e.message));};
     select.onchange=show;c.box.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{tab=b.dataset.tab;show();});show();
   },
@@ -118,18 +135,20 @@ const apiPageRenderers={
       <h2>调用内容</h2><div class="form-grid"><label class="field">保留时长（小时）<input name="logRetentionHours" type="number" min="1" max="8760" value="${Number(s.logRetentionHours ?? 72)}" required><small>超过时长的请求与回复内容自动删除，用量与费用记录保留。</small></label><label class="field">总容量上限（MB）<input name="logMaxMB" type="number" min="50" max="102400" value="${Number(s.logMaxMB ?? 2048)}" required><small>超过后从最早的内容开始删除，防止磁盘写满。</small></label></div><label class="toggle-line"><input type="checkbox" name="logContent" ${s.logContent?'checked':''}>记录完整请求上下文与回复（压缩保存，队伍页会提示）</label>
       <p class="small-note">已保存 ${Number(st.rows || 0)} 条调用内容，压缩后 ${kb(Number(st.bytes || 0))}。<button type="button" class="link-button danger" id="clear-call-content">立即清空全部调用内容</button></p><button class="btn small" type="submit">保存设置</button><p class="form-error" role="alert"></p></form></section>`;
     const form=document.getElementById('key-settings');
-    form.onsubmit=e=>{e.preventDefault();withBusy(form.querySelector('[type=submit]'),async()=>{formError(form,'');try{const f=form.elements;await api('admin/keys/settings',{maxKeys:Number(f.maxKeys.value),expiresAt:parseBeijingInput(f.expiresAt.value),logContent:f.logContent.checked,logRetentionHours:Number(f.logRetentionHours.value),logMaxMB:Number(f.logMaxMB.value),teamRpm:Number(f.teamRpm.value),announcement:f.announcement.value.trim(),blockedWords:f.blockedWords.value.split('\n').map(w=>w.trim()).filter(Boolean)});toast('API 设置已保存。');await c.reload();}catch(error){formError(form,error.message);}});};
-    document.getElementById('clear-call-content').onclick=e=>withBusy(e.currentTarget,async()=>{if(!confirm('将删除所有已保存的请求与回复内容（用量与费用记录保留），无法恢复。继续？'))return;const r=await api('admin/keys/logs/clear',{});toast(`已删除 ${Number(r.deleted)} 条调用内容。`);await c.reload();});
+    form.onsubmit=e=>{e.preventDefault();withBusy(form.querySelector('[type=submit]'),async()=>{formError(form,'');try{const f=form.elements;await c.request('admin/keys/settings',{maxKeys:Number(f.maxKeys.value),expiresAt:parseBeijingInput(f.expiresAt.value),logContent:f.logContent.checked,logRetentionHours:Number(f.logRetentionHours.value),logMaxMB:Number(f.logMaxMB.value),teamRpm:Number(f.teamRpm.value),announcement:f.announcement.value.trim(),blockedWords:f.blockedWords.value.split('\n').map(w=>w.trim()).filter(Boolean)});toast('API 设置已保存。');await c.reload();}catch(error){formError(form,error.message);}});};
+    document.getElementById('clear-call-content').onclick=e=>withBusy(e.currentTarget,async()=>{if(!confirm('将删除所有已保存的请求与回复内容（用量与费用记录保留），无法恢复。继续？'))return;const r=await c.request('admin/keys/logs/clear',{});toast(`已删除 ${Number(r.deleted)} 条调用内容。`);await c.reload();});
   }
 };
 
 function apiDialog(html){
   const dialog=document.createElement('dialog');dialog.className='api-dialog';dialog.innerHTML=html;document.body.append(dialog);
-  dialog.addEventListener('close',()=>dialog.remove());dialog.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>dialog.close());dialog.showModal();return dialog;
+  dialog.dispose=()=>{dialog.querySelectorAll('input,textarea').forEach(input=>input.value='');if(dialog.open)dialog.close();dialog.remove();apiAdminDialogs.delete(dialog);};
+  apiAdminDialogs.add(dialog);dialog.addEventListener('close',()=>dialog.dispose());dialog.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>dialog.dispose());dialog.showModal();return dialog;
 }
 
 // 添加账号 / 编辑账号, as sub2api's account dialog for API Key accounts: name, platform, Base URL, key, model whitelist or mapping, pricing.
 function apiAccountDialog(c,kind,editing){
+  if(!c.alive())return;
   const saved=c.data.upstreams,u=editing?saved[kind]:{},p=apiPlatforms[kind],owner=session;
   const s={models:Object.keys(u.models || {}),prices:Object.fromEntries(Object.entries(u.models || {}).map(([m,v])=>[m,priceColumns.map((_,i)=>v[i] ?? '')])),
     aliases:Object.entries(u.aliases || {}),catalog:[],tab:'whitelist'};
@@ -175,11 +194,12 @@ function apiAccountDialog(c,kind,editing){
   q('[data-alias-preset]').onclick=()=>{if(!s.models.length){toast('请先选择模型。');return;}if(!s.aliases.some(a=>a[0]===p.alias))s.aliases.push([p.alias,s.models[0]]);drawAliases();};
   const status=q('[data-sync-status]');
   q('[data-sync]').onclick=e=>withBusy(e.currentTarget,async()=>{
+    if(!alive())return;
     const draft={kind,url:f.url.value.trim() || p.official,key:f.key.value.trim()},button=e.currentTarget;
     if(!draft.key && !editing){status.textContent='请先填写 API Key。';return;}
     button.textContent='同步上游中…';status.textContent='';
     try{
-      const r=await api('admin/keys/upstreams/models',draft,{loginId:owner.loginId});
+      const r=await c.request('admin/keys/upstreams/models',draft);
       if(!alive())return;
       if((f.url.value.trim() || p.official)!==draft.url || f.key.value.trim()!==draft.key){status.textContent='地址或密钥已变更，请重新同步。';return;}
       status.textContent=`${r.ok?'✓':'✗'} ${r.message || ''}${r.status?` · HTTP ${Number(r.status)}`:''}`;status.classList.toggle('status-error',!r.ok);
@@ -191,9 +211,10 @@ function apiAccountDialog(c,kind,editing){
     finally{if(button.isConnected)button.textContent='同步上游支持的模型';}
   });
   form.onsubmit=e=>{e.preventDefault();withBusy(form.querySelector('[type=submit]'),async()=>{formError(form,'');try{
+    if(!alive())return;
     if(!editing && !f.key.value.trim())throw new Error('请填写 API Key');
     const body=apiAccountPayload(saved,kind,{name:f.name.value,url:f.url.value,key:f.key.value,models:s.models,prices:s.prices,aliases:s.aliases,defaultPrice:[f.defaultIn.value,f.defaultOut.value]});
-    await api('admin/keys/upstreams',{upstreams:body.upstreams});if(!alive())return;
+    await c.request('admin/keys/upstreams',{upstreams:body.upstreams});if(!alive())return;
     const free=!body.upstreams[kind].defaultPrice && Object.values(body.upstreams[kind].models).some(x=>!x.length);
     toast(free?'账号已保存。注意：未设默认单价，未单独定价的模型不计费。':editing?'账号已更新，立即生效。':'账号已创建，立即生效。');d.close();await c.reload();
   }catch(error){formError(form,error.message);}});};
@@ -202,13 +223,15 @@ function apiAccountDialog(c,kind,editing){
 
 // 测试账号连接: sends one 1-token request with the saved account (first whitelisted model) and prints a terminal-style log.
 function apiTestDialog(c,kind){
+  if(!c.alive())return;
   const u=c.data.upstreams[kind],name=apiAccountName(kind,u),model=Object.keys(u.models)[0];
   const d=apiDialog(`<div class="api-dialog-form"><header><h2>测试账号连接</h2><button type="button" class="api-x" data-close aria-label="关闭">×</button></header><div class="api-dialog-body"><div class="api-test-head"><strong>${esc(name)}</strong><span class="api-platform ${kind}"><b>${esc(apiPlatforms[kind].label)}</b><i>Key</i></span></div><p class="small-note">测试模型：<code>${esc(model)}</code>（白名单第一个模型，发送一条“hi”，最多 1 个 token）。</p><pre class="api-terminal" aria-live="polite">准备测试。点击“开始测试”按钮开始...</pre></div><footer><button type="button" class="btn secondary small" data-close>关闭</button><button type="button" class="btn small" data-start>开始测试</button></footer></div>`);
   const out=d.querySelector('.api-terminal'),line=(text,tone='')=>{out.insertAdjacentHTML('beforeend',`<span class="${tone}">${esc(text)}</span>\n`);};
   const start=d.querySelector('[data-start]');
   start.onclick=()=>withBusy(start,async()=>{
+    if(!d.open || !c.alive())return;
     out.textContent='';line(`开始测试账号：${name}`,'info');line(`账号类型：${apiPlatforms[kind].label} · API Key`);line('连接 API 中...','warn');
-    try{const r=await api(`admin/keys/upstreams/test/${kind}`);if(!d.open)return;
+    try{const r=await c.request(`admin/keys/upstreams/test/${kind}`);if(!d.open || !c.alive())return;
       if(r.ok){line('已连接到 API','ok');line(`使用模型：${r.model || model}`,'cyan');line('发送测试消息："hi"');line(`响应：${r.message || ''} · ${Number(r.latencyMs)}ms`,'warn');line('测试完成！','ok');}
       else line(`测试失败：${r.message || ''}${r.status?` · HTTP ${Number(r.status)}`:''} · ${Number(r.latencyMs)}ms`,'err');}
     catch(error){if(d.open)line(`测试失败：${error.message}`,'err');}

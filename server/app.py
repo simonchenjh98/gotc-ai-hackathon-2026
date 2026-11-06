@@ -654,6 +654,14 @@ class EventService:
                     raise APIError(401, "登录身份已变化，请重新登录")
                 return self.own_team_score(db, actor), None, None
             team_keys_route = path == "/api/team/keys" or path.startswith("/api/team/keys/")
+            admin_keys_route = path == "/api/admin/keys" or path.startswith("/api/admin/keys/")
+            if admin_keys_route:
+                self.require(actor, "admin")
+                # Download links cannot attach a page marker; all console reads, writes and probes must.
+                if not expected_login_id and not (method == "GET" and path == "/api/admin/keys/export"):
+                    raise APIError(428, "缺少页面登录信息，请刷新页面并核对登录身份后重试", "login_required")
+                if expected_login_id is not None and expected_login_id != self.login_id(cookie):
+                    raise APIError(401, "登录身份已变化，请重新登录后操作")
             if team_keys_route:
                 self.require(actor, "team")
                 # An old tab shares the new login's cookie. Require its own page marker,
