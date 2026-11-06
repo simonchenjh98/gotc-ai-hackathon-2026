@@ -30,7 +30,7 @@ test('numeric roadshow and unchanged qualitative exhibition logins show the appr
   const professional=loginPage('judge','judge'),exhibition=loginPage('judge-exhibition','judge'),roadshow=loginPage('judge-roadshow','judge'),admin=loginPage('admin','admin');
   assert.match(professional,/专业评分<br>六维 100 分/);assert.match(professional,/href="#board"/);
   assert.match(exhibition,/展示评审记录/);assert.match(exhibition,/暂不计分/);assert.match(exhibition,/href="#board-exhibition"/);
-  assert.match(roadshow,/路演评分<br>六维 100 分/);assert.match(roadshow,/完整姓名领取专属邀请码/);assert.ok(!roadshow.includes('暂不计分'));assert.match(roadshow,/href="#board-roadshow"/);
+  assert.match(roadshow,/路演评分<br>六维 100 分/);assert.match(roadshow,/邀请码就是你的真实姓名/);assert.ok(!roadshow.includes('暂不计分'));assert.match(roadshow,/href="#board-roadshow"/);
   assert.match(admin,/组织方<br>活动管理/);assert.ok(!admin.includes('决赛管理员登录'));
 });
 

@@ -31,6 +31,12 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 ## API 合同
 
+决赛评委入口先验证统一邀请码，再选择本人席位。邀请码复用私有 `shared-login-codes.json` 的 `admin` 值；未配置时入口关闭。`POST /api/finals/access` 接收 `{code}`，成功返回 `{accessToken,expiresAt}`，有效期 12 小时，不设置 Cookie，也不创建管理员或普通评委登录会话。请求沿用同源校验，并按独立限速桶限制为每 IP 每分钟 20 次、全局每分钟 400 次。真实邀请码不可写入公开网页、源码或测试。
+
+`GET /api/finals/entry`、`GET /api/finals/judge`、`POST /api/finals/score` 和 `POST /api/finals/nominations` 必须携带 `X-GOTC-Finals-Access`；除读取席位入口外，仍须携带已选择的 `X-GOTC-Finals-Judge`。缺少、过期或已因改码失效的授权返回 `401/finals_access_required`；未配置返回 `503/finals_access_unavailable`。原管理员或评委 Cookie 不能替代这项授权，决赛令牌也不能访问管理员、普通评分或选手接口。公开决赛看板与管理员决赛接口维持原有权限，计分和提名规则不变。
+
+决赛授权令牌为独立随机值，数据库 `finals_access_tokens` 仅保存 SHA-256 哈希、由当前私有码计算的 HMAC 标签及有效期。每次访问重新验证标签，因此更换私有管理码并重启服务后，旧决赛授权立即失效；原码不变的正常重启可继续使用未过期授权。决赛写操作在获取 SQLite 写锁后验证授权和席位，再按原修订号规则保存。
+
 下列路径前统一加 `/gotc`（或配置的 base path）。JSON 写入使用 `Content-Type: application/json`，携带同源 Origin 和 Cookie。成功返回 200；错误为 `{ "error": "可读错误说明" }`。错误码包括 400 输入错误、401 未登录、403 身份或来源不符、404 不存在、409 状态冲突、413 超过端点请求上限、415 内容类型错误、429 登录限速、428 缺少必须的编辑版本。版本冲突响应附具体 `code`；旧页面不能省略版本盲写。
 
 | 方法与路径 | 身份 | 请求及响应 |

@@ -88,7 +88,7 @@ async function renderRoadshowJudge(version){
   catch(error){
     if(!view.current())return;
     if(error.status!==403)throw error;
-    finalsShell(view,'ROADSHOW / 路演评委','请使用本轮路演邀请码','当前身份尚未加入本轮路演名单。',`<section class="surface"><p>${esc(error.message)}</p><button class="btn" type="button" data-roadshow-login>返回姓名领码与登录</button></section>`);
+    finalsShell(view,'ROADSHOW / 路演评委','请使用本轮路演邀请码','当前身份尚未加入本轮路演名单。',`<section class="surface"><p>${esc(error.message)}</p><button class="btn" type="button" data-roadshow-login>返回真实姓名登录</button></section>`);
     view.container.querySelector('[data-roadshow-login]').onclick=()=>{disposeFinalsView();renderLogin('judge');};return;
   }
   if(!view.valid())return;

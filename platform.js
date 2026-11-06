@@ -196,13 +196,14 @@ async function renderBoard(version) {
 }
 function renderLogin(role) {
   if(route==='judge-finals')return renderFinalsJudge(routeVersion);
+  if(route==='judge-roadshow' && typeof renderRoadshowNameLogin==='function')return renderRoadshowNameLogin(routeVersion);
   const roleLabel={team:'TEAM',judge:'JUDGE',audience:'AUDIENCE',admin:'ADMIN'}[role];
   if (!Object.hasOwn(roleName,role)) throw new Error('无效登录入口');
   const stage=stageForRoute();
   const finalsLogin=route==='admin-finals';
   const loginRoleName=route==='admin-finals'?'决赛管理员':route==='admin-roadshow'?'路演管理员':roleName[role];
   const publicBoard=finalsLogin?'#board-finals':route==='judge' || route==='team-score'?'#board':stage==='roadshow'?'#board-roadshow':'#board-exhibition';
-  const copy = {team:route==='team-score'?['本队查分','输入主办方发给本队的提交码，查看本队已发布的总分、六维均分及评委同意分享的匿名评语。']:['选手工作台<br>AI 工具 · 作品提交','用本队提交码登录，在同一工作台查看 AI 工具、准备代码仓库和提交作品。没有提交码，请先提交队伍申请。'],judge:route==='judge'?['专业评分<br>六维 100 分','使用主办方提供的评委码，选择自己的身份。评分可保存草稿，正式提交后计入专业均分。']:route==='judge-roadshow'?['路演评分<br>六维 100 分','先用名单中的完整姓名领取专属邀请码，再用邀请码登录。创意20、社会关怀15、技术呈现20、应用潜力20、AI跨界探索15、开源贡献10分；正式评分计入路演均分。']:[`${stageName(stage)}记录`,'使用主办方提供的评委码，选择自己的身份。可查看本轮队伍、保存草稿、提交评语或回避；本阶段记录暂不计分。'],audience:['选出让你<br>眼前一亮的作品。','观众选择票独立于专业成绩。使用观众邀请码登录，每个邀请码最多支持 3 支不同队伍。'],admin:route==='admin-finals'?['决赛管理<br>评分 · 提名 · 颁奖','管理8位决赛评委和决赛队伍，实时核对六维评分与提名票数，确认专项奖归属后发布结果。请使用组织方管理码登录。']:route==='admin-roadshow'?['路演管理<br>名单 · 实时成绩','配置路演评委名单，查看领码进度与实时六维评分，核对后发布路演成绩。请使用组织方管理码登录。']:['组织方<br>活动管理','管理队伍、评委、评审窗口和作品材料。请使用主办方管理码登录。']}[role];
+  const copy = {team:route==='team-score'?['本队查分','输入主办方发给本队的提交码，查看本队已发布的总分、六维均分及评委同意分享的匿名评语。']:['选手工作台<br>AI 工具 · 作品提交','用本队提交码登录，在同一工作台查看 AI 工具、准备代码仓库和提交作品。没有提交码，请先提交队伍申请。'],judge:route==='judge'?['专业评分<br>六维 100 分','使用主办方提供的评委码，选择自己的身份。评分可保存草稿，正式提交后计入专业均分。']:route==='judge-roadshow'?['路演评分<br>六维 100 分','邀请码就是你的真实姓名，输入名单中的完整姓名即可验证登录。创意20、社会关怀15、技术呈现20、应用潜力20、AI跨界探索15、开源贡献10分；正式评分计入路演均分。']:[`${stageName(stage)}记录`,'使用主办方提供的评委码，选择自己的身份。可查看本轮队伍、保存草稿、提交评语或回避；本阶段记录暂不计分。'],audience:['选出让你<br>眼前一亮的作品。','观众选择票独立于专业成绩。使用观众邀请码登录，每个邀请码最多支持 3 支不同队伍。'],admin:route==='admin-finals'?['决赛管理<br>评分 · 提名 · 颁奖','管理8位决赛评委和决赛队伍，实时核对六维评分与提名票数，确认专项奖归属后发布结果。请使用组织方管理码登录。']:route==='admin-roadshow'?['路演管理<br>名单 · 实时成绩','配置路演评委名单，查看姓名登录资格与实时六维评分，核对后发布路演成绩。请使用组织方管理码登录。']:['组织方<br>活动管理','管理队伍、评委、评审窗口和作品材料。请使用主办方管理码登录。']}[role];
   root.innerHTML = `<div class="login-layout"><div class="login-story"><p class="eyebrow">GOTC 2026 / ${roleLabel}</p><h1>${copy[0].split('<br>').map(esc).join('<br>')}</h1><p>${esc(copy[1])}</p><span class="login-pixel" aria-hidden="true"></span></div><form class="login-card" id="login-form"><h2>${esc(loginRoleName)}登录</h2>${role==='team'?'<p><a href="#claim">尚无提交码？提交队伍申请并领取 ↗</a></p><p class="small-note">组织方可使用管理码登录，再选择需要代管的队伍。</p>':''}<p>邀请码仅用于本届活动，请妥善保管。<br>如无法登录，请核对审核状态或联系主办方。</p><label class="field">${role === 'admin' ? '组织方管理码' : (role === 'judge' ? '评委登录码' : role === 'team' ? '队伍提交码' : '观众邀请码')}<input name="code" type="password" autocomplete="one-time-code" required maxlength="160" placeholder="输入你的${role === 'admin' ? '管理码' : '邀请码'}"></label><p class="form-error" role="alert"></p><button type="submit" class="btn">${route==='team-score'?'查看本队成绩':'进入'+esc(loginRoleName)+'工作台 ↗'}</button><p class="form-footnote">${finalsLogin?'公众查看已发布的决赛结果无需登录。':'公众查看成绩和评审进度无需登录。'}<a href="${publicBoard}">查看公开看板 →</a></p></form></div>`;
   const form=document.getElementById('login-form');
   const scoreLoginVersion=route==='team-score'?routeVersion:null;
@@ -242,7 +243,6 @@ function renderLogin(role) {
       await renderRoute();
     }catch(error){formError(form,error.message);}finally{if(button.isConnected)button.disabled=false;}
   };
-  if(route==='judge-roadshow' && typeof mountRoadshowClaim==='function')mountRoadshowClaim(routeVersion,form);
 }
 function renderWrongRole(role) { root.innerHTML = heading('ACCESS / 登录身份','请使用对应的邀请码',`当前身份为${esc(roleName[session.role] || session.role)}，此入口需要${roleName[role]}身份。`) + empty('切换登录身份','切换后使用此入口的专属邀请码登录；独立的队伍申请凭据会保留，可返回申请页领取提交码。','<button class="btn" id="switch-role">切换身份（保留申请）</button>');document.getElementById('switch-role').onclick=event=>logoutAccount(event,{preserveClaim:true}); }
 function adminTeamWorkbenchNotice(data){
