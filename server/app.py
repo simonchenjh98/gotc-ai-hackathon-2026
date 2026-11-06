@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 from errors import APIError
 from claims import Claims
+from team_registration import TeamRegistration, PUBLIC_PATHS, PUBLIC_ORIGINS
 from submission_records import SubmissionRecords, query_path
 from repository_backups import RepositoryBackups, ArchiveDownload
 from repositories import Repositories
@@ -50,7 +51,7 @@ SESSION_SECONDS = 12 * 3600
 LOGIN_KDF_CONCURRENCY = 4
 VOTE_LIMIT = 3
 COOKIE_NAME = "gotc_session"
-STATIC_FILES = {"downloads/gotc-gitee-submission-guide.pdf", "index.html", "styles.css", "app.js", "platform.html", "platform.js", "platform-admin.js", "platform-claims.js", "platform-draft-recovery.js", "platform-finals.js", "platform-finals.css", "platform.css", "favicon.svg"}
+STATIC_FILES = {"site-header.js", "site-header.css", "teams.html", "team-registration.js", "team-registration.css", "downloads/gotc-gitee-submission-guide.pdf", "index.html", "styles.css", "app.js", "platform.html", "platform.js", "platform-admin.js", "platform-claims.js", "platform-draft-recovery.js", "platform.css", "platform-finals.js", "platform-finals.css", "favicon.svg"}
 ASSET_EXTENSIONS = {".webp", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".woff2"}
 DOWNLOAD_EXTENSIONS = {".ics", ".txt"}
 SCHEMA = """
@@ -113,9 +114,31 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def validate_unicode(value):
+    """Reject unpaired surrogate code points before hashing, SQLite or UTF-8 output.
+
+    json.loads already combines valid escaped surrogate pairs into real Unicode
+    characters. Walk iteratively so nested JSON values and object keys are covered.
+    """
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            try:
+                item.encode('utf-8')
+            except UnicodeEncodeError:
+                raise APIError(400, '文本包含无效的 Unicode 字符，请重新输入', 'invalid_unicode') from None
+        elif isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+
+
 def text_field(value, field, limit, required=False):
     if not isinstance(value, str):
         raise APIError(400, f"{field}必须是文字")
+    validate_unicode(value)
     value = value.strip()
     if len(value) > limit or (required and not value) or any(ord(c) < 32 and c not in "\n\t" for c in value):
         raise APIError(400, f"{field}长度或内容不正确")
@@ -239,6 +262,7 @@ class EventService:
             enrich_team=lambda db,team:self.admin_data.enrich_team(db,team))
         self.admin_data=AdminDataService(self)
         self.claims=Claims(self,now_ms,text_field,scrypt_hash)
+        self.registration=TeamRegistration(self,now_ms,text_field)
         self.submission_records=SubmissionRecords(self)
         self.repositories=Repositories(self)
         self.repository_backups=RepositoryBackups(self)
@@ -254,6 +278,7 @@ class EventService:
             self.judging.initialize(db)
             self.admin_data.initialize(db)
             self.claims.initialize(db)
+            self.registration.initialize(db)
             self.keys.initialize(db)
             self.repositories.initialize(db)
             for key, value in {"scoringOpen": False, "resultsPublished": True, "minJudges": 5, "submissionsOpen": False, "submissionDeadline": None, "updatedAt": now_ms()}.items():
@@ -538,6 +563,9 @@ class EventService:
 
     def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None, server_received_at=None, finals_judge_id=None):
         """Return (JSON object or CSV bytes, optional session token, cookie action)."""
+        validate_unicode(body)
+        if path.startswith(("/api/registration", "/api/admin/registration")):
+            return self.registration.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
         if path.startswith(("/api/claims/","/api/admin/claims")):
             return self.claims.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
         if method == "POST" and path == "/api/login":
@@ -627,7 +655,7 @@ class EventService:
                 team_id = self.team_exists(db, body.get("teamId"), require_active=True)
                 revision=self.write_conflicts.check_score(db,actor["id"],team_id,body)
                 status = body.get("status")
-                if status not in {"draft", "submitted", "recused"}:
+                if not isinstance(status, str) or status not in {"draft", "submitted", "recused"}:
                     raise APIError(400, "评分状态不正确")
                 previous = db.execute("SELECT * FROM scores WHERE judge_id=? AND team_id=?", (actor["id"], team_id)).fetchone()
                 if previous and previous["status"] == "submitted" and status == "draft":
@@ -701,12 +729,12 @@ class EventService:
                         'beforeRevisions':body['expectedRevisions'],'afterRevisions':{group:body['expectedRevisions'][group]+1 for group in sorted(groups)}})
                     return {"ok":True,"config":self.write_conflicts.admin_config(db)},None,None
                 if method == "POST" and path == "/api/admin/teams":
-                    return {'ok':True,'team':self.admin_data.save_team(db,actor,body)},None,None
+                    return {'ok':True,'team':self.admin_data.save_team(db,actor,body,require_revision=True)},None,None
                 if method=='POST' and path=='/api/admin/credentials':
                     return self.credential_action(db,actor,body),None,None
                 if method == "POST" and path == "/api/admin/invitations":
                     role = body.get("role")
-                    if role not in {"judge", "audience"}:
+                    if not isinstance(role, str) or role not in {"judge", "audience"}:
                         raise APIError(400, "只能创建评委或观众邀请")
                     name = text_field(body.get("name"), "称呼", 80, True)
                     account, code = self.create_account(db, role, name)
@@ -999,9 +1027,17 @@ class EventHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
+        request_path = urlsplit(self.path).path
+        origin = self.headers.get("Origin")
+        if request_path in {self.server.service.base_path + p for p in PUBLIC_PATHS} and origin in PUBLIC_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            if self.command == "OPTIONS":
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://8.141.114.201; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
         if self.server.service.secure:
             self.send_header("Strict-Transport-Security", "max-age=31536000")
         if cookie:
@@ -1023,11 +1059,18 @@ class EventHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.handle_route()
 
+    def do_OPTIONS(self):
+        path = urlsplit(self.path).path
+        if (path in {self.server.service.base_path + p for p in PUBLIC_PATHS}
+                and self.headers.get("Origin") in PUBLIC_ORIGINS
+                and self.headers.get("Access-Control-Request-Method") in {"GET", "POST"}
+                and self.headers.get("Access-Control-Request-Headers", "").lower() in {"", "content-type"}):
+            self.headers_out(204, "text/plain", 0)
+        else:
+            self.respond(403, {"error": "不允许跨站请求"})
+
     def do_POST(self):
         self.handle_route()
-
-    def do_OPTIONS(self):
-        self.respond(405, {"error": "不支持跨域请求"})
 
     def handle_route(self):
         service = self.server.service
@@ -1035,7 +1078,10 @@ class EventHandler(BaseHTTPRequestHandler):
             parsed = urlsplit(self.path)
             if parsed.scheme or parsed.netloc or parsed.fragment:
                 raise APIError(400, "请求地址格式不正确")
-            path = unquote(parsed.path, errors="strict")
+            try:
+                path = unquote(parsed.path, errors="strict")
+            except UnicodeError:
+                raise APIError(400, "请求路径编码不正确")
             if "\\" in path or "\x00" in path or any(p in {".", ".."} for p in path.split("/")):
                 raise APIError(400, "请求路径不正确")
             if path == service.base_path and self.command in {"GET", "HEAD"}:
@@ -1065,7 +1111,8 @@ class EventHandler(BaseHTTPRequestHandler):
                 body = {}
                 received_at = None
                 if self.command == "POST":
-                    if self.headers.get("Origin") != service.origin or self.headers.get("Sec-Fetch-Site") not in {None, "same-origin", "none"}:
+                    public_registration = path in PUBLIC_PATHS and self.headers.get("Origin") in PUBLIC_ORIGINS
+                    if not public_registration and (self.headers.get("Origin") != service.origin or self.headers.get("Sec-Fetch-Site") not in {None, "same-origin", "none"}):
                         raise APIError(403, "仅允许本站发起操作，请从活动官网打开")
                     if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
                         raise APIError(400, "请求长度不正确")
@@ -1083,7 +1130,7 @@ class EventHandler(BaseHTTPRequestHandler):
                         if len(raw) != length:
                             raise ValueError('incomplete request')
                         body = json.loads(raw.decode("utf-8"), parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
-                    except (UnicodeError, ValueError):
+                    except (UnicodeError, ValueError, RecursionError):
                         raise APIError(400, "JSON格式不正确")
                     if not isinstance(body, dict):
                         raise APIError(400, "JSON内容必须是对象")

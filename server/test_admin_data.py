@@ -126,8 +126,9 @@ class AdminDataTests(unittest.TestCase):
         team_id=self.team(name='Original',track='AI for Science')
         content='number,name,project,track\n1,Planned,P,AI for Science\n2,Must not partially create,P,AI for Science\n'
         preview=self.preview('teams',content)
+        current=next(team for team in self.admin.get('/api/admin')[1]['teams'] if team['id']==team_id)
         self.assertEqual(self.admin.post('/api/admin/teams',{'id':team_id,'number':1,'name':'Concurrent edit',
-            'project':'P','track':'AI for Science'})[0],200)
+            'expectedRevision':current['revision'],'project':'P','track':'AI for Science'})[0],200)
         before=self.entities()
         self.assertEqual(self.commit(preview)[0],409)
         self.assertEqual(self.entities(),before)
@@ -195,8 +196,9 @@ class AdminDataTests(unittest.TestCase):
         with self.service.db() as db:
             db.execute('UPDATE teams SET track=? WHERE id=?',('Old custom track',unknown))
         self.assertFalse(next(row for row in self.admin.get('/api/admin')[1]['teams'] if row['id']==unknown)['trackKnown'])
+        current=next(team for team in self.admin.get('/api/admin')[1]['teams'] if team['id']==unknown)
         self.assertEqual(self.admin.post('/api/admin/teams',{'id':unknown,'number':2,'name':'Historical preserved',
-            'project':'P','track':'Old custom track'})[0],200)
+            'expectedRevision':current['revision'],'project':'P','track':'Old custom track'})[0],200)
         self.assertEqual(next(row for row in self.admin.get('/api/admin')[1]['teams'] if row['id']==unknown)['track'],'Old custom track')
 
     def review_fixture(self):
@@ -232,8 +234,9 @@ class AdminDataTests(unittest.TestCase):
         self.assertEqual(self.get_data('reviews',**params,teamId=first)['coverage']['expected'],2)
         self.assertEqual(self.get_data('reviews',**params,judgeId=one_id)['coverage']['expected'],2)
         self.assertEqual(self.get_data('reviews',**params,teamId=first,judgeId=one_id)['coverage']['expected'],1)
+        current=next(team for team in self.admin.get('/api/admin')[1]['teams'] if team['id']==first)
         self.assertEqual(self.admin.post('/api/admin/teams',{'id':first,'number':1,'name':'Current renamed',
-            'project':'Current P','track':'未来学习样态'})[0],200)
+            'expectedRevision':current['revision'],'project':'Current P','track':'未来学习样态'})[0],200)
         filtered=self.get_data('reviews',**params,track='AI for Science')
         self.assertEqual([row['name'] for row in filtered['teams']],['Frozen A'])
         self.assertEqual(filtered['coverage']['expected'],2)
@@ -365,8 +368,9 @@ class AdminDataTests(unittest.TestCase):
             for path in ['/api/admin/data/import/preview','/api/admin/data/import/commit',
                          '/api/admin/data/review-validity','/api/admin/credentials']:
                 self.assertEqual(client.post(path,{})[0],status,path)
+        current=next(team for team in self.admin.get('/api/admin')[1]['teams'] if team['id']==team_id)
         self.assertEqual(self.admin.post('/api/admin/teams',{'id':team_id,'number':1,'name':'Audit after',
-            'project':'P','track':'AI for Science'})[0],200)
+            'expectedRevision':current['revision'],'project':'P','track':'AI for Science'})[0],200)
         with self.service.db() as db:
             before=db.execute('SELECT COUNT(*) FROM audit').fetchone()[0]
         first=self.get_data('audit',limit=1)
@@ -670,7 +674,9 @@ class AdminDataTests(unittest.TestCase):
             original_team_times={row['id']:row['updated_at'] for row in db.execute('SELECT id,updated_at FROM teams')}
             judge_times={row['id']:row['created_at'] for row in db.execute("SELECT id,created_at FROM accounts WHERE role='judge'")}
         for team_id,number,name,track in [(first,1,'CURRENT_FIRST','未来学习样态'),(second,2,'CURRENT_SECOND','AI for Science')]:
-            self.assertEqual(self.admin.post('/api/admin/teams',{'id':team_id,'number':number,'name':name,'track':track})[0],200)
+            current_team=next(team for team in self.admin.get('/api/admin')[1]['teams'] if team['id']==team_id)
+            self.assertEqual(self.admin.post('/api/admin/teams',{'id':team_id,'expectedRevision':current_team['revision'],
+                'number':number,'name':name,'track':track})[0],200)
         self.window('roadshow',False)
         current=self.stage('roadshow')
         self.assertEqual(self.admin.post('/api/admin/judging/roadshow/reset',{

@@ -32,12 +32,23 @@ CREATE TABLE IF NOT EXISTS claim_requests (
  issued_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS claim_requests_pending ON claim_requests(status,expires_at);
+CREATE TABLE IF NOT EXISTS claim_declarations (
+ request_id TEXT NOT NULL REFERENCES claim_requests(id), request_revision INTEGER NOT NULL,
+ declaration_json TEXT NOT NULL, PRIMARY KEY(request_id,request_revision)
+);
 CREATE TABLE IF NOT EXISTS claim_memberships (
  person_id TEXT PRIMARY KEY REFERENCES claim_people(id),
  team_id TEXT NOT NULL REFERENCES teams(id), request_id TEXT NOT NULL REFERENCES claim_requests(id)
 );
 '''
 INVALID={'status':'invalid','team':None,'code':None,'expiresAt':None}
+MAX_CLAIM_PEOPLE=500
+
+
+def ensure_roster_capacity(db, additional):
+    # No-op imports must remain usable even if an older writer exceeded the cap.
+    if additional and db.execute('SELECT COUNT(*) FROM claim_people').fetchone()[0]+additional>MAX_CLAIM_PEOPLE:
+        raise APIError(409,f'名单最多 {MAX_CLAIM_PEOPLE} 人')
 
 
 def normalize(value):
@@ -80,13 +91,13 @@ class Claims:
             p.revision,m.team_id AS teamId FROM claim_people p LEFT JOIN claim_memberships m ON m.person_id=p.id ORDER BY p.id''')]
 
     def import_roster(self,db,actor,body):
-        if set(body)!={'people'} or not isinstance(body['people'],list) or not 1<=len(body['people'])<=500:
-            raise APIError(400,'一次导入 1–500 名参赛者')
+        if set(body)!={'people'} or not isinstance(body['people'],list) or not 1<=len(body['people'])<=MAX_CLAIM_PEOPLE:
+            raise APIError(400,f'一次导入 1–{MAX_CLAIM_PEOPLE} 名参赛者')
         people=[self.person(p) for p in body['people']]
         ids=[p['id'] for p in people];identities=[(normalize(p['name']),normalize(p['school'])) for p in people]
         if len(set(ids))!=len(ids) or len(set(identities))!=len(identities):raise APIError(409,'名单有重复编号或同名同校记录，请先人工核实')
         current={p['id']:p for p in self.roster(db)}
-        if len(set(current)|set(ids))>500:raise APIError(409,'名单最多 500 人')
+        ensure_roster_capacity(db,len(set(ids)-set(current)))
         added=0
         try:
             for p in people:
@@ -103,7 +114,7 @@ class Claims:
         if set(body)!={'person','expectedRevision'} or type(body['expectedRevision']) is not int:raise APIError(400,'需要名单修订号')
         p=self.person(body['person']);old=db.execute('SELECT * FROM claim_people WHERE id=?',(p['id'],)).fetchone()
         if body['expectedRevision']!=(old['revision'] if old else 0):raise APIError(409,'名单已变化，请重新读取后核对')
-        if not old and db.execute('SELECT COUNT(*) FROM claim_people').fetchone()[0]>=500:raise APIError(409,'名单最多 500 人')
+        if not old:ensure_roster_capacity(db,1)
         if old and db.execute('SELECT 1 FROM claim_memberships WHERE person_id=?',(p['id'],)).fetchone() and (p['name']!=old['name'] or p['school']!=old['school']):
             raise APIError(409,'已归队人员的身份不可改写，请联系组织方处理归队记录')
         try:
@@ -115,8 +126,9 @@ class Claims:
         return {'ok':True,'revision':old['revision']+1 if old else 1}
 
     def request(self,db,body):
-        if set(body)!={'name','school'}:raise APIError(400,'请只填写姓名和学校')
+        if set(body) not in ({'name','school'},{'name','school','members'}):raise APIError(400,'申请字段不正确')
         name=self.text(body['name'],'姓名',100,True);school=self.text(body['school'],'学校',200,True)
+        declaration=self.validate_declaration(name,school,body['members']) if 'members' in body else None
         if not db.execute('SELECT 1 FROM claim_people LIMIT 1').fetchone():raise APIError(503,'现场领取尚未开放，请联系组织方')
         now=self.clock()
         db.execute("UPDATE claim_requests SET status='expired',revision=revision+1 WHERE status='pending' AND expires_at<=?",(now,))
@@ -124,14 +136,57 @@ class Claims:
         request_id=secrets.token_hex(16);secret=secrets.token_urlsafe(32);pin=f'{secrets.randbelow(1000000):06d}';expires=now+24*3600*1000
         db.execute('''INSERT INTO claim_requests(id,secret_hash,pin_hash,name,school,normalized_name,normalized_school,created_at,expires_at)
             VALUES (?,?,?,?,?,?,?,?,?)''',(request_id,digest('receipt',secret),digest('pin:'+request_id,pin),name,school,normalize(name),normalize(school),now,expires))
-        return {'requestId':request_id,'secret':secret,'pin':pin,'expiresAt':expires,'status':'pending'}
+        if declaration:self.save_declaration(db,request_id,1,declaration)
+        return {'requestId':request_id,'secret':secret,'pin':pin,'expiresAt':expires,'status':'pending',
+                'requestRevision':1,'captain':{'name':name,'school':school},'declaration':declaration}
+
+    def validate_declaration(self,name,school,members):
+        if not isinstance(members,list) or not 2<=len(members)<=4:raise APIError(400,'每队须含队长及 2–4 名组员，共 3–5 人')
+        result=[]
+        for member in members:
+            if not isinstance(member,dict) or set(member)!={'name','school'}:raise APIError(400,'组员须填写姓名和学校')
+            result.append({key:self.text(member[key],label,limit,True) for key,label,limit in [('name','组员姓名',100),('school','组员学校',200)]})
+        captain={'name':name,'school':school}
+        identities=[(normalize(p['name']),normalize(p['school'])) for p in [captain]+result]
+        if len(set(identities))!=len(identities):raise APIError(400,'队长和组员中有重复的同名同校记录，请核对')
+        return {'captain':captain,'members':result}
+
+    def declaration(self,db,request_id):
+        row=db.execute('SELECT declaration_json FROM claim_declarations WHERE request_id=? ORDER BY request_revision DESC LIMIT 1',(request_id,)).fetchone()
+        return json.loads(row['declaration_json']) if row else None
+
+    def save_declaration(self,db,request_id,revision,declaration):
+        # Store a new snapshot. Pending edits prune the superseded snapshot in the same transaction;
+        # after approval no public edit can replace the frozen declaration.
+        db.execute('INSERT INTO claim_declarations VALUES (?,?,?)',(request_id,revision,json.dumps(declaration,ensure_ascii=False)))
+        db.execute('DELETE FROM claim_declarations WHERE request_id=? AND request_revision<?',(request_id,revision))
+
+    def receipt_row(self,db,body):
+        if not isinstance(body.get('requestId'),str) or not isinstance(body.get('secret'),str):return None
+        if not re.fullmatch(r'[a-f0-9]{32}',body['requestId']) or not re.fullmatch(r'[A-Za-z0-9_-]{43}',body['secret']):return None
+        row=db.execute('SELECT * FROM claim_requests WHERE id=?',(body['requestId'],)).fetchone()
+        if not row or not hmac.compare_digest(row['secret_hash'],digest('receipt',body['secret'])) or row['expires_at']<=self.clock():return None
+        return row
+
+    def update(self,db,body):
+        if set(body)!={'requestId','secret','expectedRevision','members'}:raise APIError(400,'修改申请字段不正确')
+        row=self.receipt_row(db,body)
+        if not row:return dict(INVALID)
+        if type(body['expectedRevision']) is not int:raise APIError(400,'需要申请修订号')
+        if row['revision']!=body['expectedRevision']:raise APIError(409,'申请已变化，请查询最新状态后重新核对')
+        if row['status']!='pending':raise APIError(409,'申请已处理，不可修改组员')
+        declaration=self.validate_declaration(row['name'],row['school'],body['members'])
+        self.save_declaration(db,row['id'],row['revision']+1,declaration)
+        db.execute('UPDATE claim_requests SET revision=revision+1 WHERE id=?',(row['id'],))
+        self.s.audit(db,None,'claims.update',row['id'],{'requestRevision':row['revision']+1})
+        return self.bearer(db,{'requestId':body['requestId'],'secret':body['secret']})
 
     def bearer(self,db,body,redeem=False):
-        if set(body)!={'requestId','secret'} or not isinstance(body.get('requestId'),str) or not isinstance(body.get('secret'),str):return dict(INVALID)
-        if not re.fullmatch(r'[a-f0-9]{32}',body['requestId']) or not re.fullmatch(r'[A-Za-z0-9_-]{43}',body['secret']):return dict(INVALID)
-        row=db.execute('SELECT * FROM claim_requests WHERE id=?',(body['requestId'],)).fetchone()
-        if not row or not hmac.compare_digest(row['secret_hash'],digest('receipt',body['secret'])) or row['expires_at']<=self.clock():return dict(INVALID)
-        result={'status':row['status'],'team':None,'code':None,'expiresAt':row['expires_at']}
+        if set(body)!={'requestId','secret'}:return dict(INVALID)
+        row=self.receipt_row(db,body)
+        if not row:return dict(INVALID)
+        result={'status':row['status'],'team':None,'code':None,'expiresAt':row['expires_at'],'requestRevision':row['revision'],
+                'captain':{'name':row['name'],'school':row['school']},'declaration':self.declaration(db,row['id'])}
         if row['status'] not in {'approved','issued'}:return result
         account=db.execute('SELECT * FROM accounts WHERE id=?',(row['account_id'],)).fetchone()
         if not account or not account['active'] or not hmac.compare_digest(row['account_fingerprint'],fingerprint(account)):
@@ -148,12 +203,14 @@ class Claims:
         elif not hmac.compare_digest(account['code_hash'],self.kdf(code,account['salt'])):
             result['status']='unavailable';result['team']=None;return result
         result.update(status='issued',code=code)
+        if row['status']=='approved':result['requestRevision']=row['revision']+1
         return result
 
     def listing(self,db):
         requests=[dict(row) for row in db.execute('''SELECT id,name,school,status,revision,created_at AS createdAt,expires_at AS expiresAt,
             team_id AS teamId,captain_id AS captainId,review_note AS reviewNote,pin_attempts AS pinAttempts FROM claim_requests ORDER BY created_at DESC''')]
         for row in requests:
+            row['declaration']=self.declaration(db,row['id'])
             if row['status']=='pending' and row['expiresAt']<=self.clock():row['status']='expired'
         teams=[dict(row) for row in db.execute('''SELECT t.id,t.number,t.name FROM teams t LEFT JOIN team_details d ON d.team_id=t.id
             WHERE COALESCE(d.status,'active')='active' AND NOT EXISTS(SELECT 1 FROM team_accounts a WHERE a.team_id=t.id)
@@ -163,23 +220,33 @@ class Claims:
     def review(self,db,actor,body):
         common={'requestId','expectedRevision','action','note'}
         approve={'teamId','captainId','memberIds','memberRevisions','pin','inPersonVerified','resolvedIdentity'}
-        if not isinstance(body.get('action'),str) or body['action'] not in {'approve','reject'} or set(body)!=(common|approve if body.get('action')=='approve' else common):raise APIError(400,'审核字段不正确')
+        allowed=(common|approve,common|approve|{'declaredMemberIds'}) if body.get('action')=='approve' else (common,)
+        if not isinstance(body.get('action'),str) or body['action'] not in {'approve','reject'} or set(body) not in allowed:raise APIError(400,'审核字段不正确')
         if type(body['expectedRevision']) is not int or not isinstance(body['requestId'],str):raise APIError(400,'需要申请修订号')
         note=self.text(body['note'],'审核备注',2000)
         row=db.execute('SELECT * FROM claim_requests WHERE id=?',(body['requestId'],)).fetchone()
         if not row:raise APIError(404,'申请不存在')
+        declaration=self.declaration(db,row['id'])
         approval=None
         if body['action']=='approve':
             members=body['memberIds']
-            if not isinstance(members,list) or not 1<=len(members)<=500 or any(not isinstance(p,str) or len(p)>100 for p in members) or len(set(members))!=len(members):raise APIError(400,'成员名单不正确')
+            if not isinstance(members,list) or not 1<=len(members)<=MAX_CLAIM_PEOPLE or any(not isinstance(p,str) or len(p)>100 for p in members) or len(set(members))!=len(members):raise APIError(400,'成员名单不正确')
             member_revisions=body['memberRevisions']
             if not isinstance(member_revisions,dict) or set(member_revisions)!=set(members) or any(type(revision) is not int or not 1<=revision<=9007199254740991 for revision in member_revisions.values()):
                 raise APIError(400,'请提交每位所选成员的准确名单修订号')
             if not isinstance(body['teamId'],str) or not isinstance(body['captainId'],str) or body['captainId'] not in members:raise APIError(400,'队长必须在本队名单中')
             if body['inPersonVerified'] is not True or type(body['resolvedIdentity']) is not bool:raise APIError(400,'请当面核实本人和全部组员')
             if not isinstance(body['pin'],str) or not re.fullmatch(r'\d{6}',body['pin']):raise APIError(400,'请输入申请人设备上的六位核验码')
-            approval=digest('approval',json.dumps([body['teamId'],body['captainId'],sorted(member_revisions.items()),note,body['resolvedIdentity'],digest('pin:'+row['id'],body['pin'])],ensure_ascii=False))
-            if row['status'] in {'approved','issued'} and row['approval_digest']==approval and body['expectedRevision'] in {row['revision'],1}:
+            canonical=[body['teamId'],body['captainId'],sorted(member_revisions.items()),note,body['resolvedIdentity'],digest('pin:'+row['id'],body['pin'])]
+            if declaration:
+                if row['status']=='pending' and row['revision']!=body['expectedRevision']:raise APIError(409,'申请已变化，请重新读取后核对')
+                mapping=body.get('declaredMemberIds')
+                if not isinstance(mapping,list) or len(mapping)!=len(declaration['members'])+1 or any(not isinstance(p,str) for p in mapping) or len(set(mapping))!=len(mapping) or set(mapping)!=set(members) or mapping[0]!=body['captainId']:
+                    raise APIError(400,'请为每位申报成员逐一选择唯一名单记录，不能增加或遗漏人员')
+                canonical+=['declared-v1',body['expectedRevision'],declaration,mapping]
+            elif 'declaredMemberIds' in body:raise APIError(400,'旧申请请使用现场人工组队核实流程')
+            approval=digest('approval',json.dumps(canonical,ensure_ascii=False))
+            if row['status'] in {'approved','issued'} and row['approval_digest']==approval and (declaration or body['expectedRevision'] in {row['revision'],1}):
                 return {'ok':True,'status':row['status'],'revision':row['revision']}
         if row['revision']!=body['expectedRevision']:raise APIError(409,'申请已变化，请重新读取后核对')
         if row['status']!='pending' or row['expires_at']<=self.clock():raise APIError(409,'申请已处理或过期')
@@ -199,7 +266,12 @@ class Claims:
             raise APIError(400,'核验码不正确，请核对申请人的设备')
         captain=people.get(body['captainId'])
         if not captain or normalize(captain['name'])!=row['normalized_name']:raise APIError(409,'队长姓名与申请不一致，请先核实名单或重新申请')
-        if (normalize(captain['school'])!=row['normalized_school'] or any(people[p]['needsReview'] for p in members)) and (not body['resolvedIdentity'] or not note):raise APIError(400,'学校差异或待核实条目需明确确认并填写核实说明')
+        school_difference=normalize(captain['school'])!=row['normalized_school']
+        if declaration:
+            for declared,person_id in zip([declaration['captain']]+declaration['members'],mapping):
+                if normalize(declared['name'])!=normalize(people[person_id]['name']):raise APIError(409,'申报姓名与所选名单不一致，请逐人核对')
+                school_difference|=normalize(declared['school'])!=normalize(people[person_id]['school'])
+        if (school_difference or any(people[p]['needsReview'] for p in members)) and (not body['resolvedIdentity'] or not note):raise APIError(400,'学校差异或待核实条目需明确确认并填写核实说明')
         team=db.execute("SELECT t.id FROM teams t LEFT JOIN team_details d ON d.team_id=t.id WHERE t.id=? AND COALESCE(d.status,'active')='active'",(body['teamId'],)).fetchone()
         if not team:raise APIError(409,'请选择现有有效队伍')
         try:
@@ -209,14 +281,18 @@ class Claims:
             access=self.s.team_access(db,actor,{'teamId':body['teamId'],'action':'issue'})
             account=db.execute('SELECT * FROM accounts WHERE id=?',(access['id'],)).fetchone()
             db.execute('UPDATE claim_requests SET account_id=?,account_fingerprint=? WHERE id=?',(account['id'],fingerprint(account),row['id']))
+            ordered_ids=mapping if declaration else [body['captainId']]+[person for person in members if person!=body['captainId']]
+            self.s.registration.sync_verified_members(db,actor,body['teamId'],body['captainId'],ordered_ids)
         except sqlite3.IntegrityError:raise APIError(409,'成员或队伍已经分配，请重新读取并核对')
-        self.s.audit(db,actor,'claims.approve',row['id'],{'teamId':body['teamId'],'captainId':body['captainId'],'memberIds':sorted(members),'memberRevisions':member_revisions,'note':note,'resolvedIdentity':body['resolvedIdentity']})
+        metadata={'teamId':body['teamId'],'captainId':body['captainId'],'memberIds':sorted(members),'memberRevisions':member_revisions,'note':note,'resolvedIdentity':body['resolvedIdentity']}
+        if declaration:metadata.update(declaration=declaration,declaredMemberIds=mapping,requestRevision=body['expectedRevision'])
+        self.s.audit(db,actor,'claims.approve',row['id'],metadata)
         return {'ok':True,'status':'approved','revision':row['revision']+1}
 
     def dispatch(self,method,path,body,cookie,ip,login_id,query):
         admin=path.startswith('/api/admin/claims')
         if query:raise APIError(400,'此接口不接受查询参数')
-        public_scopes={'/api/claims/request':'claims-request','/api/claims/status':'claims-status','/api/claims/redeem':'claims-redeem'}
+        public_scopes={'/api/claims/request':'claims-request','/api/claims/status':'claims-status','/api/claims/redeem':'claims-redeem','/api/claims/update':'claims-update'}
         if not admin:
             if method!='POST' or path not in public_scopes:raise APIError(404,'接口不存在')
             self.s.rate_limit(ip,public_scopes[path])
@@ -232,5 +308,6 @@ class Claims:
                 if method=='POST' and path=='/api/admin/claims/review':return self.review(db,actor,body)
             elif method=='POST':
                 if path=='/api/claims/request':return self.request(db,body)
+                if path=='/api/claims/update':return self.update(db,body)
                 if path in {'/api/claims/status','/api/claims/redeem'}:return self.bearer(db,body,path.endswith('/redeem'))
             raise APIError(404,'接口不存在')

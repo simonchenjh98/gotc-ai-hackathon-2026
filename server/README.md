@@ -277,7 +277,7 @@ Claude Code 会按自己的默认模型名请求（如 `claude-opus-…`、`clau
 
 后台页面可见时，每次检查结束后等待 3 秒再读取标记。新阶段评审记录发生变化且轮次、配置仍一致时，只更新该阶段的正式记录数量和只读记录表；页面隐藏时暂停。轮次或配置变更时提示刷新核对，截止时间到达时更新只读标识，保留未保存输入。原专业评分设置与统计、历史筛选、审计、名录、材料和一次性登录码区域不自动重绘，需要重新查询或手动刷新；原专业成绩看板仍通过 `/api/board` 定时刷新。
 
-名录 `team` 增加 `status`（`active|withdrawn|disqualified`）、`statusReason`、`booth`、`roadshowOrder`（1–9999 或 null）、`revision` 和 `trackKnown`。退出或取消资格须填写原因。非 active 队伍不进入当前公开专业榜单及原专业评分、观众投票的可选名单，继续评分或投票返回 `409/team_ineligible`；历史评分和票数保留供后台查看，恢复 active 后重新参与当前名单与排名。更新带 `expectedRevision` 时，旧版本返回 409；队伍正式提交改变公开作品名也会增加名录版本。赛道选项为 AI for Science、城市与社区问题、未来学习样态；升级前未知赛道原样保留并标注，不能自动归类。状态、展位和路演顺序不改历史快照，不自动选队或排程。
+名录 `team` 增加 `status`（`active|withdrawn|disqualified`）、`statusReason`、`booth`、`roadshowOrder`（1–9999 或 null）、`revision` 和 `trackKnown`。退出或取消资格须填写原因。非 active 队伍不进入当前公开专业榜单及原专业评分、观众投票的可选名单，继续评分或投票返回 `409/team_ineligible`；历史评分和票数保留供后台查看，恢复 active 后重新参与当前名单与排名。直接调用 `POST /api/admin/teams` 更新已有队伍必须携带 `expectedRevision`；缺失或 null 返回 428，旧版本返回 409，新建队伍不需要该字段。队伍正式提交改变公开作品名也会增加名录版本。赛道选项为 AI for Science、城市与社区问题、未来学习样态；升级前未知赛道原样保留并标注，不能自动归类。状态、展位和路演顺序不改历史快照，不自动选队或排程。
 
 CSV 队伍列为 `number,name,project,track`，另可含 `status,statusReason,booth,roadshowOrder`；number/name 必填，按 number 匹配。评委列 `id,name`，空 id 为新建，非空 id 必须匹配已有评委，不按同名更新。缺失、重复或未知表头会返回第 1 行的错误预览；数据行的重复键、列数、类型和长度错误逐行列出。最多 500 数据行，CSV 本体最多 256 KiB。专用预览端点允许 2 MiB JSON 封装，以容纳合法转义；其余端点上限不变。
 
@@ -388,7 +388,9 @@ python3 -m py_compile server/app.py server/test_api.py
 
 ### Private registration and in-person submission-code claims
 
-`platform.html#claim` accepts only a name and school. Import the private roster
+`platform.html#claim` collects the captain and 2–4 additional teammates (3–5 people
+total), each with a name and school; cross-school teams are supported. Duplicate
+normalized name+school pairs within a group are refused. Import the private roster
 before opening the desk: until at least one roster row exists, new public
 applications return 503. No roster or name-based credential lookup is public.
 Public applications return an opaque request ID, a 256-bit bearer receipt secret,
@@ -399,11 +401,15 @@ persisted in browser storage.
 
 The admin section **现场报名核验** fetches requests, roster and eligible active
 teams only when opened with its read button. Create teams through the existing
-team directory first. Select the captain and every verified group member,
-compare submitted and roster schools, enter the PIN shown on the applicant's
+team directory first. New applications show the exact submitted group and require
+one roster selection per declared person, including the captain; nobody can be
+added or omitted. Compare every submitted name/school to the selected record,
+enter the PIN shown on the applicant's
 device, and confirm the in-person verification. A school discrepancy or any
 `needsReview` member requires an explicit resolution checkbox and review note.
-The captain's normalized name must match the application. An identity typo or
+Every declared normalized name must match its mapped roster record; school
+aliases require explicit resolution and a note. Old applications without a
+declaration retain the existing manual member selection flow. An identity typo or
 parent-filled record can be corrected with the per-person revision form before
 assignment. Once assigned, the person's name/school cannot be rewritten; notes
 remain editable. Preserve source lines and originals in the private notes.
@@ -417,12 +423,13 @@ existing exact Origin and JSON protections. No endpoint accepts URL parameters.
 | `POST /api/admin/claims/roster` | `{people:[{id,name,school,notes,needsReview}]}`; 1–500 rows, total ≤500, 2 MiB import body limit. Stable IDs use ASCII letters/digits/underscore/hyphen. Exact re-import is idempotent; changed existing rows must use per-person edit. Duplicate normalized name+school is refused. |
 | `POST /api/admin/claims/person` | `{person:{id,name,school,notes,needsReview},expectedRevision}`; revision 0 adds, an existing row's revision edits. |
 | `GET /api/admin/claims` | Admin-only `requests`, `people`, and eligible `teams`; no receipt secret, PIN, account code, or code hashes. |
-| `POST /api/claims/request` | `{name,school}`; identical shape for known/unknown people. Maximum 1,000 unexpired pending requests. |
-| `POST /api/claims/status` | `{requestId,secret}`; fixed invalid shape or status and bearer-approved team, never a code. |
+| `POST /api/claims/request` | `{name,school,members:[{name,school}]}`; 2–4 teammates; legacy clients may omit `members`. Identical response shape for known/unknown identities. Maximum 1,000 unexpired pending requests; public body limit remains 16 KiB. |
+| `POST /api/claims/status` | `{requestId,secret}`; fixed invalid shape or status, `requestRevision`, this claimant's `captain` and `declaration` (`null` for legacy), and bearer-approved team; never a code. |
+| `POST /api/claims/update` | `{requestId,secret,expectedRevision,members}`; pending/unexpired only. Replaces the pending declaration with a new snapshot and increments request revision; preserves receipt secret/PIN/expiry. Also supplements old pending applications. Invalid receipts use the fixed invalid response. |
 | `POST /api/claims/redeem` | `{requestId,secret}`; approved receipt returns its repeatable code; exact retries preserve the credential. |
-| `POST /api/admin/claims/review` | Common `{requestId,expectedRevision,action,note}`. `reject` needs only these; `approve` also needs `{teamId,captainId,memberIds,memberRevisions,pin,inPersonVerified:true,resolvedIdentity:boolean}`. |
+| `POST /api/admin/claims/review` | Common `{requestId,expectedRevision,action,note}`. `reject` needs only these; `approve` also needs `{teamId,captainId,memberIds,memberRevisions,pin,inPersonVerified:true,resolvedIdentity:boolean}`. Declared applications additionally require ordered `declaredMemberIds` (captain first), exactly covering the declaration and selected member IDs. |
 
-Public request/status/redeem endpoints each use a fixed, separate rate-limit
+Public request/status/redeem/update endpoints each use a fixed, separate rate-limit
 scope (20 per IP / 400 global per minute). Incorrect organizer PIN attempts are
 durable and limited to five per request; a fresh application is then needed.
 Pending requests never reserve people. Approval transactions enforce unique
@@ -434,8 +441,14 @@ selected member ID to the revision displayed in the roster. The transaction
 rejects changed identities or notes with 409 before assigning anyone; refresh
 and re-verify the selection. Exact successful retries retain their original
 snapshot, including when a later notes edit changes the current roster.
-There is no inferred maximum contest team size beyond the 500-person
-roster bound.
+New declarations require 3–5 people; legacy applications retain their manual
+roster-bound approval behavior. Approval digests for declarations bind the exact
+snapshot, ordered mapping and base request revision, so a participant edit makes
+an open staff form stale before any assignment. Exact approval retries still
+succeed after pending edits and later redemption. Pending claimants can edit
+teammates or supplement legacy requests from the receipt page; refresh recovers
+the submitted group using only the bearer receipt. Browser storage contains only
+request ID, receipt secret, PIN and expiry, never team declarations or login codes.
 
 Approval creates a team account once through existing `team_access` with the
 organizer actor and discards the temporary code. Redemption derives
@@ -451,7 +464,9 @@ assignments because pending requests never had any.
 Approval review has its own 128 KiB body limit so all 500 roster IDs and their revision mapping fit; the
 2 MiB import limit applies only to roster import.
 
-The private tables are `claim_people`, `claim_requests`, and `claim_memberships`;
+The private tables are `claim_people`, `claim_requests`, `claim_memberships`, and
+`claim_declarations` (one current snapshot per request, keyed by request ID and revision;
+superseded pending snapshots are pruned atomically and approved declarations are frozen);
 initialization is additive and idempotent for old installations. Organizer
 approval/rejection, roster import/edit, failed PIN checks and redemption write
 the existing durable audit trail. Do not commit real roster files, release
