@@ -86,8 +86,9 @@ const RegistrationUI = (() => {
       finally{lock(false);}
     };
     q('[data-reg-search]').oninput=showList;q('[data-reg-recruiting]').onchange=showList;q('[data-reg-refresh]').onclick=refresh;
+    if(code)lock(true);
     await refresh();
-    if(code){try {const result=await request('open',{code});fill(result.team);showReceipt();}catch{/* Preserve the pending create code for an idempotent retry. */}}
+    if(code){try {const result=await request('open',{code});fill(result.team);showReceipt();}catch{/* Preserve the pending create code for an idempotent retry. */}finally{lock(false);}}
   }
   return {escape,matches,card,install};
 })();

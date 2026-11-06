@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS team_registrations (
  flags_json TEXT NOT NULL DEFAULT '[]', raw_json TEXT, created_at INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS registration_secret_hash ON team_registrations(secret_hash);
+CREATE TRIGGER IF NOT EXISTS registration_team_changed AFTER UPDATE OF name,project ON teams
+WHEN OLD.name != NEW.name OR OLD.project != NEW.project BEGIN
+ UPDATE team_registrations SET revision=revision+1 WHERE team_id=NEW.id;
+END;
 '''
 
 
@@ -42,6 +46,8 @@ class TeamRegistration:
         result = {key: self.text(value[key], key, limit, key in {'captain', 'school'}) for key, limit in limits.items()}
         if not imported and normalize(result['name']) in BAD_NAMES:
             raise APIError(400, '请给队伍起一个名字，不要填写“无 / 不知道 / 待定”')
+        if normalize(result['captain']) in BAD_NAMES:
+            raise APIError(400, '请填写队长真实姓名')
         target = value['targetSize']
         if (target is not None or not imported) and (type(target) is not int or not 3 <= target <= 5):
             raise APIError(400, '队伍目标人数请选择 3–5 人')
@@ -89,10 +95,12 @@ class TeamRegistration:
 
     def public(self, row):
         members = json.loads(row['members_json'])
+        name = '' if row['name'] == row['captain']+'的队伍（待命名）' else row['name']
+        flags = self.flags({'name': name, 'members': members, 'targetSize': row['target_size']})
         return {'id': row['team_id'], 'number': row['number'], 'name': row['name'],
                 'captain': row['captain'], 'school': row['school'], 'members': members,
                 'targetSize': row['target_size'], 'project': row['project'], 'summary': row['summary'],
-                'revision': row['revision'], 'flags': json.loads(row['flags_json']),
+                'revision': row['revision'], 'flags': flags,
                 'recruiting': len(members) < min(row['target_size'] or 5, 5), 'updatedAt': row['updated_at']}
 
     def private(self, row):
@@ -117,10 +125,13 @@ class TeamRegistration:
     def sync_people(self, db, value):
         # Registration is not identity verification. Never change verified membership.
         for name in value['members']:
+            if db.execute('SELECT 1 FROM claim_people WHERE normalized_name=?', (normalize(name),)).fetchone():
+                continue  # Keep the existing registration's school/identity; do not guess aliases.
+            school = value['school'] if name == value['captain'] else '待现场核实'
             db.execute('''INSERT OR IGNORE INTO claim_people
                 (id,name,school,normalized_name,normalized_school,notes,needs_review)
-                VALUES (?,?,?,?,?,?,1)''', ('R'+secrets.token_hex(12), name, value['school'], normalize(name),
-                                         normalize(value['school']), '来源：组队登记；学校按队长填写，现场核实本人和归属。'))
+                VALUES (?,?,?,?,?,?,1)''', ('R'+secrets.token_hex(12), name, school, normalize(name),
+                                         normalize(school), '来源：组队登记；队员学校未提供，须现场核实本人、学校和归属。'))
 
     def insert(self, db, value, secret, source_key=None, raw=None):
         if db.execute('SELECT COUNT(*) FROM teams').fetchone()[0] >= 200:
@@ -179,8 +190,9 @@ class TeamRegistration:
             flags_json=?,revision=revision+1 WHERE team_id=?''', (value['captain'],value['school'],value['phone'],value['targetSize'],
               json.dumps(value['members'],ensure_ascii=False),value['summary'],json.dumps(self.flags(value),ensure_ascii=False),row['team_id']))
         self.sync_people(db, value)
-        self.s.audit(db, None, 'registration.save', row['team_id'], {'revision': row['revision']+1})
-        return {'ok': True, 'team': self.private(self.row(db, row['team_id']))}
+        saved = self.row(db, row['team_id'])
+        self.s.audit(db, None, 'registration.save', row['team_id'], {'revision': saved['revision']})
+        return {'ok': True, 'team': self.private(saved)}
 
     def import_rows(self, db, actor, rows):
         if not isinstance(rows, list) or not 1 <= len(rows) <= 100:

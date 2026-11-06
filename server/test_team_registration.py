@@ -71,7 +71,7 @@ class RegistrationTests(unittest.TestCase):
 
     def test_validation_and_duplicate_person(self):
         code,_=self.create()
-        for changes in [{'name':'待定'},{'targetSize':True},{'targetSize':2},{'phone':'115600902583'},
+        for changes in [{'name':'待定'},{'captain':'无'},{'targetSize':True},{'targetSize':2},{'phone':'115600902583'},
                         {'members':['One','Two','Three','Four','Five']},{'members':'One'},{'name':'x'*81}]:
             r=self.public.post('/api/registration/create',{'code':secrets.token_urlsafe(32),'team':self.payload(**changes)})
             self.assertEqual(r[0],400,r[1])
@@ -122,6 +122,40 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(self.public.post('/api/registration/create',{'code':'a'*20000})[0],413)
         for _ in range(20):self.public.post('/api/registration/open',{'code':'x'*43})
         self.assertEqual(self.public.post('/api/registration/open',{'code':'x'*43})[0],429)
+
+    def test_organizer_edit_invalidates_old_registration_form(self):
+        code,team=self.create()
+        with self.service.db() as db:
+            self.service.admin_data.save_team(db,None,{'id':team['id'],'name':'Organizer corrected title'})
+        response=self.public.post('/api/registration/save',{'team':self.payload(),'code':code,'expectedRevision':team['revision']})
+        self.assertEqual(response[0],409)
+        self.assertEqual(self.public.get('/api/registration')[1]['teams'][0]['name'],'Organizer corrected title')
+
+    def test_existing_person_school_is_never_overwritten_or_duplicated(self):
+        with self.service.db() as db:
+            db.execute("INSERT INTO claim_people(id,name,school,normalized_name,normalized_school) VALUES ('known','Student A','Actual School','student a','actual school')")
+        self.create()
+        with self.service.db() as db:
+            rows=db.execute("SELECT school FROM claim_people WHERE normalized_name='student a'").fetchall()
+            self.assertEqual([r[0] for r in rows],['Actual School'])
+            self.assertEqual(db.execute("SELECT school FROM claim_people WHERE normalized_name='student b'").fetchone()[0],'待现场核实')
+
+    def test_verified_membership_is_not_changed_by_registration_code(self):
+        code,team=self.create()
+        with self.service.db() as db:
+            request=self.service.claims.request(db,{'name':'Captain','school':'Fixture School'})
+            person=db.execute("SELECT id FROM claim_people WHERE normalized_name='captain'").fetchone()[0]
+            db.execute('INSERT INTO claim_memberships VALUES (?,?,?)',(person,team['id'],request['requestId']))
+        body={'code':code,'expectedRevision':team['revision'],'team':self.payload(members=['Changed Member'])}
+        self.assertEqual(self.public.post('/api/registration/save',body)[0],409)
+        self.assertEqual(self.public.get('/api/registration')[1]['teams'][0]['members'],team['members'])
+
+    def test_submitted_project_name_cannot_be_overwritten_from_registration(self):
+        code,team=self.create()
+        with self.service.db() as db:
+            db.execute("INSERT INTO submissions(team_id,version,draft_json,submitted_json,updated_at) VALUES (?,1,'{}','{}',1)",(team['id'],))
+        body={'code':code,'expectedRevision':team['revision'],'team':self.payload(project='Replacement title')}
+        self.assertEqual(self.public.post('/api/registration/save',body)[0],409)
 
 
 if __name__=='__main__':unittest.main()
