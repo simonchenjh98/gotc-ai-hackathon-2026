@@ -205,6 +205,10 @@ class Claims:
         if row['status']=='pending':
             self.auto.attempt(db,row['id'])
             row=self.receipt_row(db,body)
+            if row is None:
+                # Approval can cross the expiry boundary while deriving credentials.
+                # Raise so the enclosing transaction also rolls back the new team.
+                raise APIError(410,'领取凭据已过期，请清除本设备上的领取凭据后重新申请','claim_expired')
         result={'status':row['status'],'team':None,'code':None,'expiresAt':row['expires_at'],'requestRevision':row['revision'],
                 'captain':{'name':row['name'],'school':row['school']},'declaration':self.declaration(db,row['id'])}
         if row['status'] not in {'approved','issued'}:return result

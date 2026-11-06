@@ -132,4 +132,31 @@ class AutoClaimsTests(unittest.TestCase):
         with self.service.db() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM claim_requests').fetchone()[0],before)
         self.assertEqual(self.counts()['teams'],0)
 
+    def test_expiry_during_automatic_approval_rolls_back_team_and_credentials(self):
+        self.source(enable=False)
+        claim=self.application()
+        revision=self.admin_call('')[1]['autoReview']['revision']
+        self.assertEqual(self.admin_call('/auto-review',{'expectedRevision':revision,'enabled':True})[0],200)
+        before=self.counts()
+        with self.service.db() as db:
+            audit_count=db.execute('SELECT COUNT(*) FROM audit').fetchone()[0]
+        current=[claim['expiresAt']-1]
+        original=self.service.claims.auto.attempt
+        def expires_after_real_approval(db,request_id):
+            original(db,request_id)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM team_accounts').fetchone()[0],1)
+            current[0]=claim['expiresAt']
+        with patch.object(self.service.claims,'clock',side_effect=lambda:current[0]), \
+             patch.object(self.service.claims.auto,'attempt',side_effect=expires_after_real_approval):
+            status,result,_=self.bearer(claim)
+        self.assertEqual(status,410,result)
+        self.assertEqual(result['code'],'claim_expired')
+        self.assertEqual(self.counts(),before)
+        with self.service.db() as db:
+            row=db.execute('SELECT status,revision,account_id,team_id FROM claim_requests WHERE id=?',(claim['requestId'],)).fetchone()
+            self.assertEqual(tuple(row),('pending',1,None,None))
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM audit').fetchone()[0],audit_count)
+        with patch.object(self.service.claims,'clock',return_value=claim['expiresAt']):
+            self.assertEqual(self.bearer(claim)[1]['status'],'invalid')
+
 if __name__=='__main__':unittest.main()
