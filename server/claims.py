@@ -219,10 +219,24 @@ class Claims:
             row['declaration']=self.declaration(db,row['id'])
             row['reviewContext'],row['references']=self.review_context(db,row['id'],row['revision'],row['declaration'])
             if row['status']=='pending' and row['expiresAt']<=self.clock():row['status']='expired'
-        teams=[dict(row) for row in db.execute('''SELECT t.id,t.number,t.name FROM teams t LEFT JOIN team_details d ON d.team_id=t.id
-            WHERE COALESCE(d.status,'active')='active' AND NOT EXISTS(SELECT 1 FROM team_accounts a WHERE a.team_id=t.id)
-            AND NOT EXISTS(SELECT 1 FROM claim_requests r WHERE r.team_id=t.id) ORDER BY t.number''')]
+        teams=[team for row in db.execute('SELECT id FROM teams ORDER BY number') if (team:=self.eligible_team(db,row['id']))]
         return {'requests':requests,'people':self.roster(db),'teams':teams,'trackOptions':TRACK_OPTIONS}
+
+    def eligible_team(self,db,team_id):
+        team=self.s.admin_data.team(db,team_id)
+        if not team or team['status']!='active':return None
+        if any(db.execute('SELECT 1 FROM '+table+' WHERE team_id=?',(team_id,)).fetchone()
+               for table in ('team_accounts','claim_requests','claim_memberships')):return None
+        registration=db.execute('SELECT * FROM team_registrations WHERE team_id=?',(team_id,)).fetchone()
+        # Hash the complete persisted snapshots; expose only staff review fields, never registration secrets.
+        snapshot=[dict(db.execute('SELECT * FROM teams WHERE id=?',(team_id,)).fetchone()),
+                  dict(db.execute('SELECT * FROM team_details WHERE team_id=?',(team_id,)).fetchone() or {}),
+                  dict(registration) if registration else None]
+        team['teamContext']=digest('claim-team-context-v1',json.dumps(snapshot,ensure_ascii=False,sort_keys=True))
+        team['registration']={'captain':registration['captain'],'school':registration['school'],
+            'members':json.loads(registration['members_json']),'revision':registration['revision'],
+            'targetSize':registration['target_size'],'summary':registration['summary']} if registration else None
+        return team
 
     def review_context(self,db,request_id,revision,declaration):
         names=sorted({normalize(p['name']) for p in [declaration['captain']]+declaration['members']}) if declaration else []
@@ -245,7 +259,8 @@ class Claims:
 
     def approve_open(self,db,actor,body):
         fields={'requestId','expectedRevision','reviewContext','teamName','track','pin','inPersonVerified','resolvedIdentity','note'}
-        if set(body)!=fields:raise APIError(400,'开放申请审核字段不正确')
+        if set(body) not in (fields,fields|{'teamId','teamContext'}):raise APIError(400,'开放申请审核字段不正确')
+        if 'teamId' in body and (not isinstance(body['teamId'],str) or not body['teamId'] or not isinstance(body['teamContext'],str) or not re.fullmatch(r'[a-f0-9]{64}',body['teamContext'])):raise APIError(400,'请选择队伍并提交当前队伍核验上下文')
         if not isinstance(body['requestId'],str) or type(body['expectedRevision']) is not int or not isinstance(body['reviewContext'],str) or not re.fullmatch(r'[a-f0-9]{64}',body['reviewContext']):raise APIError(400,'需要申请修订号及核验上下文')
         if body['inPersonVerified'] is not True or type(body['resolvedIdentity']) is not bool:raise APIError(400,'请当面核实本人和全部组员')
         if not isinstance(body['pin'],str) or not re.fullmatch(r'\d{6}',body['pin']):raise APIError(400,'请输入申请人设备上的六位核验码')
@@ -263,6 +278,12 @@ class Claims:
         self.validate_declaration(row['name'],row['school'],declaration['members'])
         context,references=self.review_context(db,row['id'],row['revision'],declaration)
         if not hmac.compare_digest(context,body['reviewContext']):raise APIError(409,'相关身份或申请已变化，请保留核实备注并刷新，重新核对后批准')
+        selected=self.eligible_team(db,body['teamId']) if 'teamId' in body else None
+        if 'teamId' in body and (not selected or not hmac.compare_digest(selected['teamContext'],body['teamContext'])):
+            raise APIError(409,'所选队伍或登记资料已变化、已发码或已归队，请保留输入并刷新核对')
+        if any(normalize(t['name'])==normalize(metadata['teamName']) and (not selected or t['id']!=selected['id'])
+               for t in db.execute('SELECT id,name FROM teams')):
+            raise APIError(409,'这个队名已存在，请明确选择已有队伍进行核验，或填写可区分的队名')
         self.verify_pin(db,actor,row,body['pin'])
         people=[declaration['captain']]+declaration['members'];matches=[]
         for person in people:
@@ -272,11 +293,21 @@ class Claims:
             possible=[p for p in references if p['normalized_name']==identity[0] and p['normalized_school']!=identity[1] and p['teamId']]
             if possible and (not body['resolvedIdentity'] or not note):raise APIError(400,'存在其他学校的同名已归队人员，请明确区分本人并填写核实说明')
             matches.append(exact)
-        used={r[0] for r in db.execute('SELECT number FROM teams')}
-        number=next((n for n in range(1,1000) if n not in used),None)
-        if number is None:raise APIError(409,'队号 1–999 已用完，请联系组织方')
+        if selected:
+            team_values={'id':selected['id'],'expectedRevision':selected['revision']}
+        else:
+            used={r[0] for r in db.execute('SELECT number FROM teams')}
+            number=next((n for n in range(1,1000) if n not in used),None)
+            if number is None:raise APIError(409,'队号 1–999 已用完，请联系组织方')
+            team_values={'number':number,'status':'active'}
         try:
-            team=self.s.admin_data.save_team(db,actor,{'number':number,'name':metadata['teamName'],'track':metadata['track'],'status':'active'})
+            team=self.s.admin_data.save_team(db,actor,{**team_values,'name':metadata['teamName'],'track':metadata['track']})
+            if selected and selected['registration']:
+                names=[person['name'] for person in people]
+                registration_value={'name':metadata['teamName'],'members':names,'targetSize':selected['registration']['targetSize']}
+                db.execute('''UPDATE team_registrations SET captain=?,school=?,members_json=?,flags_json=?,revision=revision+1
+                    WHERE team_id=?''',(declaration['captain']['name'],declaration['captain']['school'],json.dumps(names,ensure_ascii=False),
+                    json.dumps(self.s.registration.flags(registration_value),ensure_ascii=False),team['id']))
             member_ids=[]
             for person,exact in zip(people,matches):
                 person_id=exact['id'] if exact else 'P'+secrets.token_hex(16)
@@ -293,7 +324,8 @@ class Claims:
                 account_id=?,account_fingerprint=? WHERE id=?""",(team['id'],member_ids[0],approval,note,account['id'],fingerprint(account),row['id']))
         except sqlite3.IntegrityError:raise APIError(409,'成员或队伍已经分配，请重新读取并核对')
         self.s.audit(db,actor,'claims.approve-open',row['id'],{'teamId':team['id'],'memberIds':member_ids,'declaration':reviewed,
-            'requestRevision':body['expectedRevision'],'reviewContext':body['reviewContext'],'resolvedIdentity':body['resolvedIdentity'],'note':note})
+            'requestRevision':body['expectedRevision'],'reviewContext':body['reviewContext'],'resolvedIdentity':body['resolvedIdentity'],'note':note,
+            **({'selectedTeamId':body['teamId'],'teamContext':body['teamContext']} if selected else {})})
         return {'ok':True,'status':'approved','revision':row['revision']+1}
 
     def review(self,db,actor,body):

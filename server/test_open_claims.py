@@ -147,3 +147,102 @@ class OpenClaimsTests(unittest.TestCase):
         wrong='000000' if claim['pin']!='000000' else '111111'
         for _ in range(5):self.assertEqual(self.admin_call('/approve',{**body,'pin':wrong})[0],400)
         self.assertEqual(self.admin_call('/approve',body)[0],429);self.assertEqual(self.counts()['teams'],0)
+
+    def registration(self,prefix='Open',**changes):
+        import secrets
+        value={'name':prefix+' Team','captain':prefix+' Captain','school':'School A','phone':'13900000001',
+               'targetSize':3,'members':[prefix+' One'],'project':'Existing project','summary':'Retained summary',**changes}
+        code=secrets.token_urlsafe(32)
+        status,result,_=self.public.post('/api/registration/create',{'code':code,'team':value})
+        self.assertEqual(status,200,result)
+        return code,result['team'],value
+
+    def selected_approval(self,claim,team_id,**changes):
+        team=next(t for t in self.admin_call('')[1]['teams'] if t['id']==team_id)
+        return self.approval(claim,teamId=team_id,teamContext=team['teamContext'],**changes)
+
+    def test_existing_registration_approval_binds_same_team_and_locks_reviewed_members(self):
+        code,registered,value=self.registration()
+        self.assertEqual(self.public.post('/api/login',{'role':'team','code':code})[0],401)
+        with self.service.db() as db:
+            db.execute('UPDATE team_registrations SET source_key=?,raw_json=? WHERE team_id=?',('fixture-source','{"original":"unchanged"}',registered['id']))
+            original=dict(db.execute('SELECT * FROM team_registrations WHERE team_id=?',(registered['id'],)).fetchone())
+        claim=self.application();body=self.selected_approval(claim,registered['id'],teamName='Reviewed name',track='AI for Science')
+        candidate=next(t for t in self.admin_call('')[1]['teams'] if t['id']==registered['id'])
+        self.assertEqual(candidate['registration']['members'],['Open Captain','Open One'])
+        for field in ['phone','raw_json','secret_hash','source_key']:self.assertNotIn(field,candidate['registration'])
+        self.assertNotIn(code,json.dumps(candidate))
+        self.assertEqual(self.counts()['team_accounts'],0)
+        self.assertEqual(self.admin_call('/approve',body)[0],200)
+        self.assertEqual(self.counts()['teams'],1);self.assertEqual(self.counts()['claim_memberships'],3)
+        own=self.bearer(claim)[1];self.assertEqual(own['team']['id'],registered['id']);self.assertEqual(own['team']['number'],registered['number'])
+        with self.service.db() as db:
+            team=self.service.admin_data.team(db,registered['id']);updated=dict(db.execute('SELECT * FROM team_registrations WHERE team_id=?',(registered['id'],)).fetchone())
+        self.assertEqual(team['project'],'Existing project');self.assertEqual(team['name'],'Reviewed name')
+        self.assertEqual(json.loads(updated['members_json']),['Open Captain','Open One','Open Two'])
+        self.assertGreater(updated['revision'],original['revision'])
+        for field in ['phone','source_key','raw_json','secret_hash','summary','created_at']:self.assertEqual(updated[field],original[field])
+        saved=self.public.post('/api/registration/open',{'code':code})[1]['team']
+        self.assertEqual(saved['members'],['Open Captain','Open One','Open Two'])
+        self.assertEqual(self.public.post('/api/registration/save',{'code':code,'expectedRevision':saved['revision'],
+            'team':{**value,'name':'Reviewed name','members':['Open One','Different Person']}})[0],409)
+        issue=self.bearer(claim,'redeem')[1];team_client=Client(self.server)
+        self.assertEqual(team_client.post('/api/login',{'role':'team','code':issue['code']})[0],200)
+        before=self.counts();self.assertEqual(self.admin_call('/approve',body)[0],200);self.assertEqual(self.counts(),before)
+        self.assertEqual(self.admin_call('')[1]['teams'],[])
+
+    def test_selected_registration_snapshot_rejects_changed_registration_and_team_fields(self):
+        code,team,value=self.registration();claim=self.application();body=self.selected_approval(claim,team['id'])
+        saved=self.public.post('/api/registration/save',{'code':code,'expectedRevision':team['revision'],'team':{**value,'phone':'13900000002'}})
+        self.assertEqual(saved[0],200,saved[1]);before=self.counts()
+        self.assertEqual(self.admin_call('/approve',body)[0],409);self.assertEqual(self.counts(),before)
+        body=self.selected_approval(claim,team['id'])
+        with self.service.db() as db:self.service.admin_data.save_team(db,None,{'id':team['id'],'name':'Renamed registration'})
+        self.assertEqual(self.admin_call('/approve',body)[0],409);self.assertEqual(self.counts(),before)
+        self.assertEqual(self.admin_call('/approve',self.selected_approval(claim,team['id']))[0],200)
+
+    def test_existing_team_requires_explicit_selection_and_duplicate_name_is_normalized(self):
+        _,team,_=self.registration();claim=self.application(teamName='  ＯＰＥＮ   TEAM ')
+        before=self.counts();response=self.admin_call('/approve',self.approval(claim))
+        self.assertEqual(response[0],409);self.assertIn('选择',response[1]['error']);self.assertEqual(self.counts(),before)
+        body=self.selected_approval(claim,team['id']);self.assertEqual(self.admin_call('/approve',body)[0],200)
+        second=self.application('Different',teamName='open team');before=self.counts()
+        self.assertEqual(self.admin_call('/approve',self.approval(second))[0],409);self.assertEqual(self.counts(),before)
+        self.assertEqual(self.admin_call('/approve',self.approval(second,teamName='Distinct new team'))[0],200)
+
+    def test_selected_registration_issuance_failure_rolls_back_team_and_registration_changes(self):
+        _,team,_=self.registration();claim=self.application();body=self.selected_approval(claim,team['id'],teamName='Changed on approval')
+        with self.service.db() as db:
+            before_team=dict(db.execute('SELECT * FROM teams WHERE id=?',(team['id'],)).fetchone())
+            before_registration=dict(db.execute('SELECT * FROM team_registrations WHERE team_id=?',(team['id'],)).fetchone())
+        before=self.counts()
+        with patch.object(self.service,'team_access',side_effect=APIError(409,'synthetic failure')):
+            self.assertEqual(self.admin_call('/approve',body)[0],409)
+        self.assertEqual(self.counts(),before)
+        with self.service.db() as db:
+            self.assertEqual(dict(db.execute('SELECT * FROM teams WHERE id=?',(team['id'],)).fetchone()),before_team)
+            self.assertEqual(dict(db.execute('SELECT * FROM team_registrations WHERE team_id=?',(team['id'],)).fetchone()),before_registration)
+        self.assertEqual(self.admin_call('/approve',body)[0],200)
+
+    def test_optional_team_target_is_validated_and_becomes_ineligible_after_changes(self):
+        _,team,_=self.registration();claim=self.application();body=self.selected_approval(claim,team['id'])
+        for changes in [{'teamContext':'非 ASCII'},{'teamContext':None},{'teamId':''}]:
+            self.assertEqual(self.admin_call('/approve',{**body,**changes})[0],400)
+        self.assertEqual(self.admin_call('/approve',{k:v for k,v in body.items() if k!='teamContext'})[0],400)
+        with self.service.db() as db:db.execute("UPDATE team_details SET status='withdrawn' WHERE team_id=?",(team['id'],))
+        before=self.counts();self.assertEqual(self.admin_call('')[1]['teams'],[])
+        self.assertEqual(self.admin_call('/approve',body)[0],409);self.assertEqual(self.counts(),before)
+        with self.service.db() as db:db.execute("UPDATE team_details SET status='active' WHERE team_id=?",(team['id'],))
+        body=self.selected_approval(claim,team['id'])
+        self.assertEqual(self.admin.post('/api/admin/team-access',{'teamId':team['id'],'action':'issue'})[0],200)
+        before=self.counts();self.assertEqual(self.admin_call('')[1]['teams'],[])
+        self.assertEqual(self.admin_call('/approve',body)[0],409);self.assertEqual(self.counts(),before)
+
+    def test_racing_different_claims_cannot_bind_the_same_existing_team(self):
+        _,team,_=self.registration();first=self.application();second=self.application('Different')
+        bodies=[self.selected_approval(first,team['id']),self.selected_approval(second,team['id'])]
+        with ThreadPoolExecutor(max_workers=2) as pool:results=list(pool.map(lambda body:self.admin_call('/approve',body),bodies))
+        self.assertEqual(sorted(result[0] for result in results),[200,409]);self.assertEqual(self.counts()['teams'],1)
+        self.assertEqual(self.counts()['claim_memberships'],3);self.assertEqual(self.counts()['team_accounts'],1)
+        winner=bodies[0] if results[0][0]==200 else bodies[1]
+        self.assertEqual(self.admin_call('/approve',winner)[0],200)

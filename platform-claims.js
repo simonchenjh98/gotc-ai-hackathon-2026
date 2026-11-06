@@ -126,12 +126,20 @@ function makeClaimsAdminGuard(getContext){
 function claimsPersonForm(person={id:'',name:'',school:'',notes:'',needsReview:false,revision:0}){
   return `<form id="claim-person-form"><h3>${person.revision?'修订名单':'补充已核实参赛者'}</h3><input type="hidden" name="revision" value="${Number(person.revision)}"><label class="field">稳定名单编号<input name="id" maxlength="100" pattern="[A-Za-z0-9_-]+" required value="${esc(person.id)}" ${person.revision?'readonly':''}></label><label class="field">姓名<input name="name" required maxlength="100" value="${esc(person.name)}"></label><label class="field">学校<input name="school" required maxlength="200" value="${esc(person.school)}"></label><label class="field">原始记录与核实备注<textarea name="notes" maxlength="2000">${esc(person.notes)}</textarea></label><label class="toggle-line"><input type="checkbox" name="needsReview" ${person.needsReview?'checked':''}>仍需现场核实</label><button class="btn secondary small">保存名单修订</button><p class="form-error" role="alert"></p></form>`;
 }
+function claimExistingTeamMarkup(team){
+  if(!team)return '<p class="small-note">默认批准后创建新队伍；如本队已登记，请主动选择对应队伍，系统不会按队名自动绑定。</p>';
+  const registration=team.registration;
+  return `<section class="info-banner"><strong>将核验已有队伍：${esc(teamLabel(team))}</strong><p>项目：${esc(team.project || '未填写')}（保留）</p>${registration?`<p>登记队长：${esc(registration.captain)} · ${esc(registration.school)}<br>登记成员：${registration.members.map(esc).join('、')}<br>登记修订：${Number(registration.revision)}</p><p>批准即确认该登记属于本申请，并以本次现场核实的队长、学校和全体成员更新登记；原项目与联系方式保留。</p>`:'<p>批准即确认此队属于本申请；保留队号和项目，并绑定本次核实的全体成员。</p>'}</section>`;
+}
+function claimTeamSelectionMarkup(data){
+  return `<label class="field">归队方式（可选已有登记）<select name="teamId"><option value="">创建新队伍（默认）</option>${(data.teams??[]).map(team=>`<option value="${esc(team.id)}">${esc(teamLabel(team))}${team.registration?' · 已登记':''}</option>`).join('')}</select></label><div id="claim-existing-summary">${claimExistingTeamMarkup(null)}</div>`;
+}
 function claimsReviewMarkup(request,data){
   const status={pending:'待核验',approved:'已批准',issued:'已领取',rejected:'已拒绝',expired:'已过期'};
   if(request.status!=='pending')return `<h3>${esc(request.name)} · ${esc(status[request.status] || request.status)}</h3>${claimDeclarationMarkup(request.declaration)}<p>${esc(request.reviewNote)}</p>`;
   const declared=request.declaration;
   const references=request.references??[];
-  return `<form id="claim-review-form"><h3>现场核验并创建队伍 · ${esc(request.name)}</h3><p>申请学校：<strong>${esc(request.school)}</strong><br>申请编号：<code>${esc(request.id)}</code> · 修订 ${Number(request.revision)}</p>${claimDeclarationMarkup(declared)}${declared?`${claimTeamMarkup(declared,data.trackOptions??CLAIM_TRACK_OPTIONS)}<p class="small-note">逐人核实上述成员；批准后自动创建队伍、登记成员并开放本队提交码领取。</p>${references.length?`<details open><summary>相关私有身份参考（仅用于去重）</summary><ul>${references.map(p=>`<li>${esc(p.name)} · ${esc(p.school)} · ${p.teamId?'已归队，可能重复，请区分本人':'未归队，同名同校可复用'}${p.needsReview?' · 原记录待核实（参考）':''}<br>${esc(p.notes)}</li>`).join('')}</ul></details>`:'<p>无相关参考记录；现场核实后将自动登记新成员。</p>'}<label class="field">申请人设备上的六位核验码<input name="pin" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="off" required></label><label class="toggle-line"><input name="inPersonVerified" type="checkbox" required>已当面核实队长及全体组员身份和组队关系</label><label class="toggle-line"><input name="resolvedIdentity" type="checkbox">如有其他学校的同名已归队人员，已确认属于不同本人，并在下方说明</label>`:'<p class="info-banner warning">请申请人打开原领取页面，补充全体组员后再刷新审核。无需预先导入名单。</p>'}<label class="field">核实或拒绝说明<textarea name="note" maxlength="2000">${esc(request.reviewNote)}</textarea></label><div class="actions">${declared?'<button class="btn" type="submit">确认创建队伍并批准领取</button>':''}<button class="btn danger" type="button" id="claim-reject">拒绝申请</button></div><p class="form-error" role="alert"></p></form>`;
+  return `<form id="claim-review-form"><h3>现场核验并创建队伍 · ${esc(request.name)}</h3><p>申请学校：<strong>${esc(request.school)}</strong><br>申请编号：<code>${esc(request.id)}</code> · 修订 ${Number(request.revision)}</p>${claimDeclarationMarkup(declared)}${declared?`${claimTeamSelectionMarkup(data)}${claimTeamMarkup(declared,data.trackOptions??CLAIM_TRACK_OPTIONS)}<p class="small-note">逐人核实上述成员；批准后创建新队或绑定所选已有队伍、登记成员并开放本队提交码领取。</p>${references.length?`<details open><summary>相关私有身份参考（仅用于去重）</summary><ul>${references.map(p=>`<li>${esc(p.name)} · ${esc(p.school)} · ${p.teamId?'已归队，可能重复，请区分本人':'未归队，同名同校可复用'}${p.needsReview?' · 原记录待核实（参考）':''}<br>${esc(p.notes)}</li>`).join('')}</ul></details>`:'<p>无相关参考记录；现场核实后将自动登记新成员。</p>'}<label class="field">申请人设备上的六位核验码<input name="pin" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="off" required></label><label class="toggle-line"><input name="inPersonVerified" type="checkbox" required>已当面核实队长及全体组员身份和组队关系，并确认所选已有队伍及登记（如有）属于本申请</label><label class="toggle-line"><input name="resolvedIdentity" type="checkbox">如有其他学校的同名已归队人员，已确认属于不同本人，并在下方说明</label>`:'<p class="info-banner warning">请申请人打开原领取页面，补充全体组员后再刷新审核。无需预先导入名单。</p>'}<label class="field">核实或拒绝说明<textarea name="note" maxlength="2000">${esc(request.reviewNote)}</textarea></label><div class="actions">${declared?'<button class="btn" type="submit">确认建队或归队并批准领取</button>':''}<button class="btn danger" type="button" id="claim-reject">拒绝申请</button></div><p class="form-error" role="alert"></p></form>`;
 }
 function installClaimsAdmin(version){
   root.insertAdjacentHTML('beforeend',`<section class="surface" id="claims-admin"><h2>现场报名核验与提交码领取</h2><p>所有队伍均可申请，无需预置名单或队伍。组织方当面核实后创建队伍；每名选手仅归属一队。</p><button class="btn secondary small" id="claims-admin-load">读取 / 刷新申请与名单</button><p id="claims-admin-message" role="status"></p><div id="claims-admin-content"></div></section>`);
@@ -168,12 +176,20 @@ function installClaimsAdmin(version){
   }
   function selectRequest(id){
     if(!live() || busy)return;const panel=document.getElementById('claim-review');if(!replaceEditor(panel))return;const request=model.requests.find(r=>r.id===id);panel.innerHTML=claimsReviewMarkup(request,model);const form=document.getElementById('claim-review-form');if(!form)return;trackAdminForm(form);
+    const existing=form.elements.teamId;
+    if(existing)existing.onchange=()=>{
+      const team=model.teams.find(team=>team.id===existing.value);
+      document.getElementById('claim-existing-summary').innerHTML=claimExistingTeamMarkup(team);
+      form.elements.inPersonVerified.checked=false;
+    };
     const common=action=>({requestId:id,expectedRevision:request.revision,action,note:form.elements.note.value});
     form.onsubmit=e=>{
       e.preventDefault();if(!request.declaration)return;const f=form.elements;
+      const selectedId=f.teamId?.value??'',selected=(model.teams??[]).find(team=>team.id===selectedId);
+      if(selectedId && !selected){formError(form,'所选队伍已变化，请刷新后核对');return;}
       mutate(form,'admin/claims/approve',{requestId:id,expectedRevision:request.revision,reviewContext:request.reviewContext,
         teamName:f.teamName.value,track:f.track.value,note:f.note.value,pin:f.pin.value,
-        inPersonVerified:f.inPersonVerified.checked,resolvedIdentity:f.resolvedIdentity.checked});
+        ...(selected?{teamId:selected.id,teamContext:selected.teamContext}:{}),inPersonVerified:f.inPersonVerified.checked,resolvedIdentity:f.resolvedIdentity.checked});
     };
     document.getElementById('claim-reject').onclick=()=>{if(confirm('确认拒绝此申请？'))mutate(form,'admin/claims/review',common('reject'));};
   }
