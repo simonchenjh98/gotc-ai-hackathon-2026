@@ -469,7 +469,9 @@ class EventService:
         rows = db.execute("""SELECT t.*, COUNT(s.judge_id) AS judge_count, AVG(s.total_tenths)/10.0 AS average,
           (SELECT COUNT(*) FROM votes v WHERE v.team_id=t.id) AS audience_votes
           FROM teams t LEFT JOIN scores s ON s.team_id=t.id AND s.status='submitted'
-          GROUP BY t.id ORDER BY t.number""").fetchall()
+          LEFT JOIN team_details d ON d.team_id=t.id
+          WHERE (?=0 OR COALESCE(d.status,'active')='active')
+          GROUP BY t.id ORDER BY t.number""", (int(public),)).fetchall()
         result = [{"id": r["id"], "number": r["number"], "name": r["name"], "project": r["project"], "track": r["track"],
                    "judgeCount": r["judge_count"],
                    "score": self.professional_score(r["average"], r["judge_count"], config, public),
@@ -553,6 +555,15 @@ class EventService:
                 # Keep release settings, aggregates and editor revisions in one read snapshot.
                 db.execute("BEGIN")
             actor = self.account(db, cookie)
+            page_role = ("audience" if path in {"/api/audience", "/api/vote"} else
+                         "judge" if path in {"/api/judging/exhibition", "/api/judging/exhibition/", "/api/judging/exhibition/review",
+                                              "/api/judging/roadshow", "/api/judging/roadshow/", "/api/judging/roadshow/review"} else None)
+            if page_role:
+                self.require(actor, page_role)
+                if not expected_login_id:
+                    raise APIError(428, "缺少页面登录信息，请刷新页面并核对登录身份后重试", "login_required")
+                if expected_login_id != self.login_id(cookie):
+                    raise APIError(401, "登录身份已变化，请重新登录后操作")
             if path == "/api/team/score":
                 self.require(actor, "team")
                 if method != "GET":
@@ -613,7 +624,7 @@ class EventService:
                 self.require(actor, "judge")
                 if not self.config(db)["scoringOpen"]:
                     raise APIError(409, "评分尚未开放或已关闭")
-                team_id = self.team_exists(db, body.get("teamId"))
+                team_id = self.team_exists(db, body.get("teamId"), require_active=True)
                 revision=self.write_conflicts.check_score(db,actor["id"],team_id,body)
                 status = body.get("status")
                 if status not in {"draft", "submitted", "recused"}:
@@ -650,7 +661,7 @@ class EventService:
                 self.require(actor, "audience")
                 if not self.voting_window(db)['canEdit']:
                     raise APIError(409, "观众投票尚未开放、已关闭或已截止")
-                team_id = self.team_exists(db, body.get("teamId"))
+                team_id = self.team_exists(db, body.get("teamId"), require_active=True)
                 already = db.execute("SELECT 1 FROM votes WHERE account_id=? AND team_id=?", (actor["id"], team_id)).fetchone()
                 if not already:
                     count = db.execute("SELECT COUNT(*) FROM votes WHERE account_id=?", (actor["id"],)).fetchone()[0]
@@ -931,11 +942,13 @@ class EventService:
                              *[(record["submitted"] or {}).get(key, "") for key in fields], *[(record["draft"] or {}).get(key, "") for key in fields]]])
         return ("\ufeff"+output.getvalue()).encode("utf-8")
 
-    def team_exists(self, db, team_id):
+    def team_exists(self, db, team_id, *, require_active=False):
         if not isinstance(team_id, str) or len(team_id) > 80:
             raise APIError(400, "队伍编号不正确")
         if not db.execute("SELECT 1 FROM teams WHERE id=?", (team_id,)).fetchone():
             raise APIError(404, "队伍不存在")
+        if require_active and db.execute("SELECT 1 FROM team_details WHERE team_id=? AND status!='active'", (team_id,)).fetchone():
+            raise APIError(409, "该队伍已退出或被取消资格，不能继续评分或投票", "team_ineligible")
         return team_id
 
     def check_scores(self, scores):

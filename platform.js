@@ -9,7 +9,7 @@ const selectedTeams={},dirtyAdminForms=new Set();
 const stageForRoute=()=>route.endsWith('-roadshow')?'roadshow':'exhibition';
 const stageName=stage=>stage==='roadshow'?'路演评审':'展示评审';
 const stageNotice=stage=>stage==='roadshow'?'<div class="info-banner warning"><strong>组织方人工工作名单</strong><br>晋级算法尚未实现，本页名单不代表正式晋级。展示与路演的名单、材料和评语分别保存。</div>':'';
-let logoutInFlight=null,currentTeamKeys=null;
+let logoutInFlight=null,currentTeamKeys=null,currentIdentityPage=null;
 let session={role:null}, route='', pollTimer, routeVersion=0, lastBoard, judgeData, selectedTeam, toastTimer;
 const roleName = {team:'参赛队伍',judge:'专业评委',audience:'观众',admin:'组织方'};
 function toast(message) { const el = document.getElementById('platform-toast'); el.textContent = message; el.classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('visible'), 4500); }
@@ -23,7 +23,7 @@ function publishLogin(login){if(!login.loginId)return;try{localStorage.setItem(l
 function ownsBrowserLogin(login){const owner=browserLoginOwner();return !owner || !login.loginId || owner===login.loginId || (verifiedBrowserLogin?.loginId===login.loginId && verifiedBrowserLogin.owner===owner);}
 async function api(path, data, options={}) {
   const recoveryAtStart=currentTeamRecovery,sessionAtStart=session,ownerAtStart=path==='session'?browserLoginOwner():null;
-  const res = await fetch(new URL(`api/${path}`, base), {credentials:'same-origin',cache:'no-store',method:data === undefined ? 'GET' : 'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json'}),...((['team','team/score','submission','logout','judge','score','admin','admin/settings'].includes(path) || path.startsWith('submission/') || path==='team/keys' || path.startsWith('team/keys/') || path.startsWith('team/repository') || path.startsWith('admin/repositories') || path==='admin/claims' || path.startsWith('admin/claims/')) && (options.loginId ?? session.loginId)?{'X-GOTC-Login':options.loginId ?? session.loginId}:{})},body:data === undefined ? undefined : JSON.stringify(data),signal:options.signal});
+  const res = await fetch(new URL(`api/${path}`, base), {credentials:'same-origin',cache:'no-store',method:data === undefined ? 'GET' : 'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json'}),...((['team','team/score','submission','logout','judge','score','admin','admin/settings','audience','vote','judging/exhibition','judging/exhibition/review','judging/roadshow','judging/roadshow/review'].includes(path) || path.startsWith('submission/') || path==='team/keys' || path.startsWith('team/keys/') || path.startsWith('team/repository') || path.startsWith('admin/repositories') || path==='admin/claims' || path.startsWith('admin/claims/')) && (options.loginId ?? session.loginId)?{'X-GOTC-Login':options.loginId ?? session.loginId}:{})},body:data === undefined ? undefined : JSON.stringify(data),signal:options.signal});
   let body; try { body = await res.json(); } catch { throw new Error('服务暂时不可用，请稍后重试。'); }
   if (!res.ok) { if((res.status===401 || res.status===403) && recoveryAtStart && currentTeamRecovery===recoveryAtStart)recoveryAtStart.lock();if(res.status===401 && session===sessionAtStart && (!recoveryAtStart || currentTeamRecovery===recoveryAtStart))session={role:null}; const error = new Error(body.error || '操作未成功，请重试。'); error.status = res.status; error.code=body.code; throw error; }
   if(path==='session')verifiedBrowserLogin={loginId:body.loginId,owner:ownerAtStart};
@@ -186,7 +186,7 @@ function renderLogin(role) {
   const roleLabel={team:'TEAM',judge:'JUDGE',audience:'AUDIENCE',admin:'ADMIN'}[role];
   if (!Object.hasOwn(roleName,role)) throw new Error('无效登录入口');
   const stage=stageForRoute();
-  const copy = {team:route==='team-score'?['本队查分','输入主办方发给本队的提交码，查看本队已发布的专业评分总分。']:['把作品准备好，<br>把创造的过程留下来。','使用主办方为本队提供的独立提交码。草稿仅本队和组织方可见，正式提交后评委才能查看材料。'],judge:route==='judge'?['专业评分<br>六维 100 分','使用主办方提供的评委码，选择自己的身份。评分可保存草稿，正式提交后计入专业均分。']:[`${stageName(stage)}记录`,'使用主办方提供的评委码，选择自己的身份。可查看本轮队伍、保存草稿、提交评语或回避；本阶段记录暂不计分。'],audience:['选出让你<br>眼前一亮的作品。','观众选择票独立于专业成绩。使用观众邀请码登录，每个邀请码最多支持 3 支不同队伍。'],admin:['组织方<br>活动管理','管理队伍、评委、评审窗口和作品材料。请使用主办方管理码登录。']}[role];
+  const copy = {team:route==='team-score'?['本队查分','输入主办方发给本队的提交码，查看本队已发布的专业评分总分。']:['选手工作台<br>AI 工具 · 作品提交','用本队提交码登录，在同一工作台查看 AI 工具、准备代码仓库和提交作品。没有提交码，请先申请现场核验。'],judge:route==='judge'?['专业评分<br>六维 100 分','使用主办方提供的评委码，选择自己的身份。评分可保存草稿，正式提交后计入专业均分。']:[`${stageName(stage)}记录`,'使用主办方提供的评委码，选择自己的身份。可查看本轮队伍、保存草稿、提交评语或回避；本阶段记录暂不计分。'],audience:['选出让你<br>眼前一亮的作品。','观众选择票独立于专业成绩。使用观众邀请码登录，每个邀请码最多支持 3 支不同队伍。'],admin:['组织方<br>活动管理','管理队伍、评委、评审窗口和作品材料。请使用主办方管理码登录。']}[role];
   root.innerHTML = `<div class="login-layout"><div class="login-story"><p class="eyebrow">GOTC 2026 / ${roleLabel}</p><h1>${copy[0].split('<br>').map(esc).join('<br>')}</h1><p>${esc(copy[1])}</p><span class="login-pixel" aria-hidden="true"></span></div><form class="login-card" id="login-form"><h2>${esc(roleName[role])}登录</h2>${role==='team'?'<p><a href="#claim">尚无提交码？申请现场核验与领取 ↗</a></p>':''}<p>邀请码仅用于本届活动，请妥善保管。<br>如未收到或无法登录，请联系现场主办方。</p><label class="field">${role === 'admin' ? '组织方管理码' : (role === 'judge' ? '评委登录码' : role === 'team' ? '队伍提交码' : '观众邀请码')}<input name="code" type="password" autocomplete="one-time-code" required maxlength="160" placeholder="输入你的${role === 'admin' ? '管理码' : '邀请码'}"></label><p class="form-error" role="alert"></p><button type="submit" class="btn">${route==='team-score'?'查看本队成绩':'进入'+esc(roleName[role])+'工作台 ↗'}</button><p class="form-footnote">公众查看成绩和评审进度无需登录。<a href="${route==='judge' || route==='team-score'?'#board':stage==='roadshow'?'#board-roadshow':'#board-exhibition'}">查看公开看板 →</a></p></form></div>`;
   const form=document.getElementById('login-form');
   const scoreLoginVersion=route==='team-score'?routeVersion:null;
@@ -230,10 +230,12 @@ function renderWrongRole(role) { root.innerHTML = heading('ACCESS / 登录身份
 function reviewState(record){return record?.invalidated?'已作废':record?.recused?'已回避':record?.submitted?(record.hasUnsubmittedChanges?'已正式提交 · 有草稿修改':'已正式提交（未计分）'):record?.draft?'草稿已保存':'待评审';}
 function reviewMaterialMarkup(snapshot,stage=null){return `<section class="surface submitted-materials"><h2>本轮正式材料快照</h2>${stage?`<p class="small-note">轮次 ${esc(stage.runId)} · 冻结时间 ${esc(beijingTime(stage.frozenAt))}（北京时间）</p>`:''}${snapshot?`<p class="small-note">队伍提交版本 ${Number(snapshot.submissionVersion)} · 正式提交 ${esc(beijingTime(snapshot.submittedAt))}<br>本轮截取 ${esc(beijingTime(snapshot.capturedAt))}（北京时间）</p>${materialMarkup(snapshot.materials)}`:!stage?'<p class="small-note">本轮没有正式材料快照。</p>':stage.frozenAt===null?'<p class="small-note">尚未生成材料快照；首次开放时截取当时的正式材料。</p>':'<p class="small-note">本轮冻结时无正式材料；可根据现场演示记录观察。后续提交材料不会自动替换本轮快照。</p>'}</section>`;}
 async function renderExhibitionJudge(version,expectedForm=null,stage=stageForRoute()){
-  let data;
-  const stale=()=>version!==routeVersion || stage!==stageForRoute() || (expectedForm && !expectedForm.isConnected);
-  try{data=await api(`judging/${stage}`);}catch(error){if(stale())return;if(error.status===403){root.innerHTML=heading(`JUDGE / ${stageName(stage)}`,'本轮尚未获得评审授权',`请联系组织方，将你的评委身份加入${stageName(stage)}工作名单。`)+stageNotice(stage)+empty('尚未分配本轮队伍','获得授权后，可用当前身份重新读取。','<button class="btn secondary" id="retry-judge">重新读取</button>');document.getElementById('retry-judge').onclick=()=>renderExhibitionJudge(version,null,stage);return;}throw error;}
-  if(stale())return;
+  let data;const owner=session;
+  const stale=()=>version!==routeVersion || stage!==stageForRoute() || (expectedForm && !expectedForm.isConnected) || session!==owner || !ownsBrowserLogin(owner);
+  function changedLogin(){if(version!==routeVersion || stage!==stageForRoute() || (expectedForm && !expectedForm.isConnected))return;if(expectedForm)currentIdentityPage?.valid();else root.innerHTML=empty('登录身份已失效或切换','请刷新页面并核对评委身份后继续。');}
+  if(stale()){changedLogin();return;}
+  try{data=await api(`judging/${stage}`,undefined,{loginId:owner.loginId});}catch(error){if(stale()){changedLogin();return;}if(error.status===403){root.innerHTML=heading(`JUDGE / ${stageName(stage)}`,'本轮尚未获得评审授权',`请联系组织方，将你的评委身份加入${stageName(stage)}工作名单。`)+stageNotice(stage)+empty('尚未分配本轮队伍','获得授权后，可用当前身份重新读取。','<button class="btn secondary" id="retry-judge">重新读取</button>');document.getElementById('retry-judge').onclick=()=>renderExhibitionJudge(version,null,stage);return;}throw error;}
+  if(stale()){changedLogin();return;}
   judgeData=data;
   const submitted=judgeData.myReviews.filter(r=>r.submitted && !r.recused && !r.invalidated).length;
   root.innerHTML=heading(`JUDGE / ${stageName(stage)}`,`${stageName(stage)}记录`,`${esc(session.name || '评委')} · 已正式提交 ${submitted} 份评审记录（未计分）`,`<span class="status-chip ${judgeData.window.canEdit?'':'closed'}">${judgeData.window.canEdit?'评审记录开放中':'当前只读'}</span>`)+stageNotice(stage)+`<div class="stage-strip"><strong>${esc(judgeData.stage.name)}</strong><span>数值规则待配置</span><span>截止（北京时间）：${esc(beijingTime(judgeData.window.deadline))}${judgeData.window.deadline===null?'（未设置）':''}</span></div>`+rulePlaceholders(judgeData.stage);
@@ -249,25 +251,31 @@ function renderExhibitionTeamPicker(){
   document.querySelectorAll('[data-team]').forEach(b=>b.onclick=()=>{if(String(selectedTeam)===b.dataset.team)return;if(!confirmLeave())return;reviewDirty=false;selectedTeam=b.dataset.team;selectedTeams[judgeData.stage.id || 'exhibition']=selectedTeam;renderExhibitionTeamPicker();renderExhibitionJudgeEditor();});
 }
 function renderExhibitionJudgeEditor(){
-  const stage=judgeData.stage.id || 'exhibition',viewVersion=routeVersion,viewRoute=route,runId=judgeData.stage.runId;
+  const owner=session,data=judgeData,stage=judgeData.stage.id || 'exhibition',viewVersion=routeVersion,viewRoute=route,runId=judgeData.stage.runId;
   const team=judgeData.teams.find(t=>String(t.id)===String(selectedTeam));
   const record=judgeData.myReviews.find(r=>String(r.teamId)===String(selectedTeam));
   const canEdit=judgeData.window.canEdit;
   const feedback=record?.draft?.feedback ?? record?.submitted?.feedback ?? '';
   document.getElementById('judge-editor').innerHTML=reviewMaterialMarkup(team.materialSnapshot,judgeData.stage)+`<form class="judge-form" id="review-form"><span class="eyebrow">TEAM ${String(team.number).padStart(2,'0')}</span><h2>${esc(team.name)}</h2><p class="project-line">${esc(team.project || '作品名称待完善')} · ${esc(team.track || '方向待完善')}</p><p class="status-chip">${reviewState(record)} · 编辑版本 ${Number(record?.version || 0)}</p><div class="info-banner">请填写观察或评语后正式提交。保存草稿不会覆盖已提交的记录。</div>${record?.invalidated?`<div class="info-banner warning"><strong>组织方已作废此记录</strong><br>原因：${esc(record.invalidatedReason || '未填写')}。继续修改仍会保留作废状态，恢复需联系组织方。</div>`:''}<fieldset ${canEdit?'':'disabled'}><label class="field">评审观察 / 给团队的评语<textarea name="feedback" maxlength="2000" rows="6" placeholder="写下作品表现、判断依据或改进建议。">${esc(feedback)}</textarea><small>最多 2000 字，仅评委本人及组织方可见。正式记录与草稿分别保存。</small></label><div class="form-actions"><button type="submit" class="btn">正式提交评语 ↗</button><button type="button" class="btn secondary" id="save-review-draft">保存草稿</button><button type="button" class="btn secondary" id="recuse-review">回避此队</button></div></fieldset><p class="form-error" role="alert"></p></form><div id="review-conflict" aria-live="polite"></div>${record?.submitted?`<section class="surface formal-review"><h2>最近正式提交的评审记录</h2><p class="small-note">${esc(beijingTime(record.submitted.submittedAt))}（北京时间） · 未计分${record.invalidated?' · 已作废':''}${record.recused?' · 当前已回避':''}</p><p class="preserve-text">${esc(record.submitted.feedback)}</p></section>`:''}`;
-  const form=document.getElementById('review-form');let blocked=!canEdit;
+  const form=document.getElementById('review-form');let blocked=!canEdit,saving=false;
+  function valid(){
+    if(route!==viewRoute || viewVersion!==routeVersion || judgeData!==data || !form.isConnected || String(selectedTeam)!==String(team.id))return false;
+    if(editorHasLogin(form,owner,{notify:true}))return true;
+    blocked=true;form.querySelector('fieldset').disabled=false;form.elements.feedback.readOnly=true;form.querySelectorAll('button').forEach(button=>button.disabled=true);return false;
+  }
+  currentIdentityPage={valid};
   form.addEventListener('input',()=>{reviewDirty=true;});
   async function save(status){
-    if(blocked)return;
+    if(blocked || saving || !valid())return;
     const value=form.elements.feedback.value.trim();
     formError(form,'');if(status==='submitted' && !value){formError(form,'请填写评审观察或评语后正式提交。');form.elements.feedback.focus();return;}
     if(Array.from(value).length>2000){formError(form,'评审记录最多 2000 字。');return;}
-    const fieldset=form.querySelector('fieldset');fieldset.disabled=true;
-    try{await api(`judging/${stage}/review`,{runId,teamId:team.id,expectedVersion:record?.version || 0,status,feedback:value,scores:null});if(route!==viewRoute || viewVersion!==routeVersion || stage!==stageForRoute() || !form.isConnected || String(selectedTeam)!==String(team.id))return;reviewDirty=false;toast(status==='submitted'?'评审记录已正式提交（未计分）。':status==='draft'?'草稿已保存，正式记录保持原版本。':'已回避此队，不计入正式评审记录数。');await renderExhibitionJudge(viewVersion,form,stage);}
-    catch(error){if(!form.isConnected)return;formError(form,error.message);if(error.status===409){blocked=true;fieldset.disabled=false;form.elements.feedback.readOnly=true;form.querySelectorAll('button').forEach(b=>b.disabled=true);document.getElementById('review-conflict').innerHTML='<section class="surface"><h2>当前输入已保留</h2><p class="small-note">服务器版本或评审轮次已变化。请先复制需要保留的文字，再读取最新记录重新编辑。</p><button class="btn secondary" id="reload-review" type="button">读取最新记录</button></section>';document.getElementById('reload-review').onclick=()=>{if(!confirmLeave())return;reviewDirty=false;renderExhibitionJudge(viewVersion,form,stage);};}else if(error.status===401 || error.status===403){blocked=true;fieldset.disabled=true;}}
-    finally{if(form.isConnected && !blocked)fieldset.disabled=false;}
+    const fieldset=form.querySelector('fieldset');saving=true;fieldset.disabled=true;
+    try{await api(`judging/${stage}/review`,{runId,teamId:team.id,expectedVersion:record?.version || 0,status,feedback:value,scores:null},{loginId:owner.loginId});if(!valid())return;reviewDirty=false;toast(status==='submitted'?'评审记录已正式提交（未计分）。':status==='draft'?'草稿已保存，正式记录保持原版本。':'已回避此队，不计入正式评审记录数。');await renderExhibitionJudge(viewVersion,form,stage);}
+    catch(error){if(!valid())return;formError(form,error.message);if(error.status===409){blocked=true;fieldset.disabled=false;form.elements.feedback.readOnly=true;form.querySelectorAll('button').forEach(b=>b.disabled=true);document.getElementById('review-conflict').innerHTML='<section class="surface"><h2>当前输入已保留</h2><p class="small-note">服务器版本或评审轮次已变化。请先复制需要保留的文字，再读取最新记录重新编辑。</p><button class="btn secondary" id="reload-review" type="button">读取最新记录</button></section>';document.getElementById('reload-review').onclick=()=>{if(!valid() || !confirmLeave())return;reviewDirty=false;renderExhibitionJudge(viewVersion,form,stage);};}else if(error.status===401 || error.status===403 || error.status===428){blocked=true;fieldset.disabled=true;}}
+    finally{saving=false;if(valid() && !blocked)fieldset.disabled=false;}
   }
-  form.onsubmit=e=>{e.preventDefault();save('submitted');};document.getElementById('save-review-draft').onclick=()=>save('draft');document.getElementById('recuse-review').onclick=()=>{if(confirm('确认回避此队？已有正式记录会保留，但不计入本轮正式评审记录数。'))save('recused');};
+  form.onsubmit=e=>{e.preventDefault();return save('submitted');};document.getElementById('save-review-draft').onclick=()=>save('draft');document.getElementById('recuse-review').onclick=()=>{if(confirm('确认回避此队？已有正式记录会保留，但不计入本轮正式评审记录数。'))return save('recused');};
 }
 async function renderJudge(version,expectedForm=null) {
   const owner=session;const data=await api('judge',undefined,{loginId:owner.loginId});if(session!==owner || !ownsBrowserLogin(owner) || version!==routeVersion || route!=='judge' || (expectedForm && !expectedForm.isConnected))return;judgeData=data;
@@ -358,7 +366,30 @@ function renderJudgeEditor(){
   document.getElementById('save-draft').onclick=()=>save('draft');
   document.getElementById('recuse').onclick=()=>{if(confirm('确定回避此队伍？你对该队的评分将不计入专业均分。评分开放期间可重新评分。'))return save('recused');};
 }
-async function renderAudience(version){const data=await api('audience');if(version!==routeVersion)return;const voted=(data.votedTeamIds || []).map(String),limit=data.voteLimit || 3;root.innerHTML=heading('AUDIENCE / 观众选择','把一票，投给打动你的作品。',`已支持 ${voted.length} / ${limit} 支队伍。观众票独立展示，不叠加到专业总分。`)+`<div class="info-banner ${data.votingOpen?'':'warning'}">${data.votingOpen?'请先看作品演示，再选择支持的队伍。每支队伍每个邀请码最多计 1 票，提交后不能撤回。':'当前观众投票尚未开放或已截止。'}</div>`+(data.teams.length?`<div class="vote-grid">${data.teams.map(t=>`<article class="vote-card ${voted.includes(String(t.id))?'selected':''}"><span class="eyebrow">TEAM ${String(t.number).padStart(2,'0')}</span><h2>${esc(t.name)}</h2><p>${esc(t.project || '作品名称待完善')}<br>${esc(t.track || '')}</p><button class="btn ${voted.includes(String(t.id))?'secondary':''}" data-vote="${esc(t.id)}" ${voted.includes(String(t.id))||voted.length>=limit||!data.votingOpen?'disabled':''}>${voted.includes(String(t.id))?'已支持 ✓':voted.length>=limit?'投票名额已用完':'支持这个作品 ↗'}</button></article>`).join('')}</div>`:empty('队伍即将出现在这里','主办方录入队伍后，你就可以了解并支持他们的作品。'));document.querySelectorAll('[data-vote]').forEach(b=>b.onclick=()=>withBusy(b,async()=>{await api('vote',{teamId:b.dataset.vote});toast('已支持这支队伍，谢谢你的参与。');if(route==='audience')await renderAudience(routeVersion);}));}
+async function renderAudience(version){
+  const owner=session;
+  const active=()=>version===routeVersion && route==='audience';
+  function valid(){
+    if(!active())return false;
+    if(session===owner && ownsBrowserLogin(owner))return true;
+    document.querySelectorAll('[data-vote]').forEach(button=>button.disabled=true);
+    let notice=document.getElementById('audience-login-status');
+    if(!notice){root.insertAdjacentHTML('afterbegin','<p id="audience-login-status" class="info-banner warning" role="alert"></p>');notice=document.getElementById('audience-login-status');}
+    notice.textContent='当前观众登录已失效或已切换，请刷新页面并核对身份后投票。';
+    return false;
+  }
+  currentIdentityPage={valid};
+  if(!valid())return;
+  const data=await api('audience',undefined,{loginId:owner.loginId});if(!valid())return;
+  const voted=(data.votedTeamIds || []).map(String),limit=data.voteLimit || 3;root.innerHTML=heading('AUDIENCE / 观众选择','把一票，投给打动你的作品。',`已支持 ${voted.length} / ${limit} 支队伍。观众票独立展示，不叠加到专业总分。`)+`<div class="info-banner ${data.votingOpen?'':'warning'}">${data.votingOpen?'请先看作品演示，再选择支持的队伍。每支队伍每个邀请码最多计 1 票，提交后不能撤回。':'当前观众投票尚未开放或已截止。'}</div>`+(data.teams.length?`<div class="vote-grid">${data.teams.map(t=>`<article class="vote-card ${voted.includes(String(t.id))?'selected':''}"><span class="eyebrow">TEAM ${String(t.number).padStart(2,'0')}</span><h2>${esc(t.name)}</h2><p>${esc(t.project || '作品名称待完善')}<br>${esc(t.track || '')}</p><button class="btn ${voted.includes(String(t.id))?'secondary':''}" data-vote="${esc(t.id)}" ${voted.includes(String(t.id))||voted.length>=limit||!data.votingOpen?'disabled':''}>${voted.includes(String(t.id))?'已支持 ✓':voted.length>=limit?'投票名额已用完':'支持这个作品 ↗'}</button></article>`).join('')}</div>`:empty('队伍即将出现在这里','主办方录入队伍后，你就可以了解并支持他们的作品。'));
+  document.querySelectorAll('[data-vote]').forEach(button=>button.onclick=async()=>{
+    if(button.disabled || !valid())return;
+    button.disabled=true;
+    try{await api('vote',{teamId:button.dataset.vote},{loginId:owner.loginId});if(!valid())return;toast('已支持这支队伍，谢谢你的参与。');await renderAudience(version);}
+    catch(error){if(valid())toast(error.message);}
+    finally{if(button.isConnected && valid())button.disabled=false;}
+  });
+}
 
 async function renderAdmin(version,expectedElement=null,discardedEdits=null){
   const owner=session,requestedStage=adminStage,request=++adminJudgingVersion;
@@ -681,11 +712,24 @@ function installTeamRecovery(data,form,version,{restore,loadLatest,onWindow},exp
   currentTeamRecovery=context;document.getElementById('refresh-local-drafts').onclick=()=>{inspectionRevision++;comparison.innerHTML='';list();};list();return context;
 }
 
+function participantGuideMarkup(){
+  return `<section class="surface participant-start" aria-labelledby="participant-start-title"><div class="participant-start-heading"><h2 id="participant-start-title">选手操作指引</h2><p class="participant-deadline">正式提交截止：<strong>11 月 8 日（周日）13:00</strong> · 北京时间</p></div><ol class="participant-actions"><li><span class="participant-step">01</span><div><button type="button" class="text-action" id="jump-team-tools">使用 AI 工具 ↓</button><p>查看接口地址、创建本队密钥。</p></div></li><li><span class="participant-step">02</span><div><button type="button" class="text-action" id="jump-team-repository">准备代码仓库 ↓</button><p>申请本队仓库，上传代码和说明。</p></div></li><li><span class="participant-step">03</span><div><button type="button" class="text-action" id="jump-team-submission">填写并提交作品 ↓</button><p>检查材料，预览后确认正式提交。</p></div></li></ol><p class="participant-success-hint">看到“正式版 v… 已收到”才算提交成功。上传 Gitee 或保存草稿后，仍需确认正式提交。</p></section>`;
+}
+function installParticipantShortcuts(){
+  for(const [buttonId,targetId] of [['jump-team-tools','team-keys'],['jump-team-repository','team-repository'],['jump-team-submission','submission-form']]){
+    document.getElementById(buttonId).onclick=()=>{
+      const target=document.getElementById(targetId);if(!target)return;
+      target.setAttribute('tabindex','-1');target.focus({preventScroll:true});target.scrollIntoView({block:'start'});
+    };
+  }
+}
+
 async function renderTeam(version,provided=null,received=false,owner=null){
   const sessionAtStart=session,authorization=owner || (currentTeamRecovery?.sessionOwner===sessionAtStart?currentTeamRecovery:null),epochs=teamRecoveryEpochs();
   if(authorization && !authorization.hasAuthorization())return;
   const data=provided || await api('team');if(version!==routeVersion || session!==sessionAtStart || !ownsBrowserLogin(sessionAtStart) || (authorization && !authorization.hasAuthorization()))return;if(authorization && authorization.teamId!==data.team.id){authorization.lock('当前登录队伍已变化，请重新登录本队后编辑。');return;}const expectedEpoch=authorization?.store?.epoch ?? epochs(data.team.id,sessionAtStart.loginId),s=data.submission;
-  root.innerHTML=heading('TEAM / 作品提交',esc(teamLabel(data.team)),`${esc(data.team.track || '方向待完善')} · 队伍编号、名称及赛道由组织方维护。`)+windowMarkup(data.window)+`<section class="surface submission-overview"><h2 id="submission-status">${submissionState(s)}</h2><div>草稿编辑版 v${s.version} · 最新正式版 ${s.submittedVersion?'v'+s.submittedVersion:'尚未提交'}${s.submitted?.codeVersion?` · commit ${commitMarkup(s.submitted.codeVersion,s.submitted.codeUrl,data.repositorySeal)}`:''}</div><p class="small-note" id="submission-edit-state">${s.hasUnsubmittedChanges?'草稿修改尚未正式提交；评审继续使用正式材料。':'更新时间（北京时间）：'+esc(beijingTime(s.updatedAt))}</p><a href="#submitted-summary" id="view-formal-materials">查看最近正式材料</a></section>`+(received && typeof received==='object'?requestReceiptMarkup(received,received.requestId,true):submissionReceiptMarkup(data,received))+judgingMaterialsMarkup(data.judgingMaterials,s.submittedVersion)+teamRepositoryMarkup(data)+localRecoveryMarkup()+teamFormMarkup(data)+'<div id="submission-preview" aria-live="polite"></div><div id="submission-conflict" aria-live="polite"></div>'+`<section class="surface" id="submitted-summary"><h2>最近正式材料</h2>${s.submitted?`<p class="small-note">正式版本 ${s.submittedVersion} · 最近提交 ${esc(beijingTime(s.submittedAt))}（北京时间）</p>${materialMarkup(s.submitted,data.repositorySeal)}${repositoryVersionMarkup(data,s.submitted,data.team.id,s.submittedVersion,'team-repository-proof','最新正式版')}`:'<p class="small-note">尚未正式提交；草稿不会发送给评委。</p>'}</section>`+submissionHistoryMarkup()+'<div id="new-api-key" aria-live="polite"></div><section class="surface" id="team-keys"><h2>AI API 密钥</h2><p class="small-note">读取中…</p></section>';
+  root.innerHTML=heading('TEAM / 选手工作台',esc(teamLabel(data.team)),`${esc(data.team.track || '方向待完善')} · 队伍编号、名称及赛道由组织方维护。`)+participantGuideMarkup()+windowMarkup(data.window)+`<section class="surface submission-overview"><h2 id="submission-status">${submissionState(s)}</h2><div>草稿编辑版 v${s.version} · 最新正式版 ${s.submittedVersion?'v'+s.submittedVersion:'尚未提交'}${s.submitted?.codeVersion?` · commit ${commitMarkup(s.submitted.codeVersion,s.submitted.codeUrl,data.repositorySeal)}`:''}</div><p class="small-note" id="submission-edit-state">${s.hasUnsubmittedChanges?'草稿修改尚未正式提交；评审继续使用正式材料。':'更新时间（北京时间）：'+esc(beijingTime(s.updatedAt))}</p><a href="#submitted-summary" id="view-formal-materials">查看最近正式材料</a></section>`+(received && typeof received==='object'?requestReceiptMarkup(received,received.requestId,true):submissionReceiptMarkup(data,received))+teamRepositoryMarkup(data)+localRecoveryMarkup()+teamFormMarkup(data)+'<div id="submission-preview" aria-live="polite"></div><div id="submission-conflict" aria-live="polite"></div>'+`<section class="surface" id="submitted-summary"><h2>最近正式材料</h2>${s.submitted?`<p class="small-note">正式版本 ${s.submittedVersion} · 最近提交 ${esc(beijingTime(s.submittedAt))}（北京时间）</p>${materialMarkup(s.submitted,data.repositorySeal)}${repositoryVersionMarkup(data,s.submitted,data.team.id,s.submittedVersion,'team-repository-proof','最新正式版')}`:'<p class="small-note">尚未正式提交；草稿不会发送给评委。</p>'}</section>`+`<details class="team-reference"><summary>查看本轮评审采用的材料</summary>${judgingMaterialsMarkup(data.judgingMaterials,s.submittedVersion)}</details>`+submissionHistoryMarkup()+'<div id="new-api-key" aria-live="polite"></div><section class="surface" id="team-keys"><h2>AI API 密钥</h2><p class="small-note">读取中…</p></section>';
+  installParticipantShortcuts();
   document.getElementById('view-formal-materials').onclick=e=>{e.preventDefault();document.getElementById('submitted-summary').scrollIntoView({block:'start'});};
   const form=document.getElementById('submission-form'),preview=document.getElementById('submission-preview');let currentVersion=s.version,blocked=!data.window.canEdit,inputRevision=0;
   let observedInputs=JSON.stringify({...rawTeamMaterials(form),confirmed:form.elements.confirmed.checked});function changedInputs(){if(!local.isAuthorized())return;const next=JSON.stringify({...rawTeamMaterials(form),confirmed:form.elements.confirmed.checked});if(next===observedInputs)return;observedInputs=next;inputRevision++;submissionDirty=true;local.input();preview.innerHTML='';document.getElementById('submission-edit-state').textContent='当前修改尚未保存或正式提交；最近正式材料保持不变。';}form.addEventListener('input',changedInputs);form.addEventListener('change',changedInputs);
@@ -804,12 +848,13 @@ async function renderTeamScore(version) {
 
 async function renderRoute(){
   currentTeamKeys?.dispose();
+  currentIdentityPage=null;
   if(typeof disposeAdminReviewSync==='function')disposeAdminReviewSync();adminReadOnlyView=null;adminLoadPending=null;
   clearTimeout(pollTimer);if(typeof currentClaimController!=='undefined'){currentClaimController?.dispose();currentClaimController=null;}const version=++routeVersion;
   route=['claim','team','team-score','judge','judge-exhibition','board-exhibition','judge-roadshow','board-roadshow','audience','admin'].includes(location.hash.slice(1))?location.hash.slice(1):'board';
   lastBoard=null;document.body.classList.remove('screen-mode');
   document.querySelectorAll('[data-route]').forEach(a=>{a.classList.toggle('active',a.dataset.route===route);if(a.dataset.route===route)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});
-  document.title=`${{claim:'领取队伍提交码',board:'成绩看板','board-exhibition':'展示评审进度（未计分）','board-roadshow':'路演评审进度（未计分）','judge-roadshow':'路演评审记录',team:'作品提交','team-score':'本队查分',judge:'专业评分（六维100分）','judge-exhibition':'展示评审记录',audience:'观众投票',admin:'组织方后台'}[route]} · GOTC 2026`;
+  document.title=`${{claim:'领取队伍提交码',board:'成绩看板','board-exhibition':'展示评审进度（未计分）','board-roadshow':'路演评审进度（未计分）','judge-roadshow':'路演评审记录',team:'选手工作台','team-score':'本队查分',judge:'专业评分（六维100分）','judge-exhibition':'展示评审记录',audience:'观众投票',admin:'组织方后台'}[route]} · GOTC 2026`;
   account();root.innerHTML='<div class="loading-state">正在读取活动数据…</div>';
   const requiredRole=route==='team-score'?'team':route.startsWith('judge-')?'judge':route;
   try{if(route==='claim')return await renderClaim(version);if(route==='board')return await renderBoard(version);if(route==='board-exhibition' || route==='board-roadshow')return await renderExhibitionBoard(version);if(!session.role){renderLogin(requiredRole);return;}if(session.role!==requiredRole){renderWrongRole(requiredRole);return;}if(route==='team-score')return await renderTeamScore(version);if(route==='team')await renderTeam(version);if(route==='judge')await renderJudge(version);if(route==='judge-exhibition' || route==='judge-roadshow')await renderExhibitionJudge(version);if(route==='audience')await renderAudience(version);if(route==='admin')await renderAdmin(version);}
@@ -1026,8 +1071,9 @@ window.addEventListener('storage',event=>{
     renderRoute();
   }
   if (route==='team-score' && session.role==='team' && !ownsBrowserLogin(session)) renderRoute();
-  currentTeamKeys?.valid();currentTeamRecovery?.storageChanged();});
+  currentTeamKeys?.valid();currentIdentityPage?.valid();currentTeamRecovery?.storageChanged();});
 function refreshVisibleTeamScore(){
+  currentIdentityPage?.valid();
   if(route==='team-score' && session.role==='team')renderRoute();
 }
 window.addEventListener('focus',refreshVisibleTeamScore);

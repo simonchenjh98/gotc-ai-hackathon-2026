@@ -3,3 +3,6 @@ server/test_fixtures/legacy_e456bd3_app.py text eol=lf
 
 # Preserve the distributed PDF byte-for-byte.
 *.pdf binary
+
+# iCalendar requires CRLF; retain the distributed file's line endings.
+*.ics -text whitespace=cr-at-eol
