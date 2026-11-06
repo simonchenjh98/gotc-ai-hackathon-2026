@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 from errors import APIError
 from claims import Claims
+from team_registration import TeamRegistration, PUBLIC_PATHS, PUBLIC_ORIGINS
 from submission_records import SubmissionRecords, query_path
 from repository_backups import RepositoryBackups, ArchiveDownload
 from repositories import Repositories
@@ -49,7 +50,7 @@ SESSION_SECONDS = 12 * 3600
 LOGIN_KDF_CONCURRENCY = 4
 VOTE_LIMIT = 3
 COOKIE_NAME = "gotc_session"
-STATIC_FILES = {"downloads/gotc-gitee-submission-guide.pdf", "index.html", "styles.css", "app.js", "platform.html", "platform.js", "platform-admin.js", "platform-claims.js", "platform-draft-recovery.js", "platform.css", "favicon.svg"}
+STATIC_FILES = {"teams.html", "team-registration.js", "team-registration.css", "downloads/gotc-gitee-submission-guide.pdf", "index.html", "styles.css", "app.js", "platform.html", "platform.js", "platform-admin.js", "platform-claims.js", "platform-draft-recovery.js", "platform.css", "favicon.svg"}
 ASSET_EXTENSIONS = {".webp", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".woff2"}
 DOWNLOAD_EXTENSIONS = {".ics", ".txt"}
 SCHEMA = """
@@ -238,6 +239,7 @@ class EventService:
             enrich_team=lambda db,team:self.admin_data.enrich_team(db,team))
         self.admin_data=AdminDataService(self)
         self.claims=Claims(self,now_ms,text_field,scrypt_hash)
+        self.registration=TeamRegistration(self,now_ms,text_field)
         self.submission_records=SubmissionRecords(self)
         self.repositories=Repositories(self)
         self.repository_backups=RepositoryBackups(self)
@@ -252,6 +254,7 @@ class EventService:
             self.judging.initialize(db)
             self.admin_data.initialize(db)
             self.claims.initialize(db)
+            self.registration.initialize(db)
             self.keys.initialize(db)
             self.repositories.initialize(db)
             for key, value in {"scoringOpen": False, "resultsPublished": True, "minJudges": 5, "submissionsOpen": False, "submissionDeadline": None, "updatedAt": now_ms()}.items():
@@ -535,6 +538,8 @@ class EventService:
 
     def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None, server_received_at=None):
         """Return (JSON object or CSV bytes, optional session token, cookie action)."""
+        if path.startswith(("/api/registration", "/api/admin/registration")):
+            return self.registration.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
         if path.startswith(("/api/claims/","/api/admin/claims")):
             return self.claims.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
         if method == "POST" and path == "/api/login":
@@ -994,9 +999,17 @@ class EventHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
+        request_path = urlsplit(self.path).path
+        origin = self.headers.get("Origin")
+        if request_path in {self.server.service.base_path + p for p in PUBLIC_PATHS} and origin in PUBLIC_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            if self.command == "OPTIONS":
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://8.141.114.201; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
         if self.server.service.secure:
             self.send_header("Strict-Transport-Security", "max-age=31536000")
         if cookie:
@@ -1018,11 +1031,18 @@ class EventHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.handle_route()
 
+    def do_OPTIONS(self):
+        path = urlsplit(self.path).path
+        if (path in {self.server.service.base_path + p for p in PUBLIC_PATHS}
+                and self.headers.get("Origin") in PUBLIC_ORIGINS
+                and self.headers.get("Access-Control-Request-Method") in {"GET", "POST"}
+                and self.headers.get("Access-Control-Request-Headers", "").lower() in {"", "content-type"}):
+            self.headers_out(204, "text/plain", 0)
+        else:
+            self.respond(403, {"error": "不允许跨站请求"})
+
     def do_POST(self):
         self.handle_route()
-
-    def do_OPTIONS(self):
-        self.respond(405, {"error": "不支持跨域请求"})
 
     def handle_route(self):
         service = self.server.service
@@ -1060,7 +1080,8 @@ class EventHandler(BaseHTTPRequestHandler):
                 body = {}
                 received_at = None
                 if self.command == "POST":
-                    if self.headers.get("Origin") != service.origin or self.headers.get("Sec-Fetch-Site") not in {None, "same-origin", "none"}:
+                    public_registration = path in PUBLIC_PATHS and self.headers.get("Origin") in PUBLIC_ORIGINS
+                    if not public_registration and (self.headers.get("Origin") != service.origin or self.headers.get("Sec-Fetch-Site") not in {None, "same-origin", "none"}):
                         raise APIError(403, "仅允许本站发起操作，请从活动官网打开")
                     if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
                         raise APIError(400, "请求长度不正确")
