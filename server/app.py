@@ -536,7 +536,7 @@ class EventService:
             self.audit(db, current, "login")
             return {"ok": True, "role": role, "name": current["name"], "loginId": self.login_id(f"{COOKIE_NAME}={token}")}, token, "set"
 
-    def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None, server_received_at=None):
+    def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None, server_received_at=None, finals_judge_id=None):
         """Return (JSON object or CSV bytes, optional session token, cookie action)."""
         if path.startswith(("/api/claims/","/api/admin/claims")):
             return self.claims.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
@@ -554,7 +554,7 @@ class EventService:
                 db.execute("BEGIN")
             actor = self.account(db, cookie)
             if self.finals.supports(path):
-                return self.finals.dispatch(db,actor,method,path,body,query or {},expected_login_id,cookie),None,None
+                return self.finals.dispatch(db,actor,method,path,body,query or {},expected_login_id,cookie,finals_judge_id),None,None
             page_role = ("audience" if path in {"/api/audience", "/api/vote"} else
                          "judge" if path in {"/api/judging/exhibition", "/api/judging/exhibition/", "/api/judging/exhibition/review",
                                               "/api/judging/roadshow", "/api/judging/roadshow/", "/api/judging/roadshow/review"} else None)
@@ -1096,7 +1096,7 @@ class EventHandler(BaseHTTPRequestHandler):
                         peer = str(ipaddress.ip_address(proxy_ip))
                     except ValueError:
                         pass
-                value, token, cookie_action = service.dispatch(self.command, path, body, self.headers.get("Cookie", ""), peer,query=query,expected_login_id=self.headers.get("X-GOTC-Login"),server_received_at=received_at)
+                value, token, cookie_action = service.dispatch(self.command, path, body, self.headers.get("Cookie", ""), peer,query=query,expected_login_id=self.headers.get("X-GOTC-Login"),server_received_at=received_at,finals_judge_id=self.headers.get("X-GOTC-Finals-Judge"))
                 cookie = None
                 if cookie_action:
                     cookie = f"{COOKIE_NAME}={token or ''}; Path={service.base_path or '/'}; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS if cookie_action == 'set' else 0}"

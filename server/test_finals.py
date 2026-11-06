@@ -13,9 +13,12 @@ class FinalsTests(unittest.TestCase):
     team = fixtures.APITests.team
     invitation = fixtures.APITests.invitation
 
-    def request(self, client, method, path, body=None, marker=None):
+    def request(self, client, method, path, body=None, marker=None, seat=None):
+        if path.startswith('/api/finals/'):
+            return client.request(method, path, body, headers={
+                'X-GOTC-Finals-Judge': getattr(client, 'finals_judge_id', '') if seat is None else seat})
         if marker is None:
-            marker = client.get('/api/session')[1].get('loginId', '')
+            marker = client.get('/api/session')[1].get('loginId') or ''
         return client.request(method, path, body, headers={'X-GOTC-Login': marker})
 
     def admin_view(self):
@@ -33,15 +36,16 @@ class FinalsTests(unittest.TestCase):
         status, created, _ = self.request(self.admin, 'POST', '/api/admin/finals/judges', {'expectedRevision': start['config']['revision']})
         self.assertEqual(status, 200, created)
         self.judges = []
-        self.credentials = created['credentials']
-        for credential in self.credentials:
+        self.seats = created['judges']
+        self.assertNotIn('credentials', created)
+        for seat in self.seats:
             client = fixtures.Client(self.server)
-            status, response, _ = client.post('/api/login', {'role': 'judge', 'code': credential['code']})
-            self.assertEqual(status, 200, response)
+            client.finals_judge_id = seat['id']
+            self.assertEqual(client.cookie, '')
             self.judges.append(client)
         status, data, _ = self.request(self.admin, 'POST', '/api/admin/finals/roster', {
             'expectedRevision': created['config']['revision'], 'teamIds': self.teams,
-            'judgeIds': [c['id'] for c in self.credentials]})
+            'judgeIds': [seat['id'] for seat in self.seats]})
         self.assertEqual(status, 200, data)
         self.run_id = data['config']['runId']
         self.assertEqual(self.settings(True)[0], 200)
@@ -84,42 +88,44 @@ class FinalsTests(unittest.TestCase):
         self.assertEqual(public['config']['awardLimit'], 1)
         self.assertEqual(self.settings(True)[0], 409)
 
-    def test_private_endpoints_enforce_role_login_marker_and_no_suffix_bypass(self):
+    def test_admin_authentication_and_independent_seat_validation(self):
         self.assertEqual(self.public.get('/api/admin/finals')[0], 401)
         self.assertEqual(self.admin.get('/api/admin/finals')[0], 428)
         self.assertEqual(self.request(self.admin, 'GET', '/api/admin/finals', marker='wrong')[0], 401)
         self.assertEqual(self.request(self.admin, 'GET', '/api/admin/finals/')[0], 404)
-        self.assertEqual(self.public.get('/api/finals/board/')[0], 401)
+        self.assertEqual(self.public.get('/api/finals/board/')[0], 404)
         self.assertEqual(self.public.get('/api/finals/board?x=1')[0], 400)
         self.configure()
-        other, _ = self.invitation(name='Unassigned')
-        self.assertEqual(self.request(other, 'GET', '/api/finals/judge')[0], 403)
-        self.assertEqual(self.request(self.judges[0], 'GET', '/api/admin/finals')[0], 403)
-        first_marker = self.judges[0].get('/api/session')[1]['loginId']
-        self.assertEqual(self.request(self.judges[1], 'GET', '/api/finals/judge', marker=first_marker)[0], 401)
+        other, invitation = self.invitation(name='Unassigned')
+        self.assertEqual(self.request(other, 'GET', '/api/finals/judge')[0], 400)
+        self.assertEqual(self.request(other, 'GET', '/api/finals/judge', seat=invitation['id'])[0], 403)
+        self.assertEqual(self.request(self.judges[0], 'GET', '/api/admin/finals')[0], 401)
+        self.assertEqual(self.request(self.judges[1], 'GET', '/api/finals/judge', seat='not-a-seat')[0], 403)
         self.assertEqual(self.request(self.judges[0], 'GET', '/api/finals/judge/')[0], 404)
-        self.assertEqual(self.judges[0].get('/api/finals/judge')[0], 428)
+        self.assertEqual(self.judges[0].get('/api/finals/judge')[0], 400)
+        with self.service.db() as db:
+            db.execute('UPDATE accounts SET active=0 WHERE id=?', (self.seats[0]['id'],))
+        self.assertEqual(self.request(self.judges[0], 'GET', '/api/finals/judge')[0], 403)
+        entry = self.public.get('/api/finals/entry')[1]
+        self.assertFalse(entry['config']['rosterReady'])
+        self.assertNotIn(self.seats[0]['id'], {seat['id'] for seat in entry['judges']})
 
-    def test_eight_independent_credentials_no_repeat_and_roster_locks(self):
+    def test_eight_seats_no_visible_codes_no_repeat_and_roster_locks(self):
         self.configure()
-        self.assertEqual(len({c['code'] for c in self.credentials}), 8)
+        self.assertEqual(len({seat['id'] for seat in self.seats}), 8)
+        self.assertTrue(all(set(seat) == {'id', 'name', 'active'} for seat in self.seats))
         data = self.admin_view()
         self.assertTrue(data['config']['rosterLocked'])
         self.assertEqual(len(data['judges']), 8)
-        dumped = json.dumps(data)
-        for credential in self.credentials:
-            self.assertNotIn(credential['code'], dumped)
         with self.service.db() as db:
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM credential_overrides').fetchone()[0], 8)
-            audits = '\n'.join(row[0] for row in db.execute('SELECT metadata FROM audit'))
-            for credential in self.credentials:
-                self.assertNotIn(credential['code'], audits)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM credential_overrides').fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE action='credential.rotate'").fetchone()[0], 0)
         self.assertEqual(self.request(self.admin, 'POST', '/api/admin/finals/judges', {'expectedRevision': data['config']['revision']})[0], 409)
         self.assertEqual(self.settings(False)[0], 200)
         data = self.admin_view()
         self.assertEqual(self.request(self.admin, 'POST', '/api/admin/finals/roster', {
             'expectedRevision': data['config']['revision'], 'teamIds': self.teams,
-            'judgeIds': [c['id'] for c in self.credentials]})[0], 409)
+            'judgeIds': [seat['id'] for seat in self.seats]})[0], 409)
 
     def test_numeric_scores_are_independent_strict_and_concurrent_safe(self):
         self.configure()
@@ -205,8 +211,8 @@ class FinalsTests(unittest.TestCase):
         self.assertEqual(public['summary']['awards'][2]['confirmedWinners'], [b])
         self.assertEqual(public['summary']['awards'][2]['winners'], [b])
         self.assertEqual(public['summary']['awards'][2]['rawLeaders'], [a])
-        for credential in self.credentials:
-            self.assertNotIn(credential['id'], json.dumps(public))
+        for seat in self.seats:
+            self.assertNotIn(seat['id'], json.dumps(public))
         self.assertEqual(self.settings(True)[0], 200)
         self.assertFalse(self.admin_view()['summary']['awardsConfirmed'])
         self.assertIsNone(self.public.get('/api/finals/board')[1]['summary'])
@@ -245,22 +251,21 @@ class FinalsTests(unittest.TestCase):
         self.assertEqual(self.confirm()[0], 200)
         self.assertEqual(self.settings(False, True)[0], 200)
         with self.service.db() as db:
-            db.execute('UPDATE accounts SET active=0 WHERE id=?', (self.credentials[0]['id'],))
+            db.execute('UPDATE accounts SET active=0 WHERE id=?', (self.seats[0]['id'],))
         self.assertIsNone(self.public.get('/api/finals/board')[1]['summary'])
         self.assertFalse(self.admin_view()['summary']['complete'])
         self.assertEqual(self.settings(True)[0], 409)
         with self.service.db() as db:
-            db.execute('UPDATE accounts SET active=1 WHERE id=?', (self.credentials[0]['id'],))
+            db.execute('UPDATE accounts SET active=1 WHERE id=?', (self.seats[0]['id'],))
         self.assertIsNone(self.public.get('/api/finals/board')[1]['summary'])
         self.assertFalse(self.admin_view()['summary']['awardsConfirmed'])
 
-    def test_vote_cap_and_old_page_write_identity_protection(self):
+    def test_vote_cap_and_fixed_seat_attribution_without_cookie(self):
         self.configure()
         choices = {d['id']: self.teams[0] for d in DIMENSIONS}
-        first_marker = self.judges[0].get('/api/session')[1]['loginId']
         body = {'runId': self.run_id, 'expectedRevision': 0, 'status': 'submitted', 'nominations': choices}
-        response = self.request(self.judges[1], 'POST', '/api/finals/nominations', body, marker=first_marker)
-        self.assertEqual(response[0], 401)
+        response = self.request(self.judges[1], 'POST', '/api/finals/nominations', body, seat='not-a-seat')
+        self.assertEqual(response[0], 403)
         self.assertEqual(self.admin_view()['summary']['submittedBallots'], 0)
         for judge in self.judges:
             self.assertEqual(self.ballot(judge, choices)[0], 200)
@@ -269,10 +274,93 @@ class FinalsTests(unittest.TestCase):
         self.assertEqual(sum(award['totalVotes'] for award in summary['awards']), 48)
         self.assertEqual(summary['awards'][0]['suggestedWinners'], self.teams)
         self.assertTrue(all(not award['suggestedWinners'] for award in summary['awards'][1:]))
-        other, _ = self.invitation(name='Ninth non-final judge')
+        other, invitation = self.invitation(name='Ninth non-final judge')
+        other.finals_judge_id = invitation['id']
         self.assertEqual(self.ballot(other, choices)[0], 403)
         self.assertEqual(self.settings(False)[0], 200)
         self.assertEqual(self.ballot(self.judges[0], choices, revision=1)[0], 409)
+
+    def test_public_entry_anonymous_scoring_and_header_never_grants_other_permissions(self):
+        empty = self.public.get('/api/finals/entry')
+        self.assertEqual(empty[0], 200)
+        self.assertEqual(empty[1]['judges'], [])
+        self.assertFalse(empty[1]['config']['rosterReady'])
+        self.configure()
+        entry = self.public.get('/api/finals/entry')[1]
+        self.assertTrue(entry['config']['rosterReady'])
+        self.assertEqual(set(entry), {'config', 'judges'})
+        self.assertEqual(set(entry['config']), {'runId', 'open', 'published', 'judgeCount', 'rosterReady'})
+        self.assertEqual(len(entry['judges']), 8)
+        self.assertTrue(all(set(seat) == {'id', 'name'} for seat in entry['judges']))
+        first, second = self.judges[:2]
+        self.assertEqual(first.cookie, '')
+        self.assertEqual(self.score(first, values=[10] * 6)[0], 200)
+        self.assertEqual(self.ballot(first)[0], 200)
+        first_data = self.request(first, 'GET', '/api/finals/judge')[1]
+        second_data = self.request(second, 'GET', '/api/finals/judge')[1]
+        self.assertEqual(len(first_data['myScores']), 1)
+        self.assertEqual(first_data['myNominations']['status'], 'submitted')
+        self.assertEqual(second_data['myScores'], [])
+        self.assertIsNone(second_data['myNominations'])
+        summary = self.admin_view()['summary']
+        self.assertEqual(summary['teams'][0]['score'], 60)
+        self.assertEqual(summary['teams'][0]['scoreCount'], 1)
+        self.assertEqual(summary['submittedBallots'], 1)
+        headers = {'X-GOTC-Finals-Judge': first.finals_judge_id}
+        for path in ('/api/admin', '/api/admin/finals', '/api/judge'):
+            self.assertEqual(self.public.request('GET', path, headers=headers)[0], 401)
+        self.assertEqual(self.public.request('POST', '/api/score', {
+            'teamId': self.teams[0], 'scores': [10] * 6, 'feedback': '', 'status': 'submitted', 'expectedRevision': 0
+        }, headers=headers)[0], 401)
+        self.assertEqual(self.public.request('POST', '/api/admin/finals/settings', {
+            'expectedRevision': self.admin_view()['config']['revision'], 'open': False, 'published': False
+        }, headers=headers)[0], 401)
+        # An unrelated login cookie cannot change the explicitly captured finals seat.
+        first.cookie = self.admin.cookie
+        self.assertEqual(self.score(first, revision=1, values=[0] * 6)[0], 200)
+        data = self.request(first, 'GET', '/api/finals/judge')[1]
+        self.assertEqual(data['myScores'][0]['scores'], [0] * 6)
+        self.assertEqual(self.request(second, 'GET', '/api/finals/judge')[1]['myScores'], [])
+
+    def test_published_metadata_changes_require_reconfirmation_even_when_restored(self):
+        self.configure(2)
+        self.fill()
+        self.assertEqual(self.settings(False)[0], 200)
+        self.assertEqual(self.confirm()[0], 200)
+        self.assertEqual(self.settings(False, True)[0], 200)
+        original = self.admin_view()['teams'][0]
+        with self.service.db() as db:
+            db.execute('UPDATE teams SET name=?,number=?,project=? WHERE id=?',
+                       ('New visible name', 9, 'New project name', original['id']))
+        self.assertIsNone(self.public.get('/api/finals/board')[1]['summary'])
+        changed = self.admin_view()
+        self.assertFalse(changed['summary']['awardsConfirmed'])
+        self.assertEqual(next(t for t in changed['teams'] if t['id'] == original['id'])['number'], 9)
+        with self.service.db() as db:
+            db.execute('UPDATE teams SET name=?,number=?,project=? WHERE id=?',
+                       (original['name'], original['number'], original['project'], original['id']))
+        self.assertIsNone(self.public.get('/api/finals/board')[1]['summary'])
+        self.assertFalse(self.admin_view()['summary']['awardsConfirmed'])
+        self.assertEqual(self.confirm()[0], 200)
+        self.assertEqual(self.settings(False, True)[0], 200)
+        with self.service.db() as db:
+            db.execute('UPDATE accounts SET name=? WHERE id=?', ('Renamed judge', self.seats[0]['id']))
+        self.assertIsNone(self.public.get('/api/finals/board')[1]['summary'])
+        with self.service.db() as db:
+            db.execute('UPDATE accounts SET name=? WHERE id=?', (self.seats[0]['name'], self.seats[0]['id']))
+        self.assertIsNone(self.public.get('/api/finals/board')[1]['summary'])
+        self.assertFalse(self.admin_view()['summary']['awardsConfirmed'])
+        # Upgrading an earlier finals schema installs missing metadata guards once and keeps records.
+        with self.service.db() as db:
+            db.execute('DROP TRIGGER finals_team_metadata_update')
+        run_id = self.admin_view()['config']['runId']
+        backups = len(list(self.service.data_dir.glob('before-finals-*.sqlite3')))
+        self.service.finals.initialize()
+        self.assertEqual(len(list(self.service.data_dir.glob('before-finals-*.sqlite3'))), backups + 1)
+        self.assertEqual(self.admin_view()['config']['runId'], run_id)
+        self.assertEqual(self.admin_view()['summary']['submittedBallots'], 8)
+        self.service.finals.initialize()
+        self.assertEqual(len(list(self.service.data_dir.glob('before-finals-*.sqlite3'))), backups + 1)
 
 
 if __name__ == '__main__':

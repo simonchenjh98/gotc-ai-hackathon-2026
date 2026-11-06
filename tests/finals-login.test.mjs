@@ -11,12 +11,13 @@ function loginPage(route,role){
   return main.innerHTML;
 }
 
-test('finals judge login explains numeric scoring and nominations and links only to the finals public board',()=>{
-  const html=loginPage('judge-finals','judge');
-  assert.match(html,/<h1>决赛评分<br>六维 100 分与专项奖提名<\/h1>/);
-  assert.match(html,/<h2>决赛评委登录<\/h2>/);assert.match(html,/每个奖项可提名1支队伍，也可弃权/);
-  assert.match(html,/单独发给你的决赛评委登录码/);assert.match(html,/href="#board-finals"/);
-  assert.ok(!html.includes('暂不计分'));assert.ok(!html.includes('展示评审记录'));assert.ok(!html.includes('#board-exhibition'));
+test('finals judge route bypasses both login and wrong-role gates for every ordinary cookie identity',async()=>{
+  for(const role of [null,'team','judge','audience','admin']){
+    const main={innerHTML:''},calls=[];
+    const ctx=vm.createContext({document:{getElementById:()=>main,querySelectorAll:()=>[],body:{classList:{remove(){},add(){}}}},location:{href:'https://example.test/platform.html#judge-finals',hash:'#judge-finals'},URL,setTimeout,clearTimeout,calls});
+    vm.runInContext(platform+`\nrouteVersion=0;session={role:${JSON.stringify(role)}};account=()=>{};renderFinalsJudge=async()=>calls.push('finals');renderLogin=()=>calls.push('login');renderWrongRole=()=>calls.push('wrong');`,ctx);
+    await vm.runInContext('renderRoute()',ctx);assert.deepEqual(calls,['finals']);
+  }
 });
 
 test('finals admin login names the finals console and published finals results',()=>{

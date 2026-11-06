@@ -7,11 +7,15 @@ const source=fs.readFileSync(new URL('../platform-finals.js',import.meta.url),'u
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};};
 function runtime(extra={}){
-  const ctx=vm.createContext({AbortController,Map,Set,Number,Object,Date,esc,setTimeout,clearTimeout,
+  const ctx=vm.createContext({AbortController,Map,Set,Number,Object,Date,esc,setTimeout,clearTimeout,URL,base:new URL('https://example.test/gotc/'),
+    fetch:async(url,options)=>{
+      try{const result=await extra.api(String(url).split('/api/')[1],options.body?JSON.parse(options.body):undefined,{judgeId:options.headers['X-GOTC-Finals-Judge'],credentials:options.credentials,signal:options.signal});return {ok:true,status:200,json:async()=>result};}
+      catch(error){if(!error.status)throw error;return {ok:false,status:error.status,json:async()=>({error:error.message,code:error.code})};}
+    },
     metrics:items=>items.map(([value,label])=>`<span>${esc(value)} ${esc(label)}</span>`).join(''),
     dirtyAdminForms:new Set(),window:{addEventListener(){},removeEventListener(){}},document:{addEventListener(){},removeEventListener(){},hidden:false},
     session:{role:'judge',loginId:'owner-a',name:'Judge A'},route:'judge-finals',routeVersion:1,ownsBrowserLogin:()=>true,...extra});
-  vm.runInContext(source+'\nglobalThis.testHelpers={makeFinalsPoller,finalsSummaryMarkup,finalsSave,finalsTrack,createFinalsView,disposeFinalsView,finalsRequest,finalsRenderScore,finalsRenderNominations,finalsPatchSummary,finalsInstallAdmin};',ctx);
+  vm.runInContext(source+'\nglobalThis.testHelpers={makeFinalsPoller,finalsSummaryMarkup,finalsSave,finalsTrack,createFinalsView,disposeFinalsView,finalsRequest,finalsRenderScore,finalsRenderNominations,finalsPatchSummary,finalsInstallAdmin,renderFinalsJudge};',ctx);
   return ctx;
 }
 const team=(id,number,name='Team '+number)=>({id,number,name,project:'Synthetic',eligible:true,score:81.25,scoreCount:8,recusedCount:0,complete:true,rank:number,dimensions:[16,12,17,16,12,8.25]});
@@ -88,37 +92,37 @@ function formStub(){
 
 test('an authoritative save advances only through its response and preserves edits made while pending',async()=>{
   const gate=deferred(),sent=[];const ctx=runtime({api:async(path,payload,options)=>{sent.push({path,payload,options});return gate.promise;}});
-  const view=ctx.testHelpers.createFinalsView(1,'judge'),f=formStub();view.forms.add(f.form);ctx.dirtyAdminForms.add(f.form);
+  const view=ctx.testHelpers.createFinalsView(1,'seat',{id:'seat-a',name:'Judge A'}),f=formStub();view.forms.add(f.form);ctx.dirtyAdminForms.add(f.form);
   let saved;const running=ctx.testHelpers.finalsSave(view,f.form,'finals/score',{expectedRevision:3,scores:[1,2,3,4,5,6]},(value,unchanged)=>saved={value,unchanged});
   f.form.finalsEdit=2;gate.resolve({score:{revision:4}});await running;
-  assert.equal(sent[0].options.loginId,'owner-a');assert.equal(sent[0].payload.expectedRevision,3);assert.equal(saved.value.score.revision,4);assert.equal(saved.unchanged,false);assert.equal(ctx.dirtyAdminForms.has(f.form),true);assert.match(f.error.textContent,/新输入已保留/);ctx.testHelpers.disposeFinalsView();
+  assert.equal(sent[0].options.judgeId,'seat-a');assert.equal(sent[0].options.credentials,'omit');assert.equal(sent[0].payload.expectedRevision,3);assert.equal(saved.value.score.revision,4);assert.equal(saved.unchanged,false);assert.equal(ctx.dirtyAdminForms.has(f.form),true);assert.match(f.error.textContent,/新输入已保留/);ctx.testHelpers.disposeFinalsView();
 });
 
 test('conflicting writes keep the form and cannot retry before explicit reload',async()=>{
   let writes=0;const ctx=runtime({api:async()=>{writes++;throw Object.assign(new Error('revision mismatch'),{status:409});}});
-  const view=ctx.testHelpers.createFinalsView(1,'judge'),f=formStub();
+  const view=ctx.testHelpers.createFinalsView(1,'seat',{id:'seat-a',name:'Judge A'}),f=formStub();
   await ctx.testHelpers.finalsSave(view,f.form,'finals/nominations',{expectedRevision:1},()=>assert.fail('conflicts cannot save'));
   assert.equal(f.form.finalsBlocked,true);assert.match(f.error.textContent,/当前输入已保留/);assert.match(f.recovery.innerHTML,/重新载入/);
   await ctx.testHelpers.finalsSave(view,f.form,'finals/nominations',{expectedRevision:1},()=>{});assert.equal(writes,1);ctx.testHelpers.disposeFinalsView();
 });
 
-test('late success after another login cannot mutate the old view or clear unsaved input',async()=>{
-  const gate=deferred(),ctx=runtime({api:()=>gate.promise});const view=ctx.testHelpers.createFinalsView(1,'judge'),f=formStub();ctx.dirtyAdminForms.add(f.form);let applied=false;
+test('ordinary login changes cannot redirect a captured finals seat or block its successful save',async()=>{
+  const gate=deferred(),ctx=runtime({api:()=>gate.promise});const view=ctx.testHelpers.createFinalsView(1,'seat',{id:'seat-a',name:'Judge A'}),f=formStub();ctx.dirtyAdminForms.add(f.form);let applied=false;
   const running=ctx.testHelpers.finalsSave(view,f.form,'finals/score',{expectedRevision:0},()=>applied=true);
   ctx.session={role:'judge',loginId:'owner-b'};gate.resolve({score:{revision:1}});await running;
-  assert.equal(applied,false);assert.equal(ctx.dirtyAdminForms.has(f.form),true);ctx.testHelpers.disposeFinalsView();
+  assert.equal(applied,true);assert.equal(ctx.dirtyAdminForms.has(f.form),false);ctx.testHelpers.disposeFinalsView();
 });
 
 test('network write failures keep input and never send an automatic second POST',async()=>{
-  let writes=0;const ctx=runtime({api:async()=>{writes++;throw new Error('network disconnected');}});const view=ctx.testHelpers.createFinalsView(1,'judge'),f=formStub();
+  let writes=0;const ctx=runtime({api:async()=>{writes++;throw new Error('network disconnected');}});const view=ctx.testHelpers.createFinalsView(1,'seat',{id:'seat-a',name:'Judge A'}),f=formStub();
   await ctx.testHelpers.finalsSave(view,f.form,'finals/nominations',{expectedRevision:0},()=>{});
   assert.equal(writes,1);assert.equal(ctx.dirtyAdminForms.has(f.form),true);assert.match(f.error.textContent,/没有自动重发/);ctx.testHelpers.disposeFinalsView();
 });
 
-test('credential fragments are removed immediately when the captured login loses ownership',()=>{
-  let cleared=0;const secret={replaceChildren(){cleared++;}},button={disabled:false},notice={hidden:true,textContent:''};
-  const ctx=runtime(),view=ctx.testHelpers.createFinalsView(1,'judge');view.container={isConnected:true,querySelectorAll:selector=>selector==='[data-finals-secret]'?[secret]:[button],querySelector:()=>notice};
-  ctx.ownsBrowserLogin=()=>false;assert.equal(view.valid(),false);assert.equal(cleared,1);assert.equal(button.disabled,true);assert.equal(notice.hidden,false);ctx.testHelpers.disposeFinalsView();
+test('admin authentication loss still locks management controls, independently of public judge seats',()=>{
+  const button={disabled:false},notice={hidden:true,textContent:''};
+  const ctx=runtime({route:'admin-finals',session:{role:'admin',loginId:'admin-a'}}),view=ctx.testHelpers.createFinalsView(1,'admin');view.container={isConnected:true,querySelectorAll:()=>[button],querySelector:()=>notice};
+  ctx.ownsBrowserLogin=()=>false;assert.equal(view.valid(),false);assert.equal(button.disabled,true);assert.equal(notice.hidden,false);ctx.testHelpers.disposeFinalsView();
 });
 
 const dimensions=[['creativity',20],['social',15],['technical',20],['application',20],['crossdisciplinary',15],['opensource',10]].map(([id,max])=>({id,name:id,max,award:id+'奖'}));
@@ -131,7 +135,7 @@ const flush=()=>new Promise(resolve=>setImmediate(resolve));
 
 test('real score form sends all six numeric values totaling 100 and consumes only its successful revision',async()=>{
   const posted=[],ctx=runtime({api:async(path,payload)=>{posted.push({path,payload});return {score:{...payload,revision:payload.expectedRevision+1}};},confirm:()=>true});
-  const view=ctx.testHelpers.createFinalsView(1,'judge');
+  const view=ctx.testHelpers.createFinalsView(1,'seat',{id:'seat-a',name:'Judge A'});
   const selectors={'.form-error':{textContent:''},'[data-finals-draft]':{disabled:false},'[data-finals-recuse]':{disabled:false},'[type=submit]':{disabled:false},'[data-finals-total]':{innerHTML:''},'[data-finals-saved]':{textContent:''},'[data-finals-recovery]':{innerHTML:''}};
   const elements={feedback:{value:' Synthetic feedback '},...Object.fromEntries(dimensions.map(d=>['score-'+d.id,{value:String(d.max)}]))};
   const form=editableForm(selectors,elements),host={innerHTML:'',querySelector:()=>form},option={value:'a',textContent:''};
@@ -145,7 +149,7 @@ test('real score form sends all six numeric values totaling 100 and consumes onl
 });
 
 test('real scoring form rejects missing, out-of-range and sub-tenth inputs without a POST',async()=>{
-  let writes=0;const ctx=runtime({api:async()=>writes++}),view=ctx.testHelpers.createFinalsView(1,'judge');
+  let writes=0;const ctx=runtime({api:async()=>writes++}),view=ctx.testHelpers.createFinalsView(1,'seat',{id:'seat-a',name:'Judge A'});
   const selectors={'.form-error':{textContent:''},'[data-finals-draft]':{},'[data-finals-recuse]':{},'[type=submit]':{},'[data-finals-total]':{},'[data-finals-saved]':{}},elements={feedback:{value:''},...Object.fromEntries(dimensions.map(d=>['score-'+d.id,{value:String(d.max)}]))};
   const form=editableForm(selectors,elements),host={innerHTML:'',querySelector:()=>form};view.container={isConnected:true,querySelector:()=>host,querySelectorAll:()=>[]};view.config={runId:'run',open:true};view.data={dimensions,teams:[team('a',1)]};view.selected='a';view.scores=new Map();ctx.testHelpers.finalsRenderScore(view);
   for(const invalid of ['', '20.1','4.25','NaN','-1']){elements['score-creativity'].value=invalid;form.onsubmit({preventDefault(){}});await flush();assert.ok(selectors['.form-error'].textContent);}
@@ -153,7 +157,7 @@ test('real scoring form rejects missing, out-of-range and sub-tenth inputs witho
 });
 
 test('real nomination form explicitly sends all six abstentions and separately supports repeated team choices across awards',async()=>{
-  const posted=[],ctx=runtime({api:async(path,payload)=>{posted.push({path,payload});return {nominations:{...payload,revision:payload.expectedRevision+1}};}}),view=ctx.testHelpers.createFinalsView(1,'judge');
+  const posted=[],ctx=runtime({api:async(path,payload)=>{posted.push({path,payload});return {nominations:{...payload,revision:payload.expectedRevision+1}};}}),view=ctx.testHelpers.createFinalsView(1,'seat',{id:'seat-a',name:'Judge A'});
   const selectors={'.form-error':{textContent:''},'[data-finals-draft]':{},'[type=submit]':{},'[data-finals-saved]':{},'[data-finals-nomination-count]':{}},elements=Object.fromEntries(dimensions.map(d=>['nomination-'+d.id,{value:''}]));
   const form=editableForm(selectors,elements),host={innerHTML:'',querySelector:()=>form};view.container={isConnected:true,querySelector:()=>host,querySelectorAll:()=>[]};view.config={runId:'run',open:true};view.data={dimensions,teams:[team('a',1),team('b',2)]};ctx.testHelpers.finalsRenderNominations(view,null);
   form.onsubmit({preventDefault(){}});await flush();
@@ -183,7 +187,7 @@ test('unchanged statistics still re-enable award confirmation after an explicitl
   assert.equal(button.disabled,false);assert.equal(message.textContent,'请求未完成');assert.equal(host.finalsData.config.revision,4);
 });
 
-test('creating eight judge accounts locks the roster until response and preserves team selections and independent settings',async()=>{
+test('creating eight judge seats locks the roster until response and preserves team selections and independent settings',async()=>{
   for(const succeed of [true,false]){
     const gate=deferred();let posts=0;
     const ctx=runtime({route:'admin-finals',session:{role:'admin',loginId:'admin-a'},api:()=>{posts++;return gate.promise;}}),view=ctx.testHelpers.createFinalsView(1,'admin');
@@ -202,11 +206,50 @@ test('creating eight judge accounts locks the roster until response and preserve
     const saving=create.form.onsubmit({preventDefault(){}});
     assert.equal(fieldset.disabled,true);assert.equal(roster.button.disabled,true);assert.equal(settings.button.disabled,false);assert.equal(settings.form.elements.open.checked,true);
     create.form.onsubmit({preventDefault(){}});assert.equal(posts,1,'the pending generation cannot be duplicated');
-    if(succeed)gate.resolve({config:{...view.config,revision:1,judgeIds:Array.from({length:8},(_,i)=>'j'+i)},credentials:Array.from({length:8},(_,i)=>({id:'j'+i,name:'Judge '+i,code:'synthetic-code-'+i}))});
+    if(succeed)gate.resolve({config:{...view.config,revision:1,judgeIds:Array.from({length:8},(_,i)=>'j'+i)},judges:Array.from({length:8},(_,i)=>({id:'j'+i,name:'Judge '+i,active:true}))});
     else gate.reject(new Error('Temporary failure'));
     await saving;
     assert.equal(fieldset.disabled,false);assert.equal(roster.button.disabled,false);assert.equal(teamInput.checked,true);assert.equal(settings.form.elements.open.checked,true);assert.equal(settings.button.disabled,false);
     if(succeed){assert.match(judgeList.innerHTML,/Judge 7/);assert.equal(create.button.disabled,true);}else assert.equal(judgeList.innerHTML,'old judge list');
     ctx.testHelpers.disposeFinalsView();
   }
+});
+
+test('judge entry offers an explicit seat choice and no password or invitation field without changing the ordinary session',async()=>{
+  const form={elements:{judgeId:{value:''}},querySelector:()=>({textContent:''})},container={isConnected:true,querySelector:()=>form,querySelectorAll:()=>[]},main={innerHTML:'',querySelector:()=>container};
+  const calls=[],ctx=runtime({root:main,heading:(_a,title,description)=>`<h1>${esc(title)}</h1><p>${esc(description)}</p>`,session:{role:'team',loginId:'unrelated-team'},api:async path=>{calls.push(path);return {config:{runId:'r',open:true,rosterReady:true},judges:[{id:'seat-a',name:'评委一'},{id:'seat-b',name:'<评委二>'}]};}});
+  const before=ctx.session;await ctx.testHelpers.renderFinalsJudge(1);
+  assert.deepEqual(calls,['finals/entry']);assert.equal(ctx.session,before);assert.match(main.innerHTML,/name="judgeId"/);assert.match(main.innerHTML,/请选择自己的姓名或席位/);assert.match(main.innerHTML,/评委一/);assert.match(main.innerHTML,/&lt;评委二&gt;/);
+  assert.ok(!main.innerHTML.includes('type="password"'));assert.ok(!main.innerHTML.includes('name="code"'));assert.match(main.innerHTML,/href="#board-finals"/);ctx.testHelpers.disposeFinalsView();
+});
+
+test('each tab keeps its own seat header even after cookie login changes, and cannot send that header to administration',async()=>{
+  const calls=[];
+  const fetch=async(url,options)=>{calls.push({url:String(url),options});return {ok:true,status:200,json:async()=>({ok:true})};};
+  const first=runtime({fetch}),second=runtime({fetch});
+  const a=first.testHelpers.createFinalsView(1,'seat',{id:'seat-a',name:'A'}),b=second.testHelpers.createFinalsView(1,'seat',{id:'seat-b',name:'B'});
+  first.session={role:'admin',loginId:'new-admin'};first.ownsBrowserLogin=()=>false;
+  await first.testHelpers.finalsRequest(a,'finals/score',{teamId:'a'});await second.testHelpers.finalsRequest(b,'finals/nominations',{});
+  assert.equal(calls[0].options.headers['X-GOTC-Finals-Judge'],'seat-a');assert.equal(calls[1].options.headers['X-GOTC-Finals-Judge'],'seat-b');
+  for(const {options} of calls){assert.equal(options.credentials,'omit');assert.equal(options.headers['X-GOTC-Login'],undefined);assert.equal(options.headers.Cookie,undefined);}
+  await assert.rejects(first.testHelpers.finalsRequest(a,'admin/finals',{}));assert.equal(calls.length,2);
+  first.testHelpers.disposeFinalsView();second.testHelpers.disposeFinalsView();
+});
+
+test('switching seats invalidates an earlier response instead of applying it to the new editor',async()=>{
+  const gate=deferred(),ctx=runtime({api:()=>gate.promise}),first=ctx.testHelpers.createFinalsView(1,'seat',{id:'seat-a',name:'A'}),f=formStub();let applied=false;
+  const running=ctx.testHelpers.finalsSave(first,f.form,'finals/score',{expectedRevision:0},()=>applied=true);
+  const next=ctx.testHelpers.createFinalsView(1,'seat',{id:'seat-b',name:'B'});gate.resolve({score:{revision:1}});await running;
+  assert.equal(applied,false);assert.equal(next.valid(),true);assert.equal(next.judgeId,'seat-b');ctx.testHelpers.disposeFinalsView();
+});
+
+test('a rejected seat locks only that page and does not sign out an unrelated ordinary session',async()=>{
+  const ctx=runtime({session:{role:'admin',loginId:'admin-session'},fetch:async()=>({ok:false,status:403,json:async()=>({error:'席位已停用'})})}),view=ctx.testHelpers.createFinalsView(1,'seat',{id:'inactive',name:'Inactive'}),before=ctx.session;
+  await assert.rejects(ctx.testHelpers.finalsRequest(view,'finals/judge'),/席位已停用/);assert.equal(view.locked,true);assert.equal(ctx.session,before);ctx.testHelpers.disposeFinalsView();
+});
+
+test('a failed public seat list read shows a retry instead of requiring authentication',async()=>{
+  const retry={onclick:null},container={isConnected:true,querySelector:()=>retry,querySelectorAll:()=>[]},main={innerHTML:'',querySelector:()=>container};
+  const ctx=runtime({root:main,heading:()=>'',session:{role:null},api:async()=>{throw new Error('offline');}});
+  await ctx.testHelpers.renderFinalsJudge(1);assert.match(main.innerHTML,/offline/);assert.match(main.innerHTML,/重新读取评委名单/);assert.equal(typeof retry.onclick,'function');assert.ok(!main.innerHTML.includes('type="password"'));ctx.testHelpers.disposeFinalsView();
 });

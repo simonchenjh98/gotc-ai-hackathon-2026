@@ -1,3 +1,5 @@
+> 2026-11-06 后续调整：按用户在网站维护会话的明确要求，决赛取消邀请码和登录门槛；评委直接选择自己的姓名或席位评分。以下早期方案中有关评委专属码的设计已由免邀请码入口替代，管理员权限保持不变。详见 docs/finals.md。
+
 # Finals Scoring Implementation Plan
 
 > Execute the approved feature in this chat; preserve concurrent maintenance work.

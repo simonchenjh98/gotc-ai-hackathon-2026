@@ -1,4 +1,4 @@
-"""Independent eight-judge finals: numeric scores, award ballots and publication."""
+"""Independent eight-seat finals: open seat selection, scores, ballots and publication."""
 from contextlib import closing
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
@@ -57,6 +57,13 @@ DDL = [
     """CREATE TRIGGER IF NOT EXISTS finals_judge_active_update AFTER UPDATE OF active ON accounts
        WHEN OLD.active IS NOT NEW.active AND EXISTS(SELECT 1 FROM finals_judges WHERE judge_id=NEW.id)
        BEGIN UPDATE finals_config SET eligibility_revision=eligibility_revision+1 WHERE id=1; END""",
+    """CREATE TRIGGER IF NOT EXISTS finals_team_metadata_update AFTER UPDATE OF number,name,project ON teams
+       WHEN (OLD.number IS NOT NEW.number OR OLD.name IS NOT NEW.name OR OLD.project IS NOT NEW.project)
+            AND EXISTS(SELECT 1 FROM finals_teams WHERE team_id=NEW.id)
+       BEGIN UPDATE finals_config SET eligibility_revision=eligibility_revision+1 WHERE id=1; END""",
+    """CREATE TRIGGER IF NOT EXISTS finals_judge_name_update AFTER UPDATE OF name ON accounts
+       WHEN OLD.name IS NOT NEW.name AND EXISTS(SELECT 1 FROM finals_judges WHERE judge_id=NEW.id)
+       BEGIN UPDATE finals_config SET eligibility_revision=eligibility_revision+1 WHERE id=1; END""",
 ]
 
 
@@ -72,7 +79,8 @@ class FinalsService:
     def initialized(db):
         return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='finals_config'").fetchone()
                     and {'awards_json', 'eligibility_revision'} <= {r[1] for r in db.execute('PRAGMA table_info(finals_config)')}
-                    and {'finals_team_status_update', 'finals_team_status_insert', 'finals_team_status_delete', 'finals_judge_active_update'}
+                    and {'finals_team_status_update', 'finals_team_status_insert', 'finals_team_status_delete',
+                         'finals_judge_active_update', 'finals_team_metadata_update', 'finals_judge_name_update'}
                         <= {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
                     and db.execute('SELECT 1 FROM finals_config WHERE id=1').fetchone())
 
@@ -289,15 +297,14 @@ class FinalsService:
         revision = self.next_revision(body, state['revision'])
         if state['roster_locked'] or state['judges_created'] or self.judges(db, state['run_id']):
             raise APIError(409, '决赛评委已配置，不能重复批量创建')
-        credentials = []
+        judges = []
         for number in range(1, 9):
             judge, _ = self.s.create_account(db, 'judge', f'决赛评委 {number:02}')
-            code = self.s.credential_action(db, actor, {'role': 'judge', 'id': judge['id'], 'action': 'rotate'})['code']
             db.execute('INSERT INTO finals_judges VALUES (?,?)', (state['run_id'], judge['id']))
-            credentials.append({'id': judge['id'], 'name': judge['name'], 'code': code})
+            judges.append({'id': judge['id'], 'name': judge['name'], 'active': True})
         db.execute('UPDATE finals_config SET revision=?,judges_created=1 WHERE id=1', (revision,))
         self.s.audit(db, actor, 'finals.judges-created', state['run_id'], {'count': 8})
-        return {'config': self.config(db, self.state(db)), 'credentials': credentials}
+        return {'config': self.config(db, self.state(db)), 'judges': judges}
 
     def save_settings(self, db, actor, state, body):
         self.fields(body, {'expectedRevision', 'open', 'published'})
@@ -420,22 +427,40 @@ class FinalsService:
         self.s.audit(db, actor, 'finals.nominations.' + status, state['run_id'], {'revision': revision, 'nominatedAwards': sum(v is not None for v in nominations.values())})
         return {'nominations': {'revision': revision, 'status': status, 'nominations': nominations, 'updatedAt': now}}
 
-    def dispatch(self, db, actor, method, path, body, query, expected_login_id, cookie):
+    def dispatch(self, db, actor, method, path, body, query, expected_login_id, cookie, finals_judge_id=None):
         if query:
             raise APIError(400, '决赛接口不接受查询参数')
-        if path == '/api/finals/board' and method == 'GET':
-            state = self.state(db)
-            return {'config': self.config(db, state, public=True), 'dimensions': DIMENSIONS,
-                    'summary': json.loads(state['publication_json']) if self.published(db, state) else None}
-        role = 'admin' if path.startswith('/api/admin/finals') else 'judge'
-        self.s.require(actor, role)
-        if not expected_login_id:
-            raise APIError(428, '缺少页面登录信息，请刷新后核对身份', 'login_required')
-        if expected_login_id != self.s.login_id(cookie):
-            raise APIError(401, '登录身份已变化，请重新登录后操作')
         if path.endswith('/'):
             raise APIError(404, '决赛接口不存在')
         state = self.state(db)
+        if path == '/api/finals/entry' and method == 'GET':
+            judges = [j for j in self.judges(db, state['run_id']) if j['active']]
+            teams = self.teams(db, state['run_id'])
+            return {'config': {'runId': state['run_id'], 'open': bool(state['open']),
+                               'published': self.published(db, state), 'judgeCount': 8,
+                               'rosterReady': len(judges) == 8 and any(t['eligible'] for t in teams)},
+                    'judges': [{'id': j['id'], 'name': j['name']} for j in judges]}
+        if path == '/api/finals/board' and method == 'GET':
+            return {'config': self.config(db, state, public=True), 'dimensions': DIMENSIONS,
+                    'summary': json.loads(state['publication_json']) if self.published(db, state) else None}
+        if path.startswith('/api/admin/finals'):
+            self.s.require(actor, 'admin')
+            if not expected_login_id:
+                raise APIError(428, '缺少页面登录信息，请刷新后核对身份', 'login_required')
+            if expected_login_id != self.s.login_id(cookie):
+                raise APIError(401, '登录身份已变化，请重新登录后操作')
+        elif path in {'/api/finals/judge', '/api/finals/score', '/api/finals/nominations'}:
+            # A selected seat identifies attribution only. It does not authenticate a user,
+            # and it never grants permissions to the ordinary judge or administrator APIs.
+            if not isinstance(finals_judge_id, str) or not finals_judge_id:
+                raise APIError(400, '请先选择你的决赛评委姓名或席位', 'finals_seat_required')
+            actor = db.execute('''SELECT a.* FROM accounts a JOIN finals_judges j ON j.judge_id=a.id
+                                  WHERE j.run_id=? AND a.id=? AND a.role='judge' AND a.active=1''',
+                               (state['run_id'], finals_judge_id)).fetchone()
+            if actor is None:
+                raise APIError(403, '所选决赛评委席位无效或已停用，请重新选择', 'finals_seat_invalid')
+        else:
+            raise APIError(404, '决赛接口不存在')
         if method == 'GET' and path == '/api/admin/finals':
             return self.admin_view(db, state)
         if method == 'GET' and path == '/api/finals/judge':
