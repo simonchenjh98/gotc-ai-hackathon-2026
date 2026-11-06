@@ -3,6 +3,7 @@ import json
 import unittest
 import test_claims
 import test_open_claims
+from test_api import Client
 
 
 class OnlineClaimsTests(unittest.TestCase):
@@ -32,6 +33,31 @@ class OnlineClaimsTests(unittest.TestCase):
     test_selection_rollback=test_open_claims.OpenClaimsTests.test_selected_registration_issuance_failure_rolls_back_team_and_registration_changes
     test_same_target_race=test_open_claims.OpenClaimsTests.test_racing_different_claims_cannot_bind_the_same_existing_team
     test_duplicate_verified_names=test_open_claims.OpenClaimsTests.test_verified_same_name_people_allow_metadata_edits_without_losing_any_identity
+
+    def test_five_person_team_registers_is_approved_and_redeems_without_losing_members(self):
+        names=['Open One','Open Two','Open Three','Open Four']
+        code,registered,value=self.registration(targetSize=5,members=names)
+        self.assertEqual(registered['members'],['Open Captain',*names])
+        self.assertFalse(registered['recruiting'])
+        claim=self.application(members=[{'name':name,'school':'School A'} for name in names])
+        body=self.selected_approval(claim,registered['id'])
+        self.assertEqual(self.admin_call('/approve',body)[0],200)
+        receipt=self.bearer(claim,'redeem')[1]
+        self.assertEqual(receipt['team']['id'],registered['id'])
+        self.assertEqual(len(receipt['declaration']['members']),4)
+        client=Client(self.server)
+        self.assertEqual(client.post('/api/login',{'role':'team','code':receipt['code']})[0],200)
+        with self.service.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM claim_memberships WHERE team_id=?',(registered['id'],)).fetchone()[0],5)
+        current=self.public.post('/api/registration/open',{'code':code})[1]['team']
+        self.assertEqual(current['targetSize'],5)
+        self.assertEqual(current['members'],['Open Captain',*names])
+        changed={**value,'project':'Five-person project'}
+        saved=self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],'team':changed})
+        self.assertEqual(saved[0],200,saved[1]);self.assertEqual(len(saved[1]['team']['members']),5)
+        extra=[{'name':name,'school':'School A'} for name in [*names,'Open Five']]
+        invalid=self.public.post('/api/claims/request',{'name':'Six Captain','school':'School A','teamName':'Six people','track':'','members':extra})
+        self.assertEqual(invalid[0],400)
 
     def test_explicit_online_intent_auth_strict_modes_and_audit(self):
         claim=self.application();body=self.approval(claim)
