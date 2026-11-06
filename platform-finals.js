@@ -10,6 +10,14 @@ const finalsGuidance={
   opensource:'代码与说明便于他人理解和复用，许可证、引用来源与协作记录清楚。'
 };
 let activeFinalsView=null;
+const finalsAccessStorageKey='gotc-finals-access-v1';
+let finalsAccessGrant=null;
+try{const saved=JSON.parse(sessionStorage.getItem(finalsAccessStorageKey));if(saved && typeof saved.accessToken==='string' && saved.accessToken.length>=32 && Number.isFinite(saved.expiresAt) && saved.expiresAt>Date.now())finalsAccessGrant=saved;}catch{}
+function finalsHasAccess(){return !!finalsAccessGrant && finalsAccessGrant.expiresAt>Date.now();}
+function finalsSetAccess(grant){
+  finalsAccessGrant=grant;
+  try{if(grant)sessionStorage.setItem(finalsAccessStorageKey,JSON.stringify(grant));else sessionStorage.removeItem(finalsAccessStorageKey);}catch{}
+}
 
 function makeFinalsPoller({read,apply,status,alive,isHidden,subscribe,schedule=setTimeout,cancel=clearTimeout}){
   let timer=null,deadline=null,controller=null,busy=false,stopped=false,pending=false;
@@ -38,18 +46,19 @@ function disposeFinalsView(){
 }
 
 function createFinalsView(version,role,judge=null){
-  disposeFinalsView();const owner=role && role!=='seat'?session:null;
-  const view={version,owner,route,role,judgeId:judge?.id || null,judgeName:judge?.name || '',disposed:false,container:null,controllers:new Set(),cleanups:[],forms:new Set(),locked:false};
+  disposeFinalsView();const independent=['seat','entry','access'].includes(role),owner=role && !independent?session:null;
+  const view={version,owner,route,role,grant:['seat','entry'].includes(role)?finalsAccessGrant:null,judgeId:judge?.id || null,judgeName:judge?.name || '',disposed:false,container:null,controllers:new Set(),cleanups:[],forms:new Set(),locked:false};
   activeFinalsView=view;
   view.current=()=>!view.disposed && activeFinalsView===view && routeVersion===version && route===view.route && (!view.container || view.container.isConnected);
   view.lock=()=>{
     if(!view.current())return;view.locked=true;view.poller?.stop();
     view.container?.querySelectorAll('button').forEach(button=>button.disabled=true);
-    const notice=view.container?.querySelector('[data-finals-auth]');if(notice){notice.hidden=false;notice.textContent=role==='seat'?'当前评委席位已不可用。请先复制未保存的输入，再刷新并重新选择评委。':'登录身份已失效或切换。请先复制未保存的输入，再刷新并核对登录身份。';}
+    const notice=view.container?.querySelector('[data-finals-auth]');if(notice){notice.hidden=false;notice.textContent=independent?'决赛验证已失效或当前席位不可用。请先复制未保存的输入，再刷新并重新输入邀请码、选择评委。':'登录身份已失效或切换。请先复制未保存的输入，再刷新并核对登录身份。';}
   };
   view.valid=()=>{
     if(!view.current())return false;
-    if(role && role!=='seat' && (session!==owner || owner.role!==role || !owner.loginId || !ownsBrowserLogin(owner))){view.lock();return false;}
+    if(['seat','entry'].includes(role) && (!finalsHasAccess() || view.grant!==finalsAccessGrant)){view.lock();return false;}
+    if(role && !independent && (session!==owner || owner.role!==role || !owner.loginId || !ownsBrowserLogin(owner))){view.lock();return false;}
     return !view.locked;
   };
   const recheck=()=>view.valid();window.addEventListener('storage',recheck);window.addEventListener('focus',recheck);document.addEventListener('visibilitychange',recheck);
@@ -62,17 +71,18 @@ async function finalsRequest(view,path,payload,signal){
   const controller=signal?null:new AbortController();if(controller)view.controllers.add(controller);
   const timeout=controller?setTimeout(()=>controller.abort(),8000):null;
   try{
-    if(view.role==='seat'){
-      if(!['finals/judge','finals/score','finals/nominations'].includes(path) || !view.judgeId)throw new Error('请先选择当前评委席位。');
-      // The chosen seat is attribution only. Ordinary login cookies must never change it.
-      const response=await fetch(new URL(`api/${path}`,base),{method:payload===undefined?'GET':'POST',credentials:'omit',cache:'no-store',headers:{'X-GOTC-Finals-Judge':view.judgeId,...(payload===undefined?{}:{'Content-Type':'application/json'})},body:payload===undefined?undefined:JSON.stringify(payload),signal:signal || controller.signal});
+    if(['seat','entry','access'].includes(view.role)){
+      const allowed=view.role==='seat'?['finals/judge','finals/score','finals/nominations']:view.role==='entry'?['finals/entry']:['finals/access'];
+      if(!allowed.includes(path) || (view.role==='seat' && !view.judgeId))throw new Error('请先验证邀请码并选择当前评委席位。');
+      // Finals authorization and attribution are independent of ordinary account cookies.
+      const response=await fetch(new URL(`api/${path}`,base),{method:payload===undefined?'GET':'POST',credentials:'omit',cache:'no-store',headers:{...(view.grant?{'X-GOTC-Finals-Access':view.grant.accessToken}:{}),...(view.role==='seat'?{'X-GOTC-Finals-Judge':view.judgeId}:{}),...(payload===undefined?{}:{'Content-Type':'application/json'})},body:payload===undefined?undefined:JSON.stringify(payload),signal:signal || controller.signal});
       let body;try{body=await response.json();}catch{throw new Error('服务暂时不可用，请稍后重试。');}
       if(!response.ok){const error=new Error(body.error || '操作未成功，请核对当前评委席位。');error.status=response.status;error.code=body.code;throw error;}
       return body;
     }
     return await api(path,payload,{loginId:view.owner?.loginId,signal:signal || controller.signal});
   }
-  catch(error){if(view.current() && (error.status===401 || error.status===403))view.lock();throw error;}
+  catch(error){if(view.current() && view.role!=='access' && (error.status===401 || error.status===403)){if(error.code==='finals_access_required' && view.grant===finalsAccessGrant)finalsSetAccess(null);view.lock();}throw error;}
   finally{if(timeout!==null)clearTimeout(timeout);if(controller)view.controllers.delete(controller);}
 }
 
@@ -193,12 +203,40 @@ async function renderFinalsBoard(version){
   const update=latest=>finalsPatchSummary(view,latest,true);update(data);finalsStartPolling(view,'finals/board',update);
 }
 
+async function renderFinalsAccess(version){
+  const view=createFinalsView(version,'access');
+  finalsShell(view,'FINALS / 决赛评委','决赛评分与奖项提名','请输入主办方提供的邀请码，验证后选择自己的姓名或评委席位。',`<section class="surface finals-entry"><h2>决赛评委验证</h2><form data-finals-access><label class="field">决赛邀请码<input name="code" type="password" autocomplete="one-time-code" required maxlength="160" placeholder="输入主办方提供的邀请码"></label><button class="btn" type="submit">验证并选择评委席位</button><p class="form-error" role="alert"></p></form><p class="small-note">每位评委的评分和提名单独保存。</p><a href="#board-finals">查看公开决赛结果 →</a></section>`);
+  const form=view.container.querySelector('[data-finals-access]'),button=form.querySelector('button');let busy=false;
+  form.onsubmit=async event=>{
+    event.preventDefault();if(busy || !view.valid() || !form.isConnected)return;
+    busy=true;button.disabled=true;form.elements.code.disabled=true;finalsMessage(form,'');
+    try{
+      const result=await finalsRequest(view,'finals/access',{code:form.elements.code.value});
+      if(!view.valid() || !form.isConnected)return;
+      if(typeof result.accessToken!=='string' || result.accessToken.length<32 || !Number.isFinite(result.expiresAt) || result.expiresAt<=Date.now())throw new Error('验证结果无效，请重新输入邀请码。');
+      finalsSetAccess({accessToken:result.accessToken,expiresAt:result.expiresAt});
+      await renderFinalsJudge(version);
+    }catch(error){if(view.current() && form.isConnected)finalsMessage(form,error.name==='AbortError'?'验证超时，请重试。':error.message);}
+    finally{form.elements.code.value='';busy=false;if(form.isConnected){button.disabled=false;form.elements.code.disabled=false;}}
+  };
+}
+function finalsInstallAccessExit(view,version){
+  const button=view.container.querySelector('[data-finals-access-exit]');if(!button)return;
+  button.onclick=()=>{
+    if(!view.valid())return;
+    if([...view.forms].some(form=>form.finalsBusy)){toast('正在保存，请等待结果返回后再退出。');return;}
+    if([...view.forms].some(form=>dirtyAdminForms.has(form)) && !confirm('退出会放弃未保存的评分或提名，请先保存或复制输入。确认退出？'))return;
+    finalsSetAccess(null);renderFinalsAccess(version);
+  };
+}
 async function renderFinalsJudge(version,judge=null){
-  const view=createFinalsView(version,judge?'seat':null,judge);
+  if(!finalsHasAccess())return renderFinalsAccess(version);
+  const view=createFinalsView(version,judge?'seat':'entry',judge);
   if(!judge){
     let entry;try{entry=await finalsRequest(view,'finals/entry');}catch(error){finalsJudgeUnavailable(view,version,error);return;}if(!view.valid())return;
     const judges=entry.judges || [];
-    finalsShell(view,'FINALS / 决赛评委','决赛评分与奖项提名','无需邀请码或登录码。选择自己的姓名或评委席位后，即可查看队伍并评分。',`<section class="surface finals-entry"><h2>选择本次评分归属</h2><p>请按主办方分配的姓名或席位选择。每位评委的评分和提名单独保存。</p><form data-finals-entry><label class="field">评委姓名 / 席位<select name="judgeId" required><option value="">请选择自己的姓名或席位</option>${judges.map(item=>`<option value="${esc(item.id)}">${esc(item.name)}</option>`).join('')}</select></label><button class="btn" type="submit" ${judges.length?'':'disabled'}>进入评分与提名</button><p class="form-error" role="status"></p></form>${entry.config.rosterReady?'':'<p class="info-banner warning">组织方正在准备决赛名单与8个评委席位。</p>'}<p class="small-note">${entry.config.open?'决赛评分与提名已开放。':'当前尚未开放或已关闭，可进入查看已保存记录。'}</p><a href="#board-finals">查看公开决赛结果 →</a></section>`);
+    finalsShell(view,'FINALS / 决赛评委','决赛评分与奖项提名','邀请码已验证。选择自己的姓名或评委席位后，即可查看队伍并评分。',`<section class="surface finals-entry"><h2>选择本次评分归属</h2><p>请按主办方分配的姓名或席位选择。每位评委的评分和提名单独保存。</p><form data-finals-entry><label class="field">评委姓名 / 席位<select name="judgeId" required><option value="">请选择自己的姓名或席位</option>${judges.map(item=>`<option value="${esc(item.id)}">${esc(item.name)}</option>`).join('')}</select></label><button class="btn" type="submit" ${judges.length?'':'disabled'}>进入评分与提名</button><p class="form-error" role="status"></p></form>${entry.config.rosterReady?'':'<p class="info-banner warning">组织方正在准备决赛名单与8个评委席位。</p>'}<p class="small-note">${entry.config.open?'决赛评分与提名已开放。':'当前尚未开放或已关闭，可进入查看已保存记录。'}</p><div class="form-actions"><button class="btn secondary small" type="button" data-finals-access-exit>退出决赛验证</button><a href="#board-finals">查看公开决赛结果 →</a></div></section>`);
+    finalsInstallAccessExit(view,version);
     const form=view.container.querySelector('[data-finals-entry]');
     form.onsubmit=async event=>{
       event.preventDefault();if(!view.valid())return;
@@ -233,6 +271,7 @@ async function renderFinalsJudge(version,judge=null){
 
 function finalsJudgeUnavailable(view,version,error){
   if(!view.current())return;
+  if(error.code==='finals_access_required')return renderFinalsAccess(version);
   finalsShell(view,'FINALS / 决赛评委','暂时无法读取当前席位','',`<section class="surface"><p role="alert">${esc(error.name==='AbortError'?'读取超时，请重试。':error.message)}</p><button class="btn secondary" type="button" data-finals-reselect>重新读取评委名单</button></section>`);
   view.container.querySelector('[data-finals-reselect]').onclick=()=>renderFinalsJudge(version);
 }

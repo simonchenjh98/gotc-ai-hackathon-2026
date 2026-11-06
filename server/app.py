@@ -588,7 +588,7 @@ class EventService:
             self.audit(db, current, "login")
             return {"ok": True, **self.admin_team_access.session_view(current, f"{COOKIE_NAME}={token}")}, token, "set"
 
-    def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None, server_received_at=None, finals_judge_id=None):
+    def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None, server_received_at=None, finals_judge_id=None, finals_access_token=None):
         """Return (JSON object or CSV bytes, optional session token, cookie action)."""
         validate_unicode(body)
         if self.roadshow_scoring.supports(path):
@@ -621,7 +621,7 @@ class EventService:
             if actor and path in {'/api/judge', '/api/score', '/api/judging/exhibition', '/api/judging/exhibition/', '/api/judging/exhibition/review'} and self.roadshow_access.owns_account(db,actor['id']):
                 raise APIError(403, '此邀请码仅用于路演评审，请从路演入口进入')
             if self.finals.supports(path):
-                return self.finals.dispatch(db,actor,method,path,body,query or {},expected_login_id,cookie,finals_judge_id),None,None
+                return self.finals.dispatch(db,actor,method,path,body,query or {},expected_login_id,cookie,finals_judge_id,finals_access_token,ip),None,None
             if path == "/api/admin/judging/roadshow/window":
                 self.require(actor, "admin")
                 if not expected_login_id:
@@ -1196,7 +1196,7 @@ class EventHandler(BaseHTTPRequestHandler):
                         peer = str(ipaddress.ip_address(proxy_ip))
                     except ValueError:
                         pass
-                value, token, cookie_action = service.dispatch(self.command, path, body, self.headers.get("Cookie", ""), peer,query=query,expected_login_id=self.headers.get("X-GOTC-Login"),server_received_at=received_at,finals_judge_id=self.headers.get("X-GOTC-Finals-Judge"))
+                value, token, cookie_action = service.dispatch(self.command, path, body, self.headers.get("Cookie", ""), peer,query=query,expected_login_id=self.headers.get("X-GOTC-Login"),server_received_at=received_at,finals_judge_id=self.headers.get("X-GOTC-Finals-Judge"),finals_access_token=self.headers.get("X-GOTC-Finals-Access"))
                 cookie = None
                 if cookie_action:
                     cookie = f"{COOKIE_NAME}={token or ''}; Path={service.base_path or '/'}; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS if cookie_action == 'set' else 0}"
