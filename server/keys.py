@@ -94,6 +94,7 @@ STATUS_KINDS = {400: "invalid", 401: "auth", 403: "forbidden", 404: "not_found",
 UPSTREAM_TIMEOUT = 300  # waiting for the reply to start
 CONNECT_TIMEOUT = 10  # connect + TLS handshake (sub2api dial and TLS timeouts), so a dead upstream frees the slot fast
 STREAM_IDLE_TIMEOUT = 180  # silence between stream events before giving up (sub2api stream_data_interval_timeout)
+SSE_EVENT_CAP = 1024 * 1024  # inspect at most 1 MiB per event before any of its bytes reach the client
 QUEUE_CAP = 20  # waiting requests per team beyond its running ones (sub2api defaultExtraWaitSlots)
 AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW, AUTH_BLOCK = 120, 60, 60  # per client IP, as sub2api's invalid-auth limiter
 COUNT_TOKENS_CONCURRENCY, COUNT_TOKENS_RPM = 4, 120  # count_tokens is free but uses our upstream key's rate limit
@@ -169,8 +170,58 @@ def sse_error(path, info):
     return (f"event: error\ndata: {data}\n\n" if path.startswith("/v1/messages") else f"data: {data}\n\n").encode()
 
 
+def redact_error_payload(payload, secrets=()):
+    """Redact credentials in provider errors without changing their JSON structure.
+
+    Decode JSON first so escaped keys are not missed. Error strings sometimes contain JSON or URLs themselves;
+    match mixed literal, JSON-escaped and percent-encoded characters there as well. Successful replies never use this.
+    """
+    if isinstance(secrets, str):
+        secrets = (secrets,)
+    patterns = []
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if not secret:
+            continue
+        pieces = []
+        for char in secret:
+            units = char.encode("utf-16-be", "surrogatepass")
+            unicode_escape = "".join(f"\\u{int.from_bytes(units[i:i + 2], 'big'):04x}" for i in range(0, len(units), 2))
+            percent_escape = "".join(f"%{b:02x}" for b in char.encode("utf-8", "surrogatepass"))
+            alternatives = {re.escape(char), re.escape(json.dumps(char)[1:-1]),
+                            "(?i:" + re.escape(unicode_escape) + ")", "(?i:" + re.escape(percent_escape) + ")"}
+            if char == "/":
+                alternatives.add(re.escape("\\/"))
+            pieces.append("(?:" + "|".join(sorted(alternatives)) + ")")
+        patterns.append(re.compile("".join(pieces)))
+
+    def clean_text(text):
+        for pattern in patterns:
+            text = pattern.sub("***", text)
+        text = re.sub(r"(sk-|gk-|Bearer\s+)[A-Za-z0-9._\-]{6,}", r"\1***", text)
+        return re.sub(r"(?i)((?:api_?key|key|access_token|refresh_token|client_secret)=)[^&\s]+", r"\1***", text)
+
+    def clean(value):
+        if isinstance(value, str):
+            return clean_text(value)
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        if isinstance(value, dict):
+            return {clean_text(key): clean(item) for key, item in value.items()}
+        return value
+
+    text = payload.decode("utf-8", "replace") if isinstance(payload, bytes) else str(payload)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        sanitized = clean_text(text)
+        return sanitized.encode() if sanitized != text else payload
+    sanitized = clean(data)
+    return json.dumps(sanitized, ensure_ascii=False).encode() if sanitized != data else payload
+
+
 def upstream_message(payload, secret=""):
     """The upstream's own error message, cut down and with our upstream key and key-like strings removed."""
+    payload = redact_error_payload(payload, secret)
     text = payload.decode("utf-8", "replace") if isinstance(payload, bytes) else str(payload)
     try:
         data = json.loads(text)
@@ -179,10 +230,6 @@ def upstream_message(payload, secret=""):
             found if isinstance(found, str) else data.get("message") if isinstance(data, dict) and isinstance(data.get("message"), str) else text
     except ValueError:
         pass
-    if secret:
-        text = text.replace(secret, "***")
-    text = re.sub(r"(sk-|gk-|Bearer\s+)[A-Za-z0-9._\-]{6,}", r"\1***", text)
-    text = re.sub(r"(?i)((?:api_?key|key|access_token|refresh_token|client_secret)=)[^&\s]+", r"\1***", text)
     return " ".join(text.split())[:500]
 
 
@@ -699,6 +746,11 @@ class KeyService:
         # Config order is kept: the first model of each upstream is the default shown in setup snippets.
         return {name: list(item["models"]) for name, item in (self.config or {}).items()}
 
+    def error_secrets(self, call=None):
+        # Include the request's snapshot: an organizer can rotate or remove an upstream while a call is running.
+        current = tuple(item["key"] for item in (self.config or {}).values())
+        return current + tuple((call or {}).get("secrets", ()))
+
     def spend(self, db, team_id, since=0):
         return db.execute("SELECT COALESCE(SUM(cost_micro),0) FROM api_usage WHERE team_id=? AND at>=?", (team_id, since)).fetchone()[0] / 1e6
 
@@ -906,7 +958,8 @@ class KeyService:
             return {"ok": False, "status": None, "latencyMs": int((time.monotonic() - started) * 1000), "message": failure_reason(error)}
         latency = int((time.monotonic() - started) * 1000)
         if status >= 400:
-            return {"ok": False, "status": status, "latencyMs": latency, "message": upstream_message(payload, upstream["key"])}
+            return {"ok": False, "status": status, "latencyMs": latency,
+                    "message": upstream_message(payload, self.error_secrets() + (upstream["key"],))}
         if not models_only:
             return {"ok": True, "status": status, "latencyMs": latency, "model": model, "message": "连接正常，上游已返回回复"}
         try:
@@ -1061,7 +1114,7 @@ class KeyService:
         call = {"key": None, "path": path, "model": "", "stream": False, "price": None, "usage": [0] * USAGE_FIELDS, "status": 0,
                 "request": b"", "response": [], "size": 0, "started": time.monotonic(), "log": False,
                 "request_bytes": 0, "reply_bytes": 0, "done": False, "forwarded": False,
-                "request_id": uuid.uuid4().hex, "reply_headers": {}}
+                "request_id": uuid.uuid4().hex, "reply_headers": {}, "secrets": self.error_secrets()}
         try:
             query = parse_qs(urlsplit(handler.path).query)
             if "key" in query or "api_key" in query:
@@ -1349,6 +1402,7 @@ class KeyService:
         if handler.command != "POST" or name not in self.config:
             raise APIError(404, "接口不存在")
         upstream = self.config[name]
+        call["secrets"] += (upstream["key"],)
         key = self.authenticate(handler, call)
         body = self.read_body(handler)
         call["request"] = handler.raw_body if call["log"] else b""  # exactly what the client sent
@@ -1456,6 +1510,7 @@ class KeyService:
         """Claude Code calls this before requests; passed through at zero cost, recorded without content."""
         body = self.read_body(handler)
         upstream = self.config["anthropic"]
+        call["secrets"] += (upstream["key"],)
         model = resolve(upstream, body.get("model"))
         call["model"] = model or ""
         if model is None:
@@ -1477,7 +1532,8 @@ class KeyService:
                 payload = error.read(1_000_000)
             except (OSError, http.client.HTTPException):
                 payload = b"{}"
-            message = upstream_message(payload, upstream["key"])
+            payload = redact_error_payload(payload, self.error_secrets(call))
+            message = upstream_message(payload, self.error_secrets(call))
             if error.code in (404, 405, 501):
                 # The upstream has no count_tokens (Gitee AI, many compatible providers). Mirror the status, as sub2api
                 # does for count_tokens, so clients such as Claude Code fall back to their own estimate.
@@ -1537,7 +1593,8 @@ class KeyService:
             except (OSError, http.client.HTTPException):
                 payload = b""
             call["upstream_request_id"] = error.headers.get("request-id") or error.headers.get("x-request-id") or ""
-            message = upstream_message(payload, upstream["key"]) or f"HTTP {error.code}"
+            payload = redact_error_payload(payload, self.error_secrets(call))
+            message = upstream_message(payload, self.error_secrets(call)) or f"HTTP {error.code}"
             mapped = upstream_http_error(call["path"], error.code, message)
             if mapped:
                 retry = error.headers.get("retry-after")
@@ -1579,14 +1636,15 @@ class KeyService:
             except ValueError:
                 # A 200 the gateway cannot parse is not a reply (sub2api: 502, not billed); keep it for admins.
                 call["forwarded"] = False
+                payload = redact_error_payload(payload, self.error_secrets(call))
                 self.keep(call, payload[:2000])
-                preview = upstream_message(payload[:300], upstream["key"])
+                preview = upstream_message(payload, self.error_secrets(call))
                 raise GatewayError("upstream", "上游返回了无法解析的内容，请稍后重试（本次不计费）", upstream_status=response.status,
                                    upstream_message=f"上游返回 HTTP {response.status} 但内容不是 JSON：{preview}") from None
             if isinstance(data, dict) and isinstance(data.get("error"), (dict, str)):
                 # Some providers answer errors with HTTP 200 and an error object.
                 call["forwarded"] = False
-                message = upstream_message(payload, upstream["key"])
+                message = upstream_message(payload, self.error_secrets(call))
                 kind = "overloaded" if "overload" in json.dumps(data.get("error")).lower() else "upstream"
                 raise GatewayError(kind, "上游模型服务返回错误，请稍后重试（本次不计费）", upstream_status=response.status,
                                    upstream_message=message) from None
@@ -1606,26 +1664,56 @@ class KeyService:
         usage, path = call["usage"], call["path"]
         handler.close_connection = True  # HTTP/1.0: the stream ends when the connection closes
         set_read_timeout(response, STREAM_IDLE_TIMEOUT)  # silence between events, not the whole reply
-        held = []
+        def oversized_event():
+            return GatewayError("upstream", "上游流式事件过大，请联系组织方检查上游服务", upstream_status=200,
+                                upstream_message=f"SSE event buffer exceeded {SSE_EVENT_CAP} bytes")
+
+        def frames():
+            frame, size = [], 0
+            while True:
+                # Limit readline itself: checking only after an unbounded read would still allocate a giant line.
+                line = response.readline(SSE_EVENT_CAP - size + 1)
+                if not line:
+                    break
+                size += len(line)
+                if size > SSE_EVENT_CAP:
+                    raise oversized_event()
+                frame.append(line)
+                if line in (b"\n", b"\r\n"):
+                    yield frame
+                    frame, size = [], 0
+            if frame:
+                yield frame
+
+        def inspect_frame(frame):
+            # SSE joins multiple data lines with newlines; inspect the whole event before releasing an error.
+            payload = b"\n".join(line[5:].removeprefix(b" ").rstrip(b"\r\n") for line in frame if line.startswith(b"data:"))
+            event_name = next((line[6:].strip() for line in reversed(frame) if line.startswith(b"event:")), b"")
+            try:
+                event = json.loads(payload)
+            except ValueError:
+                event = None
+            error = event_name in (b"error", b"response.failed") or isinstance(event, dict) and (
+                event.get("type") in ("error", "response.failed") or isinstance(event.get("error"), (dict, str)))
+            return payload, event, error
+
+        stream = frames()
+        held, held_size, payload, event, is_error = [], 0, b"", None, False
         try:
-            for line in response:
-                held.append(line)
-                if line.startswith(b"data:") and line[5:].strip():
+            for frame in stream:
+                held_size += sum(map(len, frame))
+                if held_size > SSE_EVENT_CAP:
+                    raise oversized_event()  # bound comment/heartbeat frames held before the first data event too
+                held.append(frame)
+                payload, event, is_error = inspect_frame(frame)
+                if payload:
                     break
         except (OSError, http.client.HTTPException) as error:
             self.upstream_failed(call, error)  # nothing sent to the client yet: a clean error response
-        first = b"".join(held)
-        event = None
-        for line in held:
-            if line.startswith(b"data:") and line[5:].strip() != b"[DONE]":
-                try:
-                    event = json.loads(line[5:])
-                except ValueError:
-                    event = None
-        if isinstance(event, dict) and (event.get("type") in ("error", "response.failed") or isinstance(event.get("error"), (dict, str))):
+        if is_error:
             call["forwarded"] = False  # the upstream refused before generating anything: not billed
-            message = upstream_message(json.dumps(event).encode())
-            raw = json.dumps(event.get("error"))
+            message = upstream_message(payload, self.error_secrets(call))
+            raw = payload.decode("utf-8", "replace")
             kind = "overloaded" if "overload" in raw.lower() else "upstream_rate_limit" if "rate_limit" in raw.lower() else "upstream"
             raise GatewayError(kind, "上游模型服务返回错误，请稍后重试（本次不计费）", upstream_status=200, upstream_message=message)
         try:
@@ -1635,45 +1723,66 @@ class KeyService:
             client_open = False  # still drain below: the upstream is generating and billing regardless
         failure = None
 
-        def relay(line):
+        def relay(frame):
             nonlocal client_open
-            if line.startswith(b"data:"):
-                if line[5:].strip() == b"[DONE]":
-                    call["done"] = True
-                else:
+            payload, parsed, is_error = inspect_frame(frame)
+            if is_error:
+                sanitized = redact_error_payload(payload, self.error_secrets(call))
+                if sanitized != payload:
+                    replacement, written = [], False
+                    for line in frame:
+                        if line.startswith(b"data:"):
+                            if not written:
+                                ending = b"\r\n" if line.endswith(b"\r\n") else b"\n" if line.endswith(b"\n") else b""
+                                # Every physical payload line needs its own data field in SSE, including plain-text errors.
+                                replacement.extend(b"data: " + part + ending for part in sanitized.split(b"\n"))
+                                written = True
+                        else:
+                            replacement.append(line)
+                    frame = replacement
                     try:
-                        parsed = json.loads(line[5:])
+                        parsed = json.loads(sanitized)
                     except ValueError:
                         parsed = None
-                    read_usage(name, parsed, usage)
-                    stream_progress(name, parsed, call)
-                    if call["reply_bytes"] and call.get("stream_first_ms") is None:
-                        call["stream_first_ms"] = int((time.monotonic() - call["started"]) * 1000)
-                    if isinstance(parsed, dict) and (parsed.get("type") in ("error", "response.failed") or isinstance(parsed.get("error"), (dict, str))):
-                        call["stream_error"] = parsed  # the upstream gave up mid-stream; the client gets its frame as-is
-            self.keep(call, line)
-            if client_open:
-                try:
-                    self.send(handler, call, 200, content_type, line)
-                except ClientGone:
-                    client_open = False  # keep draining so the final usage is still billed (bounded by the upstream timeout)
+                call["stream_error"] = parsed if isinstance(parsed, dict) else {
+                    "error": {"message": upstream_message(sanitized, self.error_secrets(call))}}
+                # An error's id/event/comment lines are provider-controlled too; do not leak keys through metadata.
+                frame = [line if line.startswith(b"data:") else redact_error_payload(line, self.error_secrets(call))
+                         for line in frame]
+            if payload.strip() == b"[DONE]":
+                call["done"] = True
+            else:
+                read_usage(name, parsed, usage)
+                stream_progress(name, parsed, call)
+                if call["reply_bytes"] and call.get("stream_first_ms") is None:
+                    call["stream_first_ms"] = int((time.monotonic() - call["started"]) * 1000)
+            for line in frame:
+                self.keep(call, line)
+                if client_open:
+                    try:
+                        self.send(handler, call, 200, content_type, line)
+                    except ClientGone:
+                        client_open = False  # keep draining to capture final usage, bounded by the upstream timeout
 
-        for line in held:
-            relay(line)
+        for frame in held:
+            relay(frame)
         try:
-            for line in response:
-                relay(line)
-        except (OSError, http.client.HTTPException) as error:
+            for frame in stream:
+                relay(frame)
+        except (OSError, http.client.HTTPException, GatewayError) as error:
             failure = error
-        if call["done"] and not call.get("stream_error"):
+        if call["done"] and not call.get("stream_error") and not isinstance(failure, GatewayError):
             return  # finished (if the client left mid-way, the full drained usage is billed, as in sub2api)
         # The stream did not finish: classify, tell the client (if it is still there) and record a failed call.
         if call.get("stream_error"):
             raw = json.dumps(call["stream_error"].get("error", call["stream_error"]))
             kind = "overloaded" if "overload" in raw.lower() else "upstream"
             info = error_info(GatewayError(kind, "上游模型服务在输出过程中返回错误", status=502, upstream_status=200,
-                                           upstream_message=upstream_message(raw.encode())))
+                                           upstream_message=upstream_message(raw.encode(), self.error_secrets(call))))
             frame = None  # the upstream's own error frame was already relayed
+        elif isinstance(failure, GatewayError):
+            info = error_info(failure)
+            frame = sse_error(path, info)
         else:
             timed_out = failure is not None and isinstance(getattr(failure, "reason", failure), (TimeoutError, socket.timeout))
             reason = failure_reason(failure) if failure is not None else "上游未发送结束事件就关闭了连接"
