@@ -274,6 +274,18 @@ class GatewayTransactionTests(unittest.TestCase):
         self.assertEqual(len(FakeUpstream.calls), 1)
         self.assertEqual(self.call('/v1/messages/count_tokens', {'model': 'claude-x'}, token)[0], 404)
 
+    def test_deep_gateway_json_is_a_client_error_without_upstream_or_charge(self):
+        _, _, token = self.enabled_key()
+        raw = b'{"model":"cheap","messages":' + b'[' * 5000 + b'0' + b']' * 5000 + b'}'
+        with patch.object(keys.traceback, 'print_exc'):
+            status, result, _ = self.public.request('POST', '/v1/chat/completions', raw=raw,
+                                                   headers={'Authorization': 'Bearer ' + token})
+        self.assertEqual(status, 400, result)
+        self.assertEqual(len(FakeUpstream.calls), 0)
+        item = self.latest()
+        self.assertEqual((item['status'], item['cost']), (400, 0))
+        self.assertEqual(self.call('/v1/chat/completions', {'model': 'cheap'}, token)[0], 200)
+
     def test_platform_stream_terminal_events_and_truncation(self):
         _, _, token = self.enabled_key()
         chat = {'choices': [{'delta': {'content': 'hi'}, 'finish_reason': None}],

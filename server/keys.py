@@ -1370,7 +1370,7 @@ class KeyService:
         try:
             body = json.loads(raw, parse_constant=reject_constant)
             gateway_json(body)  # 1e400 parses to inf: refuse here rather than send invalid JSON upstream
-        except (UnicodeError, ValueError):
+        except (UnicodeError, ValueError, RecursionError):
             raise APIError(400, "JSON格式不正确") from None
         if not isinstance(body, dict):
             raise APIError(400, "JSON内容必须是对象")
