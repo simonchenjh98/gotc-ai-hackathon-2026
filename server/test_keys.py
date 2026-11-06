@@ -1,4 +1,4 @@
-"""Built-in AI gateway: team keys, metering and budgets against fake upstream providers."""
+"""Built-in AI gateway: team keys, usage metering against fake upstream providers."""
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import http.client
@@ -199,7 +199,7 @@ class GatewayTests(unittest.TestCase):
         client = self.team_client(team_id)
         self.assertEqual(client.get("/api/team/keys")[1], {"enabled": False, "keys": []})
         self.assertEqual(client.post("/api/team/keys", {"name": "early"})[0], 409)
-        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"maxKeys": 2, "dailyBudget": 1.5})[0], 200)
+        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"maxKeys": 2})[0], 200)
         self.assertNotIn("keys.maxKeys", self.public.get("/api/board")[1]["config"])
         self.assertEqual(self.admin.post("/api/admin/keys/provision", {"teamId": team_id})[0], 200)
         self.assertEqual(self.admin.post("/api/admin/keys/provision", {"teamId": team_id})[0], 409)
@@ -210,7 +210,7 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(key.startswith("gk-"))
         listing = client.get("/api/team/keys")[1]
         self.assertNotIn(key, json.dumps(listing))
-        self.assertEqual(listing["budget"]["dailyLimit"], 1.5)
+        self.assertEqual(listing["usage"], {"used24h": 0, "usedTotal": 0})
         self.assertEqual(listing["models"], {"openai": ["cheap"], "anthropic": ["claude-x", "claude-small"]})
         with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
             self.assertFalse(any(key in str(row) for row in db.execute("SELECT * FROM api_keys")))
@@ -230,7 +230,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.admin.get("/api/team/keys")[0], 403)
         self.assertEqual(client.get("/api/admin/keys")[0], 403)
 
-    def test_proxy_meters_both_upstreams_and_enforces_budget(self):
+    def test_proxy_meters_both_upstreams_and_enforces_access(self):
         team_id, client, key = self.enabled_key()
         status, models = self.call("/v1/models", None, key, method="GET")
         self.assertEqual(status, 200)
@@ -256,13 +256,11 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.call("/v1/messages", {"model": "cheap"}, key)[0], 404)  # model of the other upstream
 
         # 2000*1 + 1000*2 = 4000 micro-USD; 1000*1 + 500*2 = 2000; 1000*3 + 500*15 = 10500
-        budget = client.get("/api/team/keys")[1]["budget"]
-        self.assertAlmostEqual(budget["usedTotal"], 0.0165)
+        usage = client.get("/api/team/keys")[1]["usage"]
+        self.assertAlmostEqual(usage["usedTotal"], 0.0165)
         self.assertEqual(client.get("/api/team/keys")[1]["keys"][0]["requests"], 4)  # the rejected model call counts too
 
-        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"dailyBudget": 0.01})[0], 200)
-        self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, key)[0], 429)
-        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"dailyBudget": 5, "expiresAt": 1})[0], 200)
+        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"expiresAt": 1})[0], 200)
         self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, key)[0], 403)
         self.assertEqual(self.admin.post("/api/admin/keys/settings", {"expiresAt": None})[0], 200)
         self.assertEqual(self.admin.post("/api/admin/keys/revoke", {"teamId": team_id})[0], 200)
@@ -349,27 +347,26 @@ class GatewayTests(unittest.TestCase):
             stored = db.execute("SELECT length(request) FROM api_logs WHERE usage_id=?", (item["id"],)).fetchone()[0]
         self.assertLess(stored, sent / 5)  # compressed on disk
 
-    def test_client_header_rules(self):
+    def test_client_headers_are_unrestricted_with_legacy_rules_after_restart(self):
         _, client, key = self.enabled_key()
         rules = [{"action": "allow", "header": "User-Agent", "contains": "claude-cli"},
                  {"action": "deny", "header": "User-Agent", "contains": "openclaw"}]
-        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"clientRules": rules})[0], 200)
-        body = {"model": "cheap"}
-        self.assertEqual(self.call("/v1/chat/completions", body, key, headers={"User-Agent": "claude-cli/2.1 (external)"})[0], 200)
-        status, content = self.call("/v1/chat/completions", body, key, headers={"User-Agent": "python-requests/2"})
-        self.assertEqual(status, 403)
-        self.assertNotIn("claude-cli".encode(), content)  # generic, as sub2api: a fake client learns nothing
-        self.assertIn("未命中任何允许规则", self.admin.post("/api/admin/keys/logs", {})[1]["items"][0]["errorMessage"])  # admins see why
-        self.assertEqual(self.call("/v1/chat/completions", body, key, headers={"User-Agent": "claude-cli openclaw"})[0], 403)
-        self.assertEqual(self.call("/v1/models", None, key, method="GET", headers={"User-Agent": "curl/8"})[0], 403)
-        blocked = self.admin.post("/api/admin/keys/logs", {})[1]["items"]
-        self.assertEqual([i["status"] for i in blocked], [403, 403, 200])  # blocked attempts are visible to admins
-        self.assertEqual(client.get("/api/team/keys")[1]["clientRules"], rules)
-        for bad in [[{"action": "allow", "header": "Authorization", "contains": "x"}],
-                    [{"action": "maybe", "header": "User-Agent", "contains": "x"}],
-                    [{"action": "deny", "header": "User Agent", "contains": "x"}],
-                    [{"action": "deny", "header": "User-Agent", "contains": ""}]]:
-            self.assertEqual(self.admin.post("/api/admin/keys/settings", {"clientRules": bad})[0], 400)
+        with self.service.db() as db:
+            db.execute("INSERT INTO settings VALUES (?,?)", ("keys.clientRules", json.dumps(rules)))
+        restarted = test_api.EventService(data_dir=self.root / "private", origin=self.service.origin, static_root=self.root / "public")
+        self.server.service = self.service = restarted
+        self.service.keys.opener = self.direct
+        for headers in ({}, {"User-Agent": "WorkBuddy/5.8.4"}, {"User-Agent": "claude-cli openclaw"},
+                        {"User-Agent": "python-requests/2", "X-Stainless-Lang": "python"}):
+            with self.subTest(headers=headers):
+                self.assertEqual(self.call("/v1/models", None, key, method="GET", headers=headers)[0], 200)
+                for path, model in (("/v1/chat/completions", "cheap"), ("/v1/responses", "cheap"),
+                                    ("/v1/messages", "claude-x"), ("/v1/messages/count_tokens", "claude-x")):
+                    self.assertEqual(self.call(path, {"model": model}, key, headers=headers)[0], 200)
+        self.assertNotIn("clientRules", client.get("/api/team/keys")[1])
+        self.assertNotIn("clientRules", self.admin.get("/api/admin/keys")[1]["settings"])
+        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"clientRules": rules})[0], 400)
+        self.assertEqual(self.call("/v1/models", None, "gk-invalid", method="GET")[0], 401)
 
     def test_rpm_blocklist_announcement_overview_and_export(self):
         team_id, client, key = self.enabled_key()
@@ -446,7 +443,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual((counted["cost"], counted["model"]), (0, "claude-x"))
         self.assertNotIn("request", own["items"][0])
 
-    def test_budget_bypasses_are_closed(self):
+    def test_expiry_and_unmetered_tools_are_checked(self):
         _, _, key = self.enabled_key()
         # count_tokens obeys expiry like every other call.
         self.assertEqual(self.admin.post("/api/admin/keys/settings", {"expiresAt": 1})[0], 200)
@@ -523,13 +520,13 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.admin.post("/api/admin/team-access", {"teamId": team_id, "action": "revoke"})[0], 200)
         self.assertEqual(ok({}), 401)
 
-    def assertReleased(self, team_id):
-        """The reservation is dropped just after a successful reply is sent, so allow the server thread to finish."""
+    def assertReleased(self, team_id, expected=0):
+        """The slot is released just after the reply is sent, so allow the server thread to finish."""
         for _ in range(100):
-            if self.service.keys.reserved[team_id] == 0:
+            if self.service.keys.inflight[team_id] == expected:
                 return
             threading.Event().wait(0.02)
-        self.assertEqual(self.service.keys.reserved[team_id], 0)
+        self.assertEqual(self.service.keys.inflight[team_id], expected)
 
     def latest(self):
         return self.admin.post("/api/admin/keys/logs", {})[1]["items"][0]
@@ -591,34 +588,50 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(result["status"], 401)
         self.assertEqual(len(FakeUpstream.calls), before)  # never reached the upstream
         self.assertEqual(service.inflight[team_id], keys.TEAM_CONCURRENCY - 1)  # its slot was given back
-        self.assertReleased(team_id)
+        self.assertReleased(team_id, keys.TEAM_CONCURRENCY - 1)
 
-    def test_budget_reserves_in_flight_cost(self):
+    def test_output_limits_and_single_completions(self):
         team_id, _, key = self.enabled_key()
-        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"dailyBudget": 0.05})[0], 200)
-        # claude-x output costs $15 / 1M tokens: 8192 default output tokens alone reserve ~$0.12 > $0.05.
-        self.assertEqual(self.call("/v1/messages", {"model": "claude-x"}, key)[0], 429)
         self.assertEqual(self.call("/v1/messages", {"model": "claude-x", "max_tokens": 100}, key)[0], 200)
         self.assertEqual(FakeUpstream.calls[-1][2]["max_tokens"], 100)
-        # The forwarded output limit never exceeds what was reserved.
-        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"dailyBudget": 50})[0], 200)
         self.call("/v1/messages", {"model": "claude-x"}, key)
-        self.assertEqual(FakeUpstream.calls[-1][2]["max_tokens"], keys.RESERVE_OUTPUT_DEFAULT)  # injected when absent
+        self.assertEqual(FakeUpstream.calls[-1][2]["max_tokens"], keys.OUTPUT_DEFAULT)  # injected when absent
         self.call("/v1/messages", {"model": "claude-x", "max_tokens": 10**9}, key)
-        self.assertEqual(FakeUpstream.calls[-1][2]["max_tokens"], keys.RESERVE_OUTPUT_CAP)  # clamped
+        self.assertEqual(FakeUpstream.calls[-1][2]["max_tokens"], keys.OUTPUT_CAP)  # clamped
         self.call("/v1/chat/completions", {"model": "cheap", "max_completion_tokens": "lots"}, key)
-        self.assertEqual(FakeUpstream.calls[-1][2]["max_completion_tokens"], keys.RESERVE_OUTPUT_CAP)  # non-integer
+        self.assertEqual(FakeUpstream.calls[-1][2]["max_completion_tokens"], keys.OUTPUT_CAP)  # non-integer
         self.assertNotIn("max_tokens", FakeUpstream.calls[-1][2])  # existing field used, none added
         before = len(FakeUpstream.calls)
         for body in [{"model": "cheap", "n": 4}, {"model": "cheap", "n": "2"}, {"model": "cheap", "best_of": 3}]:
             self.assertEqual(self.call("/v1/chat/completions", body, key)[0], 400, body)
         self.assertEqual(len(FakeUpstream.calls), before)  # multi-completion requests never reach the upstream
         self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap", "n": 1}, key)[0], 200)
-        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"dailyBudget": 0.05})[0], 200)
-        service = self.service.keys
-        service.reserved[team_id] = 49_000  # $0.049 already held by another request in flight
-        self.assertEqual(self.call("/v1/messages", {"model": "claude-x", "max_tokens": 100}, key)[0], 429)
-        service.reserved[team_id] = 0
+
+    def test_existing_budget_settings_do_not_limit_metered_requests_after_restart(self):
+        team_id, client, key = self.enabled_key()
+        self.assertEqual(self.call("/v1/messages", {"model": "claude-x"}, key)[0], 200)
+        before = client.get("/api/team/keys")[1]["usage"]["usedTotal"]
+        with self.service.db() as db:
+            for name in ("dailyBudget", "totalBudget"):
+                db.execute("INSERT INTO settings VALUES (?,?)", ("keys." + name, "0"))
+            db.execute("ALTER TABLE team_api ADD COLUMN daily_budget REAL")
+            db.execute("ALTER TABLE team_api ADD COLUMN total_budget REAL")
+            db.execute("ALTER TABLE team_api ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+            db.execute("UPDATE team_api SET daily_budget=0,total_budget=0 WHERE team_id=?", (team_id,))
+        restarted = test_api.EventService(data_dir=self.root / "private", origin=self.service.origin, static_root=self.root / "public")
+        self.server.service = self.service = restarted
+        self.service.keys.opener = self.direct
+        for path, model in (("/v1/messages", "claude-x"), ("/v1/chat/completions", "cheap"), ("/v1/responses", "cheap")):
+            self.assertEqual(self.call(path, {"model": model}, key)[0], 200)
+        self.assertEqual(self.call("/v1/messages/count_tokens", {"model": "claude-x"}, key)[0], 200)
+        listing = client.get("/api/team/keys")[1]
+        self.assertGreater(listing["usage"]["usedTotal"], before)
+        self.assertEqual(listing["usage"]["used24h"], listing["usage"]["usedTotal"])
+        settings = self.admin.get("/api/admin/keys")[1]["settings"]
+        self.assertNotIn("dailyBudget", settings)
+        self.assertNotIn("totalBudget", settings)
+        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"dailyBudget": 1})[0], 400)
+        self.assertEqual(self.admin.post("/api/admin/keys/team", {"teamId": team_id, "dailyBudget": 1, "totalBudget": 1, "note": ""})[0], 404)
 
     def test_old_usage_table_gains_flag_columns(self):
         with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
@@ -644,7 +657,7 @@ class GatewayTests(unittest.TestCase):
             self.assertIn(f"上游 HTTP {code}", detail["response"])  # the admin can see why
         self.assertReleased(team_id)
 
-    def test_upstream_timeouts_are_charged_the_reservation(self):
+    def test_upstream_timeouts_are_charged_estimated_usage(self):
         team_id, _, key = self.enabled_key()
         timeout, keys.UPSTREAM_TIMEOUT = keys.UPSTREAM_TIMEOUT, 0.5
         try:
@@ -654,10 +667,10 @@ class GatewayTests(unittest.TestCase):
                 self.assertEqual(self.call("/v1/messages", body, key)[0], 504, hang)
                 item = self.latest()
                 self.assertEqual((item["status"], item["incomplete"], item["estimated"]), (504, 1, 1), hang)
-                self.assertEqual(item["output"], 1000)  # the reserved output, not zero
+                self.assertEqual(item["output"], 1000)  # the estimated output, not zero
                 self.assertGreater(item["cost"], 0.015)  # 1000 output tokens at $15 / 1M
                 detail = self.admin.post("/api/admin/keys/log", {"id": item["id"]})[1]
-                self.assertIn("请求已发出，按预留额度计费", detail["response"])
+                self.assertIn("请求已发出，按估算用量计费", detail["response"])
             self.assertEqual(self.admin.get("/api/admin/keys")[1]["overview"]["errors"], 2)
             self.assertReleased(team_id)  # released after the charge landed
         finally:
@@ -679,7 +692,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual((item["status"], item["cost"], item["estimated"]), (502, 0, 0))
 
     def test_every_upstream_failure_is_billed_by_whether_the_request_was_sent(self):
-        """Free when the upstream never received the whole request; charged the reservation once it was sent."""
+        """Free when the upstream never received the whole request; charged estimated usage once it was sent."""
         team_id, _, key = self.enabled_key()
         servers = []
 
@@ -753,7 +766,7 @@ class GatewayTests(unittest.TestCase):
                     self.assertEqual(len(FakeUpstream.calls) > before, reached)
                     self.assertIn(reason, detail)
                     if charged:
-                        self.assertIn("请求已发出，按预留额度计费", detail)
+                        self.assertIn("请求已发出，按估算用量计费", detail)
                     elif not reached:
                         self.assertIn("请求未发出，不计费", detail)
                     self.assertReleased(team_id)
@@ -774,12 +787,12 @@ class GatewayTests(unittest.TestCase):
         self.assertReleased(team_id)
         self.assertEqual(self.call("/v1/messages", {"model": "claude-x", "max_tokens": 10}, key)[0], 200)  # gateway still healthy
 
-    def test_reservation_is_released_even_if_recording_fails(self):
+    def test_concurrency_slot_is_released_even_if_recording_fails(self):
         team_id, _, key = self.enabled_key()
         with mock.patch.object(self.service.keys, "record", side_effect=lambda *a: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked"))):
             status, _ = self.call("/v1/messages", {"model": "claude-x", "max_tokens": 1000}, key)
         self.assertEqual(status, 200)  # the team still got its reply
-        self.assertReleased(team_id)  # and its budget is not blocked forever
+        self.assertReleased(team_id)  # and its slot is released
 
     def test_stream_is_drained_and_billed_when_the_client_left_before_headers(self):
         _, client, key = self.enabled_key()
@@ -897,7 +910,7 @@ class GatewayTests(unittest.TestCase):
             threading.Event().wait(0.05)
         self.assertEqual((items[0]["status"], items[0]["errorType"], items[0]["cost"]), (499, "api_error", 0))
         self.assertEqual(len(FakeUpstream.calls), before)  # never forwarded
-        self.assertReleased(team_id)
+        self.assertReleased(team_id, keys.TEAM_CONCURRENCY - 1)
 
     def test_count_tokens_mirrors_upstream_errors_and_is_never_charged(self):
         _, _, key = self.enabled_key()
@@ -1034,15 +1047,15 @@ class GatewayTests(unittest.TestCase):
             keys.QUEUE_WAIT = wait
 
     def test_settings_audit_keeps_before_and_after(self):
-        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"dailyBudget": 7, "maxKeys": 5})[0], 200)
+        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"maxKeys": 7, "teamRpm": 60})[0], 200)
         change = next(c for c in self.admin.get("/api/admin/keys")[1]["changes"] if c["action"] == "api-key.settings")
-        self.assertEqual(change["metadata"], {"dailyBudget": [5, 7]})  # unchanged maxKeys is not listed
+        self.assertEqual(change["metadata"], {"maxKeys": [5, 7]})  # unchanged teamRpm is not listed
 
     def test_input_estimate_counts_images_not_their_bytes(self):
         image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A" * 400000}}
         self.assertLess(keys.estimate_input({"messages": [{"role": "user", "content": [image]}]}), 1700)  # not 100k
         text = {"messages": [{"role": "user", "content": "字" * 300000}]}
-        self.assertGreater(keys.estimate_input(text), 200000)  # large text is never capped (no under-reservation)
+        self.assertGreater(keys.estimate_input(text), 200000)  # large text is never capped
         pdf = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "A" * 40000}}
         self.assertGreater(keys.estimate_input({"messages": [{"role": "user", "content": [pdf]}]}), 10000)
         self.assertLess(keys.estimate_input({"messages": [{"role": "user", "content": [{"type": "image_url",
@@ -1073,10 +1086,10 @@ class GatewayTests(unittest.TestCase):
         FakeUpstream.reply = None
         # Output limits: existing OpenAI fields are clamped, Anthropic gets max_tokens and a valid thinking budget.
         self.call("/v1/chat/completions", {"model": "cheap", "max_completion_tokens": 10**7}, key)
-        self.assertEqual(FakeUpstream.calls[-1][2]["max_completion_tokens"], keys.RESERVE_OUTPUT_CAP)
+        self.assertEqual(FakeUpstream.calls[-1][2]["max_completion_tokens"], keys.OUTPUT_CAP)
         self.call("/v1/messages", {"model": "claude-x", "max_tokens": 10**7, "thinking": {"type": "enabled", "budget_tokens": 10**7}}, key)
         sent = FakeUpstream.calls[-1][2]
-        self.assertEqual((sent["max_tokens"], sent["thinking"]["budget_tokens"]), (keys.RESERVE_OUTPUT_CAP, keys.RESERVE_OUTPUT_CAP - 1))
+        self.assertEqual((sent["max_tokens"], sent["thinking"]["budget_tokens"]), (keys.OUTPUT_CAP, keys.OUTPUT_CAP - 1))
         # Bodies: gzip accepted, CJK sent unescaped, NaN refused, the limit is 32 MB.
         import gzip
         packed = gzip.compress(json.dumps({"model": "cheap", "messages": [{"role": "user", "content": "你好"}]}, ensure_ascii=False).encode())
@@ -1103,7 +1116,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(json.loads(self.call("/v1/models/claude-x", None, key, method="GET")[1])["id"], "claude-x")
         self.assertEqual(self.call("/v1/models/nope", None, key, method="GET")[0], 404)
 
-    def test_review_fixes_for_responses_and_reservations(self):
+    def test_responses_state_isolation_and_output_estimates(self):
         team_id, client, key = self.enabled_key()
         other = self.team(number=2, name="别的队")
         other_client = self.team_client(other)
@@ -1118,39 +1131,22 @@ class GatewayTests(unittest.TestCase):
                       {"background": True}, {"conversation": "conv_1"}, {"prompt": {"id": "pmpt_1"}}):
             for team_key in (key, other_key):
                 self.assertEqual(self.call("/v1/responses", {"model": "cheap", "input": "hi", **extra}, team_key)[0], 400, extra)
-        # Without a client limit, OpenAI-compatible routes reserve the full output cap (nothing injected upstream).
+        # Without a client limit, OpenAI-compatible routes estimate the full output cap (nothing injected upstream).
         service = self.service.keys
         seen = []
-        real = service.reserve
-        service.reserve = lambda handler, call, estimate: (seen.append(call["reserve_out"]), real(handler, call, estimate))[1]
+        real = service.recheck_access
+        service.recheck_access = lambda handler, call: (seen.append(call["output_estimate"]), real(handler, call))[1]
         try:
             self.call("/v1/chat/completions", {"model": "cheap"}, key)
             self.call("/v1/chat/completions", {"model": "cheap", "max_tokens": 100}, key)
         finally:
-            service.reserve = real
-        self.assertEqual(seen, [keys.RESERVE_OUTPUT_CAP, 100])
+            service.recheck_access = real
+        self.assertEqual(seen, [keys.OUTPUT_CAP, 100])
         self.assertNotIn("max_tokens", FakeUpstream.calls[-2][2])
 
     def test_admin_tools_ported_from_sub2api(self):
         team_id, client, key = self.enabled_key()
-        # Per-team budget override with a note; the team page and the budget checks use it.
-        self.assertEqual(self.admin.post("/api/admin/keys/team", {"teamId": team_id, "dailyBudget": 0.001, "totalBudget": None,
-                                                                  "note": "演示队，临时调低"})[0], 200)
-        self.assertEqual(client.get("/api/team/keys")[1]["budget"]["dailyLimit"], 0.001)
-        self.assertEqual(self.call("/v1/messages", {"model": "claude-x", "max_tokens": 100}, key)[0], 429)  # reservation > override
-        row = next(t for t in self.admin.get("/api/admin/keys")[1]["teams"] if t["teamId"] == team_id)
-        self.assertEqual((row["dailyBudget"], row["note"], row["dailyLimit"]), (0.001, "演示队，临时调低", 0.001))
-        change = next(c for c in self.admin.get("/api/admin/keys")[1]["changes"] if c["action"] == "api-key.team-limits")
-        self.assertEqual(change["metadata"]["dailyBudget"], [None, 0.001])
-        self.assertEqual(self.admin.post("/api/admin/keys/team", {"teamId": team_id, "dailyBudget": -1, "totalBudget": None, "note": ""})[0], 400)
-        self.assertEqual(self.admin.post("/api/admin/keys/team", {"teamId": team_id, "dailyBudget": None, "totalBudget": None, "note": ""})[0], 200)
-        # When an exhausted 24h budget frees up again.
-        self.call("/v1/messages", {"model": "claude-x", "max_tokens": 100}, key)  # costs $0.021
-        self.admin.post("/api/admin/keys/team", {"teamId": team_id, "dailyBudget": 0.02, "totalBudget": None, "note": ""})
-        budget = client.get("/api/team/keys")[1]["budget"]
-        self.assertGreater(budget["dailyResetAt"], keys.now_ms() + 23 * 3600_000)
-        self.admin.post("/api/admin/keys/team", {"teamId": team_id, "dailyBudget": None, "totalBudget": None, "note": ""})
-        self.assertIsNone(client.get("/api/team/keys")[1]["budget"]["dailyResetAt"])
+        self.call("/v1/messages", {"model": "claude-x", "max_tokens": 100}, key)
         # Live metrics and storage on the overview.
         overview = self.admin.get("/api/admin/keys")[1]
         self.assertGreater(overview["overview"]["rpm"], 0)
@@ -1165,7 +1161,7 @@ class GatewayTests(unittest.TestCase):
         found = self.admin.post("/api/admin/keys/logs", {"requestId": wanted})[1]["items"][0]
         self.assertEqual(self.admin.post("/api/admin/keys/log", {"id": found["id"]})[1]["requestId"], wanted)
         self.assertEqual(len(self.admin.post("/api/admin/keys/logs", {"model": "claude-latest"})[1]["items"]), 1)
-        self.assertGreaterEqual(len(self.admin.post("/api/admin/keys/logs", {"model": "claude-x"})[1]["items"]), 3)
+        self.assertGreaterEqual(len(self.admin.post("/api/admin/keys/logs", {"model": "claude-x"})[1]["items"]), 2)
         # Upstream test and model list use the saved key, which never reaches the browser.
         tested = self.admin.get("/api/admin/keys/upstreams/test/anthropic")[1]
         self.assertEqual((tested["ok"], tested["status"], tested["model"]), (True, 200, "claude-x"))
@@ -1179,7 +1175,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual((failed["ok"], failed["status"]), (False, 401))
         FakeUpstream.status = 200
         self.assertEqual(client.get("/api/admin/keys/upstreams/test/openai")[0], 403)
-        # Request content: retention, size cap and clearing; call metadata (budgets) is never deleted.
+        # Request content: retention, size cap and clearing; call metadata (usage) is never deleted.
         calls_before = len(self.admin.post("/api/admin/keys/logs", {})[1]["items"])
         with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
             db.execute("UPDATE api_usage SET at=at-? WHERE id=(SELECT MIN(id) FROM api_usage)", (100 * 3600_000,))

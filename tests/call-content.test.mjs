@@ -33,12 +33,6 @@ test('request context lists system, every turn, tool results and tools',()=>{
   assert.equal(ctx.replyOf('{"choices":[{"message":{"content":"完成"}}]}'),'完成');
 });
 
-test('client rule templates parse into valid rules',()=>{
-  const rules=JSON.parse(JSON.stringify(ctx.parseClientRules(vm.runInContext("clientRuleTemplates['仅允许 WorkBuddy（官方客户端）']",ctx))));
-  assert.deepEqual(rules,[{action:'allow',header:'User-Agent',contains:'workbuddy'}]);
-  for(const text of vm.runInContext('Object.values(clientRuleTemplates)',ctx))ctx.parseClientRules(text);
-});
-
 test('upstream model and alias text round-trips and rejects bad lines',()=>{
   const models=vm.runInContext("parseModels('DeepSeek-V3 0.3 1.2\\n\\n  Qwen3-8B 0.1 0.2 0.125 0.01  ','openai')",ctx);
   assert.deepEqual(JSON.parse(JSON.stringify(models)),{'DeepSeek-V3':[0.3,1.2],'Qwen3-8B':[0.1,0.2,0.125,0.01]});
