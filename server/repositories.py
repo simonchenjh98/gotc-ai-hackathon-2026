@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS repository_bindings (
  operation_id TEXT NOT NULL UNIQUE, external_id TEXT, revision INTEGER NOT NULL,
  protection TEXT NOT NULL, message TEXT NOT NULL, updated_at INTEGER NOT NULL,
  UNIQUE(provider,organization,slug));
+CREATE TABLE IF NOT EXISTS repository_enterprise_invites (
+ organization TEXT NOT NULL, username TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('attempted','sent')), PRIMARY KEY(organization,username));
 CREATE TABLE IF NOT EXISTS repository_previews (
  id TEXT PRIMARY KEY, team_id TEXT NOT NULL REFERENCES teams(id), session_hash TEXT NOT NULL,
  binding_revision INTEGER NOT NULL, sha TEXT NOT NULL, expires_at INTEGER NOT NULL);
@@ -39,9 +42,10 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 class UpstreamError(APIError):
-    def __init__(self, upstream_status=None):
+    def __init__(self, upstream_status=None, membership_required=False):
         super().__init__(502, '仓库服务未能确认操作结果，请由管理员核对后重试', 'repository_upstream')
         self.upstream_status = upstream_status
+        self.membership_required = membership_required
 
 
 class ProviderOperations:
@@ -97,6 +101,24 @@ class Provider:
         self.origin = 'https://api.github.com' if name == 'github' else 'https://gitee.com/api/v5'
         self.web = 'https://github.com' if name == 'github' else 'https://gitee.com'
 
+    @staticmethod
+    def requires_enterprise_membership(raw):
+        # Keep only a boolean classification, never an upstream body, URL or username.
+        # The official schema does not specify error wording: narrowly recognize an
+        # explicit prerequisite, and leave all other errors to manual reconciliation.
+        try:
+            data=json.loads(raw)
+        except (ValueError, UnicodeError):
+            return False
+        message=data.get('message') if isinstance(data,dict) else None
+        if not isinstance(message,str) or len(message)>300:
+            return False
+        return bool(re.fullmatch(
+            r'(?:user must (?:first )?be a member of (?:the|this) enterprise[.!]?'
+            r'|(?:该)?用户必须先加入(?:该|此)?企业[。！]?'
+            r'|(?:该)?用户不是(?:该|此)?企业成员[，,]请先(?:添加为企业成员|加入企业)[。！]?)',
+            message.strip().lower()))
+
     def request(self, method, path, body=None):
         if not self.enabled:
             raise APIError(503, '该组织仓库渠道尚未配置或未启用，请联系组织方', 'repository_disabled')
@@ -119,9 +141,18 @@ class Provider:
                     raise UpstreamError()
                 return response.status, json.loads(raw) if raw else {}
         except HTTPError as error:
-            status = error.code
-            error.close()
-            raise UpstreamError(status) from None
+            status=error.code
+            required=False
+            try:
+                if (self.name=='gitee' and method=='PUT' and status in {400,403,422}
+                        and re.fullmatch(r'/repos/[^/]+/[^/]+/collaborators/[^/]+',path)):
+                    raw=error.read(8193)
+                    required=len(raw)<=8192 and self.requires_enterprise_membership(raw)
+            except (OSError,ValueError):
+                pass
+            finally:
+                error.close()
+            raise UpstreamError(status,required) from None
         except (URLError, TimeoutError, socket.timeout, ValueError, OSError):
             raise UpstreamError() from None
 
@@ -181,7 +212,7 @@ class Provider:
             # Paid-plan/permission failures must remain visible; a rule is not a code archive.
             return 'unverified'
 
-    def invite(self, row, username):
+    def invite(self, row, username, expected_user_id=None):
         path = self.path(row) + '/collaborators/' + quote(username, safe='')
         status, member = self.request('PUT', path, {'permission': 'push'})
         if self.name == 'github':
@@ -190,7 +221,8 @@ class Provider:
         # response must not be presented as a confirmed grant. Verify the same user's
         # effective write access independently rather than inferring it from HTTP success.
         if (status != 200 or not isinstance(member, dict) or type(member.get('id')) is not int
-                or member['id'] <= 0 or not isinstance(member.get('login'), str)
+                or member['id'] <= 0 or (expected_user_id is not None and member['id']!=expected_user_id)
+                or not isinstance(member.get('login'), str)
                 or member['login'].lower() != username.lower()):
             raise UpstreamError()
         status, permission = self.request('GET', path + '/permission')
@@ -392,9 +424,9 @@ class Repositories:
             protection = p.protect(row)
             state = 'ready'
             for username in json.loads(row['usernames_json']):
-                if p.invite(row, username) == 'invited':
+                if self.invite(p,row,username) == 'invited':
                     state = 'invited'
-            message = '仓库已创建，等待开发者接受邀请；管理员可核对恢复' if state == 'invited' else '仓库写权限已确认'
+            message = ('仓库已创建；Gitee 企业普通成员邀请已发送或成员尚未激活，请开发者检查邀请，管理员核对恢复后确认仓库写权限' if p.name=='gitee' else '仓库已创建，等待开发者接受邀请；管理员可核对恢复') if state == 'invited' else '仓库写权限已确认'
         except APIError as error:
             state, protection, message = 'reconcile', row['protection'], error.message
         with self.s.db() as db:
@@ -405,9 +437,73 @@ class Repositories:
             result = self.update(db, actor, current, state, protection=protection, message=message)
             return {'repository': self.public(result)}
 
+    def invite(self,p,row,username):
+        try:
+            return p.invite(row,username)
+        except UpstreamError as error:
+            if p.name!='gitee' or not error.membership_required:
+                raise
+        path='/enterprises/'+quote(row['organization'],safe='')+'/members'
+        with self.s.db() as db:
+            prior=db.execute('SELECT state FROM repository_enterprise_invites WHERE organization=? AND username=?',
+                             (row['organization'].lower(),username.lower())).fetchone()
+        try:
+            status,member=p.request('GET',path+'/'+quote(username,safe=''))
+        except UpstreamError as error:
+            if error.upstream_status!=404:
+                raise
+            if prior:
+                # A sent invitation can remain invisible until acceptance. An unknown
+                # send must be checked manually; neither result authorizes a resend.
+                if prior['state']=='sent':
+                    return 'invited'
+                raise APIError(409,'企业成员邀请结果待核对，请主办方人工检查邀请；平台不会自动重复邀请','repository_membership_unknown')
+            # Commit intent BEFORE the remote POST, including a lost-response/crash case.
+            with self.s.db() as db:
+                db.execute('BEGIN IMMEDIATE')
+                inserted=db.execute('INSERT OR IGNORE INTO repository_enterprise_invites VALUES (?,?,?)',
+                                    (row['organization'].lower(),username.lower(),'attempted')).rowcount
+                if not inserted:
+                    prior=db.execute('SELECT state FROM repository_enterprise_invites WHERE organization=? AND username=?',
+                                     (row['organization'].lower(),username.lower())).fetchone()
+                    if prior['state']=='sent':
+                        return 'invited'
+                    raise APIError(409,'企业成员邀请结果待核对，请主办方人工检查邀请；平台不会自动重复邀请','repository_membership_unknown')
+            try:
+                status,_=p.request('POST',path,{'username':username,'role':'member'})
+            except UpstreamError:
+                raise APIError(409,'企业普通成员邀请未能确认，请主办方检查邀请结果；平台不会自动重复邀请','repository_membership_unknown') from None
+            if status!=204:
+                raise APIError(409,'企业普通成员邀请结果待核对，请主办方人工检查邀请；平台不会自动重复邀请','repository_membership_unknown')
+            with self.s.db() as db:
+                db.execute("UPDATE repository_enterprise_invites SET state='sent' WHERE organization=? AND username=?",
+                           (row['organization'].lower(),username.lower()))
+            return 'invited'
+        user=member.get('user') if isinstance(member,dict) else None
+        enterprise=member.get('enterprise') if isinstance(member,dict) else None
+        if (status!=200 or not isinstance(user,dict) or type(user.get('id')) is not int or user['id']<=0
+                or not isinstance(user.get('login'),str) or user['login'].lower()!=username.lower()
+                or member.get('role')!='member' or type(member.get('active')) is not bool
+                or (isinstance(enterprise,dict) and 'path' in enterprise
+                    and (not isinstance(enterprise['path'],str) or enterprise['path'].lower()!=row['organization'].lower()))):
+            raise APIError(409,'企业成员身份、角色或激活状态未能确认，请主办方人工核对；平台不会修改已有企业角色','repository_membership_unknown')
+        if member['active'] is False:
+            return 'invited'
+        try:
+            # Existing enterprise roles are never edited. Effective repository push
+            # must still be independently verified for exactly this member's id.
+            return p.invite(row,username,expected_user_id=user['id'])
+        except UpstreamError as error:
+            if error.membership_required:
+                raise APIError(409,'企业普通成员已激活，但仓库写权限仍未确认，请主办方人工核对','repository_membership_unknown')
+            raise
+
     def binding(self, db, team_id):
         row = self.get(db, team_id)
         return row if row and row['external_id'] else None
+
+    def can_submit(self,row):
+        return bool(row and (row['state']=='ready' or row['provider']!='gitee' and row['state']=='invited'))
 
     def preview_row(self, db, team_id, session_hash, preview_id, reference_time=None):
         if not isinstance(preview_id, str) or not re.fullmatch(r'[0-9a-f]{48}', preview_id):
@@ -415,7 +511,7 @@ class Repositories:
         row = self.binding(db, team_id)
         preview = db.execute('SELECT * FROM repository_previews WHERE id=? AND team_id=? AND session_hash=?', (preview_id, team_id, session_hash)).fetchone()
         if (not row or not preview or preview['expires_at'] <= (self.now() if reference_time is None else reference_time) or row['revision'] != preview['binding_revision']
-                or row['state'] not in {'invited', 'ready'}):
+                or not self.can_submit(row)):
             raise APIError(409, 'SHA 预览已失效或不属于当前登录，请重新检查材料', 'repository_preview_expired')
         return row, preview
 
@@ -424,7 +520,7 @@ class Repositories:
             actor = self.identity(cookie, login_id, 'team', db)
             team = self.s.bound_submission_team(db, actor)
             row = self.binding(db, team['id'])
-            if not row or row['state'] not in {'invited', 'ready'}:
+            if not self.can_submit(row):
                 raise APIError(409, '本队仓库尚未完成绑定，请联系组织方')
             row = dict(row)
             if not self.s.submission_window(db)['canEdit']:
@@ -439,7 +535,7 @@ class Repositories:
             actor = self.identity(cookie, login_id, 'team', db)
             current_team = self.s.bound_submission_team(db, actor)
             current = self.binding(db, current_team['id'])
-            if current_team['id'] != team['id'] or not current or current['state'] not in {'invited', 'ready'} or any(
+            if current_team['id'] != team['id'] or not self.can_submit(current) or any(
                     current[k] != row[k] for k in ('revision','provider','external_id','organization','slug')):
                 raise APIError(409, '仓库绑定已变化，请重新读取')
             if not self.s.submission_window(db)['canEdit']:

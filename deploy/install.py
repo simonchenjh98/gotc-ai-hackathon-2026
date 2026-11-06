@@ -106,7 +106,7 @@ def allowed(name):
     if any(re.search(r'(?:secret|credential|admin-access|production\.env)', p, re.I) for p in parts):
         return False
     suffix = Path(name).suffix.lower()
-    return (name in FILES or name == 'scripts/backup_event.py' or
+    return (name in FILES or name in {'scripts/backup_event.py','downloads/gotc-gitee-submission-guide.pdf'} or
             (parts[0] == 'server' and suffix == '.py' and len(parts) == 2 and not parts[-1].startswith('test')) or
             (parts[0] == 'assets' and suffix in ASSETS) or
             (parts[0] == 'downloads' and suffix in {'.ics', '.txt'}))

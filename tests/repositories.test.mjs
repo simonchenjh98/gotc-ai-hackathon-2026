@@ -8,21 +8,22 @@ const sha='a'.repeat(40),previewId='b'.repeat(48);
 const repository={teamId:'T1',provider:'github',organization:'GOTC-AI-HACKATHON',slug:'gotc-2026-team-1-123',branch:'main',codeUrl:'https://github.com/GOTC-AI-HACKATHON/gotc-2026-team-1-123',state:'invited',revision:3,usernames:['Developer'],protection:'unverified',message:'等待接受邀请',archived:false};
 const providers=[{provider:'github',organization:'GOTC-AI-HACKATHON',enabled:true,message:'已配置'},{provider:'gitee',organization:'gotc-ai-hackathon',enabled:false,message:'尚未启用'}];
 const materials={projectName:'Synthetic',summary:'Summary',codeUrl:'',codeVersion:'',readmeUrl:'https://example.test/readme',license:'MIT',licenseUrl:'',demoUrl:'',demoInstructions:'Run locally',slidesUrl:'https://example.test/slides',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
-function fixture(){
+function fixture(options={}){
+  const boundRepository=options.repository || repository;
   const nodes=new Map(),calls=[];
   function node(id){
     if(nodes.has(id))return nodes.get(id);
     const item={id,isConnected:true,disabled:false,readOnly:false,value:'',checked:false,dataset:{},listeners:{},classList:{add(){},remove(){}},addEventListener(kind,fn){this.listeners[kind]=fn;},focus(){},scrollIntoView(){},querySelectorAll(){return [];},querySelector(){return null;}};
     let html='';Object.defineProperty(item,'innerHTML',{configurable:true,get:()=>html,set(value){html=value;for(const match of value.matchAll(/id="([^"]+)"/g))node(match[1]);}});nodes.set(id,item);return item;
   }
-  const root=node('platform-main');let latest={team:{id:'T1',number:1,name:'Synthetic'},window:{canEdit:true,submissionDeadline:null},submission:{version:0,draft:null,submitted:null},repository,repositoryProviders:providers};
+  const root=node('platform-main');let latest={team:{id:'T1',number:1,name:'Synthetic'},window:{canEdit:true,submissionDeadline:null},submission:{version:0,draft:null,submitted:null},repository:boundRepository,repositoryProviders:providers};
   const rootSetter=Object.getOwnPropertyDescriptor(root,'innerHTML').set;
-  Object.defineProperty(root,'innerHTML',{get:()=>root.html || '',set(value){root.html=value;rootSetter(value);const form=node('submission-form');form.elements={};for(const [key,value] of Object.entries(materials)){const input=node('material-'+key);input.value=key==='confirmed'?'':value;input.checked=value===true;form.elements[key]=input;}form.querySelector=selector=>selector==='fieldset'?node('fieldset'):node('form-error');form.querySelectorAll=selector=>selector==='input,textarea'?Object.values(form.elements):[];}});
+  Object.defineProperty(root,'innerHTML',{get:()=>root.html || '',set(value){root.html=value;rootSetter(value);const form=node('submission-form');form.elements={};const formHtml=value.match(/<form id="submission-form"[\s\S]*?<\/form>/)?.[0] || '';for(const [key,value] of Object.entries(materials)){if(!formHtml.includes(`name="${key}"`))continue;const input=node('material-'+key);input.value=key==='confirmed'?'':value;input.checked=value===true;form.elements[key]=input;}form.querySelector=selector=>selector==='fieldset'?node('fieldset'):node('form-error');form.querySelectorAll=selector=>selector==='input,textarea'?Object.values(form.elements):[];}});
   const context=vm.createContext({document:{getElementById:node},location:{href:'https://example.test/platform.html#team'},URL,TextEncoder,Intl,Date,setTimeout,clearTimeout,AbortController});
   context.transport=async(path,body)=>{
     calls.push({path,body});
     if(path==='team')return context.teamResponse?await context.teamResponse():structuredClone(latest);
-    if(path==='team/repository/preview')return context.previewResponse?await context.previewResponse():{previewId,sha,branch:'main',codeUrl:repository.codeUrl,archived:false};
+    if(path==='team/repository/preview')return context.previewResponse?await context.previewResponse():{previewId,sha,branch:'main',codeUrl:boundRepository.codeUrl,archived:false};
     if(path==='submission'){
       if(context.submissionResponse)await context.submissionResponse(body);
       const receipt={requestId:body.requestId,status:'succeeded',action:body.status,baseVersion:0,version:1,historyVersion:1,savedAt:123,materials:body.materials};
@@ -235,3 +236,34 @@ for(const [status,code] of [[429,'repository_rate_limit'],[503,'repository_busy'
     assert.match(f.root.innerHTML,/正式版 v1 已收到/);
   });
 }
+
+test('Gitee form removes duplicate inputs while real collection saves and preflights without them',async()=>{
+  const codeUrl='https://gitee.com/synthetic/project',f=fixture({repository:{...repository,provider:'gitee',codeUrl}});
+  await f.context.render();const form=f.node('submission-form'),removed=['readmeUrl','license','licenseUrl','sourcesAndLimitations'];
+  for(const key of removed)assert.equal(form.elements[key],undefined,key);
+  assert.match(f.root.innerHTML,/在仓库内维护 README/);
+  assert.match(f.root.innerHTML,/downloads\/gotc-gitee-submission-guide\.pdf/);
+  f.node('material-summary').value='Changed';form.listeners.input();
+  await f.node('save-submission-draft').onclick();
+  const draft=f.calls.find(call=>call.path==='submission');
+  assert.equal(draft.body.status,'draft');for(const key of removed)assert.ok(!(key in draft.body.materials));
+  await f.node('submission-form').onsubmit({preventDefault(){}});
+  assert.equal(f.calls.filter(call=>call.path==='team/repository/preview').length,1);
+  assert.match(f.node('submission-preview').innerHTML,new RegExp(codeUrl+'/tree/'+sha));
+  assert.match(f.node('submission-preview').innerHTML,/查看这版仓库文件 ↗/);
+  assert.match(f.node('submission-preview').innerHTML,/未检查这些文件是否存在/);
+  assert.doesNotMatch(f.node('submission-preview').innerHTML,/0{40}/);
+  await f.node('confirm-submission').onclick();
+  const sent=f.calls.filter(call=>call.path==='submission').at(-1).body;
+  assert.equal(sent.status,'submitted');assert.equal(sent.materials.codeVersion,sha);
+  for(const key of removed)assert.ok(!(key in sent.materials));
+  assert.ok(!('repositoryMaterialsUrl' in sent.materials));
+});
+
+test('manual and GitHub forms retain README license and sources controls',()=>{
+  const {h}=fixture(),data={team:{project:'P'},submission:{draft:null},window:{canEdit:true}};
+  for(const bound of [undefined,repository]){
+    const html=h.teamFormMarkup({...data,repository:bound});
+    for(const key of ['readmeUrl','license','licenseUrl','sourcesAndLimitations'])assert.match(html,new RegExp(`name="${key}"`));
+  }
+});

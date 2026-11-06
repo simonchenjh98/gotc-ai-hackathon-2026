@@ -117,3 +117,19 @@ test('team history uses exact version backup downloads with the owning team iden
   await f.node('history-list').onclick({target:{closest:()=>({dataset:{historyVersion:'1'},isConnected:true,disabled:false})}});
   assert.match(f.node('history-detail').innerHTML,/下载源码 ZIP/);assert.match(f.node('history-detail').innerHTML,/backups\/T1\/1\/source.zip/);
 });
+
+test('sealed Gitee versions without backup jobs show sealing and no queue or refresh task',()=>{
+  const {h}=fixture(),html=h.proof({repositorySeal:seal,repositoryBackup:null},materials,'T1',1,'proof','最新正式版');
+  assert.match(html,/Gitee 版本已封存/);assert.match(html,/未创建独立源码备份任务/);
+  assert.doesNotMatch(html,/排队中|处理中|下载源码|id="proof-refresh"/);
+});
+
+test('bound material reference opens the verified SHA tree without asserting README or license existence',()=>{
+  const {h}=fixture(),lean={...materials,repositoryMaterialsUrl:codeUrl+'/tree/'+sha};
+  const html=h.materialMarkup(lean);
+  assert.match(html,new RegExp('href="'+codeUrl+'/tree/'+sha+'"'));
+  assert.match(html,/查看这版仓库文件 ↗/);assert.match(html,/未检查这些文件是否存在/);
+  const copied=h.requestReceiptText({...receipt,materials:lean});assert.match(copied,new RegExp(codeUrl+'/tree/'+sha));
+  for(const url of [codeUrl+'/tree/main',codeUrl+'/tree/'+'b'.repeat(40),'https://evil.test/tree/'+sha])assert.doesNotMatch(h.materialMarkup({...lean,repositoryMaterialsUrl:url}),/查看这版仓库文件/);
+  assert.doesNotMatch(h.materialMarkup(materials),/查看这版仓库文件/);
+});

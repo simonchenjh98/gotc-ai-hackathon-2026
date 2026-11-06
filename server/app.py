@@ -47,7 +47,7 @@ SESSION_SECONDS = 12 * 3600
 LOGIN_KDF_CONCURRENCY = 4
 VOTE_LIMIT = 3
 COOKIE_NAME = "gotc_session"
-STATIC_FILES = {"index.html", "styles.css", "app.js", "platform.html", "platform.js", "platform-admin.js", "platform-draft-recovery.js", "platform.css", "favicon.svg"}
+STATIC_FILES = {"downloads/gotc-gitee-submission-guide.pdf", "index.html", "styles.css", "app.js", "platform.html", "platform.js", "platform-admin.js", "platform-draft-recovery.js", "platform.css", "favicon.svg"}
 ASSET_EXTENSIONS = {".webp", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".woff2"}
 DOWNLOAD_EXTENSIONS = {".ics", ".txt"}
 SCHEMA = """
@@ -670,9 +670,12 @@ class EventService:
                     "firstSubmittedAt": None, "submittedAt": None, "updatedAt": None, "hasUnsubmittedChanges": False}
         draft=json.loads(row["draft_json"]) if row["draft_json"] else None
         submitted=json.loads(row["submitted_json"]) if row["submitted_json"] else None
+        # This locator is server metadata; editing state compares contestant values.
+        draft_values={key:value for key,value in draft.items() if key!='repositoryMaterialsUrl'} if draft is not None else None
+        submitted_values={key:value for key,value in submitted.items() if key!='repositoryMaterialsUrl'} if submitted is not None else None
         return {"version": row["version"], "draft": draft, "submitted": submitted, "submittedVersion": row["submitted_version"],
                 "firstSubmittedAt": row["first_submitted_at"], "submittedAt": row["submitted_at"], "updatedAt": row["updated_at"],
-                "hasUnsubmittedChanges": submitted is not None and draft!=submitted}
+                "hasUnsubmittedChanges": submitted is not None and draft_values!=submitted_values}
 
     def team_submission_response(self, db, team):
         submission=self.submission(db, team['id'])
@@ -721,7 +724,7 @@ class EventService:
             result["code"]=code
         return result
 
-    def check_materials(self, materials, submitted):
+    def check_materials(self, materials, submitted, lean_gitee=False):
         limits={"projectName": 140, "summary": 600, "license": 200, "demoInstructions": 2000,
                 "sourcesAndLimitations": 2000, "codeVersion": 1024}
         urls=("codeUrl", "readmeUrl", "licenseUrl", "demoUrl", "slidesUrl", "videoUrl")
@@ -750,6 +753,8 @@ class EventService:
         result["confirmed"]=confirmed
         if submitted:
             required=("projectName", "summary", "codeUrl", "readmeUrl", "license", "slidesUrl", "videoUrl", "sourcesAndLimitations")
+            if lean_gitee:
+                required=tuple(key for key in required if key not in {'readmeUrl','license','sourcesAndLimitations'})
             if any(not result[key] for key in required):
                 raise APIError(400, "正式提交请填写全部必填项目材料")
             if not result["demoUrl"] and not result["demoInstructions"]:
@@ -765,7 +770,25 @@ class EventService:
         if type(body["expectedVersion"]) is not int or body["expectedVersion"]<0:
             raise APIError(400, "材料版本必须是非负整数")
         submitted=body["status"]=="submitted"
-        materials=self.check_materials(body["materials"], submitted)
+        binding=self.repositories.binding(db,team['id'])
+        lean_gitee=bool(binding and binding['provider']=='gitee')
+        raw_materials=body['materials']
+        if lean_gitee and isinstance(raw_materials,dict) and 'repositoryMaterialsUrl' in raw_materials:
+            # Round-tripping a prior server snapshot is supported, but a client never
+            # chooses the formal material reference. Drafts drop this server metadata.
+            raw_materials=dict(raw_materials)
+            reference=raw_materials.pop('repositoryMaterialsUrl')
+            sha=raw_materials.get('codeVersion','')
+            url=self.repositories.public(binding)['codeUrl']
+            if (not isinstance(sha,str) or not re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}',sha)
+                    or raw_materials.get('codeUrl')!=url or reference!=url+'/tree/'+sha):
+                raise APIError(400,'仓库材料定位必须对应绑定仓库的完整版本','repository_override')
+        materials=self.check_materials(raw_materials, submitted,lean_gitee=lean_gitee)
+        if lean_gitee:
+            for key in ('readmeUrl','license','licenseUrl','sourcesAndLimitations'):
+                materials[key]=''
+            if submitted:
+                materials['repositoryMaterialsUrl']=self.repositories.public(binding)['codeUrl']+'/tree/'+materials['codeVersion']
         current=now_ms()
         if not self.submission_window(db, current if accepted_at is None else accepted_at)["canEdit"]:
             raise APIError(409, "作品提交尚未开放或已截止，当前材料只读", "submission_closed")
@@ -802,7 +825,7 @@ class EventService:
                  "judgingMaterials":self.judging_materials(db,row['team_id'])} for row in rows]
 
     def submission_csv(self, db):
-        fields=("projectName", "summary", "codeUrl", "readmeUrl", "license", "licenseUrl", "demoUrl", "demoInstructions", "slidesUrl", "videoUrl", "sourcesAndLimitations", "codeVersion", "confirmed")
+        fields=("projectName", "summary", "codeUrl", "readmeUrl", "license", "licenseUrl", "demoUrl", "demoInstructions", "slidesUrl", "videoUrl", "sourcesAndLimitations", "codeVersion", "confirmed", "repositoryMaterialsUrl")
         output=io.StringIO(newline="")
         writer=csv.writer(output)
         writer.writerow(["队号", "队名", "赛道", "展示作品名", "提交状态", "编辑版本", "正式版本", "首次提交时间", "正式提交时间", "更新时间", "有未提交修改",

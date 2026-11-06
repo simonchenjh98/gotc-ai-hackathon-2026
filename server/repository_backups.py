@@ -106,7 +106,7 @@ class RepositoryBackups:
 
     def enqueue(self,db,team_id,version,request_id):
         seal=self.s.repositories.seals.source_for_version(db,team_id,version)
-        if seal:
+        if seal and os.environ.get('GOTC_REPO_BACKUP_ENABLED')=='1':
             db.execute("INSERT OR IGNORE INTO repository_backups(team_id,version,request_id,status,sha) VALUES (?,?,?,'queued',?)",(team_id,version,request_id,seal['sha']))
         return self.for_version(db,team_id,version)
 
