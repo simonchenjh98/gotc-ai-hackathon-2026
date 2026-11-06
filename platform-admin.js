@@ -168,6 +168,7 @@ function installAdminData(data,version){
     table.innerHTML=`<table class="board-table"><thead><tr><th>编号</th><th>队伍 / 作品</th><th>赛道</th><th>状态</th><th>展位 / 路演顺序</th><th>操作</th></tr></thead><tbody>${ctx.data.teams.map(team=>`<tr><td>${esc(team.number)}</td><td><strong>${esc(team.name)}</strong><br><small>${esc(team.project || '待补充')}</small></td><td>${esc(team.track || '未填写')}${team.trackKnown===false?'<br><span class="status-chip closed">历史赛道，尚未归类</span>':''}</td><td>${esc(status[team.status] || team.status || '参赛中')}<br><small>${esc(team.statusReason || '')}</small></td><td>${esc(team.booth || '未安排')} / ${esc(team.roadshowOrder ?? '未安排')}</td><td><button class="btn secondary small" type="button" data-edit-team="${esc(team.id)}">编辑</button></td></tr>`).join('') || '<tr><td colspan="6">尚未录入队伍。</td></tr>'}</tbody></table>`;
     table.querySelectorAll('[data-edit-team]').forEach(button=>button.onclick=()=>{
       const form=formFrom('team-form');
+      if(!lifecycle.valid()){formError(form,adminTeamLifecycleLoginNotice);return;}
       if(dirtyAdminForms.has(form) && !confirm('表单有未保存的修改，确认载入另一支队伍？'))return;
       form.editSession=(form.editSession || 0)+1;
       const team=ctx.data.teams.find(item=>item.id===button.dataset.editTeam);
@@ -185,7 +186,7 @@ function installAdminData(data,version){
   teamForm.insertAdjacentHTML('afterbegin','<p class="small-note">名录修改不会改写已冻结的评审轮次。状态和路演顺序不代表晋级结果。</p>');
   const lifecycle=installAdminTeamLifecycle({form:teamForm,alive,refreshDirectory,count:data.recycleCount,clearEditor:()=>document.getElementById('clear-team').onclick({lifecycleComplete:true})});
   teamForm.onsubmit=event=>{
-    event.preventDefault();if(!lifecycle.canSave()){formError(teamForm,'该队伍已移入回收站，请使用恢复流程；当前输入已保留。');return;}const values=teamForm.elements,session=teamForm.editSession || 0,editingId=values.id.value;
+    event.preventDefault();if(!lifecycle.canSave()){formError(teamForm,lifecycle.valid()?'该队伍已移入回收站，请使用恢复流程；当前输入已保留。':adminTeamLifecycleLoginNotice);return;}const values=teamForm.elements,session=teamForm.editSession || 0,editingId=values.id.value;
     if(values.status.value!=='active' && !values.statusReason.value.trim()){formError(teamForm,'请填写退出或取消资格的原因。');return;}
     const payload={number:Number(values.number.value),name:values.name.value.trim(),project:values.project.value.trim(),track:values.track.value,status:values.status.value,statusReason:values.statusReason.value.trim(),booth:values.booth.value.trim(),roadshowOrder:values.roadshowOrder.value?Number(values.roadshowOrder.value):null};
     if(values.id.value){payload.id=values.id.value;payload.expectedRevision=Number(values.expectedRevision.value);}
@@ -244,17 +245,47 @@ function adminRestoredAccessMessage(result){
   parts.push(`恢复后的参赛状态：${status[result.team?.status] || result.team?.status || '请核对'}。`);
   return parts.join('');
 }
+const adminTeamLifecycleLoginNotice='当前管理员登录已失效或切换。成员资料已隐藏，请刷新后重新核对登录身份。';
 function installAdminTeamLifecycle({form,alive,refreshDirectory,count=0,clearEditor}){
   form.insertAdjacentHTML('beforeend',`<section class="admin-team-members" aria-label="队员与学校"><div class="section-caption"><h3>队员与学校</h3><button type="button" class="btn secondary small" id="team-detail-refresh" hidden>刷新成员明细</button></div><div id="team-member-detail" aria-live="polite"><p class="small-note">编辑已有队伍后查看成员资料。</p></div></section><div class="form-actions"><button type="button" class="btn danger small" id="team-recycle-open" hidden disabled>删除队伍</button><button type="button" class="btn secondary small" id="team-recycle-toggle">回收站（${Number(count) || 0}）</button></div><div id="team-recycle-confirm" class="admin-lifecycle-panel" hidden><h3>确认删除队伍</h3><p id="team-recycle-target"></p><p class="small-note">移入回收站后停止参赛并停用登录与 API；历史材料和成绩保留，同名队伍可重新申请。恢复时需检查队名和成员冲突，并重新发放访问凭据。</p><label class="field">删除原因<textarea id="team-recycle-reason" rows="3" maxlength="500"></textarea></label><div class="form-actions"><button type="button" class="btn danger" id="team-recycle-submit">确认移入回收站</button><button type="button" class="btn secondary" id="team-recycle-cancel">取消</button></div></div><p class="form-error" id="team-lifecycle-error" role="alert"></p>`);
   form.insertAdjacentHTML('afterend',`<section class="surface admin-recycle-bin" id="team-recycle-bin" hidden><div class="section-caption"><h2>队伍回收站</h2><button type="button" class="btn secondary small" id="team-recycle-refresh">刷新回收站</button></div><p class="small-note">回收站中的队伍已停用参赛；历史材料与成绩仍保留。</p><div id="team-recycle-list" aria-live="polite"></div><section id="team-restore-detail" hidden><h3 id="team-restore-heading"></h3><div id="team-restore-members" aria-live="polite"></div><form id="team-restore-form"><div class="form-grid"><label class="field">恢复后的队名<input name="name" maxlength="80" required></label><label class="field">恢复原因<textarea name="reason" maxlength="500" rows="3" required></textarea></label></div><div id="team-restore-conflicts" aria-live="polite"></div><div id="team-restore-advisories" aria-live="polite"></div><button type="submit" class="btn" disabled>恢复队伍</button><p class="form-error" role="alert"></p></form><p id="team-restore-result" class="info-banner" hidden role="status"></p></section></section>`);
   const node=id=>document.getElementById('team-'+id),roster=node('member-detail');
   // Existing lightweight DOM fixtures need not implement this optional UI surface.
-  if(!roster)return {select(){},clear(){},updateCount(){},canSave:()=>true};
+  if(!roster)return {select(){},clear(){},updateCount(){},canSave:alive,valid:alive};
   document.getElementById('clear-team')?.insertAdjacentElement?.('afterend',node('recycle-open'));
   const owner=session,loginId=owner.loginId,marker=browserLoginOwner(),restoreForm=node('restore-form'),restoreButton=restoreForm.querySelector('[type=submit]');
-  const valid=()=>alive() && session===owner && owner.loginId===loginId && browserLoginOwner()===marker && ownsBrowserLogin(owner);
-  const request=(path,body)=>api(path,body,{loginId});
-  let detail=null,readSeq=0,listSeq=0,restoreSeq=0,restoreSession=0,restoringId=null,restored=false,confirmation=null,recycling=false,restoreBusy=null,restoreDetail=null,attempt=null,lastEditor=null;
+  let detail=null,readSeq=0,listSeq=0,restoreSeq=0,restoreSession=0,restoringId=null,restored=false,confirmation=null,recycling=false,restoreBusy=null,restoreDetail=null,attempt=null,lastEditor=null,locked=false;
+  function lock(){
+    if(locked)return;
+    locked=true;readSeq++;listSeq++;restoreSeq++;
+    detail=null;restoreDetail=null;confirmation=null;restoringId=null;attempt=null;
+    if(currentAdminTeamLifecycle!==controller || !form.isConnected || node('member-detail')!==roster)return;
+    roster.textContent=adminTeamLifecycleLoginNotice;
+    for(const id of ['recycle-target','recycle-list','restore-heading','restore-members','restore-conflicts','restore-advisories','restore-result'])node(id).textContent='';
+    for(const id of ['recycle-confirm','recycle-bin','restore-detail','restore-result','recycle-open','detail-refresh'])node(id).hidden=true;
+    for(const id of ['recycle-open','recycle-toggle','recycle-refresh','recycle-submit','detail-refresh'])node(id).disabled=true;
+    node('recycle-reason').value='';
+    restoreForm.elements.name.value='';restoreForm.elements.reason.value='';
+    restoreButton.disabled=true;dirtyAdminForms.delete(restoreForm);formError(restoreForm,'');
+    node('lifecycle-error').textContent='';
+  }
+  function valid(){
+    if(locked || currentAdminTeamLifecycle!==controller || !form.isConnected)return false;
+    if(session!==owner || !loginId || owner.loginId!==loginId || browserLoginOwner()!==marker ||
+        !ownsBrowserLogin(owner) || browserLogoutOwner()===loginId){lock();return false;}
+    return alive();
+  }
+  const controller={loginId,lock,valid};
+  currentAdminTeamLifecycle=controller;
+  async function request(path,body){
+    if(!valid())throw new Error(adminTeamLifecycleLoginNotice);
+    try{return await api(path,body,{loginId});}
+    catch(error){
+      if(currentAdminTeamLifecycle===controller && (session===owner || !session.role) &&
+          [401,403,428].includes(error.status))lock();
+      throw error;
+    }
+  }
   const selected=()=>({id:form.elements.id.value,revision:Number(form.elements.expectedRevision.value),session:form.editSession || 0});
   const same=capture=>valid() && form.isConnected && selected().id===capture.id && selected().revision===capture.revision && selected().session===capture.session;
   const ready=()=>detail && same(detail.capture) && !detail.value.recycle && /^[a-f0-9]{64}$/i.test(detail.value.recycleContext || '');
@@ -278,13 +309,14 @@ function installAdminTeamLifecycle({form,alive,refreshDirectory,count=0,clearEdi
   node('recycle-open').onclick=()=>{
     if(!valid() || !ready() || recycling)return;
     if(dirtyAdminForms.has(form) && !confirm('队伍表单有未保存的输入。删除针对下方已读取的队伍记录；确认继续查看删除确认？'))return;
+    if(!ready())return;
     confirmation={...detail.capture,context:detail.value.recycleContext,detail:detail.value};
     node('recycle-target').textContent=`${detail.value.team.number} 号 · ${detail.value.team.name}（版本 ${detail.value.team.revision}）`;
     node('recycle-confirm').hidden=false;node('lifecycle-error').textContent='';
   };
   node('recycle-cancel').onclick=close;
   node('recycle-submit').onclick=()=>withBusy(node('recycle-submit'),async()=>{
-    if(!confirmation || !same(confirmation) || !ready() || recycling)return;
+    if(!valid() || !confirmation || !same(confirmation) || !ready() || recycling)return;
     const capture=confirmation,reason=node('recycle-reason').value.trim(),editRevision=form.editRevision || 0;
     if(!reason){node('lifecycle-error').textContent='请填写删除原因。';return;}
     recycling=true;
@@ -296,7 +328,7 @@ function installAdminTeamLifecycle({form,alive,refreshDirectory,count=0,clearEdi
         if((form.editRevision || 0)===editRevision)clearEditor();
         else{node('recycle-open').hidden=true;roster.innerHTML=adminTeamRosterMarkup(detail.value);node('lifecycle-error').textContent='队伍已移入回收站。之后的新输入已保留；请从回收站恢复队伍后重新核对。';}
       }
-      await refreshDirectory();if(valid()){await loadList();toast('队伍已移入回收站，参赛访问已停用。');}
+      await refreshDirectory();if(valid()){await loadList();if(valid())toast('队伍已移入回收站，参赛访问已停用。');}
     }catch(error){
       if(same(capture)){
         close();detail=null;node('recycle-open').disabled=true;
@@ -304,9 +336,10 @@ function installAdminTeamLifecycle({form,alive,refreshDirectory,count=0,clearEdi
         else node('lifecycle-error').textContent=error.message+' 删除原因已保留，请刷新成员后重新确认。';
       }
     }finally{recycling=false;}
-  });
+  }).finally(()=>{if(locked && form.isConnected && node('member-detail')===roster)node('recycle-submit').disabled=true;});
   function updateCount(value){if(Number.isSafeInteger(value) && value>=0)node('recycle-toggle').textContent=`回收站（${value}）`;}
   async function loadList(){
+    if(!valid())return;
     const seq=++listSeq;node('recycle-list').innerHTML='<p class="small-note">正在读取回收站…</p>';
     try{
       const result=await request('admin/data/recycle-bin');if(!valid() || seq!==listSeq)return;
@@ -315,8 +348,8 @@ function installAdminTeamLifecycle({form,alive,refreshDirectory,count=0,clearEdi
       node('recycle-list').querySelectorAll('[data-restore-team]').forEach(button=>button.onclick=()=>openRestore(button.dataset.restoreTeam));
     }catch(error){if(valid() && seq===listSeq)node('recycle-list').innerHTML=`<p class="form-error">${esc(error.message)}</p>`;}
   }
-  node('recycle-toggle').onclick=()=>{node('recycle-bin').hidden=!node('recycle-bin').hidden;if(!node('recycle-bin').hidden)return loadList();};
-  node('recycle-refresh').onclick=()=>{const pending=[loadList()];if(restoringId && !restored)pending.push(loadRestore(true));return Promise.all(pending);};
+  node('recycle-toggle').onclick=()=>{if(!valid())return;node('recycle-bin').hidden=!node('recycle-bin').hidden;if(!node('recycle-bin').hidden)return loadList();};
+  node('recycle-refresh').onclick=()=>{if(!valid())return;const pending=[loadList()];if(restoringId && !restored)pending.push(loadRestore(true));return Promise.all(pending);};
   trackAdminForm(restoreForm);
   function conflicts(){
     if(!restoreDetail)return;
@@ -328,6 +361,7 @@ function installAdminTeamLifecycle({form,alive,refreshDirectory,count=0,clearEdi
   }
   restoreForm.elements.name.addEventListener('input',()=>{if(attempt && restoreForm.elements.name.value.trim()!==attempt.name){attempt=null;formError(restoreForm,'');}conflicts();});
   async function loadRestore(keep=false){
+    if(!valid())return;
     const teamId=restoringId,session=restoreSession,seq=++restoreSeq,editRevision=restoreForm.editRevision || 0;
     restoreDetail=null;restoreButton.disabled=true;node('restore-members').innerHTML='<p class="small-note">正在读取删除时成员记录…</p>';node('restore-conflicts').innerHTML='';node('restore-advisories').innerHTML='';
     try{
@@ -341,13 +375,14 @@ function installAdminTeamLifecycle({form,alive,refreshDirectory,count=0,clearEdi
     }catch(error){if(valid() && session===restoreSession && seq===restoreSeq){node('restore-members').innerHTML='<p class="small-note">删除时成员记录读取失败。</p>';if(!attempt)formError(restoreForm,error.message);}}
   }
   function openRestore(id){
+    if(!valid())return;
     if(dirtyAdminForms.has(restoreForm) && !confirm('恢复表单有未保存的输入，确认查看另一支队伍？'))return;
     if(!valid())return;
     restoringId=id;restoreSession++;restored=false;attempt=null;restoreForm.elements.name.value='';restoreForm.elements.reason.value='';node('restore-heading').textContent='正在读取所选队伍…';dirtyAdminForms.delete(restoreForm);node('restore-detail').hidden=false;node('restore-result').hidden=true;formError(restoreForm,'');
     return loadRestore();
   }
   restoreForm.onsubmit=event=>{event.preventDefault();return withBusy(restoreButton,async()=>{
-    if(!restoreDetail || (restoreBusy && restoreBusy.id===restoringId && restoreBusy.session===restoreSession) || restored || !valid())return;
+    if(!valid() || !restoreDetail || (restoreBusy && restoreBusy.id===restoringId && restoreBusy.session===restoreSession) || restored)return;
     const capture={id:restoringId,session:restoreSession,revision:restoreDetail.team.revision,editRevision:restoreForm.editRevision || 0},name=restoreForm.elements.name.value.trim(),reason=restoreForm.elements.reason.value.trim();
     if(!name || !reason){formError(restoreForm,'请填写恢复后的队名和恢复原因。');return;}
     const current=()=>valid() && capture.id===restoringId && capture.session===restoreSession;
@@ -367,8 +402,8 @@ function installAdminTeamLifecycle({form,alive,refreshDirectory,count=0,clearEdi
         if(error.status===409)await loadRestore(true);
       }
     }finally{if(restoreBusy===capture)restoreBusy=null;if(valid()){if(restoreDetail)conflicts();else restoreButton.disabled=true;}}
-  }).finally(()=>{if(valid() && (!restoreDetail || restored))restoreButton.disabled=true;else if(valid())conflicts();});};
-  return {select,clear,updateCount,canSave:()=>!detail?.value.recycle};
+  }).finally(()=>{if(!valid() || !restoreDetail || restored)restoreButton.disabled=true;else conflicts();});};
+  return {select,clear,updateCount,valid,canSave:()=>valid() && !detail?.value.recycle};
 }
 
 function adminImportMarkup(){return `<section class="surface" id="admin-import"><h2>批量导入</h2><p class="small-note">先预览，再确认。队伍按编号匹配；更新评委须填写 ID，留空会新建。预览不会写入名录或生成登录码。</p><form id="import-form"><div class="form-grid"><label class="field">导入类型<select name="kind"><option value="teams">队伍</option><option value="judges">评委</option></select></label><label class="field">上传 CSV（UTF-8）<input type="file" name="file" accept=".csv,text/csv"><small>最多 500 行、256 KiB，也可直接粘贴。</small></label></div><a class="btn secondary small" id="import-template" href="api/admin/data/template?kind=teams" download>下载队伍模板</a><label class="field">CSV 内容<textarea name="csv" rows="8" placeholder="粘贴包含表头的 CSV"></textarea></label><button class="btn small" type="submit">预览导入</button><p class="form-error" role="alert"></p></form><div id="import-preview" aria-live="polite"></div><div id="import-credentials" aria-live="polite"></div></section>`;}

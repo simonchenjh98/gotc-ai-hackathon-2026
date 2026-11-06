@@ -3,15 +3,17 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const source=fs.readFileSync(new URL('../platform-admin.js',import.meta.url),'utf8')+'\n'+fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8').split("window.addEventListener('hashchange'")[0];
+const platform=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8');
+const source=fs.readFileSync(new URL('../platform-admin.js',import.meta.url),'utf8')+'\n'+platform.split("window.addEventListener('hashchange'")[0];
 const deferred=()=>{let resolve;const promise=new Promise(r=>{resolve=r;});return {promise,resolve};};
 const ok=body=>({ok:true,json:async()=>body});
 const fail=(error,code='team_restore_conflict')=>({ok:false,status:409,json:async()=>({error,code})});
 const detail=(id='T1',overrides={})=>({team:{id,number:id==='T1'?1:2,name:'Stored '+id,revision:7,status:'active'},recycle:null,recycleContext:'a'.repeat(64),roster:{source:'approved_memberships',members:[{personId:'P1',name:'Member '+id,school:'School '+id,schoolState:'recorded',source:'approved_membership',role:'captain'}]},restoreConflicts:[],restoreAdvisories:[],...overrides});
 const archived=(id='T1',overrides={})=>detail(id,{recycle:{eventId:1,deletedAt:1,reason:'Synthetic delete',originalStatus:'active'},recycleContext:null,...overrides});
 function element(){
-  const listeners={};let html='';let buttons=[];
-  return {isConnected:true,hidden:false,disabled:false,value:'',textContent:'',classList:{add(){},remove(){}},
+  const listeners={};let html='',text='';let buttons=[];
+  return {isConnected:true,hidden:false,disabled:false,value:'',classList:{add(){},remove(){}},
+    get textContent(){return text;},set textContent(value){text=value;html='';buttons=[];},
     addEventListener(name,fn){(listeners[name]??=[]).push(fn);},
     input(){for(const fn of listeners.input || [])fn();},
     get innerHTML(){return html;},set innerHTML(value){html=value;buttons=[...value.matchAll(/data-restore-team="([^"]*)"/g)].map(match=>({...element(),dataset:{restoreTeam:match[1]}}));},
@@ -27,9 +29,9 @@ function harness(fetcher=async()=>ok(detail())){
   elements['team-form']=form({id:'T1',expectedRevision:'7',name:'Editor T1'});
   elements['team-restore-form']=form({name:'',reason:''});
   elements['platform-main']=element();elements['platform-toast']=element();
-  const requests=[],storageWrites=[],clears=[];let marker='LOGIN1';
+  const requests=[],storageWrites=[],clears=[];let marker='LOGIN1',logoutMarker=null;
   const context=vm.createContext({document:{getElementById:id=>elements[id]},location:{href:'https://example.test/platform.html#admin'},URL,URLSearchParams,Intl,Date,TextEncoder,
-    localStorage:{getItem:()=>marker,setItem:(...args)=>storageWrites.push(args)},setTimeout:()=>0,clearTimeout,confirm:()=>true,
+    localStorage:{getItem:key=>key.endsWith(':logout')?logoutMarker:marker,setItem:(...args)=>storageWrites.push(args)},setTimeout:()=>0,clearTimeout,confirm:()=>true,
     fetch:async(url,options)=>{requests.push({url,method:options.method,headers:options.headers,body:options.body?JSON.parse(options.body):undefined});return fetcher(url,options);}});
   vm.runInContext(source+"\nroute='admin';routeVersion=1;session={role:'admin',loginId:'LOGIN1'};",context);
   context.config={form:elements['team-form'],alive:()=>vm.runInContext("route==='admin' && routeVersion===1",context),refreshDirectory:async()=>{context.refreshes++;},count:2,clearEditor:()=>{clears.push(true);elements['team-form'].elements.id.value='';vm.runInContext('controller.clear()',context);}};
@@ -38,7 +40,7 @@ function harness(fetcher=async()=>ok(detail())){
   return {context,elements,requests,clears,storageWrites,node:id=>elements['team-'+id],entry:elements['team-form'],restore:elements['team-restore-form'],
     select:()=>vm.runInContext('controller.select()',context),
     switch(id){elements['team-form'].elements.id.value=id;elements['team-form'].editSession=(elements['team-form'].editSession || 0)+1;return this.select();},
-    marker(value){marker=value;},
+    marker(value){marker=value;},logoutMarker(value){logoutMarker=value;},
     async openRestore(id='T1'){await this.node('recycle-toggle').onclick();await this.node('recycle-list').querySelectorAll().find(b=>b.dataset.restoreTeam===id).onclick();},
     restoreInput(key,value){elements['team-restore-form'].elements[key].value=value;elements['team-restore-form'].elements[key].input();elements['team-restore-form'].input();},
     submitRestore:()=>elements['team-restore-form'].onsubmit({preventDefault(){}})};
@@ -157,4 +159,76 @@ test('restore double click sends one mutation and a changed login suppresses its
   await h.openRestore();h.restoreInput('reason','Reason');const first=h.submitRestore(),second=h.submitRestore();
   assert.equal(h.requests.filter(x=>x.method==='POST').length,1);assert.deepEqual(h.requests.find(x=>x.method==='POST').body,{teamId:'T1',expectedRevision:7,name:'Stored T1',reason:'Reason'});
   vm.runInContext("session={role:'admin',loginId:'LOGIN2'}",h.context);pending.resolve(ok({team:detail().team,access:{}}));await Promise.all([first,second]);assert.equal(h.node('restore-result').hidden,true);assert.equal(h.context.refreshes,0);
+});
+
+
+function identityHandlers(h){
+  const start=platform.indexOf("window.addEventListener('storage'");
+  const end=platform.indexOf("window.addEventListener('pagehide'",start);
+  const handlers={};
+  h.context.window={addEventListener:(name,callback)=>handlers[name]=callback};
+  vm.runInContext(platform.slice(start,end),h.context);
+  return handlers;
+}
+for(const change of ['cross-tab login','cross-tab logout','focus','bfcache logout'])test(`already displayed current and archived rosters are erased after ${change}`,async()=>{
+  const h=harness(async url=>ok(url.pathname.endsWith('/recycle-bin')?listing(['T2']):url.searchParams.get('teamId')==='T2'?archived('T2'):detail()));
+  await h.select();h.node('recycle-open').onclick();h.node('recycle-reason').value='Current private reason';
+  await h.openRestore('T2');h.restoreInput('reason','Archived private reason');
+  assert.match(h.node('member-detail').innerHTML,/Member T1.*School T1/);
+  assert.match(h.node('restore-members').innerHTML,/Member T2.*School T2/);
+  const handlers=identityHandlers(h);
+  if(change==='cross-tab login'){
+    h.marker('LOGIN2');handlers.storage({key:vm.runInContext('loginOwnerKey',h.context),newValue:'LOGIN2'});
+  }else if(change==='cross-tab logout')handlers.storage({key:vm.runInContext('teamLogoutKey',h.context),newValue:'LOGIN1'});
+  else if(change==='focus'){h.marker('LOGIN2');handlers.focus();}
+  else{h.logoutMarker('LOGIN1');handlers.pageshow({persisted:true});}
+  assert.match(h.node('member-detail').textContent,/成员资料已隐藏/);
+  assert.equal(h.node('member-detail').innerHTML,'');assert.equal(h.node('restore-members').innerHTML,'');
+  assert.equal(h.node('recycle-list').innerHTML,'');assert.equal(h.node('recycle-target').textContent,'');
+  assert.equal(h.node('recycle-reason').value,'');assert.equal(h.restore.elements.reason.value,'');
+  assert.equal(h.node('recycle-bin').hidden,true);assert.equal(h.restore.button.disabled,true);
+  assert.equal(h.entry.elements.name.value,'Editor T1');
+  assert.equal(vm.runInContext('controller.canSave()',h.context),false);
+  const requests=h.requests.length;
+  await h.node('recycle-refresh').onclick();await h.submitRestore();
+  assert.equal(h.requests.length,requests);
+});
+
+test('a lifecycle 401 clears displayed data and a pending old read cannot repopulate it',async()=>{
+  let expired=false;
+  const pending=deferred();
+  const h=harness(async url=>{
+    if(url.pathname.endsWith('/recycle-bin'))return expired?{ok:false,status:401,json:async()=>({error:'Expired'})}:ok(listing(['T2']));
+    return url.searchParams.get('teamId')==='T2'?pending.promise:ok(detail());
+  });
+  await h.select();await h.node('recycle-toggle').onclick();
+  const reading=h.node('recycle-list').querySelectorAll()[0].onclick();
+  expired=true;
+  await assert.rejects(vm.runInContext("api('admin/data/recycle-bin')",h.context),/Expired/);
+  pending.resolve(ok(archived('T2')));await reading;
+  assert.equal(vm.runInContext('session.role',h.context),null);
+  assert.equal(h.node('member-detail').innerHTML,'');assert.equal(h.node('restore-members').innerHTML,'');
+  assert.match(h.node('member-detail').textContent,/成员资料已隐藏/);
+});
+
+test('a lifecycle 403 locks the active roster even if the browser owner marker did not change',async()=>{
+  const h=harness(async url=>url.pathname.endsWith('/recycle-bin')
+    ?{ok:false,status:403,json:async()=>({error:'Forbidden'})}:ok(detail()));
+  await h.select();await h.node('recycle-toggle').onclick();
+  assert.equal(h.node('member-detail').innerHTML,'');
+  assert.match(h.node('member-detail').textContent,/成员资料已隐藏/);
+  assert.equal(vm.runInContext('controller.canSave()',h.context),false);
+});
+
+test('a stale 401 does not clear the private roster of a newly mounted admin login',async()=>{
+  const pending=deferred();let reads=0;
+  const h=harness(()=>++reads===2?pending.promise:ok(detail('T1',{roster:{members:[{name:reads===1?'Old member':'Current member',school:'Synthetic school'}]}})));
+  await h.select();const refresh=h.select();
+  h.marker('LOGIN2');
+  vm.runInContext("session={role:'admin',loginId:'LOGIN2'};controller=installAdminTeamLifecycle(config);",h.context);
+  await h.select();
+  pending.resolve({ok:false,status:401,json:async()=>({error:'Expired old login'})});await refresh;
+  assert.equal(vm.runInContext('session.loginId',h.context),'LOGIN2');
+  assert.match(h.node('member-detail').innerHTML,/Current member/);
+  assert.equal(vm.runInContext('controller.canSave()',h.context),true);
 });

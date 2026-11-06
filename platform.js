@@ -9,7 +9,7 @@ const selectedTeams={},dirtyAdminForms=new Set();
 const stageForRoute=()=>route.endsWith('-roadshow')?'roadshow':'exhibition';
 const stageName=stage=>stage==='roadshow'?'路演评审':'展示评审';
 const stageNotice=stage=>stage==='roadshow'?'<div class="info-banner warning"><strong>组织方人工工作名单</strong><br>晋级算法尚未实现，本页名单不代表正式晋级。展示与路演的名单、材料和评语分别保存。</div>':'';
-let logoutInFlight=null,currentTeamKeys=null,currentIdentityPage=null;
+let logoutInFlight=null,currentTeamKeys=null,currentIdentityPage=null,currentAdminTeamLifecycle=null;
 let session={role:null}, route='', pollTimer, routeVersion=0, lastBoard, judgeData, selectedTeam, toastTimer;
 const roleName = {team:'参赛队伍',judge:'专业评委',audience:'观众',admin:'组织方'};
 function toast(message) { const el = document.getElementById('platform-toast'); el.textContent = message; el.classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('visible'), 4500); }
@@ -19,6 +19,7 @@ const loginOwnerKey=`gotc-login-owner:v1:${encodeURIComponent(base.pathname)}`;
 let verifiedBrowserLogin=null;
 const teamLogoutKey=loginOwnerKey+':logout';
 function browserLoginOwner(){try{return localStorage.getItem(loginOwnerKey);}catch{return undefined;}}
+function browserLogoutOwner(){try{return localStorage.getItem(teamLogoutKey);}catch{return undefined;}}
 function publishLogin(login){if(!login.loginId)return;try{localStorage.setItem(loginOwnerKey,login.loginId);}catch{/* Server saving remains available without storage. */}}
 function ownsBrowserLogin(login){const owner=browserLoginOwner();return !owner || !login.loginId || owner===login.loginId || (verifiedBrowserLogin?.loginId===login.loginId && verifiedBrowserLogin.owner===owner);}
 async function api(path, data, options={}) {
@@ -27,7 +28,7 @@ async function api(path, data, options={}) {
   const recoveryAtStart=currentTeamRecovery,sessionAtStart=session,ownerAtStart=path==='session'?browserLoginOwner():null;
   const res = await fetch(new URL(`api/${path}`, base), {credentials:'same-origin',cache:'no-store',method:data === undefined ? 'GET' : 'POST',headers:{...(data===undefined?{}:{'Content-Type':'application/json'}),...((lifecyclePath || ['team','team/score','submission','logout','judge','score','admin','admin/settings','admin/keys/upstreams/models','admin/team-workbench','team/workbench/return','audience','vote','judging/exhibition','judging/exhibition/review','judging/roadshow','judging/roadshow/review'].includes(path) || path.startsWith('submission/') || path==='admin/keys' || path.startsWith('admin/keys/') || path==='team/keys' || path.startsWith('team/keys/') || path.startsWith('team/repository') || path.startsWith('admin/repositories') || path==='admin/claims' || path.startsWith('admin/claims/') || path==='admin/roadshow-access' || ['roadshow/scoring','roadshow/score','admin/roadshow/scoring','admin/roadshow/publish','admin/roadshow/teams','admin/judging/roadshow/window'].includes(path) || path.startsWith('finals/') || path.startsWith('admin/finals')) && (options.loginId ?? session.loginId)?{'X-GOTC-Login':options.loginId ?? session.loginId}:{})},body:data === undefined ? undefined : JSON.stringify(data),signal:options.signal});
   let body; try { body = await res.json(); } catch { throw new Error('服务暂时不可用，请稍后重试。'); }
-  if (!res.ok) { if((res.status===401 || res.status===403) && recoveryAtStart && currentTeamRecovery===recoveryAtStart)recoveryAtStart.lock();if(res.status===401 && session===sessionAtStart && (!recoveryAtStart || currentTeamRecovery===recoveryAtStart))session={role:null}; const error = new Error(body.error || '操作未成功，请重试。'); error.status = res.status; error.code=body.code; throw error; }
+  if (!res.ok) { if((res.status===401 || res.status===403) && recoveryAtStart && currentTeamRecovery===recoveryAtStart)recoveryAtStart.lock();if(res.status===401 && session===sessionAtStart && (!recoveryAtStart || currentTeamRecovery===recoveryAtStart)){session={role:null};currentAdminTeamLifecycle?.valid();} const error = new Error(body.error || '操作未成功，请重试。'); error.status = res.status; error.code=body.code; throw error; }
   if(path==='session')verifiedBrowserLogin={loginId:body.loginId,owner:ownerAtStart};
   return body;
 }
@@ -944,6 +945,7 @@ async function renderRoute(){
   if(typeof disposeFinalsView==='function')disposeFinalsView();
   currentTeamKeys?.dispose();
   currentIdentityPage=null;
+  currentAdminTeamLifecycle?.lock();currentAdminTeamLifecycle=null;
   if(typeof disposeAdminReviewSync==='function')disposeAdminReviewSync();adminReadOnlyView=null;adminLoadPending=null;
   clearTimeout(pollTimer);if(typeof currentClaimController!=='undefined'){currentClaimController?.dispose();currentClaimController=null;}const version=++routeVersion;
   route=['claim','team','team-score','judge','judge-exhibition','board-exhibition','judge-roadshow','board-roadshow','judge-finals','admin-finals','board-finals','admin-roadshow','admin-api','audience','admin'].includes(location.hash.slice(1).split('/')[0])?location.hash.slice(1).split('/')[0]:'board';
@@ -1148,9 +1150,11 @@ window.addEventListener('storage',event=>{
     renderRoute();
   }
   if (route==='team-score' && session.role==='team' && !ownsBrowserLogin(session)) renderRoute();
+  if(event?.key===teamLogoutKey && event.newValue===currentAdminTeamLifecycle?.loginId)currentAdminTeamLifecycle?.lock();
+  else currentAdminTeamLifecycle?.valid();
   currentTeamKeys?.valid();currentIdentityPage?.valid();currentTeamRecovery?.storageChanged();});
 function refreshVisibleTeamScore(){
-  currentIdentityPage?.valid();
+  currentAdminTeamLifecycle?.valid();currentIdentityPage?.valid();
   if(route==='team-score' && session.role==='team')renderRoute();
 }
 window.addEventListener('focus',refreshVisibleTeamScore);
