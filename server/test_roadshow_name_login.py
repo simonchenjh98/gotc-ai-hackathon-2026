@@ -112,7 +112,11 @@ class RoadshowNameLoginTests(unittest.TestCase):
                 response = client.request(method, path, {} if method == 'POST' else None,
                                           headers={'X-GOTC-Login': client.login_id})
                 self.assertEqual(response[0], 403, response)
-        self.assertEqual(client.get('/api/finals/judge')[0], 400)
+        # Finals fails closed before seat selection when no invitation is configured;
+        # a roadshow name-login session must not bypass that independent access gate.
+        finals = client.get('/api/finals/judge')
+        self.assertEqual(finals[0], 503)
+        self.assertEqual(finals[1]['code'], 'finals_access_unavailable')
         self.assertEqual(client.get('/api/judging/roadshow')[0], 200)
         self.assertEqual(client.get('/api/board')[0], 200)
         ordinary, _ = self.invitation(name='Ordinary existing judge')
