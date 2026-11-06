@@ -793,10 +793,7 @@ class KeyService:
             self.service.require(actor, "admin")
             return self.admin(db, actor, method, path, body, settings)
         self.service.require(actor, "team")
-        bound = db.execute("SELECT team_id FROM team_accounts WHERE account_id=?", (actor["id"],)).fetchone()
-        if not bound:
-            raise APIError(403, "队伍身份未绑定")
-        team_id = bound["team_id"]
+        team_id = self.service.bound_submission_team(db, actor)['id']
         enabled = self.config is not None and self.team_active(db, team_id)
         if method == "GET" and path == "/api/team/keys":
             if not enabled:
