@@ -113,9 +113,31 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def validate_unicode(value):
+    """Reject unpaired surrogate code points before hashing, SQLite or UTF-8 output.
+
+    json.loads already combines valid escaped surrogate pairs into real Unicode
+    characters. Walk iteratively so nested JSON values and object keys are covered.
+    """
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            try:
+                item.encode('utf-8')
+            except UnicodeEncodeError:
+                raise APIError(400, '文本包含无效的 Unicode 字符，请重新输入', 'invalid_unicode') from None
+        elif isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+
+
 def text_field(value, field, limit, required=False):
     if not isinstance(value, str):
         raise APIError(400, f"{field}必须是文字")
+    validate_unicode(value)
     value = value.strip()
     if len(value) > limit or (required and not value) or any(ord(c) < 32 and c not in "\n\t" for c in value):
         raise APIError(400, f"{field}长度或内容不正确")
@@ -538,6 +560,7 @@ class EventService:
 
     def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None, server_received_at=None):
         """Return (JSON object or CSV bytes, optional session token, cookie action)."""
+        validate_unicode(body)
         if path.startswith(("/api/registration", "/api/admin/registration")):
             return self.registration.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
         if path.startswith(("/api/claims/","/api/admin/claims")):
@@ -627,7 +650,7 @@ class EventService:
                 team_id = self.team_exists(db, body.get("teamId"), require_active=True)
                 revision=self.write_conflicts.check_score(db,actor["id"],team_id,body)
                 status = body.get("status")
-                if status not in {"draft", "submitted", "recused"}:
+                if not isinstance(status, str) or status not in {"draft", "submitted", "recused"}:
                     raise APIError(400, "评分状态不正确")
                 previous = db.execute("SELECT * FROM scores WHERE judge_id=? AND team_id=?", (actor["id"], team_id)).fetchone()
                 if previous and previous["status"] == "submitted" and status == "draft":
@@ -701,12 +724,12 @@ class EventService:
                         'beforeRevisions':body['expectedRevisions'],'afterRevisions':{group:body['expectedRevisions'][group]+1 for group in sorted(groups)}})
                     return {"ok":True,"config":self.write_conflicts.admin_config(db)},None,None
                 if method == "POST" and path == "/api/admin/teams":
-                    return {'ok':True,'team':self.admin_data.save_team(db,actor,body)},None,None
+                    return {'ok':True,'team':self.admin_data.save_team(db,actor,body,require_revision=True)},None,None
                 if method=='POST' and path=='/api/admin/credentials':
                     return self.credential_action(db,actor,body),None,None
                 if method == "POST" and path == "/api/admin/invitations":
                     role = body.get("role")
-                    if role not in {"judge", "audience"}:
+                    if not isinstance(role, str) or role not in {"judge", "audience"}:
                         raise APIError(400, "只能创建评委或观众邀请")
                     name = text_field(body.get("name"), "称呼", 80, True)
                     account, code = self.create_account(db, role, name)
@@ -1050,7 +1073,10 @@ class EventHandler(BaseHTTPRequestHandler):
             parsed = urlsplit(self.path)
             if parsed.scheme or parsed.netloc or parsed.fragment:
                 raise APIError(400, "请求地址格式不正确")
-            path = unquote(parsed.path, errors="strict")
+            try:
+                path = unquote(parsed.path, errors="strict")
+            except UnicodeError:
+                raise APIError(400, "请求路径编码不正确")
             if "\\" in path or "\x00" in path or any(p in {".", ".."} for p in path.split("/")):
                 raise APIError(400, "请求路径不正确")
             if path == service.base_path and self.command in {"GET", "HEAD"}:
@@ -1099,7 +1125,7 @@ class EventHandler(BaseHTTPRequestHandler):
                         if len(raw) != length:
                             raise ValueError('incomplete request')
                         body = json.loads(raw.decode("utf-8"), parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
-                    except (UnicodeError, ValueError):
+                    except (UnicodeError, ValueError, RecursionError):
                         raise APIError(400, "JSON格式不正确")
                     if not isinstance(body, dict):
                         raise APIError(400, "JSON内容必须是对象")

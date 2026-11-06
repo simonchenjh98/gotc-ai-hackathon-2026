@@ -110,7 +110,7 @@ class AdminDataService:
             raise APIError(400,'路演顺序应为1至9999的整数或空值')
         return result
 
-    def save_team(self, db, actor, values, batch=None):
+    def save_team(self, db, actor, values, batch=None, *, require_revision=False):
         allowed=set(TEAM_FIELDS)|{'id','expectedRevision'}
         if not set(values).issubset(allowed):
             raise APIError(400,'队伍字段不正确')
@@ -119,6 +119,11 @@ class AdminDataService:
         if team_id is not None and before is None:
             raise APIError(404,'队伍不存在')
         revision=values.get('expectedRevision')
+        # Direct administrator HTTP edits must carry the displayed team revision.
+        # Internal import commits verify a whole-row fingerprint in this same write
+        # transaction; registration edits validate their own registration revision.
+        if before and require_revision and revision is None:
+            raise APIError(428,'请先读取队伍最新信息，再携带编辑版本保存','revision_required')
         if revision is not None and (type(revision) is not int or revision<0):
             raise APIError(400,'队伍版本必须是非负整数')
         if before and revision is not None and revision!=before['revision']:

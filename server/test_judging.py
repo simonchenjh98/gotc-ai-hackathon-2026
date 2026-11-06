@@ -178,8 +178,9 @@ class ExhibitionFrameworkTests(unittest.TestCase):
         self.assertEqual(captured['submissionVersion'],1)
         materials['projectName']='FORMAL_LATER'
         self.assertEqual(team_client.post('/api/submission',{'expectedVersion':1,'status':'submitted','materials':materials})[0],200)
+        current_team=next(t for t in self.admin.get('/api/admin')[1]['teams'] if t['id']==team_id)
         self.assertEqual(self.admin.post('/api/admin/teams',{
-            'id':team_id,'number':1,'name':'Renamed after freeze','project':'FORMAL_LATER','track':'城市与社区问题'})[0],200)
+            'id':team_id,'expectedRevision':current_team['revision'],'number':1,'name':'Renamed after freeze','project':'FORMAL_LATER','track':'城市与社区问题'})[0],200)
         self.assertEqual(self.judge.get(self.judge_path)[1]['teams'][0]['materialSnapshot'],captured)
         self.window(False)
         current=self.admin_stage()
