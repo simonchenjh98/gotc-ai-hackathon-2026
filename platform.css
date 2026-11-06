@@ -42,6 +42,11 @@
 .setup-snippets{margin:22px 0}.setup-snippets details{border-top:1px solid var(--line);padding:10px 0}.setup-snippets summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--blue)}.setup-snippets pre{margin-top:10px}#key-admin>.section-caption h3,#key-admin>h3{margin:22px 0 12px}
 .call-tabs{align-items:center;margin:8px 0 14px}.call-tabs .small-note{margin-left:8px}.chat-turn{border-left:3px solid var(--line);background:#fff;margin:0 0 10px;padding:10px 14px}.chat-turn.role-system{border-color:var(--orange)}.chat-turn.role-user{border-color:var(--blue)}.chat-turn.role-assistant{border-color:#13b38b}.chat-turn.role-tool{border-color:#8a63d2}.chat-role{font:11px Consolas,monospace;color:var(--muted);margin-bottom:6px}.chat-text{margin:0;max-height:480px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.7 "Microsoft YaHei","PingFang SC",sans-serif;color:var(--navy)}.chat-tools{margin:0 0 12px;font-size:12px}.chat-tools summary{cursor:pointer;color:var(--blue)}.chat-tools ul{max-height:240px;overflow:auto;margin:8px 0;padding-left:20px;line-height:1.8}
 .upstream-panel{margin:0 0 22px}.upstream-panel>summary{font-size:15px;font-weight:700}.upstream-block{border:1px solid var(--line)!important;padding:4px 18px 0!important;margin:14px 0!important}
+.upstream-model-picker{padding:16px;margin-bottom:18px;background:var(--pale);border:1px solid var(--line)}
+.upstream-model-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px;max-height:260px;overflow:auto;margin:12px 0}
+.upstream-model-options label{display:flex;align-items:flex-start;gap:8px;padding:8px 0;font-size:12px;overflow-wrap:anywhere;cursor:pointer}
+.upstream-model-options input{flex-shrink:0;margin-top:3px;accent-color:var(--blue)}
+@media(max-width:720px){.upstream-model-options{grid-template-columns:1fr}}
 .failure-note{color:#ad302a}.failure-message{display:block;max-width:240px;overflow-wrap:anywhere;color:var(--muted)}
 .repository-panel .repository-location { overflow-wrap: anywhere; }
 .repository-review { border-top: 1px solid var(--line, #d7d7ce); padding-top: 1rem; margin-top: 1.5rem; }

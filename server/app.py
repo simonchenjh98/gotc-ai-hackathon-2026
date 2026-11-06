@@ -570,6 +570,8 @@ class EventService:
         if method=='POST' and path=='/api/submission':return self.dispatch_submission(body,cookie,expected_login_id,server_received_at)
         if path.startswith(('/api/team/repository','/api/admin/repositories')):
             return self.repositories.dispatch(method,path,body,cookie,expected_login_id,query or {}),None,None
+        if method == 'POST' and path == '/api/admin/keys/upstreams/models':
+            return self.keys.detect_models(body, cookie, expected_login_id), None, None
         with self.db() as db:
             # Resolve write identities only after the lock: revocation may have committed while queued.
             if method=="POST":
