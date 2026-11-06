@@ -253,6 +253,8 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
             package.extractall(extract)
         self.assertTrue((extract / 'index.html').is_file())
         self.assertTrue((extract / 'platform-draft-recovery.js').is_file())
+        self.assertTrue((extract / 'platform-claims.js').is_file())
+        self.assertTrue((extract / 'server' / 'claims.py').is_file())
         self.assertTrue((extract / 'server' / 'write_conflicts.py').is_file())
         with urllib.request.urlopen('file://' + str(extract / 'index.html')) as page:
             self.assertIn(b'<!doctype html', page.read(200).lower())

@@ -383,3 +383,69 @@ python3 -m py_compile server/app.py server/test_api.py
 队伍使用原提交码进入 `#team-score` 查看本队专业总分、六维均分及匿名逐条评语。`GET /api/team/score` 根据队伍会话绑定确定队伍，要求当前页面的 `X-GOTC-Login`，禁止查询参数指定其他队伍。返回 `{team:{number,name},state,score,dimensions,feedback}`；`state` 为 `published`、`unpublished` 或 `awaiting_scores`。已发布且达到 minJudges 门槛时，score 为百分制专业总均分，dimensions 为六项 `{id,name,max,score}`，每项为同一批全部 status=submitted 记录的该维算术均分，保留两位小数；feedback 为非空、知情确认分享的正式评语字符串数组，按文字稳定排序，保留换行。旧评分数值仍计入各均分，scores_json 本身为原分值，仅 total_tenths 按十分之一存储。是否进入公开前 12 名不影响本队查询。其他状态 score 为 null，dimensions/feedback 均为空数组；不返回个人分数、评委标识、时间或逐评委数值与评语关联。
 
 专业评分新表单明确告知：本次正式非空评语将在发布且达到门槛后匿名分享给本队，请勿署名或留下联系方式；正式提交非空评语前必须勾选确认，每次提交重新确认。API `POST /api/score` 仅在本次显式附带 `feedbackSharing:"team-anonymous-v1"` 且正式提交非空评语时建立分享授权；省略字段的旧客户端仍可私下保存但不会分享，旧评语不自动公开。无效声明返回 400。授权使用独立 score_feedback_visibility 表绑定本次 score_write_revisions.revision；scores 的插入、更新、删除触发器先清除授权，新服务仅在本次知情提交完成后重新写入。因此旧客户端、旧代码回滚及直接旧格式 SQL 改写不能沿用先前授权。原 scores 七列不变，原评委私有查看、组织方导出不变。
+
+### Private registration and in-person submission-code claims
+
+`platform.html#claim` accepts only a name and school. Import the private roster
+before opening the desk: until at least one roster row exists, new public
+applications return 503. No roster or name-based credential lookup is public.
+Public applications return an opaque request ID, a 256-bit bearer receipt secret,
+and a six-digit on-device verification PIN; validity is 24 hours. The receipt is
+stored in this tab's sessionStorage. Storage failures remain visible. Clearing
+this device or successfully logging out clears the receipt; codes are never
+persisted in browser storage.
+
+The admin section **现场报名核验** fetches requests, roster and eligible active
+teams only when opened with its read button. Create teams through the existing
+team directory first. Select the captain and every verified group member,
+compare submitted and roster schools, enter the PIN shown on the applicant's
+device, and confirm the in-person verification. A school discrepancy or any
+`needsReview` member requires an explicit resolution checkbox and review note.
+The captain's normalized name must match the application. An identity typo or
+parent-filled record can be corrected with the per-person revision form before
+assignment. Once assigned, the person's name/school cannot be rewritten; notes
+remain editable. Preserve source lines and originals in the private notes.
+
+Every admin claim endpoint requires the current admin cookie and `X-GOTC-Login`
+marker from `/api/session`, for both reads and writes. All POSTs also require the
+existing exact Origin and JSON protections. No endpoint accepts URL parameters.
+
+| Endpoint | Input / behavior |
+| --- | --- |
+| `POST /api/admin/claims/roster` | `{people:[{id,name,school,notes,needsReview}]}`; 1–500 rows, total ≤500, 2 MiB import body limit. Stable IDs use ASCII letters/digits/underscore/hyphen. Exact re-import is idempotent; changed existing rows must use per-person edit. Duplicate normalized name+school is refused. |
+| `POST /api/admin/claims/person` | `{person:{id,name,school,notes,needsReview},expectedRevision}`; revision 0 adds, an existing row's revision edits. |
+| `GET /api/admin/claims` | Admin-only `requests`, `people`, and eligible `teams`; no receipt secret, PIN, account code, or code hashes. |
+| `POST /api/claims/request` | `{name,school}`; identical shape for known/unknown people. Maximum 1,000 unexpired pending requests. |
+| `POST /api/claims/status` | `{requestId,secret}`; fixed invalid shape or status and bearer-approved team, never a code. |
+| `POST /api/claims/redeem` | `{requestId,secret}`; approved receipt returns its repeatable code; exact retries preserve the credential. |
+| `POST /api/admin/claims/review` | Common `{requestId,expectedRevision,action,note}`. `reject` needs only these; `approve` also needs `{teamId,captainId,memberIds,pin,inPersonVerified:true,resolvedIdentity:boolean}`. |
+
+Public request/status/redeem endpoints each use a fixed, separate rate-limit
+scope (20 per IP / 400 global per minute). Incorrect organizer PIN attempts are
+durable and limited to five per request; a fresh application is then needed.
+Pending requests never reserve people. Approval transactions enforce unique
+person membership and unique approved team through SQLite constraints. No
+partial membership/account survives a conflict. An identical approval retry is
+idempotent. Requests and per-person edits use expected revisions to reject stale
+writes. There is no inferred maximum contest team size beyond the 500-person
+roster bound.
+
+Approval creates a team account once through existing `team_access` with the
+organizer actor and discards the temporary code. Redemption derives
+`account_id + '.' + sha256('gotc-claim-code-v1\0' + receipt_secret).hexdigest()`
+(the separator is a NUL byte), stores a fresh normal salt/scrypt hash once, and
+never stores plaintext credentials. The approved request records a credential
+fingerprint, checked before first issuance and every retry. Admin rotation or
+revocation invalidates the old receipt's ability to issue a code. Teams with an
+existing account require the existing recovery controls; claims never rotate
+that account or provision API gateway keys. Rejected/expired requests release no
+assignments because pending requests never had any.
+
+Approval review has its own 64 KiB body limit so all 500 roster IDs fit; the
+2 MiB import limit applies only to roster import.
+
+The private tables are `claim_people`, `claim_requests`, and `claim_memberships`;
+initialization is additive and idempotent for old installations. Organizer
+approval/rejection, roster import/edit, failed PIN checks and redemption write
+the existing durable audit trail. Do not commit real roster files, release
+archives, database copies, or temporary test artifacts.
