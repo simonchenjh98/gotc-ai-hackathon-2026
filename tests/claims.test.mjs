@@ -112,3 +112,100 @@ test('real admin mutation handler retains selected members, PIN and notes after 
   assert.equal(form.elements.pin.value,'123456');assert.equal(form.elements.note.value,'Keep my onsite note');assert.equal(form.elements.members[0].checked,true);
   assert.match(form.error,/名单已变化/);assert.ok(dirtyAdminForms.has(form));assert.ok(buttons.every(button=>button.disabled && button.dataset.stale==='true'));
 });
+
+const declaredCaptain={name:'Fixture Captain',school:'Captain School'};
+const declaredMembers=[{name:'First Teammate',school:'First School'},{name:'Second Teammate',school:'Second School'}];
+const declaredResponse={...receipt,status:'pending',requestRevision:1,captain:declaredCaptain,declaration:{captain:declaredCaptain,members:declaredMembers},code:null};
+
+test('declared application and pending edits persist only capability, recover exact declaration and preserve failed drafts',async()=>{
+  const storage=new Storage(),calls=[];let fail=false;
+  const first=controller(storage,async(path,body)=>{calls.push({path,body});if(fail)throw new Error('申报冲突');return path.endsWith('update')?{...declaredResponse,requestRevision:2,declaration:{captain:declaredCaptain,members:body.members}}:declaredResponse;});
+  first.client.start();await first.client.apply(declaredCaptain.name,declaredCaptain.school,declaredMembers);
+  assert.equal(JSON.stringify(calls[0].body),JSON.stringify({...declaredCaptain,members:declaredMembers}));
+  assert.equal(JSON.stringify(first.states.at(-1).declaration),JSON.stringify(declaredResponse.declaration));
+  const saved=JSON.parse([...storage.map.values()][0]);assert.deepEqual(saved,receipt);
+  first.client.edit();const changed=[{...declaredMembers[0],school:'Edited School'},declaredMembers[1]];
+  fail=true;await first.client.update(changed);assert.match(first.states.at(-1).error,/申报冲突/);assert.equal(first.states.at(-1).editing,true);assert.equal(first.states.at(-1).draft.members[0].school,'Edited School');
+  assert.equal(calls.at(-1).body.expectedRevision,1);fail=false;await first.client.update(changed);
+  assert.equal(first.states.at(-1).editing,false);assert.equal(first.states.at(-1).requestRevision,2);
+  const fresh=controller(storage,async()=>({...declaredResponse,requestRevision:2,declaration:{captain:declaredCaptain,members:changed}}));await fresh.client.start();
+  assert.equal(fresh.states.at(-1).declaration.members[0].school,'Edited School');assert.equal(fresh.states.at(-1).requestRevision,2);
+  assert.ok(![...storage.map.values()].join('').includes('Edited School'));
+});
+
+test('cancel edit, clear receipt and route disposal suppress stale update responses',async()=>{
+  for(const action of ['cancelEdit','clear','dispose']){
+    const storage=new Storage();store(storage).write(receipt);let resolve;
+    const {client,states}=controller(storage,async path=>path.endsWith('update')?new Promise(r=>{resolve=r;}):declaredResponse);
+    await client.start();client.edit();const pending=client.update(declaredMembers);await client[action]();
+    resolve({...declaredResponse,requestRevision:99,declaration:{captain:declaredCaptain,members:[{name:'STALE',school:'STALE'}]}});await pending;
+    assert.ok(states.every(s=>s.requestRevision!==99));assert.ok(states.every(s=>!JSON.stringify(s.declaration).includes('STALE')));
+    if(action==='clear'){assert.equal(states.at(-1).receipt,null);assert.equal(storage.map.size,0);}
+  }
+});
+
+test('legacy receipt can supplement teammates while edits retain their base revision across status refresh',async()=>{
+  const storage=new Storage();store(storage).write(receipt);const calls=[];let revision=1;
+  const {client,states}=controller(storage,async(path,body)=>{calls.push({path,body});return {...declaredResponse,requestRevision:revision,declaration:null};});
+  await client.start();client.edit();assert.equal(states.at(-1).draft.members.length,2);
+  revision=2;await client.status();assert.equal(states.at(-1).editing,true);await client.update(declaredMembers);
+  assert.equal(calls.at(-1).body.expectedRevision,1);
+});
+
+// A small DOM fixture runs the actual public render/event handlers. Browser E2E
+// covers native validation and layout separately; these tests verify bound values.
+function claimPageFixture(transport){
+  const nodes=new Map(),storage=new Storage();
+  const decode=value=>value.replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');
+  const node=id=>{const value={id,onclick:null};nodes.set(id,value);return value;};
+  const root={html:''};Object.defineProperty(root,'innerHTML',{get(){return this.html;},set(html){
+    this.html=html;nodes.clear();for(const match of html.matchAll(/id="([^"]+)"/g))node(match[1]);
+    const form=nodes.get('claim-request-form')??nodes.get('claim-update-form');if(!form)return;
+    form.elements={};for(const name of ['name','school']){const field=html.match(new RegExp('<input name="'+name+'"[^>]*value="([^"]*)"'));if(field)form.elements[name]={value:decode(field[1])};}
+    const rows=[...html.matchAll(/<fieldset class="claim-member-row"[\s\S]*?<\/fieldset>/g)].map(match=>{
+      const fields={};for(const name of ['memberName','memberSchool'])fields[name]={value:decode(match[0].match(new RegExp('name="'+name+'"[^>]*value="([^"]*)"'))[1])};
+      return {querySelector:selector=>fields[selector.match(/name="([^"]+)"/)[1]]};
+    });
+    const remove=[...html.matchAll(/data-claim-remove="(\d+)"/g)].map(match=>({dataset:{claimRemove:match[1]}}));
+    form.querySelectorAll=selector=>selector==='[data-claim-member-row]'?rows:selector==='[data-claim-remove]'?remove:[];
+    form.rows=rows;form.remove=remove;
+  }});
+  const scope=vm.createContext({JSON,Number,Error,Set,encodeURIComponent,esc,heading:()=>'',beijingTime:String,teamLabel:t=>t.name,base:{pathname:'/test/'},sessionStorage:storage,root,document:{getElementById:id=>nodes.get(id)??null},api:transport,route:'claim',routeVersion:1,confirm:()=>true});vm.runInContext(source,scope);
+  return {scope,root,storage,nodes,render:()=>vm.runInContext('renderClaim(1)',scope),form:()=>nodes.get('claim-request-form')??nodes.get('claim-update-form'),fill(){const f=this.form();if(f.elements.name)f.elements.name.value=declaredCaptain.name;if(f.elements.school)f.elements.school.value=declaredCaptain.school;f.rows.forEach((row,i)=>{row.querySelector('[name="memberName"]').value='Teammate '+i;row.querySelector('[name="memberSchool"]').value='School '+i;});f.oninput();}};
+}
+
+test('real public form adds/removes dynamic rows, submits every entered person and retains failed/busy values',async()=>{
+  const calls=[];let reject;const page=claimPageFixture((path,body)=>{calls.push({path,body});return new Promise((_,no)=>{reject=no;});});
+  await page.render();page.fill();assert.equal(page.form().rows.length,2);
+  page.nodes.get('claim-member-add').onclick();assert.equal(page.form().rows.length,3);assert.equal(page.form().rows[0].querySelector('[name="memberName"]').value,'Teammate 0');
+  page.fill();page.nodes.get('claim-member-add').onclick();assert.equal(page.form().rows.length,4);assert.ok(!page.nodes.has('claim-member-add'));
+  page.fill();page.form().remove[1].onclick();assert.equal(page.form().rows.length,3);assert.equal(page.form().rows[1].querySelector('[name="memberName"]').value,'Teammate 2');
+  page.form().onsubmit({preventDefault(){}});assert.equal(calls.length,1);assert.equal(calls[0].body.members.length,3);assert.equal(calls[0].body.members[1].name,'Teammate 2');
+  assert.equal(page.form().elements.name.value,declaredCaptain.name);
+  page.form().rows[0].querySelector('[name="memberSchool"]').value='Typed While Busy';page.form().oninput();reject(new Error('重复成员'));await flush();
+  assert.match(page.root.innerHTML,/重复成员/);assert.equal(page.form().rows[0].querySelector('[name="memberSchool"]').value,'Typed While Busy');
+  assert.equal(page.form().rows.length,3);
+});
+
+test('real receipt form recovers after refresh, edits teammates and submits expected revision with the same capability',async()=>{
+  const calls=[];let revision=1,members=declaredMembers;
+  const page=claimPageFixture(async(path,body)=>{calls.push({path,body});if(path.endsWith('update')){members=body.members;revision++;}return {...declaredResponse,requestRevision:revision,declaration:{captain:declaredCaptain,members}};});
+  await page.render();page.fill();page.form().onsubmit({preventDefault(){}});await flush();assert.match(page.root.innerHTML,/First Teammate/);
+  await page.render();assert.equal(calls.at(-1).path,'claims/status');assert.match(page.root.innerHTML,/First Teammate/);
+  page.nodes.get('claim-edit').onclick();page.form().rows[0].querySelector('[name="memberSchool"]').value='Edited On Receipt';page.form().oninput();page.form().onsubmit({preventDefault(){}});await flush();
+  assert.equal(calls.at(-1).path,'claims/update');assert.equal(calls.at(-1).body.expectedRevision,1);assert.equal(calls.at(-1).body.secret,receipt.secret);assert.match(page.root.innerHTML,/Edited On Receipt/);assert.ok(!page.nodes.has('claim-update-form'));
+});
+
+test('declared staff mapping uses one selector per declaration and submits displayed revisions in declared order',()=>{
+  const request={id:'declared-fixture',name:declaredCaptain.name,school:declaredCaptain.school,revision:3,status:'pending',declaration:declaredResponse.declaration};
+  const people=[{id:'p1',...declaredCaptain,revision:4},{id:'p2',...declaredMembers[0],revision:5},{id:'p3',...declaredMembers[1],revision:6}];
+  const html=context.claimsReviewMarkup(request,{people,teams:[]});assert.equal([...html.matchAll(/data-claim-map="\d+"/g)].length,3);assert.ok(!html.includes('name="memberIds"'));assert.match(html,/First Teammate · First School/);
+  const selects=[{value:'p1'},{value:'p3'},{value:'p2'}],posts=[];
+  const form={elements:{teamId:{value:'T1'},captainId:selects[0],pin:{value:'123456'},note:{value:'Check exact school aliases'},inPersonVerified:{checked:true},resolvedIdentity:{checked:true}},querySelectorAll:selector=>selector==='[data-claim-map]'?selects:[]};
+  const nodes={'claim-review':{innerHTML:''},'claim-review-form':form,'claim-team-search':{},'claim-reject':{}};
+  const scope=vm.createContext({Map,Object,model:{requests:[request],people},document:{getElementById:id=>nodes[id]},busy:false,live:()=>true,replaceEditor:()=>true,trackAdminForm:()=>{},claimsReviewMarkup:()=>'',mutate:(f,path,body)=>posts.push({path,body})});
+  const helper=source.slice(source.indexOf('function claimMemberSnapshot'),source.indexOf('function claimsReviewMarkup'));
+  const handler=source.slice(source.indexOf('  function selectRequest(id){'),source.indexOf("  document.getElementById('claims-admin-load').onclick=load;"));
+  vm.runInContext(helper+'\n'+handler+'\nselectRequest("declared-fixture");',scope);form.onsubmit({preventDefault(){}});
+  assert.deepEqual([...posts[0].body.declaredMemberIds],['p1','p3','p2']);assert.deepEqual({...posts[0].body.memberRevisions},{p1:4,p3:6,p2:5});assert.equal(posts[0].body.expectedRevision,3);
+});

@@ -66,3 +66,5 @@
 
 /* In-person registration: private roster is rendered only after an admin read. */
 .claim-panel{max-width:760px}.claim-pin{font-size:2.5rem;font-weight:800;letter-spacing:.25em;font-variant-numeric:tabular-nums}.claim-columns{display:grid;grid-template-columns:1fr 1fr;gap:24px}.claim-scroll,.claim-members{max-height:360px;overflow:auto}.claim-members{border:1px solid var(--line,#ddd);padding:16px;margin:16px 0}.claim-notes{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}.claim-columns details{padding:10px 0}.claim-panel .code-output code{overflow-wrap:anywhere}.claim-panel .actions{margin-bottom:20px}[data-claim-member][hidden],[data-claim-search][hidden]{display:none}@media(max-width:700px){.claim-columns{grid-template-columns:1fr}.claim-panel .actions{display:flex;flex-wrap:wrap;gap:8px}}
+
+.claim-team-fields{min-width:0;border:1px solid var(--line,#ddd);padding:16px;margin:20px 0}.claim-member-row{min-width:0;border:1px solid var(--line,#ddd);padding:14px;margin:12px 0}.claim-team-fields legend,.claim-member-row legend{font-weight:700;padding:0 6px}.claim-declaration li{overflow-wrap:anywhere;margin:8px 0}.claim-team-fields select{max-width:100%}
