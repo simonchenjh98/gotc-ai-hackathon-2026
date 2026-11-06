@@ -66,3 +66,29 @@
 
 /* In-person registration: private roster is rendered only after an admin read. */
 .claim-panel{max-width:760px}.claim-pin{font-size:2.5rem;font-weight:800;letter-spacing:.25em;font-variant-numeric:tabular-nums}.claim-columns{display:grid;grid-template-columns:1fr 1fr;gap:24px}.claim-scroll,.claim-members{max-height:360px;overflow:auto}.claim-members{border:1px solid var(--line,#ddd);padding:16px;margin:16px 0}.claim-notes{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}.claim-columns details{padding:10px 0}.claim-panel .code-output code{overflow-wrap:anywhere}.claim-panel .actions{margin-bottom:20px}[data-claim-member][hidden],[data-claim-search][hidden]{display:none}@media(max-width:700px){.claim-columns{grid-template-columns:1fr}.claim-panel .actions{display:flex;flex-wrap:wrap;gap:8px}}
+
+/* Participant entry: keep frequently used tasks visible and other roles grouped. */
+.platform-more{position:relative;font-size:13px}
+.platform-more summary{cursor:pointer;min-height:44px;display:flex;align-items:center;gap:7px;white-space:nowrap;list-style:none;padding:10px 0}
+.platform-more summary::-webkit-details-marker{display:none}
+.platform-more summary:after{content:'＋';color:var(--blue)}
+.platform-more[open] summary:after{content:'−'}
+.platform-more summary:focus-visible,.team-reference>summary:focus-visible{outline:3px solid var(--orange);outline-offset:4px}
+.platform-more-links{position:absolute;right:0;top:100%;z-index:10;min-width:210px;padding:10px 16px;background:#fff;border:1px solid var(--line);box-shadow:0 12px 30px #0b21481a;display:grid;gap:2px}
+.platform-header nav .platform-more-links a{display:block;min-height:44px;padding:12px 4px;border-bottom:0}
+.participant-start{border-top:4px solid var(--blue)}
+.participant-start-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px 24px;flex-wrap:wrap}
+.participant-start-heading h2{margin-bottom:12px}
+.participant-deadline{margin:0 0 18px;font-size:13px;line-height:1.8;color:var(--muted)}
+.participant-deadline strong{color:var(--navy)}
+.participant-actions{list-style:none;padding:0;margin:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}
+.participant-actions li{display:flex;gap:12px;padding:14px 16px;background:var(--pale)}
+.participant-step{font:12px Consolas,monospace;color:var(--blue);padding-top:13px}
+.participant-actions .text-action{min-height:44px;text-align:left;padding:7px 0;font-size:16px;font-weight:700;color:var(--blue)}
+.participant-actions p{margin:0;font-size:12px;line-height:1.9;color:var(--muted)}
+.participant-success-hint{margin:18px 0 0;font-size:13px;line-height:1.8}
+.team-reference{margin:0 0 22px;border:1px solid var(--line);background:#fff}
+.team-reference>summary{padding:18px 28px;min-height:48px;cursor:pointer;font-size:14px;font-weight:600}
+.team-reference>.surface{margin:0;border:0;border-top:1px solid var(--line)}
+#team-keys,#team-repository,#submission-form{scroll-margin-top:24px}
+@media(max-width:720px){.platform-header nav{flex-wrap:wrap;overflow:visible;justify-content:flex-start;gap:4px 18px}.platform-header nav>a{min-height:44px}.platform-more{flex-basis:100%}.platform-more-links{position:static;min-width:0;max-width:none;width:100%;box-shadow:none}.participant-actions{grid-template-columns:1fr;gap:10px}.participant-start{padding:22px}.participant-deadline{margin-bottom:12px}.participant-actions li{padding:8px 14px}.participant-success-hint{font-size:12px}.team-reference>summary{padding:16px 22px}}
