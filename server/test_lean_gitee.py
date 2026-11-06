@@ -233,6 +233,19 @@ class LeanGiteeTests(unittest.TestCase):
         self.assertEqual(draft['submission']['submitted'],saved)
         self.assertEqual(self.request(self.client,'/api/submission/history/1')[1]['materials'],saved)
 
+    def test_bound_transition_ignores_only_nonapplicable_repo_fields_before_validation(self):
+        self.admin_action(self.application());self.open_submissions()
+        old={**self.materials(),'readmeUrl':'unfinished-readme','licenseUrl':'http://invalid',
+             'license':'x'*500,'sourcesAndLimitations':'old text to move into repo'}
+        status,result,_=self.request(self.client,'/api/submission',{
+            'requestId':'transition-draft-0001','expectedVersion':0,'status':'draft','materials':old})
+        self.assertEqual(status,200,result)
+        for field in ('readmeUrl','licenseUrl','license','sourcesAndLimitations'):self.assertEqual(result['submission']['draft'][field],'')
+        self.assertEqual(result['submission']['draft']['projectName'],old['projectName'])
+        for field in ('demoUrl','slidesUrl','videoUrl'):
+            with self.assertRaises(APIError):self.service.check_materials({**old,field:'http://invalid'},False,lean_gitee=True)
+        with self.assertRaises(APIError):self.service.check_materials(old,False,lean_gitee=False)
+
     def test_unbound_and_github_still_require_duplicate_fields_and_client_cannot_forge_reference(self):
         materials={k:v for k,v in self.materials().items() if k not in {'readmeUrl','license','sourcesAndLimitations'}}
         self.open_submissions()

@@ -32,26 +32,36 @@ async function api(path, data, options={}) {
 function trackAdminForm(form){form.addEventListener('input',()=>{form.editRevision=(form.editRevision || 0)+1;dirtyAdminForms.add(form);});}
 function stageHasUnsavedInputs(){return [...dirtyAdminForms].some(form=>form.isConnected && form.closest('#judging-admin'));}
 function clearStageUnsavedInputs(){for(const form of dirtyAdminForms)if(!form.isConnected || form.closest('#judging-admin'))dirtyAdminForms.delete(form);}
-function confirmLeave(){return !(submissionDirty || reviewDirty || scoreDirty || dirtyAdminForms.size) || confirm(submissionDirty?'有尚未保存服务器的作品输入。离开不会自动提交；只有成功保存的本机副本可在重新登录本队后找回，未备份输入可能丢失。确认离开？':'有尚未保存的输入，确认离开并放弃这些输入？');}
+function claimNavigationState(){return typeof currentClaimController!=='undefined'?currentClaimController?.navigationState?.()??{}:{};}
+function confirmLeave(){const claim=claimNavigationState();if(claim.pendingInitial){toast('申请正在提交，请等待领取凭据保存后再离开。');return false;}return !(claim.dirty || submissionDirty || reviewDirty || scoreDirty || dirtyAdminForms.size) || confirm(submissionDirty?'有尚未保存服务器的作品输入。离开不会自动提交；只有成功保存的本机副本可在重新登录本队后找回，未备份输入可能丢失。确认离开？':'有尚未保存的输入，确认离开并放弃这些输入？');}
 function account(){
   const el=document.getElementById('account');el.innerHTML=session.role?`<span>${esc(session.name || roleName[session.role])}</span><button id="logout">退出</button>`:'';
   document.getElementById('logout')?.addEventListener('click',logoutAccount);
 }
-async function logoutAccount(event){
+async function logoutAccount(event,{preserveClaim=false}={}){
+    if(claimNavigationState().pendingInitial){toast('申请正在提交，请等待领取凭据保存后再退出。');return false;}
     if(logoutInFlight?.owner===session)return;
     const operation={owner:session,context:currentTeamRecovery},button=event?.currentTarget || document.getElementById('logout');logoutInFlight=operation;button.disabled=true;
     const owned=()=>session===operation.owner;
     try{let local=null,teamAtExit=null;
       if(session.role==='team'){teamAtExit=await api('team');if(!owned())return;if(currentTeamRecovery && currentTeamRecovery.teamId!==teamAtExit.team.id)currentTeamRecovery.lock('当前登录队伍已变化，本地副本需重新授权后查看。');const store=teamDraftStore(teamAtExit,undefined,teamAtExit.loginId ?? operation.owner.loginId ?? '');const captured=store?.capturePurge();local={purge:()=>store?.purge(captured) ?? false};}
-      if(teamAtExit?!confirm(`退出当前登录的${teamAtExit.team.name}会清除本浏览器内本队当前及历史恢复副本，并停止旧标签编辑；退出期间重新登录后新建的副本会保留；服务器材料不受影响。确认退出？`):!confirmLeave())return;
+      if(teamAtExit?!confirm(`退出当前登录的${teamAtExit.team.name}会清除本浏览器内本队当前及历史恢复副本，并停止旧标签编辑；退出期间重新登录后新建的副本会保留；服务器材料不受影响。${claimNavigationState().dirty?'本页尚未提交的队伍申请输入也会丢弃。':''}确认退出？`):!confirmLeave())return;
+      if(!preserveClaim && typeof hasClaimReceipt==='function' && hasClaimReceipt() && !confirm('退出会清除此标签页的队伍申请凭据。请先返回申请页领取并复制提交码；尚未批准的申请将无法继续领取。确认清除并退出？'))return false;
       await api('logout',{}, {loginId:teamAtExit?.loginId ?? operation.owner.loginId});
-      const claimClearError=typeof clearClaimReceipt==='function'?clearClaimReceipt():'';if(claimClearError)toast(claimClearError);
+      const claimClearError=!preserveClaim && typeof clearClaimReceipt==='function'?clearClaimReceipt():'';if(claimClearError)toast(claimClearError);
       if(operation.owner.role==='team' && operation.owner.loginId){
         try{localStorage.setItem(teamLogoutKey,operation.owner.loginId);}catch{/* Revalidate on focus when storage is unavailable. */}
       }
-      let cleaned=true;if(local && (owned() || operation.owner.loginId))cleaned=local.purge();if(!owned())return;submissionDirty=false;reviewDirty=false;scoreDirty=false;dirtyAdminForms.clear();currentTeamRecovery?.lock('已退出。');session={role:null};await renderRoute();if(!cleaned)toast('已退出，但无法确认本队本地副本已清理，请在共享设备上清除此站点的浏览器数据。');
+      let cleaned=true;if(local && (owned() || operation.owner.loginId))cleaned=local.purge();if(!owned())return;submissionDirty=false;reviewDirty=false;scoreDirty=false;dirtyAdminForms.clear();currentTeamRecovery?.lock('已退出。');session={role:null};await renderRoute();if(!cleaned)toast('已退出，但无法确认本队本地副本已清理，请在共享设备上清除此站点的浏览器数据。');return true;
     }catch(error){if(owned() || (logoutInFlight===operation && !session.role))toast('退出未确认，本地副本已保留。'+error.message);}
     finally{if(logoutInFlight===operation)logoutInFlight=null;if(button.isConnected)button.disabled=false;}
+}
+
+async function openClaimWorkbench(event){
+  event.preventDefault();
+  if(!confirmLeave())return;
+  if(session.role && !await logoutAccount(event,{preserveClaim:true}))return;
+  location.hash='team';
 }
 
 function heading(kicker,title,description,tools='') { return `<div class="page-heading"><div><p class="eyebrow">${kicker}</p><h1>${title}</h1><p>${description}</p></div>${tools ? `<div class="heading-tools">${tools}</div>` : ''}</div>`; }
@@ -186,8 +196,8 @@ function renderLogin(role) {
   const roleLabel={team:'TEAM',judge:'JUDGE',audience:'AUDIENCE',admin:'ADMIN'}[role];
   if (!Object.hasOwn(roleName,role)) throw new Error('无效登录入口');
   const stage=stageForRoute();
-  const copy = {team:route==='team-score'?['本队查分','输入主办方发给本队的提交码，查看本队已发布的专业评分总分。']:['选手工作台<br>AI 工具 · 作品提交','用本队提交码登录，在同一工作台查看 AI 工具、准备代码仓库和提交作品。没有提交码，请先申请现场核验。'],judge:route==='judge'?['专业评分<br>六维 100 分','使用主办方提供的评委码，选择自己的身份。评分可保存草稿，正式提交后计入专业均分。']:[`${stageName(stage)}记录`,'使用主办方提供的评委码，选择自己的身份。可查看本轮队伍、保存草稿、提交评语或回避；本阶段记录暂不计分。'],audience:['选出让你<br>眼前一亮的作品。','观众选择票独立于专业成绩。使用观众邀请码登录，每个邀请码最多支持 3 支不同队伍。'],admin:['组织方<br>活动管理','管理队伍、评委、评审窗口和作品材料。请使用主办方管理码登录。']}[role];
-  root.innerHTML = `<div class="login-layout"><div class="login-story"><p class="eyebrow">GOTC 2026 / ${roleLabel}</p><h1>${copy[0].split('<br>').map(esc).join('<br>')}</h1><p>${esc(copy[1])}</p><span class="login-pixel" aria-hidden="true"></span></div><form class="login-card" id="login-form"><h2>${esc(roleName[role])}登录</h2>${role==='team'?'<p><a href="#claim">尚无提交码？申请现场核验与领取 ↗</a></p>':''}<p>邀请码仅用于本届活动，请妥善保管。<br>如未收到或无法登录，请联系现场主办方。</p><label class="field">${role === 'admin' ? '组织方管理码' : (role === 'judge' ? '评委登录码' : role === 'team' ? '队伍提交码' : '观众邀请码')}<input name="code" type="password" autocomplete="one-time-code" required maxlength="160" placeholder="输入你的${role === 'admin' ? '管理码' : '邀请码'}"></label><p class="form-error" role="alert"></p><button type="submit" class="btn">${route==='team-score'?'查看本队成绩':'进入'+esc(roleName[role])+'工作台 ↗'}</button><p class="form-footnote">公众查看成绩和评审进度无需登录。<a href="${route==='judge' || route==='team-score'?'#board':stage==='roadshow'?'#board-roadshow':'#board-exhibition'}">查看公开看板 →</a></p></form></div>`;
+  const copy = {team:route==='team-score'?['本队查分','输入主办方发给本队的提交码，查看本队已发布的总分、六维均分及评委同意分享的匿名评语。']:['选手工作台<br>AI 工具 · 作品提交','用本队提交码登录，在同一工作台查看 AI 工具、准备代码仓库和提交作品。没有提交码，请先提交队伍申请。'],judge:route==='judge'?['专业评分<br>六维 100 分','使用主办方提供的评委码，选择自己的身份。评分可保存草稿，正式提交后计入专业均分。']:[`${stageName(stage)}记录`,'使用主办方提供的评委码，选择自己的身份。可查看本轮队伍、保存草稿、提交评语或回避；本阶段记录暂不计分。'],audience:['选出让你<br>眼前一亮的作品。','观众选择票独立于专业成绩。使用观众邀请码登录，每个邀请码最多支持 3 支不同队伍。'],admin:['组织方<br>活动管理','管理队伍、评委、评审窗口和作品材料。请使用主办方管理码登录。']}[role];
+  root.innerHTML = `<div class="login-layout"><div class="login-story"><p class="eyebrow">GOTC 2026 / ${roleLabel}</p><h1>${copy[0].split('<br>').map(esc).join('<br>')}</h1><p>${esc(copy[1])}</p><span class="login-pixel" aria-hidden="true"></span></div><form class="login-card" id="login-form"><h2>${esc(roleName[role])}登录</h2>${role==='team'?'<p><a href="#claim">尚无提交码？提交队伍申请并领取 ↗</a></p>':''}<p>邀请码仅用于本届活动，请妥善保管。<br>如无法登录，请核对审核状态或联系主办方。</p><label class="field">${role === 'admin' ? '组织方管理码' : (role === 'judge' ? '评委登录码' : role === 'team' ? '队伍提交码' : '观众邀请码')}<input name="code" type="password" autocomplete="one-time-code" required maxlength="160" placeholder="输入你的${role === 'admin' ? '管理码' : '邀请码'}"></label><p class="form-error" role="alert"></p><button type="submit" class="btn">${route==='team-score'?'查看本队成绩':'进入'+esc(roleName[role])+'工作台 ↗'}</button><p class="form-footnote">公众查看成绩和评审进度无需登录。<a href="${route==='judge' || route==='team-score'?'#board':stage==='roadshow'?'#board-roadshow':'#board-exhibition'}">查看公开看板 →</a></p></form></div>`;
   const form=document.getElementById('login-form');
   const scoreLoginVersion=route==='team-score'?routeVersion:null;
   const identityField=document.createElement('label');
@@ -226,7 +236,7 @@ function renderLogin(role) {
     }catch(error){formError(form,error.message);}finally{if(button.isConnected)button.disabled=false;}
   };
 }
-function renderWrongRole(role) { root.innerHTML = heading('ACCESS / 登录身份','请使用对应的邀请码',`当前身份为${esc(roleName[session.role] || session.role)}，此入口需要${roleName[role]}身份。`) + empty('切换登录身份','退出当前账号后，使用此入口的专属邀请码登录。','<button class="btn" id="switch-role">退出并切换</button>');document.getElementById('switch-role').onclick=logoutAccount; }
+function renderWrongRole(role) { root.innerHTML = heading('ACCESS / 登录身份','请使用对应的邀请码',`当前身份为${esc(roleName[session.role] || session.role)}，此入口需要${roleName[role]}身份。`) + empty('切换登录身份','切换后使用此入口的专属邀请码登录；独立的队伍申请凭据会保留，可返回申请页领取提交码。','<button class="btn" id="switch-role">切换身份（保留申请）</button>');document.getElementById('switch-role').onclick=event=>logoutAccount(event,{preserveClaim:true}); }
 function reviewState(record){return record?.invalidated?'已作废':record?.recused?'已回避':record?.submitted?(record.hasUnsubmittedChanges?'已正式提交 · 有草稿修改':'已正式提交（未计分）'):record?.draft?'草稿已保存':'待评审';}
 function reviewMaterialMarkup(snapshot,stage=null){return `<section class="surface submitted-materials"><h2>本轮正式材料快照</h2>${stage?`<p class="small-note">轮次 ${esc(stage.runId)} · 冻结时间 ${esc(beijingTime(stage.frozenAt))}（北京时间）</p>`:''}${snapshot?`<p class="small-note">队伍提交版本 ${Number(snapshot.submissionVersion)} · 正式提交 ${esc(beijingTime(snapshot.submittedAt))}<br>本轮截取 ${esc(beijingTime(snapshot.capturedAt))}（北京时间）</p>${materialMarkup(snapshot.materials)}`:!stage?'<p class="small-note">本轮没有正式材料快照。</p>':stage.frozenAt===null?'<p class="small-note">尚未生成材料快照；首次开放时截取当时的正式材料。</p>':'<p class="small-note">本轮冻结时无正式材料；可根据现场演示记录观察。后续提交材料不会自动替换本轮快照。</p>'}</section>`;}
 async function renderExhibitionJudge(version,expectedForm=null,stage=stageForRoute()){
@@ -620,17 +630,35 @@ function teamRepositoryMarkup(data){
   const repository=data.repository,providers=data.repositoryProviders || [],enabled=providers.some(p=>p.enabled);
   return `<section class="surface repository-panel" id="team-repository"><h2>本队代码仓库</h2>${repository?repositoryStatusMarkup(repository):`<p>申请主办方组织下的本队独立仓库。管理员核对用户名归属后授予本仓库写权限。</p>${providers.map(p=>`<p class="small-note">${esc(p.provider)} · ${esc(p.organization)} · ${esc(p.message)}</p>`).join('')}${!enabled?'<p>组织仓库尚未启用，请联系组织方；已有队伍仍可使用当前材料表单。</p>':`<form id="repository-application"><label class="field">仓库平台<select name="provider">${providers.map(p=>`<option value="${esc(p.provider)}" ${p.enabled?'':'disabled'}>${esc(p.provider)}${p.enabled?'':'（尚未启用）'}</option>`).join('')}</select></label><label class="field">开发者用户名<textarea name="usernames" required rows="3" maxlength="220" placeholder="每行一个用户名，最多 5 人；不要填网址或邮箱"></textarea></label><button class="btn secondary" type="submit">申请本队仓库</button><p class="form-error" role="alert"></p></form>`}`}${repository?'<button type="button" class="btn secondary small" id="refresh-team-repository">刷新仓库状态</button>':''}<p id="repository-message" role="status"></p></section>`;
 }
-function installTeamRepository(data,version,isCurrent){
+function syncRepositoryMaterialFields(data,previous){
+  const form=document.getElementById('submission-form');if(!form || !data.repository?.codeUrl)return;
+  for(const key of ['codeUrl','codeVersion']){
+    const input=form.elements[key];if(!input)continue;
+    input.required=false;input.type='hidden';const label=input.closest?.('label');if(label)label.hidden=true;
+    if(key==='codeUrl')input.value=data.repository.codeUrl;
+    else if(previous?.codeUrl!==data.repository.codeUrl)input.value='';
+  }
+  if(leanGitee(data)){
+    const preserved=[];
+    for(const key of repositoryMaterialFields){
+      const input=form.elements[key];if(!input)continue;
+      if(input.value)preserved.push((materialFields.find(f=>f[0]===key)?.[1] || key)+'：\n'+input.value);
+      input.required=false;input.disabled=true;const label=input.closest?.('label');if(label)label.hidden=true;
+    }
+    if(!form.querySelector('[data-repository-material-note]'))form.insertAdjacentHTML('afterbegin',repositoryMaterialNote()+
+      (preserved.length?`<details data-repository-previous-input><summary>复制切换前的仓库说明输入</summary><p>这些输入保留在本页供复制到仓库，后续保存不再提交这些重复字段。</p><pre class="preserve-text">${esc(preserved.join('\n\n'))}</pre></details>`:''));
+  }
+}
+function repositoryMaterialNote(){return '<p class="small-note" data-repository-material-note>本队已绑定 Gitee。请用 Git push，并在仓库内维护 README / 运行说明、许可证、第三方来源和已知局限；无需在官网重复填写。正式提交将指向核验后的固定 SHA，平台不检查这些文件是否存在。</p>';}
+function installTeamRepository(data,version,isCurrent,onUpdate=()=>{}){
   const box=document.getElementById('team-repository'),loginId=session.loginId;
   if(!box)return;
   const live=()=>box.isConnected && version===routeVersion && isCurrent();
   async function update(result){
     if(!live())return;
-    data.repository=result.repository;data.repositoryProviders=result.providers || data.repositoryProviders;
-    if(data.repository?.codeUrl){
-      for(const key of ['codeUrl','codeVersion']){const input=document.getElementById('material-'+key);if(input){input.required=false;input.type='hidden';if(input.closest?.('label'))input.closest('label').hidden=true;input.value=key==='codeUrl'?data.repository.codeUrl:'';}}
-    }
-    box.outerHTML=teamRepositoryMarkup(data);installTeamRepository(data,version,isCurrent);
+    const previous=data.repository;data.repository=result.repository;data.repositoryProviders=result.providers || data.repositoryProviders;
+    syncRepositoryMaterialFields(data,previous);onUpdate();
+    box.outerHTML=teamRepositoryMarkup(data);installTeamRepository(data,version,isCurrent,onUpdate);
   }
   const form=document.getElementById('repository-application');
   if(form)form.onsubmit=e=>{e.preventDefault();return withBusy(form.querySelector('button'),async()=>{if(!live())return;try{const usernames=form.elements.usernames.value.split(/[\s,，]+/).filter(Boolean);await update(await api('team/repository/apply',{provider:form.elements.provider.value,usernames},{loginId}));}catch(error){if(live())formError(form,error.message);}});};
@@ -653,7 +681,7 @@ async function installRepositoryAdmin(existing=null,owner=session){
     document.getElementById('refresh-repositories').onclick=e=>withBusy(e.currentTarget,()=>installRepositoryAdmin(box,owner));
   }catch(error){if(live())box.innerHTML=`<h3>组织仓库申请</h3><p role="alert">${esc(error.message)}</p>`;}
 }
-function teamFormMarkup(data){const s=data.submission,materials=s.draft || {projectName:data.team.project || ''},lean=leanGitee(data);const groups=[['项目说明',['projectName','summary','sourcesAndLimitations']],['代码与运行',['codeUrl','codeVersion','readmeUrl','license','licenseUrl','demoUrl','demoInstructions']],['展示材料',['slidesUrl','videoUrl']]];return `<form id="submission-form" class="surface submission-form" novalidate><h2>项目材料草稿</h2><p class="small-note">带 * 为正式提交必填；保存草稿可缺项。PPT 和视频各填一个 HTTPS 分享链接。请确保仓库公开、材料链接无需登录即可访问。平台保存字段和 URL；Gitee 正式版本封存状态见下方；已有独立源码备份可继续下载。PPT 和视频不备份。</p><p><a href="downloads/gotc-gitee-submission-guide.pdf" target="_blank" rel="noopener noreferrer">下载选手指南（PDF）</a></p>${lean?'<p class="small-note">本队已绑定 Gitee。请用 Git push，并在仓库内维护 README / 运行说明、许可证、第三方来源和已知局限；无需在官网重复填写。正式提交将指向核验后的固定 SHA，平台不检查这些文件是否存在。</p>':''}<fieldset ${data.window.canEdit?'':'disabled'}>${groups.map(([title,keys])=>`<h3>${title}</h3><div class="form-grid">${keys.filter(key=>!lean || !repositoryMaterialFields.has(key)).map(key=>{if(data.repository?.codeUrl && ['codeUrl','codeVersion'].includes(key))return `<input id="material-${key}" type="hidden" name="${key}" value="${esc(key==='codeUrl'?data.repository.codeUrl:'')}">`;const [,label,limit,type,required]=materialFields.find(f=>f[0]===key);return `<label class="field ${type==='textarea' || submissionHelp[key]?'wide':''}" for="material-${key}">${esc(label)}${required?' *':''}${type==='textarea'?`<textarea id="material-${key}" name="${key}" maxlength="${limit}" ${required?'required':''}>${esc(materials[key] || '')}</textarea>`:`<input id="material-${key}" name="${key}" type="${type}" maxlength="${limit}" value="${esc(materials[key] || '')}" ${required?'required':''} ${type==='url'?'placeholder="https://…"':''} ${submissionHelp[key]?`aria-describedby="help-${key}"`:''}>`}${submissionHelp[key]?`<small id="help-${key}">${esc(submissionHelp[key])}</small>`:''}</label>`;}).join('')}</div>`).join('')}<label class="toggle-line" for="material-confirmed"><input id="material-confirmed" type="checkbox" name="confirmed" ${materials.confirmed?'checked':''} required><span>我已检查材料可访问，填写开源与来源信息，并移除个人隐私和密钥。此为队伍自查声明。</span></label><div class="form-actions"><button type="button" id="save-submission-draft" class="btn secondary">保存草稿</button><button type="submit" class="btn">检查并正式提交 ↗</button></div></fieldset><div id="submission-errors" role="alert" tabindex="-1"></div><p class="form-error" role="alert"></p></form>`;}
+function teamFormMarkup(data){const s=data.submission,materials=s.draft || {projectName:data.team.project || ''},lean=leanGitee(data);const groups=[['项目说明',['projectName','summary','sourcesAndLimitations']],['代码与运行',['codeUrl','codeVersion','readmeUrl','license','licenseUrl','demoUrl','demoInstructions']],['展示材料',['slidesUrl','videoUrl']]];return `<form id="submission-form" class="surface submission-form" novalidate><h2>项目材料草稿</h2><p class="small-note">带 * 为正式提交必填；保存草稿可缺项。PPT 和视频各填一个 HTTPS 分享链接。请确保仓库公开、材料链接无需登录即可访问。平台保存字段和 URL；Gitee 正式版本封存状态见下方；已有独立源码备份可继续下载。PPT 和视频不备份。</p><p><a href="downloads/gotc-gitee-submission-guide.pdf" target="_blank" rel="noopener noreferrer">下载选手指南（PDF）</a></p>${lean?repositoryMaterialNote():''}<fieldset ${data.window.canEdit?'':'disabled'}>${groups.map(([title,keys])=>`<h3>${title}</h3><div class="form-grid">${keys.filter(key=>!lean || !repositoryMaterialFields.has(key)).map(key=>{if(data.repository?.codeUrl && ['codeUrl','codeVersion'].includes(key))return `<input id="material-${key}" type="hidden" name="${key}" value="${esc(key==='codeUrl'?data.repository.codeUrl:(materials.codeUrl===data.repository.codeUrl && /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(materials.codeVersion || '')?materials.codeVersion:''))}">`;const [,label,limit,type,required]=materialFields.find(f=>f[0]===key);return `<label class="field ${type==='textarea' || submissionHelp[key]?'wide':''}" for="material-${key}">${esc(label)}${required?' *':''}${type==='textarea'?`<textarea id="material-${key}" name="${key}" maxlength="${limit}" ${required?'required':''}>${esc(materials[key] || '')}</textarea>`:`<input id="material-${key}" name="${key}" type="${type}" maxlength="${limit}" value="${esc(materials[key] || '')}" ${required?'required':''} ${type==='url'?'placeholder="https://…"':''} ${submissionHelp[key]?`aria-describedby="help-${key}"`:''}>`}${submissionHelp[key]?`<small id="help-${key}">${esc(submissionHelp[key])}</small>`:''}</label>`;}).join('')}</div>`).join('')}<label class="toggle-line" for="material-confirmed"><input id="material-confirmed" type="checkbox" name="confirmed" ${materials.confirmed?'checked':''} required><span>我已检查材料可访问，填写开源与来源信息，并移除个人隐私和密钥。此为队伍自查声明。</span></label><div class="form-actions"><button type="button" id="save-submission-draft" class="btn secondary">保存草稿</button><button type="submit" class="btn">检查并正式提交 ↗</button></div></fieldset><div id="submission-errors" role="alert" tabindex="-1"></div><p class="form-error" role="alert"></p></form>`;}
 function submissionProblems(materials,formal,options={}){
   const errors=[];
   for(const [key,label,limit,type,required] of materialFields){if(options.leanGitee && repositoryMaterialFields.has(key) || options.awaitingSha && key==='codeVersion')continue;const value=materials[key] || '';let message='';if(formal && required && !value)message='请填写'+label;else if(Array.from(value).length>limit || (key==='codeVersion' && new TextEncoder().encode(value).length>1024))message=label+'超过长度限制';else if(type==='url' && value && !safeMaterialUrl(value))message=label+'请填写完整 HTTPS 链接';if(message)errors.push({key,message});}
@@ -734,10 +762,10 @@ async function renderTeam(version,provided=null,received=false,owner=null){
   const form=document.getElementById('submission-form'),preview=document.getElementById('submission-preview');let currentVersion=s.version,blocked=!data.window.canEdit,inputRevision=0;
   let observedInputs=JSON.stringify({...rawTeamMaterials(form),confirmed:form.elements.confirmed.checked});function changedInputs(){if(!local.isAuthorized())return;const next=JSON.stringify({...rawTeamMaterials(form),confirmed:form.elements.confirmed.checked});if(next===observedInputs)return;observedInputs=next;inputRevision++;submissionDirty=true;local.input();preview.innerHTML='';document.getElementById('submission-edit-state').textContent='当前修改尚未保存或正式提交；最近正式材料保持不变。';}form.addEventListener('input',changedInputs);form.addEventListener('change',changedInputs);
   const local=installTeamRecovery(data,form,version,{restore(materials,next){for(const [key] of materialFields)if(form.elements[key])form.elements[key].value=materials[key];form.elements.confirmed.checked=false;submissionDirty=true;blocked=!next.window.canEdit;form.querySelector('fieldset').disabled=blocked;preview.innerHTML='';document.getElementById('submission-edit-state').textContent='本地副本已填入表单，尚未保存服务器或正式提交。';},loadLatest(next){if(!local.isAuthorized())return;submissionDirty=false;renderTeam(version,next,false,local);},onWindow(window){if(!window.canEdit){blocked=true;form.querySelector('fieldset').disabled=true;}}},expectedEpoch);
-  installTeamRepository(data,version,()=>local.isAuthorized());
+  installTeamRepository(data,version,()=>local.isAuthorized(),()=>{preview.innerHTML='';changedInputs();});
   if(s.submitted)installRepositoryBackup(document.getElementById('team-repository-proof'),'team',s.submittedVersion,s.submitted,()=>local.isAuthorized(),{teamId:data.team.id,latest:true});
   installSubmissionHistory(document.getElementById('submission-history'),'submission/history',()=>local.isAuthorized(),{teamId:data.team.id});
-  function values(){return Object.fromEntries([...materialFields.filter(([key])=>!!form.elements[key]).map(([key])=>[key,form.elements[key].value.trim()]),['confirmed',form.elements.confirmed.checked]]);}
+  function values(){return Object.fromEntries([...materialFields.filter(([key])=>!!form.elements[key] && !(leanGitee(data) && repositoryMaterialFields.has(key))).map(([key])=>[key,form.elements[key].value.trim()]),['confirmed',form.elements.confirmed.checked]]);}
   function validate(materials,formal,awaitingSha=false){const errors=submissionProblems(materials,formal,{leanGitee:leanGitee(data),awaitingSha}),box=document.getElementById('submission-errors');box.innerHTML=errors.length?`<p>请检查以下 ${errors.length} 项：</p><ul>${errors.map(({key,message})=>`<li><a href="#material-${key}" data-error-field="${key}">${esc(message)}</a></li>`).join('')}</ul>`:'';box.querySelectorAll('[data-error-field]').forEach(link=>link.onclick=e=>{e.preventDefault();form.elements[link.dataset.errorField].focus();form.elements[link.dataset.errorField].scrollIntoView({block:'center'});});if(errors.length)box.focus();return errors.length===0;}
   function preserve(){form.querySelector('fieldset').disabled=false;form.querySelectorAll('input,textarea').forEach(input=>{if(input.type==='checkbox')input.disabled=true;else input.readOnly=true;});form.querySelectorAll('button').forEach(button=>button.disabled=true);preview.innerHTML='';}
   function recovery(message,requestId=null){const box=document.getElementById('submission-conflict');box.innerHTML=`<section class="surface"><h2>当前输入已保留</h2><p>${esc(message)}</p>${requestId?`<p class="request-number">本次请求编号：<code>${esc(requestId)}</code></p><button type="button" class="btn secondary" id="query-submission-request">查询这次请求结果</button><div id="submission-request-result" role="status"></div>`:''}<p>读取最新记录仅供核对，不代表本次操作成功；不会自动重发。请先复制需要保留的输入。</p><button type="button" class="btn secondary" id="load-latest-submission">读取服务器最新记录</button><div id="latest-submission"></div></section>`;if(requestId)document.getElementById('query-submission-request').onclick=e=>withBusy(e.currentTarget,async()=>{if(!local.isAuthorized())return;const receipt=await api('submission/requests/'+encodeURIComponent(requestId));if(!local.isAuthorized())return;document.getElementById('submission-request-result').innerHTML=requestReceiptMarkup(receipt,requestId);if(receipt.requestId===requestId && ['succeeded','rejected'].includes(receipt.status))formError(form,'');});document.getElementById('load-latest-submission').onclick=e=>withBusy(e.currentTarget,async()=>{if(!local.isAuthorized())return;const latest=await api('team');if(!local.isAuthorized())return;document.getElementById('latest-submission').innerHTML=windowMarkup(latest.window)+submissionReceiptMarkup(latest)+judgingMaterialsMarkup(latest.judgingMaterials,latest.submission.submittedVersion)+`<h3>服务器最新草稿 · 编辑版本 ${latest.submission.version}</h3>${materialMarkup(latest.submission.draft)}<button type="button" class="btn secondary" id="restart-submission">使用最新草稿重新编辑</button>`;document.getElementById('restart-submission').onclick=()=>{if(!local.isAuthorized())return;if(confirm('确认放弃上方尚未保存的输入，并使用最新草稿重新编辑？请先复制要保留的内容。')){submissionDirty=false;renderTeam(version,latest,false,local);}};});box.scrollIntoView({block:'start'});}
@@ -867,8 +895,8 @@ function createTeamKeyContext(version){
   currentTeamKeys?.dispose();
   const owner=session,loginId=owner.loginId,box=document.getElementById('team-keys'),out=document.getElementById('new-api-key');
   const authorization=currentTeamRecovery?.sessionOwner===owner?currentTeamRecovery:null;
-  const context={owner,loginId,box,out,active:true,busy:false,copying:false,key:'',data:null,generation:0,
-    dispose(){this.active=false;this.key='';if(out)out.innerHTML='';},
+  const context={owner,loginId,box,out,active:true,busy:false,copying:false,key:'',pendingKey:null,data:null,generation:0,
+    dispose(){this.active=false;this.key='';this.pendingKey=null;if(out)out.innerHTML='';},
     lock(){this.dispose();if(box?.isConnected && document.getElementById('team-keys')===box)box.innerHTML=`<h2>AI API 密钥</h2><p class="small-note" role="alert">${teamKeyLoginNotice}</p>`;},
     valid(){
       if(!this.active)return false;
@@ -886,6 +914,25 @@ function createTeamKeyContext(version){
   };
   currentTeamKeys=context;return context;
 }
+function revealPendingTeamKey(view){
+  if(!view.valid() || !view.pendingKey)return;const result=view.pendingKey;view.pendingKey=null;
+  view.key=result.key;
+  const out=view.out;
+  out.innerHTML=`<div class="code-output"><strong>新密钥 · ${esc(result.item.name)}</strong><code>${esc(view.key)}</code><p>仅显示这一次，离开或刷新页面后无法再查看。请立即复制保存。</p><button type="button" class="btn secondary small" id="copy-api-key">复制密钥</button>${setupSnippets(view.data,view.key)}</div>`;
+  const copy=document.getElementById('copy-api-key');
+  copy.onclick=async()=>{
+    if(!view.valid() || view.copying || !view.key || !copy.isConnected || document.getElementById('copy-api-key')!==copy)return;
+    const value=view.key;view.copying=true;copy.disabled=true;
+    try{
+      await view.request('team/keys');
+      if(!view.valid() || view.key!==value || !copy.isConnected || document.getElementById('copy-api-key')!==copy)return;
+      await navigator.clipboard.writeText(value);
+      if(view.valid() && view.key===value)toast('密钥已复制。');
+    }catch(error){if(view.valid())toast('复制未完成，请核对登录身份后重试。'+error.message);}
+    finally{view.copying=false;if(view.valid() && copy.isConnected)copy.disabled=false;}
+  };
+  out.scrollIntoView({block:'center'});
+}
 async function loadTeamKeys(version,context=null){
   const view=context || createTeamKeyContext(version),box=view.box;
   if(!view.valid())return false;
@@ -893,9 +940,12 @@ async function loadTeamKeys(version,context=null){
   const alive=()=>view.valid() && generation===view.generation;
   let data;
   try{data=await view.request('team/keys');}
-  catch(error){if(alive())box.innerHTML=`<h2>AI API 密钥</h2><p class="small-note">${esc(error.message)}</p>`;return false;}
+  catch(error){if(alive()){
+    box.innerHTML=`<h2>AI API 密钥</h2><p class="small-note" role="status">${view.pendingKey?'密钥已创建，正在等待身份验证；请保持本页，重试验证不会创建第二把密钥。':''}${esc(error.message)}</p><button type="button" class="btn secondary small" id="retry-team-keys">重试读取 / 验证</button>`;
+    document.getElementById('retry-team-keys').onclick=async()=>{if(!view.valid() || view.busy)return;view.busy=true;try{await loadTeamKeys(version,view);}finally{view.busy=false;if(view.valid())view.updateButtons?.();}};
+  }return false;}
   if(!alive())return false;
-  if(!data.enabled){view.key='';view.out.innerHTML='';box.innerHTML='<h2>AI API 密钥</h2><p class="small-note">本队 API 访问权限尚未开通或已停用，请联系组织方。</p>';return false;}
+  if(!data.enabled){view.key='';view.pendingKey=null;view.out.innerHTML='';box.innerHTML='<h2>AI API 密钥</h2><p class="small-note">本队 API 访问权限尚未开通或已停用，请联系组织方。</p>';return false;}
   view.data=data;
   const usage=data.usage,keys=data.keys,full=keys.length>=data.maxKeys,models=Object.entries(data.models).map(([kind,list])=>`${kind==='openai'?'OpenAI 兼容':'Anthropic'}：${list.map(esc).join('、')}`).join('<br>');
   box.innerHTML=`<h2>AI API 密钥</h2>${data.announcement?`<div class="info-banner warning"><strong>组织方公告</strong><br>${esc(data.announcement)}</div>`:''}<p class="small-note">OpenAI 兼容 SDK 的 base_url：<code>${esc(data.baseUrl)}/v1</code><br>Anthropic SDK 的 base_url：<code>${esc(data.baseUrl)}</code><br>${models}</p>${metrics([[usd(usage.used24h),'近24小时全队已用'],[usd(usage.usedTotal),'累计全队已用'],[`${keys.length} / ${data.maxKeys}`,'有效密钥'],[data.expiresAt===null?'未设置':beijingTime(data.expiresAt),'访问到期（北京时间）']])}${data.logContent?'<div class="info-banner">组织方会记录每次 API 调用的请求与回复内容（不含密钥），用于用量核对与安全审查，请勿发送个人隐私或敏感信息。</div>':''}<div class="info-banner warning">密钥只在创建时显示一次，请放入环境变量，切勿提交到代码仓库；疑似泄露请立即删除并重新创建。</div><div class="invite-list">${keys.map(k=>`<div class="invite-row"><span>${esc(k.name)}<small><code>${esc(k.masked)}</code> · 近24小时 ${usd(k.used24h)} · 累计 ${usd(k.usedTotal)} · ${Number(k.requests)} 次请求 · 最近使用 ${esc(beijingTime(k.lastUsedAt))}</small></span><button type="button" class="btn danger small" data-key-delete="${esc(k.id)}">删除</button></div>`).join('') || '<p class="small-note">尚未创建密钥。</p>'}</div>${setupSnippets(data,'<你的密钥>')}<h3>本队最近调用</h3><div id="team-calls"><p class="small-note">读取中…</p></div><form id="key-form"><div class="settings-row"><label class="field">新密钥名称<input name="name" required maxlength="40" placeholder="例如：alice-laptop" ${full?'disabled':''}></label><button class="btn small" type="submit" ${full?'disabled':''}>创建密钥 ↗</button></div><p class="form-error" role="alert"></p></form>`;
@@ -908,24 +958,9 @@ async function loadTeamKeys(version,context=null){
     try{
       const result=await view.request('team/keys',{name:form.elements.name.value.trim()});
       if(!alive())return;
-      // Revalidate with the captured identity before revealing the result, including when localStorage is unavailable.
-      if(!await loadTeamKeys(version,view) || !view.valid())return;
-      view.key=result.key;
-      const out=view.out;
-      out.innerHTML=`<div class="code-output"><strong>新密钥 · ${esc(result.item.name)}</strong><code>${esc(view.key)}</code><p>仅显示这一次，离开或刷新页面后无法再查看。请立即复制保存。</p><button type="button" class="btn secondary small" id="copy-api-key">复制密钥</button>${setupSnippets(view.data,view.key)}</div>`;
-      const copy=document.getElementById('copy-api-key');
-      copy.onclick=async()=>{
-        if(!view.valid() || view.copying || !view.key || !copy.isConnected || document.getElementById('copy-api-key')!==copy)return;
-        const value=view.key;view.copying=true;copy.disabled=true;
-        try{
-          await view.request('team/keys');
-          if(!view.valid() || view.key!==value || !copy.isConnected || document.getElementById('copy-api-key')!==copy)return;
-          await navigator.clipboard.writeText(value);
-          if(view.valid() && view.key===value)toast('密钥已复制。');
-        }catch(error){if(view.valid())toast('复制未完成，请核对登录身份后重试。'+error.message);}
-        finally{view.copying=false;if(view.valid() && copy.isConnected)copy.disabled=false;}
-      };
-      out.scrollIntoView({block:'center'});
+      view.pendingKey=result;view.key='';view.out.innerHTML='';
+      // Only a protected read can reveal this captured one-time response.
+      await loadTeamKeys(version,view);
     }catch(error){if(alive() && form.isConnected)formError(form,error.message);}
     finally{view.busy=false;if(view.valid())view.updateButtons?.();}
   };
@@ -942,6 +977,7 @@ async function loadTeamKeys(version,context=null){
   const calls=document.getElementById('team-calls');
   view.request('team/keys/logs').then(logs=>{if(alive() && calls.isConnected && document.getElementById('team-calls')===calls)calls.innerHTML=callTable(logs.items,false);})
     .catch(error=>{if(alive() && calls.isConnected && document.getElementById('team-calls')===calls)calls.innerHTML=`<p class="small-note">${esc(error.message)}</p>`;});
+  revealPendingTeamKey(view);
   return true;
 }
 async function loadKeyAdmin(teams,version){const box=document.getElementById('key-admin');let data;try{data=await api('admin/keys');}catch(e){if(version===routeVersion && box?.isConnected)box.innerHTML=`<p class="small-note">${esc(e.message)}</p>`;return;}if(version!==routeVersion || !box?.isConnected)return;
@@ -1079,5 +1115,5 @@ function refreshVisibleTeamScore(){
 window.addEventListener('focus',refreshVisibleTeamScore);
 window.addEventListener('pageshow',event=>{if(event.persisted)refreshVisibleTeamScore();});
 window.addEventListener('pagehide',()=>currentTeamRecovery?.flush());
-window.addEventListener('beforeunload',event=>{currentTeamRecovery?.flush();if(submissionDirty || reviewDirty || scoreDirty || dirtyAdminForms.size){event.preventDefault();event.returnValue='';}});
+window.addEventListener('beforeunload',event=>{currentTeamRecovery?.flush();if(claimNavigationState().pendingInitial || claimNavigationState().dirty || submissionDirty || reviewDirty || scoreDirty || dirtyAdminForms.size){event.preventDefault();event.returnValue='';}});
 (async()=>{try{session=await api('session');}catch{session={role:null};}await renderRoute();})();

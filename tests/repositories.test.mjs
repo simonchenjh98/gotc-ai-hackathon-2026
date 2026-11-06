@@ -16,13 +16,14 @@ function fixture(options={}){
     const item={id,isConnected:true,disabled:false,readOnly:false,value:'',checked:false,dataset:{},listeners:{},classList:{add(){},remove(){}},addEventListener(kind,fn){this.listeners[kind]=fn;},focus(){},scrollIntoView(){},querySelectorAll(){return [];},querySelector(){return null;}};
     let html='';Object.defineProperty(item,'innerHTML',{configurable:true,get:()=>html,set(value){html=value;for(const match of value.matchAll(/id="([^"]+)"/g))node(match[1]);}});nodes.set(id,item);return item;
   }
-  const root=node('platform-main');let latest={team:{id:'T1',number:1,name:'Synthetic'},window:{canEdit:true,submissionDeadline:null},submission:{version:0,draft:null,submitted:null},repository:boundRepository,repositoryProviders:providers};
+  const root=node('platform-main');let latest={team:{id:'T1',number:1,name:'Synthetic'},window:{canEdit:true,submissionDeadline:null},submission:options.submission??{version:0,draft:null,submitted:null},repository:boundRepository,repositoryProviders:providers};
   const rootSetter=Object.getOwnPropertyDescriptor(root,'innerHTML').set;
-  Object.defineProperty(root,'innerHTML',{get:()=>root.html || '',set(value){root.html=value;rootSetter(value);const form=node('submission-form');form.elements={};const formHtml=value.match(/<form id="submission-form"[\s\S]*?<\/form>/)?.[0] || '';for(const [key,value] of Object.entries(materials)){if(!formHtml.includes(`name="${key}"`))continue;const input=node('material-'+key);input.value=key==='confirmed'?'':value;input.checked=value===true;form.elements[key]=input;}form.querySelector=selector=>selector==='fieldset'?node('fieldset'):node('form-error');form.querySelectorAll=selector=>selector==='input,textarea'?Object.values(form.elements):[];}});
-  const context=vm.createContext({document:{getElementById:node},location:{href:'https://example.test/platform.html#team'},URL,TextEncoder,Intl,Date,setTimeout,clearTimeout,AbortController});
+  Object.defineProperty(root,'innerHTML',{get:()=>root.html || '',set(value){root.html=value;rootSetter(value);const form=node('submission-form');form.elements={};const formHtml=value.match(/<form id="submission-form"[\s\S]*?<\/form>/)?.[0] || '';for(const [key,value] of Object.entries(materials)){if(!formHtml.includes(`name="${key}"`))continue;const input=node('material-'+key);input.value=key==='confirmed'?'':value;input.checked=value===true;input.label={hidden:false};input.closest=()=>input.label;if(options.readRenderedValues){const tag=formHtml.match(new RegExp('<input[^>]*name="'+key+'"[^>]*>'));const text=formHtml.match(new RegExp('<textarea[^>]*name="'+key+'"[^>]*>([\\s\\S]*?)<\/textarea>'));if(tag){input.value=tag[0].match(/value="([^"]*)"/)?.[1]??'';input.checked=/ checked/.test(tag[0]);}else if(text)input.value=text[1];}form.elements[key]=input;}form.querySelector=selector=>selector==='fieldset'?node('fieldset'):selector==='[data-repository-material-note]'?(form.note?{}:null):node('form-error');form.insertAdjacentHTML=(where,html)=>{form.note=(form.note??'')+html;};form.querySelectorAll=selector=>selector==='input,textarea'?Object.values(form.elements):[];}});
+  const context=vm.createContext({liveRepository:options.liveRepository,document:{getElementById:node},location:{href:'https://example.test/platform.html#team'},URL,TextEncoder,Intl,Date,setTimeout,clearTimeout,AbortController});
   context.transport=async(path,body)=>{
     calls.push({path,body});
     if(path==='team')return context.teamResponse?await context.teamResponse():structuredClone(latest);
+    if(path==='team/repository')return context.repositoryResponse();
     if(path==='team/repository/preview')return context.previewResponse?await context.previewResponse():{previewId,sha,branch:'main',codeUrl:boundRepository.codeUrl,archived:false};
     if(path==='submission'){
       if(context.submissionResponse)await context.submissionResponse(body);
@@ -35,7 +36,7 @@ function fixture(options={}){
   context.recoveryStates=[];
   vm.runInContext(source+`\napi=transport;session={role:'team',loginId:'synthetic-login'};routeVersion=1;route='team';
     installTeamRecovery=()=>({isAuthorized:()=>true,hasAuthorization:()=>true,sessionOwner:session,teamId:'T1',input(){},pending(){},acknowledge(){},result(sent,state){globalThis.recoveryStates.push(state);}});
-    installTeamRepository=()=>{};installSubmissionHistory=()=>{};loadTeamKeys=()=>{};
+    if(!liveRepository)installTeamRepository=()=>{};installSubmissionHistory=()=>{};loadTeamKeys=()=>{};
     globalThis.h={teamFormMarkup,teamRepositoryMarkup,repositoryAdminMarkup,repositoryStatusMarkup,materialMarkup,requestReceiptMarkup,renderTeam};globalThis.render=()=>renderTeam(1);`,context);
   return {context,calls,node,root,h:context.h};
 }
@@ -266,4 +267,30 @@ test('manual and GitHub forms retain README license and sources controls',()=>{
     const html=h.teamFormMarkup({...data,repository:bound});
     for(const key of ['readmeUrl','license','licenseUrl','sourcesAndLimitations'])assert.match(html,new RegExp(`name="${key}"`));
   }
+});
+
+test('requested to ready Gitee transition preserves common inputs, retires obsolete validation, and invalidates preview',async()=>{
+  const ready={...repository,provider:'gitee',state:'ready',codeUrl:'https://gitee.com/synthetic/ready'};
+  const f=fixture({liveRepository:true,repository:{...ready,state:'requested',codeUrl:null}});await f.context.render();
+  const form=f.node('submission-form');form.elements.projectName.value='Unsent project';form.elements.summary.value='Unsent summary';
+  form.elements.readmeUrl.value='unfinished-readme';form.elements.sourcesAndLimitations.value='Copy these source notes';
+  f.node('submission-preview').innerHTML='OLD PREVIEW';f.context.repositoryResponse=async()=>({repository:ready});
+  await f.node('refresh-team-repository').onclick({currentTarget:f.node('refresh-team-repository')});
+  assert.equal(form.elements.projectName.value,'Unsent project');assert.equal(form.elements.summary.value,'Unsent summary');
+  assert.equal(form.elements.slidesUrl.value,materials.slidesUrl);assert.equal(form.elements.readmeUrl.disabled,true);assert.equal(form.elements.readmeUrl.required,false);
+  assert.equal(form.elements.readmeUrl.label.hidden,true);assert.match(form.note,/README/);assert.match(form.note,/unfinished-readme/);assert.match(form.note,/Copy these source notes/);
+  assert.equal(f.node('submission-preview').innerHTML,'');assert.equal(vm.runInContext('submissionDirty',f.context),true);
+  await f.node('save-submission-draft').onclick();const saved=f.calls.find(call=>call.path==='submission').body.materials;
+  assert.equal(saved.projectName,'Unsent project');assert.equal(saved.codeUrl,ready.codeUrl);
+  assert.ok(!Object.hasOwn(saved,'readmeUrl'));assert.ok(!Object.hasOwn(saved,'sourcesAndLimitations'));
+});
+
+test('rendered unchanged bound draft retains its saved full SHA while formal preview still reads the latest server SHA',async()=>{
+  const bound={...repository,provider:'gitee',codeUrl:'https://gitee.com/synthetic/project'},saved={...materials,codeUrl:'https://gitee.com/synthetic/project',codeVersion:sha};
+  const f=fixture({readRenderedValues:true,repository:bound,submission:{version:0,draft:saved,submitted:saved,submittedVersion:1}});await f.context.render();
+  assert.equal(f.node('material-codeVersion').value,sha);
+  await f.node('save-submission-draft').onclick();assert.equal(f.calls.find(call=>call.path==='submission').body.materials.codeVersion,sha);
+  f.context.previewResponse=async()=>({previewId,sha:'c'.repeat(40),branch:'main',codeUrl:bound.codeUrl});
+  await f.node('submission-form').onsubmit({preventDefault(){}});assert.match(f.node('submission-preview').innerHTML,/c{40}/);
+  assert.equal(f.calls.filter(call=>call.path==='team/repository/preview').length,1);
 });

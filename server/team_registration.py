@@ -130,14 +130,14 @@ class TeamRegistration:
         for name in value['members']:
             if db.execute('SELECT 1 FROM claim_people WHERE normalized_name=?', (normalize(name),)).fetchone():
                 continue  # Keep the existing registration's school/identity; do not guess aliases.
-            school = value['school'] if name == value['captain'] else '待现场核实'
+            school = value['school'] if name == value['captain'] else '待核对'
             pending.append((name, school))
         ensure_roster_capacity(db, len(pending))
         for name, school in pending:
             db.execute('''INSERT OR IGNORE INTO claim_people
                 (id,name,school,normalized_name,normalized_school,notes,needs_review)
                 VALUES (?,?,?,?,?,?,1)''', ('R'+secrets.token_hex(12), name, school, normalize(name),
-                                         normalize(school), '来源：组队登记；队员学校未提供，须现场核实本人、学校和归属。'))
+                                         normalize(school), '来源：组队登记；队员学校未提供，须核对本人、学校和归属。'))
 
     def sync_verified_members(self, db, actor, team_id, captain_id, member_ids):
         row = self.row(db, team_id)
@@ -209,17 +209,17 @@ class TeamRegistration:
             raise APIError(409, '队伍资料已变化，本次未保存。请复制当前输入，再重新读取本队资料')
         value = self.clean(body['team'])
         verified = db.execute('SELECT 1 FROM claim_memberships WHERE team_id=?', (row['team_id'],)).fetchone() is not None
-        self.check_duplicates(db, value, row['team_id'], check_members=not verified)
         if verified:
-            members = json.loads(row['members_json'])
-            # The name-only editor cannot distinguish same-name people at different
-            # schools. Compare its distinct display values, but retain every verified
-            # person in the stored list when saving phone/project/summary changes.
-            displayed = list(dict.fromkeys(normalize(name) for name in members))
-            if (value['captain'] != row['captain'] or value['school'] != row['school'] or
-                    [normalize(name) for name in value['members']] != displayed or value['targetSize'] != row['target_size']):
-                raise APIError(409, '本队已完成现场身份核验，成员变化请交由组织方处理')
-            value['members'] = members
+            confirmed=json.loads(row['members_json'])
+            # Keep every approved identity; name-only edits accept the exact full list or ordered tail.
+            if value['captain'] != row['captain'] or value['school'] != row['school'] or body['team']['members'] not in (confirmed,confirmed[1:]):
+                raise APIError(409, '本队成员已获组织方批准，成员变化请交由组织方处理')
+            if value['targetSize']<len(confirmed):
+                raise APIError(400, '目标人数不能少于已批准的完整成员人数')
+            if value['targetSize'] != row['target_size']:
+                raise APIError(409, '本队人数已由组织方确认，人数变化请交由组织方处理')
+            value['members']=confirmed
+        self.check_duplicates(db, value, row['team_id'], check_members=not verified)
         # A registration edit must not overwrite an already submitted project title.
         if db.execute('SELECT 1 FROM submissions WHERE team_id=? AND submitted_json IS NOT NULL', (row['team_id'],)).fetchone() and value['project'] != row['project']:
             raise APIError(409, '已正式提交的项目名称请在选手工作台更新')

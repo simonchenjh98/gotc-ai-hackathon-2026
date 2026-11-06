@@ -138,7 +138,7 @@ class RegistrationTests(unittest.TestCase):
         with self.service.db() as db:
             rows=db.execute("SELECT school FROM claim_people WHERE normalized_name='student a'").fetchall()
             self.assertEqual([r[0] for r in rows],['Actual School'])
-            self.assertEqual(db.execute("SELECT school FROM claim_people WHERE normalized_name='student b'").fetchone()[0],'待现场核实')
+            self.assertEqual(db.execute("SELECT school FROM claim_people WHERE normalized_name='student b'").fetchone()[0],'待核对')
 
     def test_verified_membership_is_not_changed_by_registration_code(self):
         code,team=self.create()

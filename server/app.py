@@ -857,6 +857,8 @@ class EventService:
         urls=("codeUrl", "readmeUrl", "licenseUrl", "demoUrl", "slidesUrl", "videoUrl")
         if not isinstance(materials, dict) or not set(materials).issubset({*limits, *urls, "confirmed"}):
             raise APIError(400, "项目材料字段不正确")
+        if lean_gitee:
+            materials={**materials,**{key:'' for key in ('readmeUrl','license','licenseUrl','sourcesAndLimitations')}}
         result={key: text_field(materials.get(key, ""), key, limit) for key,limit in limits.items()}
         if len(result['codeVersion'].encode('utf-8'))>1024:
             raise APIError(400,'代码版本最多1024字节')
