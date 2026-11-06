@@ -25,6 +25,10 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 组织方可以在私有数据目录放置 `shared-login-codes.json`，用 `admin` 和/或 `judge` 字段配置统一登录码。真实值仅放在该私有文件，不进入 Git 或公开网页。启动时同步仍使用统一码的账号哈希，使已更改密码账号的旧会话失效，保留账号 ID、评分和投票。若配置了评委统一码且还没有任何评委身份，自动创建“评委01”；后续新建评委身份沿用统一码。多位评委共用登录码时，正确输入登录码后选择自己的身份，各自记录分开保存。单独重发的评委会退出统一码，使用自己的新码；启动会保留该独立码，不再恢复统一码，也不出现在统一码的身份选择中。观众邀请码不受统一码影响。
 
+管理员也可在选手入口填写现有统一管理码，服务端仍验证真实管理员账号，登录结果先为 `role: "admin"`。选择有效队伍后进入代管会话，可准备该队材料、申请仓库、查看该队历史及已开通的 API 工具；无需创建学生账号或改变提交码。代管不越过作品提交窗口、模型权限、密钥数量或调用限制。没有学生提交身份的队伍可先准备材料与仓库，但其 API 密钥实际调用仍遵守既有队伍账号启用条件。
+
+代管会话的数据库 `sessions.account_id` 始终属于真实管理员，`admin_team_sessions` 将当前令牌关联到唯一队伍。对选手接口仅呈现该队权限；进入、返回和再次选队都旋转令牌，使旧标签的身份标记失效。管理员账号停用、管理码轮换时删除会话、会话到期或退出后，代管也失效。材料、仓库、密钥等审计记录实际管理员 ID、`role: "admin"` 和 `metadata.operator` 中的目标队伍。旧学生账号和会话保持原有规则。
+
 ## API 合同
 
 下列路径前统一加 `/gotc`（或配置的 base path）。JSON 写入使用 `Content-Type: application/json`，携带同源 Origin 和 Cookie。成功返回 200；错误为 `{ "error": "可读错误说明" }`。错误码包括 400 输入错误、401 未登录、403 身份或来源不符、404 不存在、409 状态冲突、413 超过端点请求上限、415 内容类型错误、429 登录限速、428 缺少必须的编辑版本。版本冲突响应附具体 `code`；旧页面不能省略版本盲写。
@@ -33,8 +37,11 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 |---|---|---|
 | GET `/api/board` | 公开 | `{teams,stats,config,updatedAt,serverTime}`；teams 仅为已发布且达门槛的前 12 名 |
 | GET `/api/team/score` | 本队 | `{team,state,score,dimensions,feedback}`；必须带本页 `X-GOTC-Login` |
-| POST `/api/login` | 公开 | `{role: "admin"\|"judge"\|"audience"\|"team",code}` → `{ok,role,name}`，设置会话 Cookie |
-| GET `/api/session` | 公开 | `{role: null\|"admin"\|"judge"\|"audience"\|"team",name}` |
+| POST `/api/login` | 公开 | `{role: "admin"\|"judge"\|"audience"\|"team",code,accountId?}` → `{ok,role,name,loginId,operator}`，设置会话 Cookie；多身份统一码先返回 `selectAccount,accounts` |
+| GET `/api/session` | 公开 | `{role: null\|"admin"\|"judge"\|"audience"\|"team",name,loginId,operator}`；代管的 operator 为 `{adminId,adminName,teamId,teamName}`，其他身份为 null |
+| GET `/api/admin/team-workbench` | 管理员 | 必带 `X-GOTC-Login`，返回 `{teams:[{id,number,name}],role,name,loginId,operator:null}` |
+| POST `/api/admin/team-workbench` | 管理员 | `{teamId}`，必带 `X-GOTC-Login`，旋转 Cookie 并返回 `{ok,role:"team",name,loginId,operator}` |
+| POST `/api/team/workbench/return` | 管理员代管 | `{}`，必带 `X-GOTC-Login`，旋转 Cookie 恢复 `{ok,role:"admin",name,loginId,operator:null}`；普通队伍无权调用 |
 | POST `/api/logout` | 任意 | `{}` → `{ok}`，删除当前会话 |
 | GET `/api/judge` | 评委 | `{teams,myScores,dimensions,scoringOpen,name}` |
 | POST `/api/score` | 评委 | `{teamId,scores:[六项数字],feedback,status:"draft"\|"submitted"\|"recused",expectedRevision,feedbackSharing?}` → `{ok,status,score}` |
