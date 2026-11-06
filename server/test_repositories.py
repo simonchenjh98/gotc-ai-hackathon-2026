@@ -35,6 +35,9 @@ class Remote:
         self.calls.append((method, path, body))
         if self.timeout_read and method == 'GET':
             raise UpstreamError()
+        if self.provider=='gitee' and method=='GET' and '/members/' in path:
+            return 200,{'user':{'id':456,'login':path.rsplit('/',1)[-1]},'role':'member','active':True,
+                        'enterprise':{'path':path.split('/')[2]}}
         if method == 'POST' and path.startswith(('/orgs/', '/enterprises/')):
             org = path.split('/')[2]
             self.repo = {'id': 123, 'full_name': org + '/' + body['name'], 'description': body['description'], 'default_branch': 'main',
@@ -256,7 +259,7 @@ class RepositoryTests(unittest.TestCase):
         row = result['repository']
         self.assertEqual(row['state'], 'reconcile')
         self.assertIsNone(row['externalId'])
-        self.assertFalse(any('/collaborators/' in c[1] for c in self.remote.calls))
+        self.assertFalse(any('/collaborators/' in c[1] or '/members' in c[1] for c in self.remote.calls))
         row = self.admin_action(row, 'reconcile')[1]['repository']
         self.assertEqual(row['state'], 'reconcile')
         self.assertEqual(len([c for c in self.remote.calls if c[0] == 'POST']), 1)
@@ -318,7 +321,7 @@ class RepositoryTests(unittest.TestCase):
         grants = [c for c in self.remote.calls if '/collaborators/' in c[1] and c[0] == 'PUT']
         self.assertEqual(len(grants), 1)
         self.assertEqual(grants[0][2], {'permission': 'push'})
-        self.assertFalse(any(c[0] in {'DELETE', 'PATCH'} or '/members/' in c[1] for c in self.remote.calls))
+        self.assertFalse(any(c[0] in {'DELETE','PATCH'} or c[0] in {'POST','PUT'} and '/members' in c[1] for c in self.remote.calls))
         # The organizer resolves inherited privileges outside the service; only then can recovery finish.
         self.remote.gitee_permission = 'push'
         self.assertEqual(self.admin_action(row, 'reconcile')[1]['repository']['state'], 'ready')
