@@ -340,7 +340,8 @@ class APITests(unittest.TestCase):
             scores = [20, 20, 20, 15, 15, 10 if i < 2 else 0]
             self.assertEqual(judge.score({"teamId": team_id, "scores": scores, "status": "submitted", "feedback": "@FORMULA"})[0], 200)
         self.assertEqual([t["rank"] for t in self.public.get("/api/board")[1]["teams"]], [1, 2, 3])
-        status, body, _ = self.admin.post("/api/admin/teams", {"id": ids[1], "number": 2, "name": "Updated", "project": "Real", "track": "城市与社区问题"})
+        current = next(team for team in self.admin.get('/api/admin')[1]['teams'] if team['id'] == ids[1])
+        status, body, _ = self.admin.post("/api/admin/teams", {"id": ids[1], "expectedRevision": current['revision'], "number": 2, "name": "Updated", "project": "Real", "track": "城市与社区问题"})
         self.assertEqual(status, 200)
         status, content, headers = self.admin.get("/api/admin/export")
         self.assertEqual(status, 200)

@@ -467,7 +467,8 @@ def stream_progress(upstream, data, call):
         texts = [data.get("delta")] if data["type"].endswith(".delta") else []
     else:
         choices = data.get("choices") if isinstance(data.get("choices"), list) else []
-        if isinstance(data.get("usage"), dict) or any(isinstance(c, dict) and c.get("finish_reason") for c in choices):
+        # Usage may be reported mid-stream; only a terminal marker proves the reply completed.
+        if any(isinstance(c, dict) and c.get("finish_reason") for c in choices):
             call["done"] = True
         texts = []
         for choice in choices:
@@ -664,6 +665,7 @@ class KeyService:
         self.seed = config  # raw gateway.json content, copied into the database once
         self.config = parse_config(config)
         self.lock = threading.Lock()
+        self.config_publish_lock = threading.Lock()
         self.slot_free = threading.Condition(self.lock)
         # ponytail: in-memory per-team concurrency; correct because the service is a single process.
         self.inflight = defaultdict(int)
@@ -731,12 +733,18 @@ class KeyService:
             raise APIError(400, "上游设置不正确：" + str(error)) from None
         db.execute("INSERT INTO gateway_config VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
                    (json.dumps(new, ensure_ascii=False), now_ms()))
-        # ponytail: swapped before commit; a failed commit would leave memory ahead of the DB until restart.
-        self.config = config
         self.service.audit(db, actor, "api-upstreams.save", metadata={name: {"url": item["url"], "models": list(item["models"]),
                                                                             "keyChanged": item["key"] != old.get(name, {}).get("key")}
                                                                      for name, item in new.items()})
-        return {"ok": True, "upstreams": self.public_config(db), "models": self.models()}
+        result = {"ok": True, "upstreams": self.public_config(db),
+                  "models": {name: list(item["models"]) for name, item in (config or {}).items()}}
+        # dispatch already holds the SQLite write transaction. Finish every DB operation before
+        # publishing, and serialize commit + publication so a later save cannot publish first.
+        # There must be no subsequent DB writes or fallible response building on this path.
+        with self.config_publish_lock:
+            db.commit()
+            self.config = config
+        return result
 
     def settings(self, db):
         return {r["key"][5:]: json.loads(r["value"])
@@ -1216,7 +1224,6 @@ class KeyService:
         """Store the call once, before the final bytes are sent where possible, so history is never behind the client."""
         if not call["key"] or call.get("recorded"):
             return
-        call["recorded"] = True
         if not call["status"]:
             call["status"] = 500  # defensive: every stored call has a real outcome
         usage, price = list(call["usage"]), call["price"] or (0,) * USAGE_FIELDS
@@ -1259,6 +1266,8 @@ class KeyService:
                 # Full context, compressed: agent requests resend the whole conversation and compress ~5-10x.
                 db.execute("INSERT INTO api_logs VALUES (?,?,?,?,?,?)", (usage_id, json.dumps(headers, ensure_ascii=False),
                            zlib.compress(call["request"], 6), zlib.compress(response, 6), len(call["request"]), call["size"]))
+        # Only suppress the finalization retry after the entire transaction has committed.
+        call["recorded"] = True
 
     def lookup(self, db, handler):
         parts = handler.headers.get("Authorization", "").split(None, 1)
@@ -1368,13 +1377,15 @@ class KeyService:
         return body
 
     def serve(self, handler, path, call):
-        if self.config is None:
+        # A live upstream edit applies to subsequent calls; this request keeps one coherent snapshot.
+        config = self.config
+        if config is None:
             raise APIError(404, "接口不存在")
         if (path == "/v1/models" or path.startswith("/v1/models/")) and handler.command == "GET":
             self.authenticate(handler)  # not metered or logged
             # Fields of both APIs, so OpenAI and Anthropic SDKs can each parse the list (sub2api answers per platform).
             data = [{"id": m, "object": "model", "owned_by": name, "created": 0, "type": "model", "display_name": m,
-                     "created_at": "2024-01-01T00:00:00Z"} for name, models in self.models().items() for m in models]
+                     "created_at": "2024-01-01T00:00:00Z"} for name, item in config.items() for m in item["models"]]
             if path != "/v1/models":
                 item = next((d for d in data if d["id"] == path[len("/v1/models/"):]), None)
                 if item is None:
@@ -1383,7 +1394,7 @@ class KeyService:
             listing = {"object": "list", "data": data, "has_more": False,
                        "first_id": data[0]["id"] if data else None, "last_id": data[-1]["id"] if data else None}
             return self.send(handler, call, 200, "application/json", gateway_json(listing))
-        if path == "/v1/messages/count_tokens" and handler.command == "POST" and "anthropic" in self.config:
+        if path == "/v1/messages/count_tokens" and handler.command == "POST" and "anthropic" in config:
             key = self.authenticate(handler, call)  # expiry
             call["log"] = False  # metadata row only, zero cost
             team = key["team_id"]
@@ -1394,14 +1405,14 @@ class KeyService:
                 self.counting[team] += 1
             try:
                 self.recheck_access(handler, call)
-                return self.count_tokens(handler, call)
+                return self.count_tokens(handler, call, config["anthropic"])
             finally:
                 with self.lock:
                     self.counting[team] -= 1
         name, suffix = ROUTES.get(path, (None, None))
-        if handler.command != "POST" or name not in self.config:
+        if handler.command != "POST" or name not in config:
             raise APIError(404, "接口不存在")
-        upstream = self.config[name]
+        upstream = config[name]
         call["secrets"] += (upstream["key"],)
         key = self.authenticate(handler, call)
         body = self.read_body(handler)
@@ -1506,10 +1517,9 @@ class KeyService:
                     raise
             time.sleep(delay)
 
-    def count_tokens(self, handler, call):
+    def count_tokens(self, handler, call, upstream):
         """Claude Code calls this before requests; passed through at zero cost, recorded without content."""
         body = self.read_body(handler)
-        upstream = self.config["anthropic"]
         call["secrets"] += (upstream["key"],)
         model = resolve(upstream, body.get("model"))
         call["model"] = model or ""

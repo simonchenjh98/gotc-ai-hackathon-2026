@@ -277,7 +277,7 @@ Claude Code 会按自己的默认模型名请求（如 `claude-opus-…`、`clau
 
 后台页面可见时，每次检查结束后等待 3 秒再读取标记。新阶段评审记录发生变化且轮次、配置仍一致时，只更新该阶段的正式记录数量和只读记录表；页面隐藏时暂停。轮次或配置变更时提示刷新核对，截止时间到达时更新只读标识，保留未保存输入。原专业评分设置与统计、历史筛选、审计、名录、材料和一次性登录码区域不自动重绘，需要重新查询或手动刷新；原专业成绩看板仍通过 `/api/board` 定时刷新。
 
-名录 `team` 增加 `status`（`active|withdrawn|disqualified`）、`statusReason`、`booth`、`roadshowOrder`（1–9999 或 null）、`revision` 和 `trackKnown`。退出或取消资格须填写原因。非 active 队伍不进入当前公开专业榜单及原专业评分、观众投票的可选名单，继续评分或投票返回 `409/team_ineligible`；历史评分和票数保留供后台查看，恢复 active 后重新参与当前名单与排名。更新带 `expectedRevision` 时，旧版本返回 409；队伍正式提交改变公开作品名也会增加名录版本。赛道选项为 AI for Science、城市与社区问题、未来学习样态；升级前未知赛道原样保留并标注，不能自动归类。状态、展位和路演顺序不改历史快照，不自动选队或排程。
+名录 `team` 增加 `status`（`active|withdrawn|disqualified`）、`statusReason`、`booth`、`roadshowOrder`（1–9999 或 null）、`revision` 和 `trackKnown`。退出或取消资格须填写原因。非 active 队伍不进入当前公开专业榜单及原专业评分、观众投票的可选名单，继续评分或投票返回 `409/team_ineligible`；历史评分和票数保留供后台查看，恢复 active 后重新参与当前名单与排名。直接调用 `POST /api/admin/teams` 更新已有队伍必须携带 `expectedRevision`；缺失或 null 返回 428，旧版本返回 409，新建队伍不需要该字段。队伍正式提交改变公开作品名也会增加名录版本。赛道选项为 AI for Science、城市与社区问题、未来学习样态；升级前未知赛道原样保留并标注，不能自动归类。状态、展位和路演顺序不改历史快照，不自动选队或排程。
 
 CSV 队伍列为 `number,name,project,track`，另可含 `status,statusReason,booth,roadshowOrder`；number/name 必填，按 number 匹配。评委列 `id,name`，空 id 为新建，非空 id 必须匹配已有评委，不按同名更新。缺失、重复或未知表头会返回第 1 行的错误预览；数据行的重复键、列数、类型和长度错误逐行列出。最多 500 数据行，CSV 本体最多 256 KiB。专用预览端点允许 2 MiB JSON 封装，以容纳合法转义；其余端点上限不变。
 
