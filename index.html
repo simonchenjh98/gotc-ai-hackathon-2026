@@ -19,8 +19,8 @@
   <header class="site-header">
     <a class="brand" href="#" aria-label="GOTC黑客松首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span><strong>GOTC <span class="brand-year">2026</span></strong><small>开源 AI 黑客松</small></span></a>
     <button class="menu-toggle" aria-expanded="false" aria-controls="main-nav">菜单 <span>＋</span></button>
-    <nav id="main-nav" aria-label="主导航"><a href="#about">关于活动</a><a href="#schedule">活动日程</a><a href="#judging">评分细则</a><a href="#submission">作品提交</a><a href="https://8.141.114.201/gotc/platform.html#board" class="nav-live"><span class="status-dot"></span>实时看板 ↗</a></nav>
-    <a class="header-cta" href="#join">参与活动 <span>↗</span></a>
+    <nav id="main-nav" aria-label="主导航"><a href="#about">关于活动</a><a href="#schedule">活动日程</a><a href="#judging">评分细则</a><a href="#participants">选手入口</a><a href="https://8.141.114.201/gotc/platform.html#board" class="nav-live"><span class="status-dot"></span>实时看板 ↗</a></nav>
+    <a class="header-cta" href="#participants">我是选手 <span>↗</span></a>
   </header>
 
   <main id="main">
@@ -32,13 +32,24 @@
         <h1 id="hero-title">百格成城<span class="title-square">.</span></h1>
         <p class="hero-motto">让每一个想法，<br>成为未来的一格。</p>
         <p class="hero-description">用两天时间，和一群同行者，<br>把真实问题变成一个能点开、能使用的作品。</p>
-        <div class="hero-actions"><a class="button primary" href="#schedule">查看活动日程 <span>↓</span></a><a class="text-link" href="https://8.141.114.201/gotc/platform.html#judge">评委评分入口 ↗</a></div>
-        <div class="hero-location"><span class="date-block"><b>11.07—08</b><small>2026 · 周六 / 周日</small></span><span class="location-block"><b>北京亦庄实验中学</b><small>两天日间共创 · 不通宵</small></span></div>
+        <div class="hero-actions"><a class="button primary" href="#participants">进入选手入口 <span>↗</span></a><a class="text-link" href="#schedule">查看最新日程 ↓</a></div>
+        <div class="hero-location"><span class="date-block"><b>11.07—08</b><small>2026 · 周六 / 周日</small></span><span class="location-block"><b>北京亦庄实验中学</b><small>周六最晚 21:00 离场 · 不通宵</small></span></div>
       </div>
       <span class="hero-coordinate" aria-hidden="true">BEIJING / YIZHUANG<br>IDEAS BECOME REAL.</span>
     </section>
 
     <div class="event-strip"><div class="wrap"><span><b>12—18</b> 岁青少年</span><span><b>200</b> 位共创者 · 目标招募</span><span><b>3—5</b> 人 / 队</span><span><b>11.14</b> 优秀项目亮相 GOTC</span></div></div>
+
+    <section class="section wrap participant-section" id="participants" aria-labelledby="participant-title">
+      <div class="section-heading"><div><p class="eyebrow">FOR PARTICIPANTS / 选手入口</p><h2 id="participant-title">准备好，就从这里开始。</h2></div><a class="text-link" href="https://8.141.114.201/gotc/platform.html#team-score">查看本队成绩 ↗</a></div>
+      <div class="submission-deadline"><span>作品提交截止</span><strong><time datetime="2026-11-08T13:00:00+08:00">11 月 8 日 · 周日 13:00</time></strong><small>北京时间 · 12:30—13:00 为项目提交时段，请提前准备材料。</small></div>
+      <ol class="participant-steps">
+        <li><span class="step-number" aria-hidden="true">01</span><h3>领取本队提交码</h3><p>还没有提交码？由队长填写姓名和学校，携组员到现场组织方处核验。已领码的队伍直接进入工作台。</p><a class="text-link" href="https://8.141.114.201/gotc/platform.html#claim">申请现场核验 / 领码 ↗</a></li>
+        <li><span class="step-number" aria-hidden="true">02</span><h3>进入本队工作台</h3><p>用本队提交码登录，领取 AI API 密钥、准备 Gitee 仓库，并填写作品材料。请确定一位队员负责最后提交。</p><a class="button primary" href="https://8.141.114.201/gotc/platform.html#team">进入选手工作台 ↗</a></li>
+        <li><span class="step-number" aria-hidden="true">03</span><h3>确认正式提交</h3><p>代码上传后，回到工作台点击“检查并正式提交”，核对预览，再点击“确认正式提交”。看到“正式版 v… 已收到”后保存回执。</p><a class="text-link" href="#submission">查看材料清单 ↓</a></li>
+      </ol>
+      <p class="participant-help">上传代码或保存草稿还不算正式提交。遇到领码、仓库或提交问题，请联系现场组织方或技术支持。<a href="downloads/gotc-gitee-submission-guide.pdf" target="_blank" rel="noopener noreferrer">查看图文指南 ↗</a></p>
+    </section>
 
     <section class="section wrap about" id="about">
       <div class="section-intro"><p class="eyebrow">01 / THE IDEA</p><h2>从一个真实问题，<br>开始一次创造。</h2></div>
@@ -55,10 +66,31 @@
     </div></section>
 
     <section class="section wrap" id="schedule">
-      <div class="section-heading"><div><p class="eyebrow">03 / MAKE TIME FOR IDEAS</p><h2>两天，把想法变成作品。</h2></div><a class="text-link" href="downloads/gotc-hackathon.ics" download>加入我的日历 ↗</a></div>
-      <div class="schedule-tabs" aria-label="选择活动日期"><button id="tab-day1" data-day="day1" class="active"><strong>11.07</strong><span>周六 · 探索与开发</span></button><button id="tab-day2" data-day="day2"><strong>11.08</strong><span>周日 · 测试与展示</span></button><button id="tab-gotc" data-day="gotc"><strong>11.14</strong><span>周六 · GOTC 展示</span><span class="tab-arrow">↗</span></button></div>
-      <div class="schedule-panel" id="day1" aria-labelledby="tab-day1"><h3 class="sr-only">11月7日活动日程</h3><div class="schedule-row"><time>08:30—10:00</time><div><h4>从这里，正式出发</h4><p>签到、开幕、规则说明、赛题发布</p></div><span class="event-tag">启程</span></div><div class="schedule-row"><time>10:00—12:00</time><div><h4>找到队友，也找到问题</h4><p>组队确认、问题定义、项目启动卡审核</p></div><span class="event-tag">定义</span></div><div class="schedule-row"><time>13:00—17:30</time><div><h4>让第一个版本跑起来</h4><p>原型开发、导师巡场、第一次测试</p></div><span class="event-tag blue">共创</span></div><p class="schedule-note">12:00—13:00 为午间休息。午餐自行安排；当天活动结束后离场休息。</p></div>
-      <div class="schedule-panel" id="day2" aria-labelledby="tab-day2"><h3 class="sr-only">11月8日活动日程</h3><div class="schedule-row"><time>08:30—12:00</time><div><h4>交给用户，再改一次</h4><p>继续开发、用户测试、项目完善</p></div><span class="event-tag blue">迭代</span></div><div class="schedule-row"><time>13:00—14:30</time><div><h4>准备把作品介绍给世界</h4><p>最终提交、展示准备、分区布展</p></div><span class="event-tag">提交</span></div><div class="schedule-row"><time>14:30—16:30</time><div><h4>每一个作品，都值得被看见</h4><p>分区评审、项目展示、观众参观</p></div><span class="event-tag orange">展示</span></div><div class="schedule-row"><time>16:30—17:30</time><div><h4>这一次结束，是下一次开始</h4><p>结果公布、GOTC 候选项目说明、合影闭幕</p></div><span class="event-tag">闭幕</span></div><p class="schedule-note">12:00—13:00 为午间休息。提交时间与现场分区以主办方通知为准。</p></div>
+      <div class="section-heading"><div><p class="eyebrow">03 / MAKE TIME FOR IDEAS</p><h2>两天，把想法变成作品。</h2></div><div class="schedule-actions"><a class="text-link" href="downloads/gotc-hackathon.ics" download>加入我的日历 ↗</a><a class="text-link" href="assets/schedule-20261106.jpg" target="_blank" rel="noopener noreferrer">查看完整日程海报 ↗</a></div></div>
+      <p class="schedule-update">最新日程 · 2026 年 11 月 6 日更新 · 以下时间均为北京时间</p>
+      <div class="schedule-tabs" aria-label="选择活动日期"><button id="tab-day1" data-day="day1" class="active"><strong>11.07</strong><span>周六 · 探索与开发</span></button><button id="tab-day2" data-day="day2"><strong>11.08</strong><span>周日 · 提交与展示</span></button><button id="tab-gotc" data-day="gotc"><strong>11.14</strong><span>周六 · GOTC 展示</span><span class="tab-arrow">↗</span></button></div>
+      <div class="schedule-panel" id="day1" aria-labelledby="tab-day1"><h3 class="sr-only">11月7日活动日程</h3>
+        <div class="schedule-row"><time>08:00—08:30</time><div><h4>签到</h4></div><span class="event-tag ">签到</span></div>
+        <div class="schedule-row"><time>08:45—10:00</time><div><h4>开幕式</h4><p>赛程介绍、技术平台讲解、学术分享，以及赛事活动总技术导师的技术分享 · 亦馨剧场</p></div><span class="event-tag ">开幕</span></div>
+        <div class="schedule-row"><time>10:00—12:00</time><div><h4>组队开发</h4><p>篮球馆</p></div><span class="event-tag blue">开发</span></div>
+        <div class="schedule-row"><time>12:00—13:00</time><div><h4>午间休息</h4></div><span class="event-tag ">休息</span></div>
+        <div class="schedule-row"><time>13:00—17:00</time><div><h4>第二场技术开发</h4></div><span class="event-tag blue">开发</span></div>
+        <div class="schedule-row"><time>15:30—16:30</time><div><h4>AI 开源项目讲座</h4><p>图书馆 · 与技术开发同步，可自愿听讲</p></div><span class="event-tag orange">分享</span></div>
+        <div class="schedule-row"><time>17:00—18:30</time><div><h4>晚间休息</h4></div><span class="event-tag ">休息</span></div>
+        <div class="schedule-row"><time>18:30—21:00</time><div><h4>晚间开发</h4><p>自主安排开发进度，最晚 21:00 离场</p></div><span class="event-tag blue">开发</span></div>
+        <div class="schedule-row"><time>21:00</time><div><h4>离场</h4></div><span class="event-tag ">离场</span></div>
+        <p class="schedule-note">讲座与开发同步进行，请与队友协调安排；周六不通宵，最晚 21:00 离场。</p></div>
+      <div class="schedule-panel" id="day2" aria-labelledby="tab-day2"><h3 class="sr-only">11月8日活动日程</h3>
+        <div class="schedule-row"><time>08:00</time><div><h4>现场开放开发</h4></div><span class="event-tag blue">开发</span></div>
+        <div class="schedule-row"><time>09:30—10:30</time><div><h4>AI 开源项目经验分享</h4><p>图书馆 · 与技术开发同步，可自愿听讲</p></div><span class="event-tag orange">分享</span></div>
+        <div class="schedule-row deadline-row"><time>12:30—13:00</time><div><h4>项目提交</h4><p>13:00 截止提交项目（北京时间）；请完成正式确认并保存回执</p></div><span class="event-tag orange">截止</span></div>
+        <div class="schedule-row"><time>13:00—14:00</time><div><h4>AI 研究与实践项目分享</h4><p>4 个正在进行的项目 · 图书馆</p></div><span class="event-tag orange">分享</span></div>
+        <div class="schedule-row"><time>14:00—15:30</time><div><h4>路演时间</h4></div><span class="event-tag blue">路演</span></div>
+        <div class="schedule-row"><time>16:00—17:00</time><div><h4>决赛展示</h4></div><span class="event-tag blue">展示</span></div>
+        <div class="schedule-row"><time>17:15—17:45</time><div><h4>现场颁奖</h4></div><span class="event-tag orange">颁奖</span></div>
+        <div class="schedule-row"><time>17:45—18:00</time><div><h4>合影留念、领取证书</h4></div><span class="event-tag ">合影</span></div>
+        <div class="schedule-row"><time>18:00</time><div><h4>离场，活动结束</h4></div><span class="event-tag ">离场</span></div>
+        <p class="schedule-note">项目提交于 13:00 截止。请按现场分组和顺序候场，提前调试设备。</p></div>
       <div class="schedule-panel" id="gotc" aria-labelledby="tab-gotc"><h3 class="sr-only">11月14日GOTC展示安排</h3><div class="gotc-callout"><span class="eyebrow">THE NEXT STAGE / 11.14 PM</span><h3>从黑客松，走向开源社区。</h3><p>优秀项目有机会入选 GOTC 青少年开发者专场，与开发者、企业和社区交流，并参与“优秀青少年开源 AI 创新奖”评选。</p></div><div class="schedule-row"><time>11.09—13</time><div><h4>打磨与彩排</h4><p>稳定性修复、README 与许可证补充、展示材料完善和线上彩排</p></div></div><div class="schedule-row"><time>11.14 下午</time><div><h4>GOTC 项目展示</h4><p>项目布展、展位交流、短路演、评审复核与交流</p></div><span class="event-tag orange">GOTC</span></div><p class="schedule-note">本专场为方案安排。详细时间、展位容量与 GOTC 具体会场以主办方后续通知为准；入选兼顾项目质量、开源准备和代表性。</p></div>
     </section>
 
@@ -78,15 +110,15 @@
       <p class="rules-notice"><strong>展示评审记录</strong> 组织方也可独立配置本轮队伍、授权评委与评审窗口，保存评语和正式材料快照。本阶段暂不计分，计分与晋级规则待确认。路演评审记录另设独立阶段，由组织方维护人工工作名单；名单不代表正式晋级。<a href="https://8.141.114.201/gotc/platform.html#judge-roadshow">填写路演评审记录 ↗</a> · <a href="https://8.141.114.201/gotc/platform.html#board-roadshow">查看路演评审进度（未计分）↗</a><a href="https://8.141.114.201/gotc/platform.html#judge-exhibition">填写展示评审记录 ↗</a> · <a href="https://8.141.114.201/gotc/platform.html#board-exhibition">查看展示评审进度（未计分）↗</a></p>
     </div></section>
 
-    <section class="section wrap submission-section" id="submission"><div class="submission-copy"><p class="eyebrow">05 / SHIP YOUR IDEA</p><h2>交付一个作品，<br>也留下创造的过程。</h2><p>每队提交一套完整材料。请提前测试演示链接，准备本地备用版本，并说明作品目前的局限。</p><a class="text-link" href="downloads/submission-checklist.txt" download>下载作品提交清单 ↓</a> · <a class="text-link" href="downloads/gotc-gitee-submission-guide.pdf" download>下载选手操作指南（PDF）↓</a><p><a class="text-link" href="https://8.141.114.201/gotc/platform.html#claim">现场核验 / 领取队伍提交码 ↗</a></p><p><a class="button primary" href="https://8.141.114.201/gotc/platform.html#team">申请 Gitee 仓库 / 提交作品 ↗</a></p><p class="small-note">使用主办方发放的本队独立提交码登录，申请 Gitee 企业组织下的本队仓库；管理员核对开发者用户名后批准。绑定后，平台自动读取正式分支完整 SHA，预览并确认后提交。未绑定仓库的旧队伍仍可手填仓库与完整 commit。禁止 force push、删除正式分支或改写正式提交。</p></div><div class="checklist" aria-label="作品提交自查清单"><p class="checklist-heading">提交前，逐项检查 <span id="check-count">0 / 6</span></p><label><input type="checkbox" data-check="prototype"><span><strong>可运行原型</strong><small>可访问的链接，或本地演示文件</small></span></label><label><input type="checkbox" data-check="slides"><span><strong>5—7 页展示材料</strong><small>问题、方案、AI 使用、测试和分工</small></span></label><label><input type="checkbox" data-check="video"><span><strong>2 分钟演示视频</strong><small>完整展示一次核心操作流程</small></span></label><label><input type="checkbox" data-check="code"><span><strong>公开仓库与最终代码版本</strong><small>推荐用 Git 将代码推送到本队仓库；绑定队伍由平台读取完整 SHA。旧队伍可手填 HTTPS 仓库主页与完整 commit，禁止 force push</small></span></label><label><input type="checkbox" data-check="readme"><span><strong>README、运行说明与许可证</strong><small>写在本次提交的仓库中；绑定 Gitee 后无需在官网重复填写</small></span></label><label><input type="checkbox" data-check="sources"><span><strong>来源说明与项目局限</strong><small>写入 README，列出模型、数据、图片和第三方代码的来源及已知限制</small></span></label><p class="small-note">勾选仅保存在当前浏览器，供你自查使用。</p></div></section>
+    <section class="section wrap submission-section" id="submission"><div class="submission-copy"><p class="eyebrow">05 / SHIP YOUR IDEA</p><h2>交付一个作品，<br>也留下创造的过程。</h2><p>每队提交一套完整材料。11 月 8 日（周日）12:30—13:00 提交，13:00 截止。请提前检查演示链接，准备本地备用版本。</p><a class="text-link" href="downloads/submission-checklist.txt" download>下载作品提交清单 ↓</a> · <a class="text-link" href="downloads/gotc-gitee-submission-guide.pdf" download>下载选手操作指南（PDF）↓</a><p><a class="text-link" href="https://8.141.114.201/gotc/platform.html#claim">现场核验 / 领取队伍提交码 ↗</a></p><p><a class="button primary" href="https://8.141.114.201/gotc/platform.html#team">进入选手工作台 / 提交作品 ↗</a></p><p class="small-note">先上传代码，再到工作台填写作品与展示链接。绑定 Gitee 后，官网会自动读取代码版本；README、许可证、来源和局限写在仓库里即可。最后核对预览、确认提交，并保存成功回执。</p></div><div class="checklist" aria-label="作品提交自查清单"><p class="checklist-heading">提交前，逐项检查 <span id="check-count">0 / 6</span></p><label><input type="checkbox" data-check="prototype"><span><strong>可运行原型</strong><small>可访问的链接，或本地演示文件</small></span></label><label><input type="checkbox" data-check="slides"><span><strong>5—7 页展示材料</strong><small>问题、方案、AI 使用、测试和分工</small></span></label><label><input type="checkbox" data-check="video"><span><strong>2 分钟演示视频</strong><small>完整展示一次核心操作流程</small></span></label><label><input type="checkbox" data-check="code"><span><strong>公开仓库与最终代码版本</strong><small>推荐用 Git 将代码推送到本队仓库；绑定队伍由平台读取完整 SHA。旧队伍可手填 HTTPS 仓库主页与完整 commit，禁止 force push</small></span></label><label><input type="checkbox" data-check="readme"><span><strong>README、运行说明与许可证</strong><small>写在本次提交的仓库中；绑定 Gitee 后无需在官网重复填写</small></span></label><label><input type="checkbox" data-check="sources"><span><strong>来源说明与项目局限</strong><small>写入 README，列出模型、数据、图片和第三方代码的来源及已知限制</small></span></label><p class="small-note">勾选仅保存在当前浏览器，供你自查使用。</p></div></section>
 
     <section class="join-section" id="join"><div class="wrap join-grid"><div><p class="eyebrow">06 / YOUR NEXT MOVE</p><h2>你的那一格，<br>会是什么样子？</h2><p>面向北京，欢迎有条件的京外青少年团队参加。<br>可以个人报名，也可以和队友、学校一起报名。</p><div class="join-facts"><span>免费参与</span><span>自带电脑</span><span>午餐及交通住宿自理</span></div><a class="button primary" href="https://v.wjx.cn/vm/waliBci.aspx" target="_blank" rel="noopener noreferrer">打开活动报名表 ↗</a><p class="small-note">计划报名截止：10 月 31 日；名额与录取以主办方确认为准。</p></div><div class="qr-card"><img src="assets/registration-qr.jpg" width="220" height="220" alt="活动报名二维码，也可点击左侧按钮打开同一报名表" loading="lazy"><strong>扫码报名，一起创造</strong><span>11.07—08 · 北京亦庄实验中学</span></div></div></section>
 
-    <section class="section wrap faq-section"><div><p class="eyebrow">BEFORE YOU COME</p><h2>你可能还想知道。</h2></div><div class="faq-list"><details><summary>不会编程，也可以参加吗？</summary><p>可以。活动不要求编程基础或竞赛经历。你可以参与问题研究、交互设计、AI 工具使用、用户测试与展示，和队友共同完成原型。</p></details><details><summary>还没有队友，怎么办？</summary><p>可以个人报名，现场会协助组队。每队 3—5 人，也欢迎以团队或学校为单位报名。</p></details><details><summary>需要准备什么？</summary><p>自带电脑与充电器，提前整理你关心的问题和可使用的公开资料。活动提供导师指导及模型 API、算力等支持，具体接入方式现场说明。午餐、交通及住宿自行安排。</p></details><details><summary>活动会通宵吗？</summary><p>不会。两天均为日间活动。未成年人须履行监护人知情同意及签到签退要求，京外团队建议由学校或机构组织并安排成人领队。</p></details><details><summary>所有团队都会去 GOTC 吗？</summary><p>黑客松优秀项目与公开征集项目共同参加遴选。入选项目应能稳定演示，完成开源与来源说明，并由青少年承担主要创作和讲解任务。具体名额与会场安排另行通知。</p></details><details><summary>评委和观众如何使用评分平台？</summary><p>专业评委使用主办方提供的登录码，按分配的身份登录，可保存草稿、正式提交、修改评分或回避。观众使用独立观众码投票。成绩看板公开展示汇总数据，不显示评委身份、单份评分或评语。展示评审记录另有独立入口，其进度暂不计分。</p></details></div></section>
+    <section class="section wrap faq-section"><div><p class="eyebrow">BEFORE YOU COME</p><h2>你可能还想知道。</h2></div><div class="faq-list"><details><summary>不会编程，也可以参加吗？</summary><p>可以。活动不要求编程基础或竞赛经历。你可以参与问题研究、交互设计、AI 工具使用、用户测试与展示，和队友共同完成原型。</p></details><details><summary>还没有队友，怎么办？</summary><p>可以个人报名，现场会协助组队。每队 3—5 人，也欢迎以团队或学校为单位报名。</p></details><details><summary>需要准备什么？</summary><p>自带电脑与充电器，提前整理你关心的问题和可使用的公开资料。活动提供导师指导及模型 API、算力等支持，具体接入方式现场说明。午餐、交通及住宿自行安排。</p></details><details><summary>活动会通宵吗？</summary><p>不会。周六安排晚间开发，最晚 21:00 离场；周日 18:00 活动结束。未成年人须履行监护人知情同意及签到签退要求，京外团队建议由学校或机构组织并安排成人领队。</p></details><details><summary>所有团队都会去 GOTC 吗？</summary><p>黑客松优秀项目与公开征集项目共同参加遴选。入选项目应能稳定演示，完成开源与来源说明，并由青少年承担主要创作和讲解任务。具体名额与会场安排另行通知。</p></details><details><summary>评委和观众如何使用评分平台？</summary><p>专业评委使用主办方提供的登录码，按分配的身份登录，可保存草稿、正式提交、修改评分或回避。观众使用独立观众码投票。成绩看板公开展示汇总数据，不显示评委身份、单份评分或评语。展示评审记录另有独立入口，其进度暂不计分。</p></details></div></section>
 
     <section class="organizers wrap"><p class="eyebrow">BUILT TOGETHER / 组织机构</p><dl><div><dt>指导单位</dt><dd>北京经济技术开发区信息产业局</dd></div><div><dt>主办单位</dt><dd>开源中国（OSCHINA）<br>北京亦庄少年人工智能学院</dd></div><div><dt>承办单位</dt><dd>北京亦庄实验中学</dd></div><div><dt>平台与算力支持</dt><dd>Gitee AI、模力方舟</dd></div><div><dt>学术支持</dt><dd>北京大学计算机学院<br>情感与认知智能机器人实验室</dd></div><div><dt>媒体支持</dt><dd>得到 AI 学习圈<br>WaytoAGI 教育版</dd></div></dl><p class="small-note">组织架构及具体安排以各单位最终确认为准。</p></section>
   </main>
-  <footer class="site-footer wrap"><a class="footer-title" href="#">百格成城<span>■</span></a><p>GOTC 2026 开源 AI 黑客松<br><small>活动信息更新：2026.10.28</small></p><div><button class="text-link" id="share-button">复制官网链接 ↗</button><a href="https://github.com/simonchenjh98/gotc-ai-hackathon-2026" target="_blank" rel="noopener noreferrer">GitHub 源码 ↗</a></div></footer>
+  <footer class="site-footer wrap"><a class="footer-title" href="#">百格成城<span>■</span></a><p>GOTC 2026 开源 AI 黑客松<br><small>活动信息更新：2026.11.06</small></p><div><button class="text-link" id="share-button">复制官网链接 ↗</button><a href="https://github.com/simonchenjh98/gotc-ai-hackathon-2026" target="_blank" rel="noopener noreferrer">GitHub 源码 ↗</a></div></footer>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 </body>
 </html>
