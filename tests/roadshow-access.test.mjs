@@ -75,15 +75,25 @@ test('login transport accepts cookies only on the dedicated name endpoint and re
   await assert.rejects(ctx.helpers.roadshowNameRequest('admin/roadshow-access',{}),/入口不正确/);assert.equal(sent.length,2);
 });
 
-function realLoginHarness({post,confirm}={}){
+function realLoginHarness({post,confirm,storageBlocked=false}={}){
   const controls=Object.fromEntries(['.form-error','[data-roadshow-availability]','[data-roadshow-login-button]','[data-roadshow-refresh]'].map(key=>[key,element()])),form={isConnected:true,elements:{judgeName:element()},querySelector:key=>controls[key]};
-  let marker='before-login';const published=[],renders=[];const ctx=runtime({route:'judge-roadshow',routeVersion:4,session:{role:null},root:{innerHTML:'',querySelector:()=>form},browserLoginOwner:()=>marker,publishLogin:result=>{published.push(result.loginId);marker=result.loginId;},renderRoute:async()=>renders.push('scoring'),api:confirm || (async()=>({role:'judge',loginId:'new-login',name:'陈计宏'})),fetch:async(url,options)=>({ok:true,json:async()=>String(url).endsWith('/login')?(post?post():{ok:true,role:'judge',loginId:'new-login',name:'陈计宏'}):{configured:true,nameLoginAvailable:true}})});
+  let marker='before-login';const published=[],renders=[];const ctx=runtime({route:'judge-roadshow',routeVersion:4,session:{role:null},root:{innerHTML:'',querySelector:()=>form},browserLoginOwner:()=>marker,publishLogin:result=>{published.push(result.loginId);if(!storageBlocked)marker=result.loginId;},renderRoute:async()=>renders.push('scoring'),api:confirm || (async()=>({role:'judge',loginId:'new-login',name:'陈计宏'})),fetch:async(url,options)=>({ok:true,json:async()=>String(url).endsWith('/login')?(post?post():{ok:true,role:'judge',loginId:'new-login',name:'陈计宏'}):{configured:true,nameLoginAvailable:true}})});
   const controller=ctx.renderRoadshowNameLogin(4);return {ctx,controller,form,published,renders,error:controls['.form-error'],setMarker:value=>marker=value};
 }
 
 test('real-name login publishes its marker then verifies the matching judge cookie before opening scoring',async()=>{
   const h=realLoginHarness();await flush();h.form.elements.judgeName.value='陈计宏';await h.controller.login();
   assert.deepEqual(h.published,['new-login']);assert.equal(h.ctx.session.role,'judge');assert.equal(h.ctx.session.loginId,'new-login');assert.deepEqual(h.renders,['scoring']);h.controller.dispose();
+});
+
+test('a failed storage write with a readable old marker still accepts the matching verified judge cookie',async()=>{
+  const h=realLoginHarness({storageBlocked:true});await flush();h.form.elements.judgeName.value='陈计宏';await h.controller.login();
+  assert.deepEqual(h.published,['new-login']);assert.equal(h.ctx.browserLoginOwner(),'before-login');assert.equal(h.ctx.session.loginId,'new-login');assert.deepEqual(h.renders,['scoring']);h.controller.dispose();
+});
+
+test('storage failure never bypasses marker changes while the judge cookie is being verified',async()=>{
+  const check=deferred(),h=realLoginHarness({storageBlocked:true,confirm:()=>check.promise});await flush();h.form.elements.judgeName.value='陈计宏';const pending=h.controller.login();await flush();
+  h.setMarker('new-login-in-another-tab');check.resolve({role:'judge',loginId:'new-login'});await pending;assert.equal(h.ctx.session.role,null);assert.deepEqual(h.renders,[]);h.controller.dispose();
 });
 
 test('a mismatched cookie confirmation cannot open scoring or adopt the other identity',async()=>{

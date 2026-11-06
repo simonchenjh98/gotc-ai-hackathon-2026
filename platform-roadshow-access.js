@@ -54,7 +54,8 @@ function renderRoadshowNameLogin(version){
   const current=()=>routeVersion===version && route==='judge-roadshow' && session===owner && browserLoginOwner()===marker;
   const controller=makeRoadshowNameLoginController({form,isCurrent:current,load:signal=>roadshowNameRequest('roadshow/access',undefined,signal),login:(body,signal)=>roadshowNameRequest('roadshow/login',body,signal),accept:async(result,signal,valid)=>{
     if(!valid())return;publishLogin(result);marker=browserLoginOwner();
-    if(marker && marker!==result.loginId)throw new Error('浏览器登录身份已切换，请刷新后重新输入姓名。');
+    // Storage writes can fail while an old marker remains readable. Verify the cookie
+    // against this response and reject changes to the captured marker during that read.
     const confirmed=await api('session',undefined,{signal});
     if(signal.aborted || !valid())return;
     if(confirmed.role!=='judge' || confirmed.loginId!==result.loginId)throw new Error('浏览器的登录身份与刚验证的姓名不一致，请核对后重新登录。');
