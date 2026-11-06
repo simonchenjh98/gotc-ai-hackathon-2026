@@ -25,8 +25,15 @@ class RoadshowIsolationTests(unittest.TestCase):
         return data
 
     def window(self, stage, opened=True, deadline=None):
+        before=self.stage(stage)
+        if stage=='roadshow' and opened and before['stage']['rosterEditable']:
+            judges=list(before['roster']['judgeIds'])
+            while len(judges)<3:
+                judges.append(self.invitation(name='Roadshow judge '+str(len(judges)))[1]['id'])
+            if judges!=before['roster']['judgeIds']:
+                before=self.roster(stage,before['roster']['teamIds'],judges)
         status,data,_=self.admin.post('/api/admin/judging/'+stage+'/window',{
-            'expectedRevision':self.stage(stage)['stage']['revision'],'open':opened,'deadline':deadline})
+            'expectedRevision':before['stage']['revision'],'open':opened,'deadline':deadline})
         self.assertEqual(status,200,data)
         return data
 
@@ -133,6 +140,7 @@ class RoadshowIsolationTests(unittest.TestCase):
         self.assertEqual(self.review(r_judge,'roadshow',second)[0],409)
         self.assertEqual(self.review(e_judge,'exhibition',first)[0],200)
         self.window('exhibition',False)
+        self.window('roadshow',False)
         self.window('roadshow')
         self.assertEqual(self.review(e_judge,'exhibition',first,1)[0],409)
         self.assertEqual(self.review(r_judge,'roadshow',second)[0],200)

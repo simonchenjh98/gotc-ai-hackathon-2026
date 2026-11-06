@@ -32,8 +32,12 @@
         ${link('专业评分', entry('judge'), 'judge', 'judge')}
         ${link('展示评审记录', entry('judge-exhibition'), 'judge-exhibition', 'judge-exhibition')}
         ${link('展示进度（未计分）', entry('board-exhibition'), 'board-exhibition', 'board-exhibition')}
-        ${link('路演评审记录', entry('judge-roadshow'), 'judge-roadshow', 'judge-roadshow')}
-        ${link('路演进度（未计分）', entry('board-roadshow'), 'board-roadshow', 'board-roadshow')}
+        ${link('路演评分（六维100分）', entry('judge-roadshow'), 'judge-roadshow', 'judge-roadshow')}
+        ${link('路演成绩', entry('board-roadshow'), 'board-roadshow', 'board-roadshow')}
+        ${link('路演后台', entry('admin-roadshow'), 'admin-roadshow', 'admin-roadshow')}
+        ${link('决赛评分与提名', entry('judge-finals'), 'judge-finals', 'judge-finals')}
+        ${link('决赛结果', entry('board-finals'), 'board-finals', 'board-finals')}
+        ${link('决赛后台', entry('admin-finals'), 'admin-finals', 'admin-finals')}
         ${link('观众投票', entry('audience'), 'audience', 'audience')}
         ${link('组织方', entry('admin'), 'admin', 'admin')}
       </div></details>

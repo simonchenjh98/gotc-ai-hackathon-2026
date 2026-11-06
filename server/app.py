@@ -30,6 +30,9 @@ from repository_backups import RepositoryBackups, ArchiveDownload
 from repositories import Repositories
 from write_conflicts import WriteConflicts
 from judging import JudgingService
+from finals import FinalsService
+from roadshow_access import RoadshowAccess
+from roadshow_scoring import RoadshowScoring
 from admin_data import AdminDataService, TRACK_OPTIONS
 from keys import KeyService, load_config
 
@@ -50,7 +53,7 @@ SESSION_SECONDS = 12 * 3600
 LOGIN_KDF_CONCURRENCY = 4
 VOTE_LIMIT = 3
 COOKIE_NAME = "gotc_session"
-STATIC_FILES = {"site-header.js", "site-header.css", "teams.html", "team-registration.js", "team-registration.css", "downloads/gotc-gitee-submission-guide.pdf", "index.html", "styles.css", "app.js", "platform.html", "platform.js", "platform-admin.js", "platform-claims.js", "platform-draft-recovery.js", "platform.css", "favicon.svg"}
+STATIC_FILES = {"site-header.js", "site-header.css", "teams.html", "team-registration.js", "team-registration.css", "downloads/gotc-gitee-submission-guide.pdf", "index.html", "styles.css", "app.js", "platform.html", "platform.js", "platform-admin.js", "platform-claims.js", "platform-draft-recovery.js", "platform.css", "platform-finals.js", "platform-finals.css", "platform-roadshow-access.js", "platform-roadshow-access.css", "platform-roadshow-scoring.js", "favicon.svg"}
 ASSET_EXTENSIONS = {".webp", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".woff2"}
 DOWNLOAD_EXTENSIONS = {".ics", ".txt"}
 SCHEMA = """
@@ -266,6 +269,9 @@ class EventService:
         self.repositories=Repositories(self)
         self.repository_backups=RepositoryBackups(self)
         self.write_conflicts=WriteConflicts(self)
+        self.finals=FinalsService(self,now_ms,text_field)
+        self.roadshow_access=RoadshowAccess(self,now_ms,text_field,scrypt_hash)
+        self.roadshow_scoring=RoadshowScoring(self,now_ms,text_field)
         self.write_conflicts.backup_before_upgrade()
         self.admin_data.backup_before_upgrade()
         self.keys=KeyService(self, load_config(self.data_dir / "gateway.json"), text_field)
@@ -275,7 +281,9 @@ class EventService:
             db.executescript(SCHEMA)
             self.judging.initialize(db)
             self.admin_data.initialize(db)
+            self.roadshow_scoring.initialize(db)
             self.claims.initialize(db)
+            self.roadshow_access.initialize(db)
             self.registration.initialize(db)
             self.keys.initialize(db)
             self.repositories.initialize(db)
@@ -315,6 +323,7 @@ class EventService:
         self.submission_records.initialize(backup=database_existed)
         with self.db() as db:self.repository_backups.initialize(db)
         self.write_conflicts.initialize()
+        self.finals.initialize()
 
     def migrate_accounts(self):
         """Rebuild only the legacy role CHECK; preserve IDs and referencing tables."""
@@ -558,9 +567,13 @@ class EventService:
             self.audit(db, current, "login")
             return {"ok": True, "role": role, "name": current["name"], "loginId": self.login_id(f"{COOKIE_NAME}={token}")}, token, "set"
 
-    def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None, server_received_at=None):
+    def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None, server_received_at=None, finals_judge_id=None):
         """Return (JSON object or CSV bytes, optional session token, cookie action)."""
         validate_unicode(body)
+        if self.roadshow_scoring.supports(path):
+            return self.roadshow_scoring.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
+        if self.roadshow_access.supports(path):
+            return self.roadshow_access.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
         if path.startswith(("/api/registration", "/api/admin/registration")):
             return self.registration.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
         if path.startswith(("/api/claims/","/api/admin/claims")):
@@ -576,10 +589,20 @@ class EventService:
             # Resolve write identities only after the lock: revocation may have committed while queued.
             if method=="POST":
                 db.execute("BEGIN IMMEDIATE")
-            elif method=="GET" and path in {"/api/admin", "/api/team/score", "/api/board", "/api/judge", "/api/audience"}:
+            elif method=="GET" and (self.finals.supports(path) or path in {"/api/admin", "/api/team/score", "/api/board", "/api/judge", "/api/audience"}):
                 # Keep release settings, aggregates and editor revisions in one read snapshot.
                 db.execute("BEGIN")
             actor = self.account(db, cookie)
+            if actor and path in {'/api/judge', '/api/score', '/api/judging/exhibition', '/api/judging/exhibition/', '/api/judging/exhibition/review'} and self.roadshow_access.owns_account(db,actor['id']):
+                raise APIError(403, '此邀请码仅用于路演评审，请从路演入口进入')
+            if self.finals.supports(path):
+                return self.finals.dispatch(db,actor,method,path,body,query or {},expected_login_id,cookie,finals_judge_id),None,None
+            if path == "/api/admin/judging/roadshow/window":
+                self.require(actor, "admin")
+                if not expected_login_id:
+                    raise APIError(428, "请刷新路演窗口页面并核对登录身份", "login_required")
+                if expected_login_id != self.login_id(cookie):
+                    raise APIError(401, "管理员登录身份已变化，请重新进入路演窗口")
             page_role = ("audience" if path in {"/api/audience", "/api/vote"} else
                          "judge" if path in {"/api/judging/exhibition", "/api/judging/exhibition/", "/api/judging/exhibition/review",
                                               "/api/judging/roadshow", "/api/judging/roadshow/", "/api/judging/roadshow/review"} else None)
@@ -1142,7 +1165,7 @@ class EventHandler(BaseHTTPRequestHandler):
                         peer = str(ipaddress.ip_address(proxy_ip))
                     except ValueError:
                         pass
-                value, token, cookie_action = service.dispatch(self.command, path, body, self.headers.get("Cookie", ""), peer,query=query,expected_login_id=self.headers.get("X-GOTC-Login"),server_received_at=received_at)
+                value, token, cookie_action = service.dispatch(self.command, path, body, self.headers.get("Cookie", ""), peer,query=query,expected_login_id=self.headers.get("X-GOTC-Login"),server_received_at=received_at,finals_judge_id=self.headers.get("X-GOTC-Finals-Judge"))
                 cookie = None
                 if cookie_action:
                     cookie = f"{COOKIE_NAME}={token or ''}; Path={service.base_path or '/'}; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS if cookie_action == 'set' else 0}"

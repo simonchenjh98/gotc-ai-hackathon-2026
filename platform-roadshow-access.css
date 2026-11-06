@@ -1,0 +1,6 @@
+.roadshow-claim{position:relative;max-width:100%;margin-top:28px;color:var(--ink,#10243d);text-align:left}
+.roadshow-claim h2{font-size:1.25rem}.roadshow-claim p{font-size:.92rem}
+.roadshow-claim textarea{font-family:ui-monospace,monospace;overflow-wrap:anywhere;word-break:break-all}
+.roadshow-claim [data-roadshow-refresh]{margin-top:12px}.roadshow-claim [data-roadshow-result]{margin-top:20px}
+.roadshow-claim [hidden]{display:none}.roadshow-access-admin{display:grid;gap:24px}
+.roadshow-access-admin textarea{min-height:180px;resize:vertical}.roadshow-access-admin .table-scroll{overflow-x:auto}

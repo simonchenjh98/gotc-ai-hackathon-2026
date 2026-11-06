@@ -34,11 +34,13 @@ class PageSessionOwnershipTests(unittest.TestCase):
         team = self.team()
         first, first_invite = self.invitation('judge', 'First judge')
         second, second_invite = self.invitation('judge', 'Second judge')
+        _, third_invite = self.invitation('judge', 'Third roadshow judge')
         for stage in ('exhibition', 'roadshow'):
             with self.subTest(stage=stage):
                 self.stage_path = '/api/admin/judging/' + stage
                 self.judge_path = '/api/judging/' + stage
-                self.configure([team], [first_invite['id'], second_invite['id']])
+                judges = [first_invite['id'], second_invite['id']] + ([third_invite['id']] if stage == 'roadshow' else [])
+                self.configure([team], judges)
                 self.window()
                 page = first.get(self.judge_path)[1]
                 body = {'runId': page['stage']['runId'], 'teamId': team, 'expectedVersion': 0,
@@ -56,11 +58,13 @@ class PageSessionOwnershipTests(unittest.TestCase):
         team = self.team()
         first, first_invite = self.invitation('judge', 'First judge')
         second, second_invite = self.invitation('judge', 'Second judge')
+        _, third_invite = self.invitation('judge', 'Third roadshow judge')
         for stage in ('exhibition', 'roadshow'):
             with self.subTest(stage=stage):
                 self.stage_path = '/api/admin/judging/' + stage
                 self.judge_path = '/api/judging/' + stage
-                self.configure([team], [first_invite['id'], second_invite['id']])
+                judges = [first_invite['id'], second_invite['id']] + ([third_invite['id']] if stage == 'roadshow' else [])
+                self.configure([team], judges)
                 self.window()
                 page = second.get(self.judge_path)[1]
                 body = {'runId': page['stage']['runId'], 'teamId': team, 'expectedVersion': 0,

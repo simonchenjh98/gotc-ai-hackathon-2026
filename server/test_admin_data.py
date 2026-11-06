@@ -660,10 +660,12 @@ class AdminDataTests(unittest.TestCase):
         outside=self.team(3,'OUTSIDE_ROSTER',track='未来学习样态')
         one,one_invite=self.invitation(name='Authorized one')
         two,two_invite=self.invitation(name='Authorized two')
+        _,three_invite=self.invitation(name='Authorized three with no review')
+        historical_judge_ids={one_invite['id'],two_invite['id'],three_invite['id']}
         _,outside_invite=self.invitation(name='OUTSIDE_AUTHORIZATION')
         self.roster('exhibition',[second],[outside_invite['id']])
         self.window('exhibition')
-        self.roster('roadshow',[first,second],[one_invite['id'],two_invite['id']])
+        self.roster('roadshow',[first,second],list(historical_judge_ids))
         self.window('roadshow')
         self.assertEqual(self.review(one,'roadshow',first,feedback='Historical formal')[0],200)
         self.assertEqual(self.review(two,'roadshow',first,state='recused',feedback='')[0],200)
@@ -682,7 +684,6 @@ class AdminDataTests(unittest.TestCase):
         self.assertEqual(self.admin.post('/api/admin/judging/roadshow/reset',{
             'expectedRevision':current['stage']['revision'],'reason':'New independent worklist'})[0],200)
         self.roster('roadshow',[outside],[outside_invite['id']])
-        self.window('roadshow')
         filters={'stage':'roadshow','runId':historical}
         _,teams,_=self.csv_data('teams',**filters)
         self.assertEqual({row['id'] for row in teams},{first,second})
@@ -692,13 +693,13 @@ class AdminDataTests(unittest.TestCase):
             self.assertEqual((row['stage'],row['runId'],row['frozenAt'],row['recordFilter']),('roadshow',historical,str(frozen_at),'all'))
             self.assertEqual(row['updatedAt'],str(original_team_times[row['id']]))
         _,judges,_=self.csv_data('judges',**filters)
-        self.assertEqual({row['id'] for row in judges},{one_invite['id'],two_invite['id']})
+        self.assertEqual({row['id'] for row in judges},historical_judge_ids)
         for row in judges:
             self.assertEqual((row['stage'],row['runId'],row['frozenAt'],row['recordFilter']),('roadshow',historical,str(frozen_at),'all'))
             self.assertEqual(row['createdAt'],str(judge_times[row['id']]))
         for status,expected_teams,expected_judges in [
             ('submitted',{first},{one_invite['id']}),('recused',{first},{two_invite['id']}),
-            ('draft',{second},{one_invite['id']}),('missing',{first,second},{one_invite['id'],two_invite['id']})]:
+            ('draft',{second},{one_invite['id']}),('missing',{first,second},historical_judge_ids)]:
             _,team_rows,_=self.csv_data('teams',**filters,status=status)
             _,judge_rows,_=self.csv_data('judges',**filters,status=status)
             self.assertEqual({row['id'] for row in team_rows},expected_teams,status)
@@ -715,7 +716,7 @@ class AdminDataTests(unittest.TestCase):
         self.assertEqual([(row['id'],row['name']) for row in teams],[(second,'Frozen second')])
         for kind in ['reviews','rosters']:
             _,rows,_=self.csv_data(kind,**filters)
-            self.assertEqual(len(rows),4)
+            self.assertEqual(len(rows),6)
             self.assertTrue(all(row['stage']=='roadshow' and row['runId']==historical and row['frozenAt']==str(frozen_at) for row in rows))
         with self.service.db() as db:
             current_team_times={row['id']:row['updated_at'] for row in db.execute('SELECT id,updated_at FROM teams')}

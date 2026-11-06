@@ -7,13 +7,13 @@ const source=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8').s
 function context(hash='#judge',role='judge'){
   const main={innerHTML:''};
   const ctx=vm.createContext({document:{getElementById:id=>id==='platform-main'?main:{},querySelectorAll:()=>[],body:{classList:{remove(){}}}},location:{href:`https://example.test/platform.html${hash}`,hash},URL,Date,setTimeout,clearTimeout});
-  vm.runInContext(source+`\nsession={role:${JSON.stringify(role)}};account=()=>{};globalThis.calls=[];renderBoard=async()=>calls.push('numeric-board');renderExhibitionBoard=async()=>calls.push('exhibition-board');renderJudge=async()=>calls.push('numeric-judge');renderExhibitionJudge=async()=>calls.push('exhibition-judge');renderLogin=role=>calls.push('login:'+role);renderWrongRole=role=>calls.push('wrong-role:'+role);`,ctx);
+  vm.runInContext(source+`\nsession={role:${JSON.stringify(role)}};account=()=>{};globalThis.calls=[];renderBoard=async()=>calls.push('numeric-board');renderExhibitionBoard=async()=>calls.push('exhibition-board');renderJudge=async()=>calls.push('numeric-judge');renderExhibitionJudge=async()=>calls.push('exhibition-judge');renderRoadshowJudge=async()=>calls.push('roadshow-numeric-judge');renderRoadshowBoard=async()=>calls.push('roadshow-numeric-board');renderLogin=role=>calls.push('login:'+role);renderWrongRole=role=>calls.push('wrong-role:'+role);`,ctx);
   return ctx;
 }
 
-test('original public routes keep numeric board and judge while exhibition uses separate suffixes',async()=>{
-  for(const [hash,expected] of [['','numeric-board'],['#board','numeric-board'],['#judge','numeric-judge'],['#board-exhibition','exhibition-board'],['#judge-exhibition','exhibition-judge'],['#judge-roadshow','exhibition-judge'],['#board-roadshow','exhibition-board']]){
-    const ctx=context(hash);await vm.runInContext('renderRoute()',ctx);assert.equal(ctx.calls[0],expected);
+test('original numeric routes and exhibition remain unchanged while roadshow uses its independent numeric renderer',async()=>{
+  for(const [hash,expected] of [['','numeric-board'],['#board','numeric-board'],['#judge','numeric-judge'],['#board-exhibition','exhibition-board'],['#judge-exhibition','exhibition-judge'],['#judge-roadshow','roadshow-numeric-judge'],['#board-roadshow','roadshow-numeric-board']]){
+    const ctx=context(hash);await vm.runInContext('renderRoute()',ctx);assert.equal(ctx.calls[0],expected,hash || 'default board');
   }
   for(const hash of ['#judge','#judge-exhibition','#judge-roadshow']){
     const ctx=context(hash,null);await vm.runInContext('renderRoute()',ctx);assert.equal(ctx.calls[0],'login:judge');
