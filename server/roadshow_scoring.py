@@ -50,7 +50,7 @@ class RoadshowScoring:
     def supports(path):
         return any(path == endpoint or path.startswith(endpoint + '/') for endpoint in
                    ('/api/roadshow/scoring', '/api/roadshow/score', '/api/roadshow/board',
-                    '/api/admin/roadshow/scoring', '/api/admin/roadshow/publish'))
+                    '/api/admin/roadshow/scoring', '/api/admin/roadshow/publish', '/api/admin/roadshow/teams'))
 
     def initialize(self, db):
         for statement in DDL:
@@ -183,7 +183,25 @@ class RoadshowScoring:
         return result
 
     def admin_view(self, db, state):
-        return {'config': self.config(db, state), 'dimensions': DIMENSIONS, 'summary': self.summary(db, state)}
+        return {'config': self.config(db, state), 'dimensions': DIMENSIONS, 'summary': self.summary(db, state),
+                'availableTeams': self.s.finals.teams(db),
+                'roster': {'teamIds': [team['id'] for team in self.teams(db, state)],
+                           'editable': self.s.judging.stage_view(state)['rosterEditable']}}
+
+    def save_teams(self, db, actor, state, body):
+        self.fields(body, {'runId', 'expectedRevision', 'teamIds'})
+        if not isinstance(body['runId'], str) or body['runId'] != state['run_id']:
+            raise APIError(409, '路演轮次已更新，请核对最新页面', 'roadshow_run_conflict')
+        self.next_revision(body, state['revision'])
+        team_ids = self.s.judging.identifier_list(body['teamIds'], '路演队伍名单')
+        eligible = {team['id'] for team in self.s.finals.teams(db) if team['eligible']}
+        if not set(team_ids) <= eligible:
+            raise APIError(400, '路演名单包含不存在或已失去参赛资格的队伍')
+        judge_ids = [row[0] for row in db.execute(
+            'SELECT judge_id FROM judging_grants WHERE run_id=? ORDER BY judge_id', (state['run_id'],))]
+        self.s.judging.set_roster(db, actor, state, {
+            'expectedRevision': body['expectedRevision'], 'teamIds': team_ids, 'judgeIds': judge_ids})
+        return {'ok': True, **self.admin_view(db, self.s.judging.state(db, 'roadshow'))}
 
     def save_score(self, db, actor, state, body):
         self.require_judge(db, actor, state)
@@ -264,7 +282,8 @@ class RoadshowScoring:
                 saved = self.publication_state(db)
                 return {'config': self.config(db, state, public=True), 'dimensions': DIMENSIONS,
                         'summary': json.loads(saved['publication_json']) if self.published(db, state) else None}
-            if path not in {'/api/roadshow/scoring', '/api/roadshow/score', '/api/admin/roadshow/scoring', '/api/admin/roadshow/publish'}:
+            if path not in {'/api/roadshow/scoring', '/api/roadshow/score', '/api/admin/roadshow/scoring',
+                            '/api/admin/roadshow/publish', '/api/admin/roadshow/teams'}:
                 raise APIError(404, '路演评分接口不存在')
             actor = self.s.account(db, cookie)
             self.s.require(actor, 'admin' if path.startswith('/api/admin/') else 'judge')
@@ -274,6 +293,10 @@ class RoadshowScoring:
                 raise APIError(401, '登录身份已变化，请重新进入')
             if method == 'GET' and path == '/api/admin/roadshow/scoring':
                 return self.admin_view(db, state)
+            if path == '/api/admin/roadshow/teams':
+                if method != 'POST':
+                    raise APIError(404, '路演队伍保存接口不存在')
+                return self.save_teams(db, actor, state, body)
             if method == 'POST' and path == '/api/admin/roadshow/publish':
                 return self.publish(db, actor, state, body)
             self.require_judge(db, actor, state)
