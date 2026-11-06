@@ -122,7 +122,7 @@ class RoadshowAccessTests(unittest.TestCase):
         self.assertEqual(judge.get('/api/judging/exhibition')[0], 403)
         self.assertEqual(judge.post('/api/judging/exhibition/review', {})[0], 403)
         self.assertEqual(judge.get('/api/admin')[0], 403)
-        self.assertEqual(judge.get('/api/finals/judge')[0], 503)  # Finals invitation is not configured in this fixture.
+        self.assertEqual(judge.get('/api/finals/judge')[0], 400)
         self.assertEqual(judge.get('/api/board')[0], 200)
         ordinary, _ = self.invitation(name='ordinary-existing-judge')
         self.assertEqual(ordinary.get('/api/judge')[0], 200)
