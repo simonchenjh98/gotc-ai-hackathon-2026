@@ -277,14 +277,38 @@ class GatewayTransactionTests(unittest.TestCase):
     def test_deep_gateway_json_is_a_client_error_without_upstream_or_charge(self):
         _, _, token = self.enabled_key()
         raw = b'{"model":"cheap","messages":' + b'[' * 5000 + b'0' + b']' * 5000 + b'}'
-        with patch.object(keys.traceback, 'print_exc'):
-            status, result, _ = self.public.request('POST', '/v1/chat/completions', raw=raw,
-                                                   headers={'Authorization': 'Bearer ' + token})
+        status, result, _ = self.public.request('POST', '/v1/chat/completions', raw=raw,
+                                               headers={'Authorization': 'Bearer ' + token})
         self.assertEqual(status, 400, result)
         self.assertEqual(len(FakeUpstream.calls), 0)
         item = self.latest()
         self.assertEqual((item['status'], item['cost']), (400, 0))
         self.assertEqual(self.call('/v1/chat/completions', {'model': 'cheap'}, token)[0], 200)
+
+    def test_gateway_container_depth_boundary_preserves_nested_payload_and_literal_braces(self):
+        _, _, token = self.enabled_key()
+        leaf = b'"literal { [ ] } and \\"quoted\\" text"'
+
+        def payload(nested):
+            return (b'{"model":"cheap","messages":[],"metadata":' + b'{"nested":' * nested +
+                    leaf + b'}' * nested + b'}')
+
+        # Both inputs parse on supported runtimes: enforce our limit rather than a parser's recursion threshold.
+        raw = payload(keys.JSON_DEPTH_LIMIT)
+        json.loads(raw)
+        status, result, _ = self.public.request('POST', '/v1/chat/completions', raw=raw,
+                                               headers={'Authorization': 'Bearer ' + token})
+        self.assertEqual(status, 400, result)
+        self.assertEqual(result['error']['code'], 'invalid_request')
+        self.assertEqual(len(FakeUpstream.calls), 0)
+        self.assertEqual((self.latest()['status'], self.latest()['cost']), (400, 0))
+
+        raw = payload(keys.JSON_DEPTH_LIMIT - 1)  # The root object counts as one container.
+        status, result, _ = self.public.request('POST', '/v1/chat/completions', raw=raw,
+                                               headers={'Authorization': 'Bearer ' + token})
+        self.assertEqual(status, 200, result)
+        self.assertEqual(len(FakeUpstream.calls), 1)
+        self.assertEqual(FakeUpstream.calls[0][2]['metadata'], json.loads(raw)['metadata'])
 
     def test_platform_stream_terminal_events_and_truncation(self):
         _, _, token = self.enabled_key()

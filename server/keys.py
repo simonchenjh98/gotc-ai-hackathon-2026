@@ -69,6 +69,7 @@ DEFAULTS = {"keys.maxKeys": 5, "keys.expiresAt": None,
 ROUTES = {"/v1/chat/completions": ("openai", "/chat/completions"), "/v1/messages": ("anthropic", "/messages"),
           "/v1/responses": ("openai", "/responses")}  # Responses API: Codex CLI
 BODY_LIMIT = 32 * 1024 * 1024  # sub2api allows 32 MB text bodies; screenshots and long agent sessions need it
+JSON_DEPTH_LIMIT = 128  # independent of the Python JSON parser's platform/version recursion limit
 # Error classification copied from sub2api (handler/ops_error_logger.go classifyOpsPhase + owner mapping):
 # kind -> (default status, Anthropic error type, OpenAI error type, OpenAI code, phase, owner).
 # phase: request|auth|upstream|network|internal; owner: client (the team's request), provider (upstream), platform (gateway).
@@ -309,6 +310,25 @@ def passed_headers(headers):
 def gateway_json(value):
     """Compact UTF-8 JSON for upstream bodies: CJK is not escaped (half the bytes) and NaN/Infinity never go out."""
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+
+
+def validate_json_depth(value):
+    """Bound container depth before recursive schema/media inspection or serialization.
+
+    Iterator frames keep this check non-recursive and use memory proportional to
+    depth, even for requests containing many sibling messages or long strings.
+    """
+    stack = [iter((value,))]
+    while stack:
+        try:
+            item = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
+        if isinstance(item, (dict, list)):
+            if len(stack) > JSON_DEPTH_LIMIT:
+                raise GatewayError("invalid", f"JSON 嵌套过深，最多允许 {JSON_DEPTH_LIMIT} 层")
+            stack.append(iter(item.values() if isinstance(item, dict) else item))
 
 
 class ClientGone(Exception):
@@ -1369,6 +1389,7 @@ class KeyService:
             raise ValueError(name)
         try:
             body = json.loads(raw, parse_constant=reject_constant)
+            validate_json_depth(body)
             gateway_json(body)  # 1e400 parses to inf: refuse here rather than send invalid JSON upstream
         except (UnicodeError, ValueError, RecursionError):
             raise APIError(400, "JSON格式不正确") from None
