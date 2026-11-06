@@ -1,4 +1,4 @@
-"""Private registration roster and in-person team credential claims.
+"""Private reference identities and organizer-reviewed team credential claims.
 
 Receipts are bearer credentials. Only their hashes and credential fingerprints
 persist; organizer reads deliberately never include receipt/PIN/code material.
@@ -258,16 +258,23 @@ class Claims:
             raise APIError(400,'核验码不正确，请核对申请人的设备')
 
     def approve_open(self,db,actor,body):
-        fields={'requestId','expectedRevision','reviewContext','teamName','track','pin','inPersonVerified','resolvedIdentity','note'}
-        if set(body) not in (fields,fields|{'teamId','teamContext'}):raise APIError(400,'开放申请审核字段不正确')
+        fields={'requestId','expectedRevision','reviewContext','teamName','track','resolvedIdentity','note'}
+        online_fields=fields|{'verificationMethod','applicationReviewed'}
+        onsite_fields=fields|{'pin','inPersonVerified'}
+        online=set(body) in (online_fields,online_fields|{'teamId','teamContext'})
+        if not online and set(body) not in (onsite_fields,onsite_fields|{'teamId','teamContext'}):raise APIError(400,'开放申请审核字段不正确')
         if 'teamId' in body and (not isinstance(body['teamId'],str) or not body['teamId'] or not isinstance(body['teamContext'],str) or not re.fullmatch(r'[a-f0-9]{64}',body['teamContext'])):raise APIError(400,'请选择队伍并提交当前队伍核验上下文')
         if not isinstance(body['requestId'],str) or type(body['expectedRevision']) is not int or not isinstance(body['reviewContext'],str) or not re.fullmatch(r'[a-f0-9]{64}',body['reviewContext']):raise APIError(400,'需要申请修订号及核验上下文')
-        if body['inPersonVerified'] is not True or type(body['resolvedIdentity']) is not bool:raise APIError(400,'请当面核实本人和全部组员')
-        if not isinstance(body['pin'],str) or not re.fullmatch(r'\d{6}',body['pin']):raise APIError(400,'请输入申请人设备上的六位核验码')
+        if type(body['resolvedIdentity']) is not bool:raise APIError(400,'身份区分确认字段不正确')
+        if online:
+            if body['verificationMethod']!='online' or body['applicationReviewed'] is not True:raise APIError(400,'请明确审核申请并批准')
+        else:
+            if body['inPersonVerified'] is not True:raise APIError(400,'请当面核实本人和全部组员')
+            if not isinstance(body['pin'],str) or not re.fullmatch(r'\d{6}',body['pin']):raise APIError(400,'请输入申请人设备上的六位核验码')
         metadata=self.team_metadata(body);note=self.text(body['note'],'审核备注',2000)
         row=db.execute('SELECT * FROM claim_requests WHERE id=?',(body['requestId'],)).fetchone()
         if not row:raise APIError(404,'申请不存在')
-        canonical={**body,**metadata,'note':note,'pin':digest('pin:'+row['id'],body['pin'])}
+        canonical={**body,**metadata,'note':note,**({} if online else {'pin':digest('pin:'+row['id'],body['pin'])})}
         approval=digest('open-approval-v1',json.dumps(canonical,ensure_ascii=False,sort_keys=True))
         # Compare applied intent before context, which necessarily changes after membership assignment.
         if row['status'] in {'approved','issued'} and row['approval_digest']==approval:
@@ -284,7 +291,7 @@ class Claims:
         if any(normalize(t['name'])==normalize(metadata['teamName']) and (not selected or t['id']!=selected['id'])
                for t in db.execute('SELECT id,name FROM teams')):
             raise APIError(409,'这个队名已存在，请明确选择已有队伍进行核验，或填写可区分的队名')
-        self.verify_pin(db,actor,row,body['pin'])
+        if not online:self.verify_pin(db,actor,row,body['pin'])
         people=[declaration['captain']]+declaration['members'];matches=[]
         for person in people:
             identity=(normalize(person['name']),normalize(person['school']))
@@ -325,6 +332,7 @@ class Claims:
         except sqlite3.IntegrityError:raise APIError(409,'成员或队伍已经分配，请重新读取并核对')
         self.s.audit(db,actor,'claims.approve-open',row['id'],{'teamId':team['id'],'memberIds':member_ids,'declaration':reviewed,
             'requestRevision':body['expectedRevision'],'reviewContext':body['reviewContext'],'resolvedIdentity':body['resolvedIdentity'],'note':note,
+            **({'verificationMethod':'online','applicationReviewed':True} if online else {'verificationMethod':'onsite','inPersonVerified':True}),
             **({'selectedTeamId':body['teamId'],'teamContext':body['teamContext']} if selected else {})})
         return {'ok':True,'status':'approved','revision':row['revision']+1}
 
@@ -388,7 +396,7 @@ class Claims:
             account=db.execute('SELECT * FROM accounts WHERE id=?',(access['id'],)).fetchone()
             db.execute('UPDATE claim_requests SET account_id=?,account_fingerprint=? WHERE id=?',(account['id'],fingerprint(account),row['id']))
         except sqlite3.IntegrityError:raise APIError(409,'成员或队伍已经分配，请重新读取并核对')
-        metadata={'teamId':body['teamId'],'captainId':body['captainId'],'memberIds':sorted(members),'memberRevisions':member_revisions,'note':note,'resolvedIdentity':body['resolvedIdentity']}
+        metadata={'verificationMethod':'onsite','inPersonVerified':True,'teamId':body['teamId'],'captainId':body['captainId'],'memberIds':sorted(members),'memberRevisions':member_revisions,'note':note,'resolvedIdentity':body['resolvedIdentity']}
         if declaration:metadata.update(declaration=declaration,declaredMemberIds=mapping,requestRevision=body['expectedRevision'])
         self.s.audit(db,actor,'claims.approve',row['id'],metadata)
         return {'ok':True,'status':'approved','revision':row['revision']+1}

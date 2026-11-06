@@ -127,11 +127,11 @@ class TeamRegistration:
         for name in value['members']:
             if db.execute('SELECT 1 FROM claim_people WHERE normalized_name=?', (normalize(name),)).fetchone():
                 continue  # Keep the existing registration's school/identity; do not guess aliases.
-            school = value['school'] if name == value['captain'] else '待现场核实'
+            school = value['school'] if name == value['captain'] else '待核对'
             db.execute('''INSERT OR IGNORE INTO claim_people
                 (id,name,school,normalized_name,normalized_school,notes,needs_review)
                 VALUES (?,?,?,?,?,?,1)''', ('R'+secrets.token_hex(12), name, school, normalize(name),
-                                         normalize(school), '来源：组队登记；队员学校未提供，须现场核实本人、学校和归属。'))
+                                         normalize(school), '来源：组队登记；队员学校未提供，须核对本人、学校和归属。'))
 
     def insert(self, db, value, secret, source_key=None, raw=None):
         if db.execute('SELECT COUNT(*) FROM teams').fetchone()[0] >= 200:
@@ -183,9 +183,9 @@ class TeamRegistration:
             # A name-only registration editor cannot collapse distinct verified people.
             # Accept its ordered tail or a compatible full-list payload, then keep the authoritative roster.
             if value['captain'] != row['captain'] or value['school'] != row['school'] or body['team']['members'] not in (confirmed,confirmed[1:]):
-                raise APIError(409, '本队已完成现场身份核验，成员变化请交由组织方处理')
+                raise APIError(409, '本队成员已获组织方批准，成员变化请交由组织方处理')
             if value['targetSize']<len(confirmed):
-                raise APIError(400, '目标人数不能少于已现场核实的完整成员人数')
+                raise APIError(400, '目标人数不能少于已批准的完整成员人数')
             value['members']=confirmed
         self.check_duplicates(db, value, row['team_id'])
         # A registration edit must not overwrite an already submitted project title.

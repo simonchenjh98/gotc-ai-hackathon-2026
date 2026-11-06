@@ -56,7 +56,7 @@ test('single flight suppresses duplicate application and invalid receipt does no
 
 test('public markup escapes server strings and renders only receipt, status and bearer-approved team',()=>{
   const html=context.claimStateMarkup({receipt,error:'<img src=x onerror=alert(1)>',status:'issued',team:{number:1,name:'<script>evil()</script>'},code:'<secret>',busy:false});
-  assert.ok(!html.includes('<img'));assert.ok(!html.includes('<script>'));assert.ok(html.includes('&lt;secret&gt;'));assert.ok(!html.includes(receipt.secret));assert.ok(html.includes(receipt.pin));
+  assert.ok(!html.includes('<img'));assert.ok(!html.includes('<script>'));assert.ok(html.includes('&lt;secret&gt;'));assert.ok(!html.includes(receipt.secret));assert.ok(!html.includes(receipt.pin));
   const pending=context.claimStateMarkup({receipt,error:'',status:'pending',team:null,code:null,busy:false});assert.ok(!pending.includes('id="claim-redeem"'));
   assert.ok(context.claimStateMarkup({receipt,error:'',status:'approved',team:{number:1,name:'Fixture'},code:null,busy:false}).includes('id="claim-redeem"'));
 });
@@ -195,7 +195,7 @@ test('direct staff review shows private duplicate references and posts only revi
   const request={id:'declared-fixture',name:declaredCaptain.name,school:declaredCaptain.school,revision:3,status:'pending',reviewContext:'opaque-context',declaration:declaredResponse.declaration,
     references:[{id:'reference',name:declaredCaptain.name,school:'Other School',teamId:'assigned',notes:'Reference note',needsReview:true}]};
   const html=context.claimsReviewMarkup(request,{people:[],teams:[]});
-  assert.match(html,/First Teammate · First School/);assert.match(html,/可能重复/);assert.match(html,/Other School/);assert.match(html,/inPersonVerified/);
+  assert.match(html,/First Teammate · First School/);assert.match(html,/可能重复/);assert.match(html,/Other School/);assert.ok(!html.includes('name="pin"'));assert.ok(!html.includes('name="inPersonVerified"'));assert.match(html,/线上申请审核/);
   assert.match(html,/<select name="teamId"><option value="">创建新队伍（默认）/);assert.ok(!html.includes('data-claim-map'));assert.ok(!html.includes('data-copy-value'));
   const posts=[];
   const form={elements:{teamName:{value:'Reviewed Team'},track:{value:''},pin:{value:'123456'},note:{value:'Distinct people verified'},inPersonVerified:{checked:true},resolvedIdentity:{checked:true}}};
@@ -204,7 +204,7 @@ test('direct staff review shows private duplicate references and posts only revi
   const handler=source.slice(source.indexOf('  function selectRequest(id){'),source.indexOf("  document.getElementById('claims-admin-load').onclick=load;"));
   vm.runInContext(handler+'\nselectRequest("declared-fixture");',scope);form.onsubmit({preventDefault(){}});
   assert.equal(posts[0].path,'admin/claims/approve');assert.equal(posts[0].body.reviewContext,'opaque-context');assert.equal(posts[0].body.expectedRevision,3);
-  assert.equal(posts[0].body.teamName,'Reviewed Team');assert.equal(posts[0].body.track,'');assert.equal(posts[0].body.resolvedIdentity,true);
+  assert.equal(posts[0].body.teamName,'Reviewed Team');assert.equal(posts[0].body.track,'');assert.equal(posts[0].body.resolvedIdentity,true);assert.equal(posts[0].body.verificationMethod,'online');assert.equal(posts[0].body.applicationReviewed,true);assert.ok(!Object.hasOwn(posts[0].body,'pin'));assert.ok(!Object.hasOwn(posts[0].body,'inPersonVerified'));
   assert.ok(!Object.hasOwn(posts[0].body,'memberIds'));
 });
 
@@ -334,7 +334,7 @@ test('public and admin track choices match existing server tracks while blank re
   const tracks=JSON.parse(backend.match(/TRACK_OPTIONS=(\[[^\n]+\])/)[1]);
   const html=context.claimTeamMarkup({teamName:'A < B',track:''});
   for(const track of tracks)assert.ok(html.includes('value="'+track+'"'));
-  assert.match(html,/待定（现场确认）/);assert.match(html,/A &lt; B/);assert.ok(!html.includes('<select name="track" required'));
+  assert.match(html,/待定/);assert.match(html,/A &lt; B/);assert.ok(!html.includes('<select name="track" required'));
   assert.match(html,/<input name="teamName" required/);
 });
 
@@ -344,16 +344,31 @@ test('optional existing team selection displays registration and binds its displ
   const html=context.claimsReviewMarkup(request,{teams:[team],people:[]});
   assert.match(html,/<option value="">创建新队伍（默认）/);assert.ok(!html.includes('selected'));
   const summary=context.claimExistingTeamMarkup(team);assert.match(summary,/Old Captain/);assert.match(summary,/Old School/);assert.match(summary,/Member &lt;two&gt;/);
-  assert.match(summary,/Preserved &lt;project&gt;/);assert.match(summary,/登记修订：9/);assert.match(summary,/以本次现场核实/);
+  assert.match(summary,/Preserved &lt;project&gt;/);assert.match(summary,/登记修订：9/);assert.match(summary,/以本次审核通过/);
   const posts=[],form={elements:{teamId:{value:''},teamName:{value:'Reviewed Team'},track:{value:''},pin:{value:'123456'},note:{value:'Verified'},inPersonVerified:{checked:true},resolvedIdentity:{checked:false}}};
   const nodes={'claim-review':{innerHTML:''},'claim-review-form':form,'claim-reject':{},'claim-existing-summary':{innerHTML:''}};
   const scope=vm.createContext({model:{requests:[request],teams:[team]},document:{getElementById:id=>nodes[id]},busy:false,live:()=>true,replaceEditor:()=>true,trackAdminForm:()=>{},claimsReviewMarkup:()=>'',claimExistingTeamMarkup:context.claimExistingTeamMarkup,mutate:(f,path,body)=>posts.push(body),formError:(f,error)=>{f.error=error;}});
   const handler=source.slice(source.indexOf('  function selectRequest(id){'),source.indexOf("  document.getElementById('claims-admin-load').onclick=load;"));
   vm.runInContext(handler+'\nselectRequest("select-fixture");',scope);
   form.onsubmit({preventDefault(){}});assert.ok(!Object.hasOwn(posts[0],'teamId'));assert.ok(!Object.hasOwn(posts[0],'teamContext'));
-  form.elements.teamId.value=team.id;form.elements.teamId.onchange();assert.equal(form.elements.inPersonVerified.checked,false);assert.match(nodes['claim-existing-summary'].innerHTML,/Old Captain/);
-  form.elements.inPersonVerified.checked=true;form.onsubmit({preventDefault(){}});
+  form.elements.teamId.value=team.id;form.elements.teamId.onchange();assert.match(nodes['claim-existing-summary'].innerHTML,/Old Captain/);
+  form.onsubmit({preventDefault(){}});
   assert.equal(posts[1].teamId,team.id);assert.equal(posts[1].teamContext,'displayed-team-context');assert.equal(posts[1].reviewContext,'claim-context');
   form.elements.teamId.value='missing';form.onsubmit({preventDefault(){}});assert.equal(posts.length,2);assert.match(form.error,/所选队伍已变化/);
   form.elements.teamId.value='';form.elements.teamId.onchange();assert.match(nodes['claim-existing-summary'].innerHTML,/默认批准后创建新队伍/);
+});
+
+test('online application and review require no device PIN, physical visit, or external message',()=>{
+  const pending=context.claimStateMarkup({...declaredResponse,receipt,draft:{...declaredCaptain,members:declaredMembers},busy:false,error:''});
+  assert.match(pending,/等待审核/);assert.match(pending,/已提交至组织方后台/);
+  assert.ok(!pending.includes(receipt.pin));assert.ok(!pending.includes('id="claim-redeem"'));
+  const review=context.claimsReviewMarkup({id:'online',name:declaredCaptain.name,school:declaredCaptain.school,status:'pending',revision:1,declaration:declaredResponse.declaration},{teams:[],people:[]});
+  for(const html of [pending,review]){
+    assert.doesNotMatch(html,/name="(?:pin|inPersonVerified)"/);assert.doesNotMatch(html,/现场|当面|私信|出示|六位/);
+  }
+  assert.match(review,/点击批准即确认已审核申报信息/);assert.match(review,/说明（选填/);
+  for(const file of ['index.html','platform.js','platform-admin.js','platform.html','team-registration.js']){
+    const text=fs.readFileSync(new URL('../'+file,import.meta.url),'utf8');
+    assert.doesNotMatch(text,/申请现场核验|现场核验入口|携组员到现场组织方处核验/);
+  }
 });
