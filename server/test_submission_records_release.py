@@ -248,8 +248,14 @@ class SubmissionRecordsReleaseTests(unittest.TestCase):
         backup_tool=load_module('gotc_records_backup_tool',ROOT/'scripts/backup_event.py')
         backup=self.root/'exports'/'backup.sqlite3'
         report=backup_tool.copy_database(service.db_path,backup)
+        original_key=(service.data_dir/'roadshow-claim-key').read_bytes()
+        self.assertEqual(report['privateFiles'],['roadshow-claim-key'])
+        self.assertEqual((backup.parent/'roadshow-claim-key').read_bytes(),original_key)
+        self.assertEqual(stat.S_IMODE((backup.parent/'roadshow-claim-key').stat().st_mode),0o600)
         restored=self.root/'restored'/'event.sqlite3'
         backup_tool.copy_database(backup,restored)
+        self.assertEqual((restored.parent/'roadshow-claim-key').read_bytes(),original_key)
+        self.assertEqual(stat.S_IMODE((restored.parent/'roadshow-claim-key').stat().st_mode),0o600)
         self.assertEqual(snapshot(backup),before)
         self.assertEqual(snapshot(restored),before)
         self.assertEqual(report['rows']['submission_requests'],3)
@@ -281,6 +287,8 @@ class SubmissionRecordsReleaseTests(unittest.TestCase):
         installed_backup=tree/'backups'/release/'event.sqlite3'
         self.assertEqual(snapshot(installed_backup),before)
         self.private_valid(installed_backup)
+        self.assertEqual((installed_backup.parent/'roadshow-claim-key').read_bytes(),original_key)
+        self.assertEqual(stat.S_IMODE((installed_backup.parent/'roadshow-claim-key').stat().st_mode),0o600)
         self.assertEqual(snapshot(tree/'data'/'event.sqlite3'),before)
 
 

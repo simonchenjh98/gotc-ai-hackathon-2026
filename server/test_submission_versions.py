@@ -127,8 +127,9 @@ class VersionSubmissionTests(unittest.TestCase):
         self.assertEqual(first.get('/api/team')[1]['judgingMaterials']['exhibition']['materialSnapshot']['submissionVersion'],2)
         third=self.team(3,'No formal materials');third_client,_=self.access(third)
         road='/api/admin/judging/roadshow'
+        roadshow_judges=[grant['id']]+[self.invitation(name='Roadshow snapshot judge '+str(index))[1]['id'] for index in range(2)]
         revision=self.admin.get(road)[1]['stage']['revision']
-        self.assertEqual(self.admin.post(road+'/roster',{'expectedRevision':revision,'teamIds':[third],'judgeIds':[grant['id']]})[0],200)
+        self.assertEqual(self.admin.post(road+'/roster',{'expectedRevision':revision,'teamIds':[third],'judgeIds':roadshow_judges})[0],200)
         revision=self.admin.get(road)[1]['stage']['revision']
         self.assertEqual(self.admin.post(road+'/window',{'expectedRevision':revision,'open':True,'deadline':None})[0],200)
         no_material=third_client.get('/api/team')[1]['judgingMaterials']['roadshow']

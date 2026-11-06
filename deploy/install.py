@@ -134,6 +134,43 @@ def allowed(name):
             (parts[0] == 'downloads' and suffix in {'.ics', '.txt'}))
 
 
+# Keep this small helper standalone: the installer runs before release extraction.
+def copy_roadshow_claim_key(database, source_directory, destination_directory):
+    """Copy the immutable private key only after validating the backed-up database."""
+    tables = {row[0] for row in database.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    required = 'roadshow_access_roster' in tables and database.execute('SELECT 1 FROM roadshow_access_roster LIMIT 1').fetchone() is not None
+    binding = database.execute('SELECT key_digest FROM roadshow_access_config WHERE id=1').fetchone() if 'roadshow_access_config' in tables else None
+    source = Path(source_directory) / 'roadshow-claim-key'
+    destination = Path(destination_directory) / 'roadshow-claim-key'
+    if source.is_symlink():
+        raise ValueError('Roadshow claim key must not be a symlink')
+    if not source.exists():
+        if required:
+            raise ValueError('The original roadshow claim key is required for this database')
+        return False
+    key = source.read_bytes()
+    if len(key) != 32 or (binding and hashlib.sha256(key).hexdigest() != binding[0]) or (required and not binding):
+        raise ValueError('Roadshow claim key does not match the database')
+    if destination.is_symlink():
+        raise ValueError('Destination roadshow claim key must not be a symlink')
+    try:
+        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        if not destination.is_file() or destination.read_bytes() != key:
+            raise ValueError('Refusing to overwrite a different destination roadshow claim key') from None
+        os.chmod(destination, 0o600)
+    else:
+        try:
+            with os.fdopen(descriptor, 'wb') as stream:
+                stream.write(key)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+    return True
+
+
 def nginx_candidate(source):
     # Tokenize braces without counting braces in comments or quoted strings.
     pattern = r'''#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[{};]|[^\s{};#"']+'''
@@ -252,6 +289,7 @@ def main():
     if (data / 'event.sqlite3').is_file():
         with closing(sqlite3.connect(data / 'event.sqlite3')) as source, closing(sqlite3.connect(backup / 'event.sqlite3')) as target:
             source.backup(target)
+            copy_roadshow_claim_key(target, data, backup)
         os.chmod(backup / 'event.sqlite3', 0o600)
     release = ROOT / 'releases' / args.release
     release.mkdir(mode=0o755)

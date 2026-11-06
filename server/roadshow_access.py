@@ -1,9 +1,11 @@
 """Roster-bound roadshow invitation claiming; never exposes the public roster."""
 import base64
+from contextlib import closing
 import hashlib
 import hmac
 import os
 import secrets
+import sqlite3
 import unicodedata
 
 from errors import APIError
@@ -33,6 +35,11 @@ class RoadshowAccess:
         path = service.data_dir / 'roadshow-claim-key'
         if path.is_symlink():
             raise RuntimeError('Roadshow claim key must not be a symlink')
+        if not path.exists() and service.db_path.exists():
+            with closing(sqlite3.connect(service.db_path.as_uri() + '?mode=ro', uri=True)) as database:
+                roster = database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadshow_access_roster'").fetchone()
+                if roster and database.execute('SELECT 1 FROM roadshow_access_roster LIMIT 1').fetchone():
+                    raise RuntimeError('The original roadshow claim key is missing; restore it with the database')
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
@@ -52,7 +59,10 @@ class RoadshowAccess:
         digest = hashlib.sha256(self.key).hexdigest()
         db.execute('INSERT OR IGNORE INTO roadshow_access_config(id,key_digest) VALUES (1,?)', (digest,))
         if not hmac.compare_digest(db.execute('SELECT key_digest FROM roadshow_access_config WHERE id=1').fetchone()[0], digest):
-            raise RuntimeError('Roadshow claim key does not match the existing roster; restore the original key')
+            if db.execute('SELECT 1 FROM roadshow_access_roster LIMIT 1').fetchone():
+                raise RuntimeError('Roadshow claim key does not match the existing roster; restore the original key')
+            # A DB-only legacy restore with no identity history has no code to preserve.
+            db.execute('UPDATE roadshow_access_config SET key_digest=? WHERE id=1', (digest,))
 
     @staticmethod
     def supports(path):
