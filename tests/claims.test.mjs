@@ -82,3 +82,33 @@ test('API and route wiring protects admin reads/writes and logout clears tab cla
   const installer=source.slice(source.indexOf('function installClaimsAdmin'));
   assert.match(installer,/onclick=load/);assert.ok(!/\n\s*load\(\);/.test(installer));
 });
+
+test('real approval handler submits exact selected revisions from displayed model, including a stale same-panel selection',()=>{
+  const people=[{id:'p1',name:'Captain',revision:2},{id:'p2',name:'Bob',revision:7},{id:'unselected',name:'Other',revision:9}];
+  const request={id:'request-fixture',revision:1,status:'pending'};
+  const selected=[{value:'p1'},{value:'p2'}],posts=[];
+  const form={elements:{teamId:{value:'T1'},captainId:{value:'p1'},pin:{value:'123456'},note:{value:'Verified Bob onsite'},inPersonVerified:{checked:true},resolvedIdentity:{checked:false}},querySelectorAll:()=>selected};
+  const nodes={'claim-review':{innerHTML:''},'claim-review-form':form,'claim-member-search':{},'claim-team-search':{},'claim-reject':{}};
+  const scope=vm.createContext({Map,Object,model:{requests:[request],people},document:{getElementById:id=>nodes[id]},busy:false,live:()=>true,replaceEditor:()=>true,trackAdminForm:()=>{},claimsReviewMarkup:()=>'',mutate:(f,path,body)=>posts.push({form:f,path,body})});
+  const helper=source.slice(source.indexOf('function claimMemberSnapshot'),source.indexOf('function claimsReviewMarkup'));
+  const handler=source.slice(source.indexOf('  function selectRequest(id){'),source.indexOf("  document.getElementById('claims-admin-load').onclick=load;"));
+  vm.runInContext(helper+'\n'+handler+'\nselectRequest("request-fixture");',scope);
+  // A successful person-editor write does not refresh the displayed roster model.
+  const nowSavedPerson={...people[1],name:'Charlie',revision:8};assert.equal(nowSavedPerson.revision,8);
+  form.onsubmit({preventDefault(){}});
+  assert.equal(posts.length,1);assert.equal(posts[0].path,'admin/claims/review');
+  assert.deepEqual({...posts[0].body.memberRevisions},{p1:2,p2:7});assert.deepEqual([...posts[0].body.memberIds],['p1','p2']);
+  assert.equal(posts[0].body.note,'Verified Bob onsite');assert.equal(posts[0].body.expectedRevision,1);
+  assert.ok(!Object.hasOwn(posts[0].body.memberRevisions,'unselected'));
+});
+
+test('real admin mutation handler retains selected members, PIN and notes after roster revision conflict',async()=>{
+  const buttons=[{disabled:false,dataset:{}},{disabled:false,dataset:{}}];
+  const form={elements:{pin:{value:'123456'},note:{value:'Keep my onsite note'},members:[{checked:true,value:'p2'}]},error:'',querySelectorAll:selector=>selector==='button'?buttons:[],querySelector:()=>null};
+  const dirtyAdminForms=new Set([form]);
+  const scope=vm.createContext({busy:false,live:()=>true,api:async()=>{const error=new Error('所选成员的名单已变化');error.status=409;throw error;},dirtyAdminForms,message:{textContent:''},formError:(target,error)=>target.error=error,form});
+  const mutation=source.slice(source.indexOf('  async function mutate(form,path,body){'),source.indexOf('  function replaceEditor(panel)'));
+  vm.runInContext(mutation,scope);await vm.runInContext("mutate(form,'admin/claims/review',{})",scope);
+  assert.equal(form.elements.pin.value,'123456');assert.equal(form.elements.note.value,'Keep my onsite note');assert.equal(form.elements.members[0].checked,true);
+  assert.match(form.error,/名单已变化/);assert.ok(dirtyAdminForms.has(form));assert.ok(buttons.every(button=>button.disabled && button.dataset.stale==='true'));
+});

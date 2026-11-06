@@ -418,7 +418,7 @@ existing exact Origin and JSON protections. No endpoint accepts URL parameters.
 | `POST /api/claims/request` | `{name,school}`; identical shape for known/unknown people. Maximum 1,000 unexpired pending requests. |
 | `POST /api/claims/status` | `{requestId,secret}`; fixed invalid shape or status and bearer-approved team, never a code. |
 | `POST /api/claims/redeem` | `{requestId,secret}`; approved receipt returns its repeatable code; exact retries preserve the credential. |
-| `POST /api/admin/claims/review` | Common `{requestId,expectedRevision,action,note}`. `reject` needs only these; `approve` also needs `{teamId,captainId,memberIds,pin,inPersonVerified:true,resolvedIdentity:boolean}`. |
+| `POST /api/admin/claims/review` | Common `{requestId,expectedRevision,action,note}`. `reject` needs only these; `approve` also needs `{teamId,captainId,memberIds,memberRevisions,pin,inPersonVerified:true,resolvedIdentity:boolean}`. |
 
 Public request/status/redeem endpoints each use a fixed, separate rate-limit
 scope (20 per IP / 400 global per minute). Incorrect organizer PIN attempts are
@@ -427,7 +427,12 @@ Pending requests never reserve people. Approval transactions enforce unique
 person membership and unique approved team through SQLite constraints. No
 partial membership/account survives a conflict. An identical approval retry is
 idempotent. Requests and per-person edits use expected revisions to reject stale
-writes. There is no inferred maximum contest team size beyond the 500-person
+writes. Approval also requires an exact `memberRevisions` mapping from every
+selected member ID to the revision displayed in the roster. The transaction
+rejects changed identities or notes with 409 before assigning anyone; refresh
+and re-verify the selection. Exact successful retries retain their original
+snapshot, including when a later notes edit changes the current roster.
+There is no inferred maximum contest team size beyond the 500-person
 roster bound.
 
 Approval creates a team account once through existing `team_access` with the
@@ -441,7 +446,7 @@ existing account require the existing recovery controls; claims never rotate
 that account or provision API gateway keys. Rejected/expired requests release no
 assignments because pending requests never had any.
 
-Approval review has its own 64 KiB body limit so all 500 roster IDs fit; the
+Approval review has its own 128 KiB body limit so all 500 roster IDs and their revision mapping fit; the
 2 MiB import limit applies only to roster import.
 
 The private tables are `claim_people`, `claim_requests`, and `claim_memberships`;

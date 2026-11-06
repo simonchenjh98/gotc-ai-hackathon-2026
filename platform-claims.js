@@ -62,6 +62,10 @@ function makeClaimsAdminGuard(getContext){
 function claimsPersonForm(person={id:'',name:'',school:'',notes:'',needsReview:false,revision:0}){
   return `<form id="claim-person-form"><h3>${person.revision?'修订名单':'补充已核实参赛者'}</h3><input type="hidden" name="revision" value="${Number(person.revision)}"><label class="field">稳定名单编号<input name="id" maxlength="100" pattern="[A-Za-z0-9_-]+" required value="${esc(person.id)}" ${person.revision?'readonly':''}></label><label class="field">姓名<input name="name" required maxlength="100" value="${esc(person.name)}"></label><label class="field">学校<input name="school" required maxlength="200" value="${esc(person.school)}"></label><label class="field">原始记录与核实备注<textarea name="notes" maxlength="2000">${esc(person.notes)}</textarea></label><label class="toggle-line"><input type="checkbox" name="needsReview" ${person.needsReview?'checked':''}>仍需现场核实</label><button class="btn secondary small">保存名单修订</button><p class="form-error" role="alert"></p></form>`;
 }
+function claimMemberSnapshot(memberIds,people){
+  const revisions=new Map(people.map(person=>[person.id,person.revision]));
+  return {memberIds:[...memberIds],memberRevisions:Object.fromEntries(memberIds.map(id=>[id,revisions.get(id)]))};
+}
 function claimsReviewMarkup(request,data){
   const status={pending:'待核验',approved:'已批准',issued:'已领取',rejected:'已拒绝',expired:'已过期'};
   if(request.status!=='pending')return `<h3>${esc(request.name)} · ${esc(status[request.status] || request.status)}</h3><p>${esc(request.reviewNote)}</p>`;
@@ -107,7 +111,7 @@ function installClaimsAdmin(version){
     document.getElementById('claim-team-search').oninput=e=>{const q=e.target.value.trim().toLowerCase();for(const option of form.elements.teamId.options)option.hidden=Boolean(option.value && !option.textContent.toLowerCase().includes(q));};
     form.elements.captainId.onchange=()=>{const captain=model.people.find(p=>p.id===form.elements.captainId.value);document.getElementById('claim-captain-school').textContent=captain?`申请学校：${request.school}；名单学校：${captain.school}。${captain.notes}`:'';};
     const common=action=>({requestId:id,expectedRevision:request.revision,action,note:form.elements.note.value});
-    form.onsubmit=e=>{e.preventDefault();const f=form.elements;mutate(form,'admin/claims/review',{...common('approve'),teamId:f.teamId.value,captainId:f.captainId.value,memberIds:[...form.querySelectorAll('[name="memberIds"]:checked')].map(input=>input.value),pin:f.pin.value,inPersonVerified:f.inPersonVerified.checked,resolvedIdentity:f.resolvedIdentity.checked});};
+    form.onsubmit=e=>{e.preventDefault();const f=form.elements;mutate(form,'admin/claims/review',{...common('approve'),teamId:f.teamId.value,captainId:f.captainId.value,...claimMemberSnapshot([...form.querySelectorAll('[name="memberIds"]:checked')].map(input=>input.value),model.people),pin:f.pin.value,inPersonVerified:f.inPersonVerified.checked,resolvedIdentity:f.resolvedIdentity.checked});};
     document.getElementById('claim-reject').onclick=()=>{if(confirm('确认拒绝此申请？'))mutate(form,'admin/claims/review',common('reject'));};
   }
   document.getElementById('claims-admin-load').onclick=load;

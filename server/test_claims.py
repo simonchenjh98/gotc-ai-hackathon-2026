@@ -29,9 +29,13 @@ class ClaimsTests(unittest.TestCase):
         result=self.public.post('/api/claims/request',{'name':name,'school':school});self.assertEqual(result[0],200,result[1]);return result[1]
 
     def approval(self,claim,team=None,**changes):
-        return {'requestId':claim['requestId'],'expectedRevision':1,'action':'approve','note':'Verified at desk',
+        body={'requestId':claim['requestId'],'expectedRevision':1,'action':'approve','note':'Verified at desk',
                 'teamId':team or self.team(),'captainId':'p1','memberIds':['p1','p2'],'pin':claim['pin'],
                 'inPersonVerified':True,'resolvedIdentity':False,**changes}
+        if 'memberRevisions' not in body:
+            displayed={person['id']:person['revision'] for person in self.admin_call('')[1]['people']}
+            body['memberRevisions']={person:displayed.get(person,1) for person in body['memberIds']}
+        return body
 
     def bearer(self,claim,path='status',**changes):
         return self.public.post('/api/claims/'+path,{'requestId':claim['requestId'],'secret':claim['secret'],**changes})
@@ -192,13 +196,53 @@ class ClaimsTests(unittest.TestCase):
         self.assertLessEqual(claim['expiresAt'],self.service.claims.clock()+24*3600*1000)
 
     def test_full_roster_membership_has_no_implicit_team_size_cap(self):
-        people=[{'id':f'fixture-{index:03}-'+'x'*80,'name':f'Fixture {index}',
+        people=[{'id':f'fixture-{index:03}-'+'x'*88,'name':f'Fixture {index}',
                  'school':'Synthetic School','notes':'','needsReview':False} for index in range(500)]
         self.roster(people);claim=self.claim(people[0]['name'],people[0]['school'])
         body=self.approval(claim,captainId=people[0]['id'],memberIds=[p['id'] for p in people])
-        self.assertGreater(len(json.dumps(body)),16384)
+        self.assertEqual(len(people[0]['id']),100)
+        self.assertGreater(len(json.dumps(body)),64*1024)
+        self.assertLess(len(json.dumps(body)),128*1024)
         self.assertEqual(self.admin_call('/review',body)[0],200)
         with self.service.db() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM claim_memberships').fetchone()[0],500)
+
+    def test_stale_member_snapshot_from_other_admin_and_same_panel(self):
+        people=self.roster();claim=self.claim();body=self.approval(claim)
+        other=Client(self.server)
+        self.assertEqual(other.post('/api/login',{'role':'admin','code':self.admin_code})[0],200)
+        changed={**people[1],'name':'Synthetic Charlie'}
+        # A different organizer edits a non-captain identity after the selector was read.
+        self.assertEqual(self.admin_call('/person',{'expectedRevision':1,'person':changed},client=other)[0],200)
+        conflict=self.admin_call('/review',body)
+        self.assertEqual(conflict[0],409);self.assertIn('名单已变化',conflict[1]['error'])
+        with self.service.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM claim_memberships').fetchone()[0],0)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM team_accounts').fetchone()[0],0)
+            self.assertEqual(db.execute('SELECT status,revision FROM claim_requests WHERE id=?',(claim['requestId'],)).fetchone()[:],('pending',1))
+        # The same organizer's person editor also leaves an older review selection stale.
+        refreshed=self.approval(claim,body['teamId'])
+        self.assertEqual(self.admin_call('/person',{'expectedRevision':2,'person':{**changed,'school':'New Verified School'}})[0],200)
+        self.assertEqual(self.admin_call('/review',refreshed)[0],409)
+        final=self.approval(claim,body['teamId'])
+        self.assertEqual(final['memberRevisions'],{'p1':1,'p2':3})
+        self.assertEqual(self.admin_call('/review',final)[0],200)
+        # Post-approval notes changes must not destroy idempotency of the applied request.
+        self.assertEqual(self.admin_call('/person',{'expectedRevision':3,'person':{**changed,'school':'New Verified School','notes':'After approval note'}})[0],200)
+        self.assertEqual(self.admin_call('/review',final)[0],200)
+        self.assertEqual(self.admin_call('/review',{**final,'memberRevisions':{'p1':1,'p2':4}})[0],409)
+        with self.service.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM claim_memberships').fetchone()[0],2)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM team_accounts').fetchone()[0],1)
+
+    def test_member_snapshot_requires_exact_positive_integer_map(self):
+        self.roster();claim=self.claim();body=self.approval(claim)
+        omitted={key:value for key,value in body.items() if key!='memberRevisions'}
+        self.assertEqual(self.admin_call('/review',omitted)[0],400)
+        for snapshot in [None,[],{}, {'p1':1}, {'p1':1,'p2':1,'extra':1},
+                         {'p1':True,'p2':1},{'p1':'1','p2':1},{'p1':0,'p2':1},
+                         {'p1':1.0,'p2':1},{'p1':9007199254740992,'p2':1}]:
+            self.assertEqual(self.admin_call('/review',{**body,'memberRevisions':snapshot})[0],400)
+        self.assertEqual(self.admin_call('/review',body)[0],200)
 
     def test_old_installation_initializes_empty_private_tables_idempotently(self):
         team=self.team()
