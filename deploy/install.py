@@ -109,7 +109,7 @@ MemoryMax=512M
 [Install]
 WantedBy=multi-user.target
 '''
-FILES = {'site-header.js', 'site-header.css', 'teams.html', 'team-registration.js', 'team-registration.css', 'index.html', 'styles.css', 'app.js', 'platform.html', 'platform.css', 'platform.js', 'platform-admin.js', 'platform-claims.js', 'platform-draft-recovery.js', 'platform-finals.js', 'platform-finals.css', 'platform-roadshow-access.js', 'platform-roadshow-access.css', 'platform-roadshow-scoring.js', 'favicon.svg'}
+FILES = {'site-header.js', 'site-header.css', 'teams.html', 'team-registration.js', 'team-registration.css', 'index.html', 'styles.css', 'app.js', 'platform.html', 'platform.css', 'platform.js', 'platform-admin.js', 'platform-api-admin.js', 'platform-api-admin.css', 'platform-claims.js', 'platform-draft-recovery.js', 'platform-finals.js', 'platform-finals.css', 'platform-roadshow-access.js', 'platform-roadshow-access.css', 'platform-roadshow-scoring.js', 'favicon.svg'}
 ASSETS = {'.webp', '.png', '.jpg', '.jpeg', '.svg', '.ico', '.woff', '.woff2'}
 
 

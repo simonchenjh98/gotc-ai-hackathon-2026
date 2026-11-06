@@ -372,3 +372,27 @@ test('online application and review require no device PIN, physical visit, or ex
     assert.doesNotMatch(text,/申请现场核验|现场核验入口|携组员到现场组织方处核验/);
   }
 });
+
+test('trusted import uses displayed revision and preserves all source data',async()=>{
+  const payload={autoReview:{expectedRevision:0,sourceName:'Synthetic relay',sourceSha256:'a'.repeat(64),entries:[{id:'one',name:'Example',school:'Original School',eligible:true,notes:'Preserve'}]}};
+  const file={size:120,text:async()=>JSON.stringify(payload)},form={isConnected:true,elements:{file:{files:[file]}}},sent=[],errors=[];
+  await context.importTrustedClaimsFile({form,file,expectedRevision:9,isCurrent:()=>true,submit:body=>sent.push(JSON.parse(JSON.stringify(body))),onError:error=>errors.push(error)});
+  assert.deepEqual(sent,[{autoReview:{...payload.autoReview,expectedRevision:9}}]);assert.equal(payload.autoReview.expectedRevision,0);assert.deepEqual(errors,[]);
+});
+
+test('trusted import discards detached, refreshed, replaced-model, edited, busy and stale-session reads',async()=>{
+  for(const change of ['detached','read','model','input','busy','session','file']){
+    let resolve;const file={size:120,text:()=>new Promise(r=>{resolve=r;})},form={isConnected:true,elements:{file:{files:[file]}}};
+    const original={};let model=original,read=4,input=2,busy=false,live=true;const sent=[],errors=[];
+    const pending=context.importTrustedClaimsFile({form,file,expectedRevision:7,isCurrent:()=>model===original && read===4 && input===2 && !busy && live,submit:body=>sent.push(body),onError:error=>errors.push(error)});
+    if(change==='detached')form.isConnected=false;
+    if(change==='read')read++;
+    if(change==='model')model={};
+    if(change==='input')input++;
+    if(change==='busy')busy=true;
+    if(change==='session')live=false;
+    if(change==='file')form.elements.file.files=[{}];
+    resolve(JSON.stringify({autoReview:{expectedRevision:0,sourceName:'Synthetic',sourceSha256:'a'.repeat(64),entries:[]}}));await pending;
+    assert.equal(sent.length,0,change);assert.deepEqual(errors,[],change);
+  }
+});

@@ -963,6 +963,14 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(keys.full_price([3, 15]), [3, 15, 3.75, 0.3, 6])  # 1h writes default to 2x input
         self.assertEqual(keys.full_price([3, 15, 4, 0.2]), [3, 15, 4, 0.2, 6])
         self.assertEqual(keys.full_price([3, 15, 4, 0.2, 9]), [3, 15, 4, 0.2, 9])
+        # Name-only models (as fetched from /models) use the upstream default price, or $0 without one.
+        url = "https://x.test/v1"
+        cfg = keys.parse_config({"openai": {"url": url, "key": "k", "models": {"a": [], "b": [1, 2]}, "defaultPrice": [0.5, 2]}})
+        self.assertEqual(cfg["openai"]["models"], {"a": [0.5, 2, 0.625, 0.05, 1], "b": [1, 2, 1.25, 0.1, 2]})
+        self.assertEqual(keys.parse_config({"openai": {"url": url, "key": "k", "models": {"a": []}}})["openai"]["models"]["a"], [0, 0, 0, 0, 0])
+        for bad in ([1], [], [-1, 2]):
+            with self.assertRaises(ValueError):
+                keys.parse_config({"openai": {"url": url, "key": "k", "models": {"a": []}, "defaultPrice": bad}})
 
         _, _, key = self.enabled_key()
         FakeUpstream.usage = {"input_tokens": 100, "output_tokens": 10, "cache_creation_input_tokens": 1000,

@@ -13,3 +13,21 @@
 管理员列表提供每份申请的 `reviewContext`，包含申请版本和相关同名参考记录的快照摘要。`POST /api/admin/claims/approve` 提交 `requestId`、`expectedRevision`、`reviewContext`、`teamName`、`track`、`verificationMethod: "online"`、`applicationReviewed: true`、`resolvedIdentity`、`note`。普通审核备注可为空，同名冲突仍须明确区分并填写说明。点击批准才会发送审核意图。批准事务重新验证上下文；相关记录有变化时要求刷新核对，无关人员的变化不会阻塞申请。选择已有队伍时另传 `teamId` 与列表中的 `teamContext`；事务内同时核对完整队伍和登记快照及资格，任何相关编辑、改名、发码或归队都要求重新读取核对。选择与其快照包含在幂等摘要内，相同批准载荷可安全重试，包括领码之后。旧版 `pin` + `inPersonVerified` 载荷仍按原流程校验，不能与线上审核字段混用；已有领取凭据不失效。审计区分 online 与 onsite，线上批准不记作到场核验。现有 `/api/admin/claims/review` 继续支持旧版名单映射客户端与拒绝操作。
 
 公众只能通过自身 bearer 凭据读取本申请、申报信息和获批队伍，不能查询私有身份、身份匹配结果或管理员上下文。管理员列表不返回 PIN、领取凭据或提交码。现有身份、登录标记、同源写入、请求大小和速率限制继续适用。
+
+## Trusted relay automatic approval
+
+Automatic review defaults to disabled. Only the current authenticated administrator can import or enable a separate trusted snapshot. Public registration and ordinary `people` imports do not confer eligibility. The captain and every member (3–5 people total) must each have exactly one eligible, complete name+school match in the snapshot, using NFKC, case folding and whitespace normalization only. Duplicate pairs remain ambiguous, including when one duplicate is ineligible. No aliases or fuzzy matching are applied. Matching data does not prove physical identity.
+
+Use the protected `POST /api/admin/claims/roster` ingress with this alternate complete replacement contract (synthetic example):
+
+```json
+{"autoReview":{"expectedRevision":0,"sourceName":"Synthetic relay","sourceSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"id":"synthetic-1","name":"Example Captain","school":"Example School","eligible":true,"notes":""}]}}
+```
+
+`entries` accepts 0–500 unique IDs, each with exactly the five shown fields. Empty names/schools are retained but never qualify; duplicate normalized identity pairs are retained but never qualify. The source digest identifies the organizer's source file; it is not a computed digest of the JSON transport. Import is atomic, increments the configuration revision, and always disables automatic review. The existing `{people:[...]}` contract is unchanged. The HTTP import limit remains 2 MiB.
+
+`POST /api/admin/claims/auto-review` accepts exactly `{"expectedRevision":1,"enabled":true}`. Every change requires the current revision and increments it; enabling requires at least one complete unique eligible entry. `GET /api/admin/claims` returns a private `autoReview` summary with revision, enabled, sourceName, sourceSha256, count, eligibleCount and ambiguousCount. No public roster lookup or individual match hints exist.
+
+New applications, pending edits and valid pending bearer status/redemption checks may attempt automatic approval. Rejected, expired and processed receipts are unchanged. Approval uses the existing atomic team/membership/account pipeline and frozen declaration; ordinary conflicts roll back to pending manual review. Snapshot revision, source digest and matched source IDs are recorded in a distinct `claims.approve-auto` audit event. The ordinary bearer redemption and credential fingerprint checks still govern delivery. Automatic approval does not provision API access.
+
+An existing name collision is reusable only for one active, unissued eligible registered team with the exact normalized team name, captain name/school and full member-name multiset. Registration collects only the captain school; teammate schools are established by the trusted snapshot. A name spanning different schools in the trusted snapshot leaves existing-registration reuse manual because the registration cannot distinguish those identities. Reuse preserves the team ID, project and management secret, and applies authoritative membership/contact/target-size synchronization. Other collisions remain manual.

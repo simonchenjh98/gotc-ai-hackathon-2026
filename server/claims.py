@@ -12,6 +12,7 @@ import sqlite3
 import unicodedata
 
 from errors import APIError
+from claims_auto import AutoReview
 from admin_data import TRACK_OPTIONS
 
 SCHEMA='''
@@ -70,9 +71,11 @@ class Claims:
         self.clock=clock
         self.text=text
         self.kdf=kdf
+        self.auto=AutoReview(self,normalize)
 
     def initialize(self,db):
         db.executescript(SCHEMA)
+        self.auto.initialize(db)
 
     def person(self,value):
         if not isinstance(value,dict) or set(value)!={'id','name','school','notes','needsReview'}:
@@ -92,6 +95,7 @@ class Claims:
             p.revision,m.team_id AS teamId FROM claim_people p LEFT JOIN claim_memberships m ON m.person_id=p.id ORDER BY p.id''')]
 
     def import_roster(self,db,actor,body):
+        if 'autoReview' in body:return self.auto.replace(db,actor,body)
         if set(body)!={'people'} or not isinstance(body['people'],list) or not 1<=len(body['people'])<=MAX_CLAIM_PEOPLE:
             raise APIError(400,f'一次导入 1–{MAX_CLAIM_PEOPLE} 名参赛者')
         people=[self.person(p) for p in body['people']]
@@ -140,8 +144,8 @@ class Claims:
         db.execute('''INSERT INTO claim_requests(id,secret_hash,pin_hash,name,school,normalized_name,normalized_school,created_at,expires_at)
             VALUES (?,?,?,?,?,?,?,?,?)''',(request_id,digest('receipt',secret),digest('pin:'+request_id,pin),name,school,normalize(name),normalize(school),now,expires))
         if declaration:self.save_declaration(db,request_id,1,declaration)
-        return {'requestId':request_id,'secret':secret,'pin':pin,'expiresAt':expires,'status':'pending',
-                'requestRevision':1,'captain':{'name':name,'school':school},'declaration':declaration}
+        result=self.bearer(db,{'requestId':request_id,'secret':secret})
+        return {**result,'requestId':request_id,'secret':secret,'pin':pin}
 
     def team_metadata(self,body):
         if not ({'teamName','track'} & set(body)):return {}
@@ -198,6 +202,13 @@ class Claims:
         if set(body)!={'requestId','secret'}:return dict(INVALID)
         row=self.receipt_row(db,body)
         if not row:return dict(INVALID)
+        if row['status']=='pending':
+            self.auto.attempt(db,row['id'])
+            row=self.receipt_row(db,body)
+            if row is None:
+                # Approval can cross the expiry boundary while deriving credentials.
+                # Raise so the enclosing transaction also rolls back the new team.
+                raise APIError(410,'领取凭据已过期，请清除本设备上的领取凭据后重新申请','claim_expired')
         result={'status':row['status'],'team':None,'code':None,'expiresAt':row['expires_at'],'requestRevision':row['revision'],
                 'captain':{'name':row['name'],'school':row['school']},'declaration':self.declaration(db,row['id'])}
         if row['status'] not in {'approved','issued'}:return result
@@ -227,7 +238,7 @@ class Claims:
             row['reviewContext'],row['references']=self.review_context(db,row['id'],row['revision'],row['declaration'])
             if row['status']=='pending' and row['expiresAt']<=self.clock():row['status']='expired'
         teams=[team for row in db.execute('SELECT id FROM teams ORDER BY number') if (team:=self.eligible_team(db,row['id']))]
-        return {'requests':requests,'people':self.roster(db),'teams':teams,'trackOptions':TRACK_OPTIONS}
+        return {'requests':requests,'people':self.roster(db),'teams':teams,'trackOptions':TRACK_OPTIONS,'autoReview':self.auto.summary(db)}
 
     def eligible_team(self,db,team_id):
         team=self.s.admin_data.team(db,team_id)
@@ -421,6 +432,7 @@ class Claims:
                 if login_id!=self.s.login_id(cookie):raise APIError(401,'登录身份已变化，请重新登录')
                 if method=='GET' and path=='/api/admin/claims':return self.listing(db)
                 if method=='POST' and path=='/api/admin/claims/roster':return self.import_roster(db,actor,body)
+                if method=='POST' and path=='/api/admin/claims/auto-review':return self.auto.configure(db,actor,body)
                 if method=='POST' and path=='/api/admin/claims/person':return self.edit_person(db,actor,body)
                 if method=='POST' and path=='/api/admin/claims/approve':return self.approve_open(db,actor,body)
                 if method=='POST' and path=='/api/admin/claims/review':return self.review(db,actor,body)
