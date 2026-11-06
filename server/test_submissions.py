@@ -190,7 +190,7 @@ class SubmissionAPITests(unittest.TestCase):
         self.assertEqual(status,200,result)
         self.assertEqual(result['submission']['submittedVersion'],2)
         first_time=result['submission']['firstSubmittedAt']
-        self.assertEqual(self.public.get('/api/board')[1]['teams'][0]['project'],'Synthetic Project')
+        self.assertEqual(judge.get('/api/judge')[1]['teams'][0]['project'],'Synthetic Project')
         changed=self.materials(projectName='PRIVATE_DRAFT_NEW',summary='PRIVATE_DRAFT_NEW')
         self.assertEqual(self.save(client,2,'draft',changed)[0],200)
         current=client.get('/api/team')[1]['submission']
@@ -199,7 +199,7 @@ class SubmissionAPITests(unittest.TestCase):
         self.assertEqual(judge.get('/api/judge')[1]['submissions'][0]['materials']['projectName'],'Synthetic Project')
         self.assertEqual(self.save(client,2,materials=self.materials(projectName='Stale'))[0],409)
         self.assertEqual(client.get('/api/team')[1]['submission'],current)
-        self.assertEqual(self.public.get('/api/board')[1]['teams'][0]['project'],'Synthetic Project')
+        self.assertEqual(judge.get('/api/judge')[1]['teams'][0]['project'],'Synthetic Project')
         self.service=EventService(data_dir=self.service.data_dir,origin=self.service.origin,static_root=self.service.root)
         self.server.service=self.service
         self.assertEqual(client.get('/api/team')[1]['submission'],current)
@@ -213,7 +213,7 @@ class SubmissionAPITests(unittest.TestCase):
         self.assertEqual(result['submission']['submittedVersion'],4)
         self.assertEqual(result['submission']['firstSubmittedAt'],first_time)
         self.assertFalse(result['submission']['hasUnsubmittedChanges'])
-        self.assertEqual(self.public.get('/api/board')[1]['teams'][0]['project'],'Final revised')
+        self.assertEqual(judge.get('/api/judge')[1]['teams'][0]['project'],'Final revised')
 
     def test_window_default_close_exact_deadline_and_reopen_are_independent(self):
         client,_=self.access(self.team())

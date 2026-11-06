@@ -189,6 +189,53 @@ class APITests(unittest.TestCase):
         self.assertIsNone(old.get('/api/session')[1]['role'])
         self.assertEqual(fresh.get('/api/judge')[0], 200)
 
+    def test_team_score_uses_bound_identity_and_published_board_rules(self):
+        path = "/api/team/score"
+        a, b = self.team(1, "甲队"), self.team(2, "乙队")
+
+        def team_login(team_id):
+            status, access, _ = self.admin.post("/api/admin/team-access", {"teamId": team_id, "action": "issue"})
+            self.assertEqual(status, 200)
+            client = Client(self.server)
+            status, login, _ = client.post("/api/login", {"role": "team", "code": access["code"]})
+            self.assertEqual(status, 200)
+            return client, {"X-GOTC-Login": login["loginId"]}
+
+        first, marker_a = team_login(a)
+        second, marker_b = team_login(b)
+
+        def lookup(client, headers):
+            status, result, response_headers = client.request("GET", path, headers=headers)
+            self.assertEqual(status, 200)
+            self.assertEqual(response_headers["Cache-Control"], "no-store")
+            self.assertEqual(set(result), {"team", "state", "score", "dimensions", "feedback"})
+            return result
+
+        self.assertEqual(self.public.get(path)[0], 401)
+        self.assertEqual(self.admin.get(path)[0], 403)
+        self.assertEqual(first.get(path)[0], 428)
+        self.assertEqual(first.request("GET", path, headers=marker_b)[0], 401)
+        self.assertEqual(first.request("GET", path+"?teamId="+b, headers=marker_a)[0], 400)
+        self.assertEqual(lookup(first, marker_a), {"team":{"number":1, "name":"甲队"}, "state":"awaiting_scores", "score":None, "dimensions":[], "feedback":[]})
+        self.assertEqual(self.admin.settings({"scoringOpen":True, "resultsPublished":False, "minJudges":2})[0], 200)
+        judges = [self.invitation(name=name)[0] for name in ("甲评委","乙评委")]
+        for judge in judges:
+            self.assertEqual(judge.score({"teamId":b, "scores":[0]*6, "feedback":"私有", "status":"submitted"})[0], 200)
+        self.assertEqual(lookup(second, marker_b)["state"], "unpublished")
+        self.assertIsNone(lookup(second, marker_b)["score"])
+        self.assertEqual(self.admin.settings({"resultsPublished":True})[0], 200)
+        self.assertEqual(lookup(second, marker_b), {"team":{"number":2, "name":"乙队"}, "state":"published", "score":0, "dimensions":[{**d,"score":0} for d in DIMENSIONS], "feedback":[]})
+        self.assertEqual(judges[0].score({"teamId":a, "scores":[20,20,20,15,15,10], "status":"submitted"})[0], 200)
+        self.assertEqual(judges[1].score({"teamId":a, "scores":[10,10,10,5,5,0], "status":"draft"})[0], 200)
+        self.assertEqual(lookup(first, marker_a)["state"], "awaiting_scores")
+        self.assertEqual(judges[1].score({"teamId":a, "scores":[10,10,10,5,5,0], "status":"submitted"})[0], 200)
+        self.assertEqual(lookup(first, marker_a)["score"], 70)
+        self.assertEqual(self.public.get("/api/board")[1]["teams"][0]["score"], 70)
+        self.assertEqual(judges[1].score({"teamId":a, "status":"recused"})[0], 200)
+        self.assertIsNone(lookup(first, marker_a)["score"])
+        self.assertEqual(self.admin.post("/api/admin/team-access", {"teamId":a,"action":"revoke"})[0], 200)
+        self.assertEqual(first.request("GET",path,headers=marker_a)[0], 401)
+
     def test_score_threshold_average_recusal_edits_and_publication(self):
         team_id = self.team()
         self.open()
@@ -199,11 +246,13 @@ class APITests(unittest.TestCase):
         def save(client, values, status="submitted"):
             return client.score({"teamId": team_id, "scores": values, "feedback": "PRIVATE_FEEDBACK", "status": status})
         self.assertEqual(save(judges[0], eighty, "draft")[0], 200)
-        self.assertEqual(self.public.get("/api/board")[1]["teams"][0]["judgeCount"], 0)
+        self.assertEqual(self.public.get("/api/board")[1]["teams"], [])
+        self.assertEqual(judges[0].get("/api/judge")[1]["teams"][0]["judgeCount"], 0)
         self.assertEqual(save(judges[0], eighty)[0], 200)
         for client in judges[1:4]:
             self.assertEqual(save(client, full)[0], 200)
-        row = self.public.get("/api/board")[1]["teams"][0]
+        self.assertEqual(self.public.get("/api/board")[1]["teams"], [])
+        row = judges[0].get("/api/judge")[1]["teams"][0]
         self.assertEqual(row["judgeCount"], 4)
         self.assertIsNone(row["score"])
         self.assertIsNone(row["rank"])
@@ -214,9 +263,9 @@ class APITests(unittest.TestCase):
         self.assertEqual(save(judges[0], full, "draft")[0], 409)
         self.assertEqual(self.public.get("/api/board")[1]["teams"][0]["score"], 92)
         self.assertEqual(judges[4].score({"teamId": team_id, "status": "recused"})[0], 200)
-        self.assertIsNone(self.public.get("/api/board")[1]["teams"][0]["score"])
+        self.assertEqual(self.public.get("/api/board")[1]["teams"], [])
         self.assertEqual(save(judges[4], full, "draft")[0], 200)
-        self.assertIsNone(self.public.get("/api/board")[1]["teams"][0]["score"])
+        self.assertEqual(self.public.get("/api/board")[1]["teams"], [])
         self.assertEqual(save(judges[4], full)[0], 200)
         self.assertEqual(len(judges[0].get("/api/judge")[1]["myScores"]), 1)
         self.assertEqual(len(judges[1].get("/api/judge")[1]["myScores"]), 1)
@@ -225,7 +274,7 @@ class APITests(unittest.TestCase):
         self.assertNotIn("feedback", public_serialized)
         self.assertNotIn("scores_json", public_serialized)
         self.assertEqual(self.admin.settings({"resultsPublished": False})[0], 200)
-        self.assertIsNone(self.public.get("/api/board")[1]["teams"][0]["score"])
+        self.assertEqual(self.public.get("/api/board")[1]["teams"], [])
         self.assertEqual(self.admin.get("/api/admin")[1]["teams"][0]["score"], 92)
         self.assertEqual(self.admin.settings({"resultsPublished": True, "scoringOpen": False})[0], 200)
         for state in ["submitted", "draft", "recused"]:
@@ -267,13 +316,14 @@ class APITests(unittest.TestCase):
         selected = state["votedTeamIds"][0]
         self.assertTrue(audience.post("/api/vote", {"teamId": selected})[1]["alreadyVoted"])
         board = self.public.get("/api/board")[1]
-        self.assertEqual(sum(t["audienceVotes"] for t in board["teams"]), 3)
-        self.assertTrue(all(t["score"] is None and t["judgeCount"] == 0 for t in board["teams"]))
+        self.assertEqual(board["stats"]["audienceVotes"], 3)
+        self.assertEqual(board["teams"], [])
+        self.assertTrue(all(t["score"] is None and t["judgeCount"] == 0 for t in state["teams"]))
         self.assertFalse(board["config"]["audienceIncludedInScore"])
         self.assertEqual(audience.score({"teamId": selected, "scores": [0] * 6, "status": "submitted"})[0], 403)
         self.assertEqual(self.admin.post("/api/admin/revoke", {"role": "audience", "id": invitation["id"]})[0], 200)
         self.assertEqual(audience.get("/api/audience")[0], 401)
-        self.assertEqual(sum(t["audienceVotes"] for t in self.public.get("/api/board")[1]["teams"]), 3)
+        self.assertEqual(self.public.get("/api/board")[1]["stats"]["audienceVotes"], 3)
 
     def test_tied_ranks_team_updates_csv_and_audit(self):
         ids = [self.team(i + 1, "=FORMULA" if i == 0 else f"Team{i}") for i in range(3)]
@@ -283,7 +333,7 @@ class APITests(unittest.TestCase):
         for i, team_id in enumerate(ids):
             scores = [20, 20, 20, 15, 15, 10 if i < 2 else 0]
             self.assertEqual(judge.score({"teamId": team_id, "scores": scores, "status": "submitted", "feedback": "@FORMULA"})[0], 200)
-        self.assertEqual([t["rank"] for t in self.public.get("/api/board")[1]["teams"]], [1, 1, 3])
+        self.assertEqual([t["rank"] for t in self.public.get("/api/board")[1]["teams"]], [1, 2, 3])
         status, body, _ = self.admin.post("/api/admin/teams", {"id": ids[1], "number": 2, "name": "Updated", "project": "Real", "track": "城市与社区问题"})
         self.assertEqual(status, 200)
         status, content, headers = self.admin.get("/api/admin/export")

@@ -4,8 +4,8 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 
 const fullSource=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8');
-const source=fullSource.split("window.addEventListener('hashchange'")[0];
-const storageListener=fullSource.match(/^window\.addEventListener\('storage'.*$/m)[0];
+// Register the actual window listeners, leaving bootstrap to the fixture.
+const source=fullSource.split("(async()=>{try{session=await api('session');}")[0];
 const recoverySource=fs.readFileSync(new URL('../platform-draft-recovery.js',import.meta.url),'utf8');
 const wait=()=>new Promise(resolve=>setImmediate(resolve));
 const deferred=()=>{let resolve;const promise=new Promise(done=>{resolve=done;});return {promise,resolve};};
@@ -53,7 +53,7 @@ function harness(transport){
       if(request.method==='POST')return response({ok:true,key:'gk-SYNTHETIC-A',item:{name:'synthetic-laptop'}});
       return response(info());
     }});
-  vm.runInContext(source+"\nroute='team';routeVersion=1;session={role:'team',loginId:'login-a'};"+storageListener,ctx);
+  vm.runInContext(source+"\nroute='team';routeVersion=1;session={role:'team',loginId:'login-a'};",ctx);
   return {ctx,requests,copied,events,get:id=>nodes.get(id),setMarker:value=>{marker=value;},noStorage:()=>{storageAvailable=false;},
     installRecovery(){
       for(const id of ['local-draft-recovery','local-draft-status','local-draft-candidates','local-draft-comparison','refresh-local-drafts'])node(id);

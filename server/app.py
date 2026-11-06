@@ -78,6 +78,22 @@ CREATE TABLE IF NOT EXISTS scores (
  status TEXT NOT NULL CHECK(status IN ('draft','submitted','recused')), updated_at INTEGER NOT NULL,
  PRIMARY KEY(judge_id,team_id)
 );
+-- Separate from the original seven-column scores schema for rollback compatibility.
+CREATE TABLE IF NOT EXISTS score_feedback_visibility (
+ judge_id TEXT NOT NULL, team_id TEXT NOT NULL, revision INTEGER NOT NULL,
+ PRIMARY KEY(judge_id,team_id),
+ FOREIGN KEY(judge_id,team_id) REFERENCES scores(judge_id,team_id)
+);
+-- All writers, including rollback servers, invalidate consent before replacing a record.
+CREATE TRIGGER IF NOT EXISTS score_feedback_after_insert AFTER INSERT ON scores BEGIN
+ DELETE FROM score_feedback_visibility WHERE judge_id=NEW.judge_id AND team_id=NEW.team_id;
+END;
+CREATE TRIGGER IF NOT EXISTS score_feedback_after_update AFTER UPDATE ON scores BEGIN
+ DELETE FROM score_feedback_visibility WHERE judge_id=OLD.judge_id AND team_id=OLD.team_id;
+END;
+CREATE TRIGGER IF NOT EXISTS score_feedback_before_delete BEFORE DELETE ON scores BEGIN
+ DELETE FROM score_feedback_visibility WHERE judge_id=OLD.judge_id AND team_id=OLD.team_id;
+END;
 CREATE TABLE IF NOT EXISTS votes (
  account_id TEXT NOT NULL REFERENCES accounts(id), team_id TEXT NOT NULL REFERENCES teams(id), created_at INTEGER NOT NULL,
  PRIMARY KEY(account_id,team_id)
@@ -402,6 +418,45 @@ class EventService:
         return db.execute("SELECT a.* FROM sessions s JOIN accounts a ON a.id=s.account_id WHERE s.token_hash=? AND s.expires_at>? AND a.active=1",
                           (hashlib.sha256(token.encode()).hexdigest(), now_ms())).fetchone()
 
+    @staticmethod
+    def professional_score(average, judge_count, config, public=True):
+        if average is None or judge_count < config["minJudges"]:
+            return None
+        if public and not config["resultsPublished"]:
+            return None
+        return round(average, 2)
+
+    def own_team_score(self, db, actor):
+        team = self.bound_submission_team(db, actor)
+        config = self.config(db)
+        row = db.execute("""SELECT COUNT(judge_id) AS judge_count, AVG(total_tenths)/10.0 AS average
+                            FROM scores WHERE team_id=? AND status='submitted'""", (team["id"],)).fetchone()
+        score = self.professional_score(row["average"], row["judge_count"], config)
+        if score is not None:
+            state = "published"
+        elif config["resultsPublished"]:
+            state = "awaiting_scores"
+        else:
+            state = "unpublished"
+        dimensions, feedback = [], []
+        if state == "published":
+            # scores_json stores point values; only total_tenths is scaled by ten.
+            submitted = db.execute("SELECT scores_json FROM scores WHERE team_id=? AND status='submitted'", (team["id"],)).fetchall()
+            totals = [Decimal(0) for _ in DIMENSIONS]
+            for record in submitted:
+                for index, value in enumerate(json.loads(record["scores_json"])):
+                    totals[index] += Decimal(str(value))
+            dimensions = [{**dimension, "score": round(float(total / len(submitted)), 2)}
+                          for dimension, total in zip(DIMENSIONS, totals)]
+            comments = db.execute("""SELECT s.feedback FROM scores s
+                JOIN score_feedback_visibility v ON v.judge_id=s.judge_id AND v.team_id=s.team_id
+                JOIN score_write_revisions r ON r.judge_id=s.judge_id AND r.team_id=s.team_id AND r.revision=v.revision
+                WHERE s.team_id=? AND s.status='submitted'""", (team["id"],))
+            # Text-only ordering cannot associate comments with judge order or scores.
+            feedback = sorted(record["feedback"] for record in comments if record["feedback"].strip())
+        return {"team": {"name": team["name"], "number": team["number"]}, "state": state,
+                "score": score, "dimensions": dimensions, "feedback": feedback}
+
     def teams(self, db, public=True):
         config = self.config(db)
         rows = db.execute("""SELECT t.*, COUNT(s.judge_id) AS judge_count, AVG(s.total_tenths)/10.0 AS average,
@@ -410,7 +465,7 @@ class EventService:
           GROUP BY t.id ORDER BY t.number""").fetchall()
         result = [{"id": r["id"], "number": r["number"], "name": r["name"], "project": r["project"], "track": r["track"],
                    "judgeCount": r["judge_count"],
-                   "score": round(r["average"], 2) if r["average"] is not None and r["judge_count"] >= config["minJudges"] and (not public or config["resultsPublished"]) else None,
+                   "score": self.professional_score(r["average"], r["judge_count"], config, public),
                    "rank": None, "audienceVotes": r["audience_votes"]} for r in rows]
         ranked = sorted((r for r in result if r["score"] is not None), key=lambda r: (-r["score"], r["number"]))
         previous = None
@@ -420,7 +475,14 @@ class EventService:
                 rank = position
             row["rank"] = rank
             previous = row["score"]
-        return result if public else [self.admin_data.enrich_team(db,team) for team in result]
+        if public:
+            visible = {row["id"]: position for position, row in enumerate(ranked[:12], 1)}
+            for row in result:
+                row["rank"] = visible.get(row["id"])
+                if row["rank"] is None:
+                    row["score"] = None
+            return result
+        return [self.admin_data.enrich_team(db,team) for team in result]
 
     def require(self, actor, role):
         if actor is None:
@@ -476,10 +538,21 @@ class EventService:
             # Resolve write identities only after the lock: revocation may have committed while queued.
             if method=="POST":
                 db.execute("BEGIN IMMEDIATE")
-            elif method=="GET" and path=="/api/admin":
-                # Keep form values and their revision tokens in one read snapshot.
+            elif method=="GET" and path in {"/api/admin", "/api/team/score", "/api/board", "/api/judge", "/api/audience"}:
+                # Keep release settings, aggregates and editor revisions in one read snapshot.
                 db.execute("BEGIN")
             actor = self.account(db, cookie)
+            if path == "/api/team/score":
+                self.require(actor, "team")
+                if method != "GET":
+                    raise APIError(405, "请使用查询入口读取成绩")
+                if query:
+                    raise APIError(400, "查分由当前登录队伍确定")
+                if not expected_login_id:
+                    raise APIError(428, "请刷新页面并核对登录队伍", "login_required")
+                if expected_login_id != self.login_id(cookie):
+                    raise APIError(401, "登录身份已变化，请重新登录")
+                return self.own_team_score(db, actor), None, None
             team_keys_route = path == "/api/team/keys" or path.startswith("/api/team/keys/")
             if team_keys_route:
                 self.require(actor, "team")
@@ -506,7 +579,11 @@ class EventService:
                 return {"role": actor["role"] if actor else None, "name": actor["name"] if actor else "", "loginId": self.login_id(cookie) if actor else None}, None, None
             if method == "GET" and path == "/api/board":
                 config = self.config(db)
-                return {"teams": self.teams(db), "config": config, "updatedAt": config["updatedAt"], "serverTime": now_ms()}, None, None
+                teams = sorted((team for team in self.teams(db) if team["rank"] is not None), key=lambda team: team["rank"])
+                stats = {"teamCount": db.execute("SELECT COUNT(*) FROM teams").fetchone()[0],
+                         "submittedScores": db.execute("SELECT COUNT(*) FROM scores WHERE status='submitted'").fetchone()[0],
+                         "audienceVotes": db.execute("SELECT COUNT(*) FROM votes").fetchone()[0]}
+                return {"teams": teams, "stats": stats, "config": config, "updatedAt": config["updatedAt"], "serverTime": now_ms()}, None, None
             if method == "POST" and path == "/api/logout":
                 if actor:
                     try:
@@ -534,6 +611,9 @@ class EventService:
                 if previous and previous["status"] == "submitted" and status == "draft":
                     raise APIError(409, "已有正式评分，请修改后重新提交；草稿不会覆盖正式评分")
                 feedback = text_field(body.get("feedback", ""), "反馈", 2000)
+                sharing = body.get("feedbackSharing")
+                if sharing is not None and sharing != "team-anonymous-v1":
+                    raise APIError(400, "评语分享声明不正确")
                 values, total = [], None
                 if status != "recused":
                     values, total = self.check_scores(body.get("scores"))
@@ -541,6 +621,8 @@ class EventService:
                   scores_json=excluded.scores_json,total_tenths=excluded.total_tenths,feedback=excluded.feedback,status=excluded.status,updated_at=excluded.updated_at""",
                            (actor["id"], team_id, json.dumps(values), total, feedback, status, now_ms()))
                 score=self.write_conflicts.advance_score(db,actor["id"],team_id,revision)
+                if status == "submitted" and feedback and sharing == "team-anonymous-v1":
+                    db.execute("INSERT INTO score_feedback_visibility VALUES (?,?,?)", (actor["id"], team_id, revision))
                 self.audit(db,actor,"score."+status,team_id,metadata={
                     "before":{"revision":revision-1,"status":previous["status"],"total":previous["total_tenths"]/10 if previous["total_tenths"] is not None else None} if previous else None,
                     "after":{"revision":revision,"status":status,"total":total/10 if total is not None else None},

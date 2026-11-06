@@ -48,10 +48,11 @@ class LegacyScoringCompatibilityTests(unittest.TestCase):
                 self.assertEqual(self.numeric(judge, team, total)[0], 200)
             if index == 3:
                 board = self.public.get('/api/board')[1]
-                self.assertTrue(all(row['judgeCount'] == 4 and row['score'] is None for row in board['teams']))
+                self.assertEqual(board['teams'], [])
+                self.assertEqual(board['stats']['submittedScores'], 12)
         board = self.public.get('/api/board')[1]
         self.assertEqual([row['score'] for row in board['teams']], [80, 80, 70])
-        self.assertEqual([row['rank'] for row in board['teams']], [1, 1, 3])
+        self.assertEqual([row['rank'] for row in board['teams']], [1, 2, 3])
         framework = self.public.get('/api/judging/exhibition/board')[1]
         self.assertEqual(framework['teams'][0]['reviewCount'], 0)
         self.assertIsNone(framework['teams'][0]['score'])
@@ -78,10 +79,10 @@ class LegacyScoringCompatibilityTests(unittest.TestCase):
             'expectedRevision': current['stage']['revision'], 'open': False, 'deadline': None})[0], 200)
         self.assertEqual(self.admin.settings({'scoringOpen': True})[0], 200)
         self.assertEqual(self.numeric(judges[4], teams[0], 50)[0], 200)
-        self.assertEqual(self.public.get('/api/board')[1]['teams'][0]['score'], 78)
+        self.assertEqual(next(row for row in self.public.get('/api/board')[1]['teams'] if row['id']==teams[0])['score'], 78)
         self.assertFalse(judges[0].get('/api/judging/exhibition')[1]['window']['canEdit'])
         self.assertEqual(self.admin.settings({'resultsPublished': False})[0], 200)
-        self.assertTrue(all(row['score'] is None and row['rank'] is None for row in self.public.get('/api/board')[1]['teams']))
+        self.assertEqual(self.public.get('/api/board')[1]['teams'], [])
         self.assertEqual(self.admin.get('/api/admin')[1]['teams'][0]['score'], 78)
         self.assertEqual(self.public.get('/api/judging/exhibition/board')[1]['teams'][0]['reviewCount'], 1)
         exported = self.admin.get('/api/admin/export')

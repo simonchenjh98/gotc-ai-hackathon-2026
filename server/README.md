@@ -31,12 +31,13 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 | 方法与路径 | 身份 | 请求及响应 |
 |---|---|---|
-| GET `/api/board` | 公开 | `{teams,config,updatedAt,serverTime}` |
+| GET `/api/board` | 公开 | `{teams,stats,config,updatedAt,serverTime}`；teams 仅为已发布且达门槛的前 12 名 |
+| GET `/api/team/score` | 本队 | `{team,state,score,dimensions,feedback}`；必须带本页 `X-GOTC-Login` |
 | POST `/api/login` | 公开 | `{role: "admin"\|"judge"\|"audience"\|"team",code}` → `{ok,role,name}`，设置会话 Cookie |
 | GET `/api/session` | 公开 | `{role: null\|"admin"\|"judge"\|"audience"\|"team",name}` |
 | POST `/api/logout` | 任意 | `{}` → `{ok}`，删除当前会话 |
 | GET `/api/judge` | 评委 | `{teams,myScores,dimensions,scoringOpen,name}` |
-| POST `/api/score` | 评委 | `{teamId,scores:[六项数字],feedback,status:"draft"\|"submitted"\|"recused",expectedRevision}` → `{ok,status,score}` |
+| POST `/api/score` | 评委 | `{teamId,scores:[六项数字],feedback,status:"draft"\|"submitted"\|"recused",expectedRevision,feedbackSharing?}` → `{ok,status,score}` |
 | GET `/api/audience` | 观众 | `{teams,votedTeamIds,voteLimit:3,votingOpen,name}` |
 | POST `/api/vote` | 观众 | `{teamId}` → `{ok,alreadyVoted}` |
 | GET `/api/admin` | 管理员 | `{teams,judges,audience,config,stats}` |
@@ -54,13 +55,13 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 登录限流与上述并发上限独立：同一 IP、同一角色每分钟最多 20 次，每个角色全局每分钟最多 400 次；成功、失败及统一码选择身份的两个步骤都计数。同一校园网络出口可能共用 IP 配额，429 应作为限流单独排查，不解释为数据库容量不足。
 
-公开 `teams` 的每行结构：
+公开看板 `teams` 的每行结构（只含可公布的前 12 名，score 为数字、rank 为 1–12）：
 
 ```json
 {
   "id": "T随机标识", "number": 1, "name": "正式队名",
   "project": "作品名称", "track": "探索方向", "judgeCount": 0,
-  "score": null, "rank": null, "audienceVotes": 0
+  "score": 80.25, "rank": 1, "audienceVotes": 0
 }
 ```
 
@@ -317,7 +318,7 @@ python3 -B scripts/backup_event.py restore /private/backups/event-copy.sqlite3 /
 
 评分必须填齐六项数字，范围受各项上限约束，最小步长 0.1；拒绝布尔值、字符串、NaN、Infinity 和多余小数位。反馈选填，最多 2000 字。所有评分修改都必须在评分开放时进行。草稿和回避不计入均分；提交后可直接修改并重新正式提交。**已提交记录不能被草稿覆盖**，返回 409 并保留原成绩。提交后可以明确回避；回避后可以恢复草稿或正式提交。
 
-达到最少不同专业评委数且成绩已公开，才返回专业平均分和排名。平均分涵盖全部有效提交，不去最高最低，公开保留两位小数；相同显示分数并列，采用 1、1、3 排名。公开接口只展示聚合值，不展示评委身份、反馈或单份分数。后台可查看达到人数门槛的分数，即使尚未向公众发布。
+达到最少不同专业评委数且成绩已公开，才进入公开专业看板候选。平均分涵盖全部有效正式提交，不去最高最低，保留两位小数。服务端按该可比分数降序、数值队号升序截取前 12 名，公开位置连续为 1–12，不追加同分队伍；未发布或无合格队伍时 teams 为空。公开接口不返回其他队伍、评委身份、反馈、各维分或单份分数。`stats:{teamCount,submittedScores,audienceVotes}` 独立统计全场，避免将前 12 名当作全场。评委 `/api/judge` 和观众 `/api/audience` 保留完整名单及进度/票数，非前 12 名的 score/rank 为 null。后台仍可查看达人数门槛的全部分数及原并列名次，即使尚未向公众发布。展示/路演进度接口不受此截取影响。
 
 观众每个邀请码最多支持 3 个不同队伍，每队限一票，重复请求幂等；并发请求受事务保护。观众票单独统计，**不加入专业分，不计入评委人数门槛**。此版本由 `votingOpen`、`votingDeadline` 独立控制投票，专业评分仍由 `scoringOpen` 控制；投票提交后不能撤回。
 
@@ -378,3 +379,7 @@ python3 -m py_compile server/app.py server/test_api.py
 管理员 `GET /api/admin/submissions/{teamId}/checks?version=N` 返回 `{teamId,version,latestVersion,items}`；每项 `{field,url,status,revision,checkedAt,actor,note}`。仅生成非空代码/README/许可证/演示/幻灯片/视频链接，地址来自不可变历史。POST同一路径接收 `{version,field,expectedRevision,status,note}`；备注最多500字，状态 `unchecked/accessible/permission_required/unavailable`。仅当前正式版可写，每项独立并发修订；版号推进或修订冲突均409。操作者与记录时间由服务器产生。新正式版默认未检查，旧版只读，即使地址相同也不复制。人工记录仅反映当时观察，不证明作品合格或永久可访问，不自动抓取或通知。
 
 新增请求账本、正式历史、人工检查和迁移元数据表。非空升级先创建私有 `before-submission-records-*.sqlite3` SQLite整库备份；备份失败停止启动。DDL、真实当前正式回填与标记独立原子提交，失败全部回滚，重复启动幂等。旧代码回退期间不维护新记录，再升级只补当时仍保有的当前正式一份并保留缺口，不虚构请求回执、不覆盖已有历史。代码回退不恢复数据库，不自动覆盖现库；整库SQLite备份恢复包含新表。私有临时库演练不代表生产迁移或部署。
+
+队伍使用原提交码进入 `#team-score` 查看本队专业总分、六维均分及匿名逐条评语。`GET /api/team/score` 根据队伍会话绑定确定队伍，要求当前页面的 `X-GOTC-Login`，禁止查询参数指定其他队伍。返回 `{team:{number,name},state,score,dimensions,feedback}`；`state` 为 `published`、`unpublished` 或 `awaiting_scores`。已发布且达到 minJudges 门槛时，score 为百分制专业总均分，dimensions 为六项 `{id,name,max,score}`，每项为同一批全部 status=submitted 记录的该维算术均分，保留两位小数；feedback 为非空、知情确认分享的正式评语字符串数组，按文字稳定排序，保留换行。旧评分数值仍计入各均分，scores_json 本身为原分值，仅 total_tenths 按十分之一存储。是否进入公开前 12 名不影响本队查询。其他状态 score 为 null，dimensions/feedback 均为空数组；不返回个人分数、评委标识、时间或逐评委数值与评语关联。
+
+专业评分新表单明确告知：本次正式非空评语将在发布且达到门槛后匿名分享给本队，请勿署名或留下联系方式；正式提交非空评语前必须勾选确认，每次提交重新确认。API `POST /api/score` 仅在本次显式附带 `feedbackSharing:"team-anonymous-v1"` 且正式提交非空评语时建立分享授权；省略字段的旧客户端仍可私下保存但不会分享，旧评语不自动公开。无效声明返回 400。授权使用独立 score_feedback_visibility 表绑定本次 score_write_revisions.revision；scores 的插入、更新、删除触发器先清除授权，新服务仅在本次知情提交完成后重新写入。因此旧客户端、旧代码回滚及直接旧格式 SQL 改写不能沿用先前授权。原 scores 七列不变，原评委私有查看、组织方导出不变。
