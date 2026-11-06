@@ -67,10 +67,10 @@ class GatewayProtocolErrorTests(unittest.TestCase):
                         self.assertGreater(item["cost"], 0)
                         billed += item["cost"]
                         failures += 1
-                        self.assertAlmostEqual(client.get("/api/team/keys")[1]["budget"]["used24h"], billed)
+                        self.assertAlmostEqual(client.get("/api/team/keys")[1]["usage"]["used24h"], billed)
                         self.assertEqual(self.admin.get("/api/admin/keys")[1]["overview"]["errors"], failures)
                         detail = self.admin.post("/api/admin/keys/log", {"id": item["id"]})[1]["response"]
-                        self.assertIn("请求已发出，按预留额度计费", detail)
+                        self.assertIn("请求已发出，按估算用量计费", detail)
                         self.assertReleased(team_id)
                         self.assertEqual(self.service.keys.inflight[team_id], 0)
 
@@ -86,23 +86,9 @@ class GatewayProtocolErrorTests(unittest.TestCase):
                 item = self.latest()
                 self.assertEqual((status, item["status"], item["errorOwner"]), (502, 502, "provider"))
                 self.assertEqual((item["cost"], item["incomplete"], item["estimated"]), (0, 0, 0))
-                self.assertEqual(client.get("/api/team/keys")[1]["budget"]["used24h"], 0)
+                self.assertEqual(client.get("/api/team/keys")[1]["usage"]["used24h"], 0)
                 self.assertReleased(team_id)
                 self.assertEqual(self.service.keys.counting[team_id], 0)
-
-    def test_malformed_reply_charge_prevents_reusing_the_spent_budget(self):
-        team_id, _, key = self.enabled_key()
-        self.assertEqual(self.admin.post("/api/admin/keys/team", {
-            "teamId": team_id, "dailyBudget": None, "totalBudget": 0.02, "note": "protocol regression",
-        })[0], 200)
-        body = {"model": "claude-x", "max_tokens": 1000, "messages": [{"role": "user", "content": "hello"}]}
-        with self.upstream_reply(self.malformed_replies["bad status line"]) as received:
-            self.assertEqual(self.call("/v1/messages", body, key)[0], 502)
-            # One reservation costs at least $0.015; only the first fits in $0.02.
-            self.assertEqual(self.call("/v1/messages", body, key)[0], 403)
-        self.assertEqual(len(received), 1, "The exhausted budget must reject before forwarding")
-        self.assertReleased(team_id)
-        self.assertEqual(self.service.keys.inflight[team_id], 0)
 
     def test_invalid_upstream_url_is_not_charged_before_any_request_is_sent(self):
         team_id, client, key = self.enabled_key()
@@ -121,7 +107,7 @@ class GatewayProtocolErrorTests(unittest.TestCase):
                 item = self.latest()
                 self.assertEqual((item["cost"], item["estimated"], item["incomplete"]), (0, 0, 0))
                 self.assertEqual((status, item["status"], item["errorOwner"]), (500, 500, "platform"))
-                self.assertEqual(client.get("/api/team/keys")[1]["budget"]["used24h"], 0)
+                self.assertEqual(client.get("/api/team/keys")[1]["usage"]["used24h"], 0)
                 self.assertReleased(team_id)
                 self.assertEqual(self.service.keys.inflight[team_id], 0)
 

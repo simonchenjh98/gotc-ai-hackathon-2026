@@ -12,7 +12,7 @@ const deferred=()=>{let resolve;const promise=new Promise(done=>{resolve=done;})
 const response=(data,status=200)=>({ok:status<400,status,json:async()=>data});
 const info=()=>({enabled:true,baseUrl:'https://example.test/gotc',models:{openai:['synthetic-model']},maxKeys:5,
   keys:[{id:'K-old',name:'old',masked:'gk-old',requests:0}],logContent:false,
-  budget:{used24h:0,dailyLimit:5,usedTotal:0,totalLimit:50,expiresAt:null}});
+  usage:{used24h:0,usedTotal:0},expiresAt:null});
 
 function harness(transport){
   const nodes=new Map(),requests=[],copied=[],events={},storageValues=new Map();let marker='login-a',storageAvailable=true;

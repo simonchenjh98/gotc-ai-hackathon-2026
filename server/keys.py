@@ -1,7 +1,7 @@
-"""Built-in AI API gateway: team keys, upstream proxy, metering and team budgets. Standard library only.
+"""Built-in AI API gateway: team keys, upstream proxy, usage metering. Standard library only.
 
-Organizers enable a team once; the team then creates its own keys and every key spends the same team
-budget. Keys are shown once and stored only as SHA-256 hashes. Requests are forwarded with the
+Organizers enable a team once; the team then creates its own keys and usage is tracked per team.
+Keys are shown once and stored only as SHA-256 hashes. Requests are forwarded with the
 organizer's upstream keys from the private gateway.json, which teams never see.
 """
 from __future__ import annotations
@@ -33,8 +33,7 @@ from errors import APIError
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS team_api (
- team_id TEXT PRIMARY KEY REFERENCES teams(id), active INTEGER NOT NULL CHECK(active IN (0,1)), created_at INTEGER NOT NULL,
- daily_budget REAL, total_budget REAL, note TEXT NOT NULL DEFAULT ''
+ team_id TEXT PRIMARY KEY REFERENCES teams(id), active INTEGER NOT NULL CHECK(active IN (0,1)), created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS api_keys (
  id TEXT PRIMARY KEY, team_id TEXT NOT NULL REFERENCES teams(id), name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE,
@@ -63,7 +62,7 @@ CREATE TABLE IF NOT EXISTS api_logs (
  request BLOB NOT NULL, response BLOB NOT NULL, request_bytes INTEGER NOT NULL, response_bytes INTEGER NOT NULL
 );
 """
-DEFAULTS = {"keys.dailyBudget": 5, "keys.totalBudget": 50, "keys.maxKeys": 5, "keys.expiresAt": None,
+DEFAULTS = {"keys.maxKeys": 5, "keys.expiresAt": None,
             "keys.logContent": True, "keys.teamRpm": 60, "keys.announcement": "", "keys.blockedWords": [],
             "keys.logRetentionHours": 72, "keys.logMaxMB": 2048}  # request content is bounded (sub2api keeps no bodies at all)
 # Public path -> (upstream name, path appended to that upstream's base URL)
@@ -81,7 +80,6 @@ ERROR_KINDS = {
     "not_found": (404, "not_found_error", "invalid_request_error", "model_not_found", "request", "client"),
     "too_large": (413, "request_too_large", "invalid_request_error", "request_too_large", "request", "client"),
     "rate_limit": (429, "rate_limit_error", "rate_limit_error", "rate_limit_exceeded", "request", "client"),
-    "usage_limit": (429, "rate_limit_error", "insufficient_quota", "usage_limit_exceeded", "request", "client"),
     "client_closed": (499, "api_error", "api_error", "client_closed_request", "internal", "platform"),
     "internal": (500, "api_error", "api_error", "internal_error", "internal", "platform"),
     "upstream": (502, "api_error", "upstream_error", "upstream_error", "upstream", "provider"),
@@ -101,8 +99,8 @@ AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW, AUTH_BLOCK = 120, 60, 60  # per client IP, as
 COUNT_TOKENS_CONCURRENCY, COUNT_TOKENS_RPM = 4, 120  # count_tokens is free but uses our upstream key's rate limit
 KEY_CREATE_PER_HOUR = 60  # as sub2api; deleting a key does not give the quota back
 QUEUE_WAIT = 30  # seconds a request waits for a free team slot before 429 (agent tools send bursts)
-RESERVE_OUTPUT_DEFAULT = 8192  # output tokens reserved when the request sets no max_tokens (as sub2api)
-RESERVE_OUTPUT_CAP = 128000
+OUTPUT_DEFAULT = 8192  # default output tokens for Anthropic requests without max_tokens
+OUTPUT_CAP = 128000
 IMAGE_TOKENS = 1600  # ceiling for one image (Anthropic: width*height/750, images resized to ~1.15 MP)
 RETRY_STATUSES = {429, 503, 529}  # explicit "not processed" answers; 5xx/timeouts may already be billed upstream
 # Tools must run on the client. Anthropic "client tools" (bash, text editor, computer, memory) are allowed;
@@ -437,25 +435,25 @@ OUTPUT_LIMIT_FIELDS = ("max_tokens", "max_completion_tokens", "max_output_tokens
 
 
 def bound_output(body, inject=True):
-    """Clamp the output limit the upstream will honour to what gets reserved, so the reservation is a true ceiling.
+    """Bound explicit output limits and return an output estimate for missing-usage accounting.
 
     Any limit above the cap (or a non-integer one) is lowered to the cap; with no limit at all, max_tokens is set to
-    the default. Returns the number of output tokens reserved.
+    the default for Anthropic requests.
     """
     present = [f for f in OUTPUT_LIMIT_FIELDS if f in body]
-    limit = RESERVE_OUTPUT_DEFAULT
+    limit = OUTPUT_DEFAULT
     for field in present:
         value = body[field]
-        value = value if type(value) is int and value > 0 else RESERVE_OUTPUT_CAP
-        body[field] = min(value, RESERVE_OUTPUT_CAP)
+        value = value if type(value) is int and value > 0 else OUTPUT_CAP
+        body[field] = min(value, OUTPUT_CAP)
     if present:
         limit = max(body[f] for f in present)
     elif inject:
         body["max_tokens"] = limit  # Anthropic requires max_tokens anyway
     else:
         # OpenAI-compatible routes get no injected field (o-series/gpt-5 reject max_tokens, some providers reject the
-        # alternatives), so without a client limit the reservation is the cap: a true ceiling, released after the call.
-        limit = RESERVE_OUTPUT_CAP
+        # alternatives), so use the cap as a fallback estimate when the client gives no limit.
+        limit = OUTPUT_CAP
     thinking = body.get("thinking")
     if isinstance(thinking, dict) and type(thinking.get("budget_tokens")) is int and type(body.get("max_tokens")) is int \
             and thinking["budget_tokens"] >= body["max_tokens"] > 1024:
@@ -532,7 +530,7 @@ def beijing_midnight():
 
 
 def estimate_input(body):
-    """Input tokens for reservations and fallbacks: text at bytes/4 with no cap (so large prompts are never under-reserved),
+    """Input tokens for missing-usage estimates: text at bytes/4 with no cap (so large prompts are not underestimated),
     each base64 image at most IMAGE_TOKENS instead of its byte size; other base64 data (PDFs...) stays at bytes/4.
     Only the image payload string itself is set aside; everything around it is still counted."""
     images = 0
@@ -623,11 +621,9 @@ class KeyService:
         # ponytail: in-memory per-team concurrency; correct because the service is a single process.
         self.inflight = defaultdict(int)
         self.recent = defaultdict(deque)  # team -> monotonic times of requests in the last minute
-        self.reserved = defaultdict(int)  # team -> micro-USD held by requests in flight
         self.waiting = defaultdict(int)  # team -> requests queued for a slot
         self.counting = defaultdict(int)  # team -> count_tokens calls in flight
         self.last_prune = 0.0
-        self.team_locks = defaultdict(threading.Lock)  # per team, so one team's budget check never blocks the others
         self.auth_failures, self.auth_blocked = defaultdict(deque), {}
         self.auth_failures_seen = deque(maxlen=100000)  # failed key attempts, for the admin overview
         self.opener = make_opener()  # honours HTTPS_PROXY for reaching upstreams
@@ -647,10 +643,6 @@ class KeyService:
         for column, kind in added.items():  # databases created before these columns existed
             if column not in columns:
                 db.execute(f"ALTER TABLE api_usage ADD COLUMN {column} {kind}")
-        team_columns = {r["name"] for r in db.execute("PRAGMA table_info(team_api)")}
-        for column, kind in {"daily_budget": "REAL", "total_budget": "REAL", "note": "TEXT NOT NULL DEFAULT ''"}.items():
-            if column not in team_columns:  # per-team overrides of the global budgets (sub2api: per-user limits)
-                db.execute(f"ALTER TABLE team_api ADD COLUMN {column} {kind}")
         for key, value in DEFAULTS.items():
             db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, json.dumps(value)))
         if self.seed:
@@ -707,26 +699,6 @@ class KeyService:
         # Config order is kept: the first model of each upstream is the default shown in setup snippets.
         return {name: list(item["models"]) for name, item in (self.config or {}).items()}
 
-    def limits(self, db, team_id, settings):
-        """(24h, total) budget for a team: its own override if the organizer set one, else the global setting."""
-        row = db.execute("SELECT daily_budget,total_budget FROM team_api WHERE team_id=?", (team_id,)).fetchone()
-        daily = row["daily_budget"] if row and row["daily_budget"] is not None else settings["dailyBudget"]
-        total = row["total_budget"] if row and row["total_budget"] is not None else settings["totalBudget"]
-        return daily, total
-
-    def daily_reset_at(self, db, team_id, limit):
-        """When the rolling 24h spend first drops back under the limit, or None if it is already under."""
-        used = 0
-        rows = db.execute("SELECT at,cost_micro FROM api_usage WHERE team_id=? AND at>=? ORDER BY at", (team_id, now_ms() - DAY_MS)).fetchall()
-        used = sum(r["cost_micro"] for r in rows) / 1e6
-        if used < limit:
-            return None
-        for r in rows:
-            used -= r["cost_micro"] / 1e6
-            if used < limit:
-                return r["at"] + DAY_MS
-        return None
-
     def spend(self, db, team_id, since=0):
         return db.execute("SELECT COALESCE(SUM(cost_micro),0) FROM api_usage WHERE team_id=? AND at>=?", (team_id, since)).fetchone()[0] / 1e6
 
@@ -749,7 +721,6 @@ class KeyService:
         if method == "GET" and path == "/api/team/keys":
             if not enabled:
                 return {"enabled": False, "keys": []}
-            daily_limit, total_limit = self.limits(db, team_id, settings)
             since = now_ms() - DAY_MS
             keys = [{"id": r["id"], "name": r["name"], "masked": r["masked"], "createdAt": r["created_at"], "lastUsedAt": r["last_used_at"],
                      "used24h": r["day"] / 1e6, "usedTotal": r["total"] / 1e6, "requests": r["requests"]}
@@ -760,10 +731,10 @@ class KeyService:
             return {"enabled": True, "baseUrl": self.service.origin + self.service.base_path, "models": self.models(),
                     "maxKeys": settings["maxKeys"], "keys": keys, "logContent": settings["logContent"],
                     "announcement": settings["announcement"],
-                    "budget": {"used24h": self.spend(db, team_id, since), "dailyLimit": daily_limit, "dailyResetAt": self.daily_reset_at(db, team_id, daily_limit),
-                               "usedTotal": self.spend(db, team_id), "totalLimit": total_limit, "expiresAt": settings["expiresAt"]}}
+                    "usage": {"used24h": self.spend(db, team_id, since), "usedTotal": self.spend(db, team_id)},
+                    "expiresAt": settings["expiresAt"]}
         if not enabled:
-            raise APIError(409, "本队 API 额度尚未开通或已停用")
+            raise APIError(409, "本队 API 访问权限尚未开通或已停用")
         if method == "GET" and path == "/api/team/keys/logs":
             items = self.logs(db, {"teamId": team_id})  # metadata only; content stays admin-only
             for item in items["items"]:  # teams see what failed and whose fault it was, not upstream internals
@@ -799,7 +770,7 @@ class KeyService:
     def admin(self, db, actor, method, path, body, settings):
         if method == "GET" and path == "/api/admin/keys":
             since = now_ms() - DAY_MS
-            rows = db.execute("""SELECT t.team_id, t.active, t.daily_budget, t.total_budget, t.note,
+            rows = db.execute("""SELECT t.team_id, t.active,
               (SELECT COUNT(*) FROM api_keys k WHERE k.team_id=t.team_id AND k.active=1) AS key_count FROM team_api t""").fetchall()
             today = beijing_midnight()
             overview = dict(db.execute("""SELECT COUNT(*) AS requests, COALESCE(SUM(cost_micro),0)/1e6 AS cost,
@@ -829,14 +800,12 @@ class KeyService:
                     "upstreams": self.public_config(db), "storage": storage,
                     "changes": changes,
                     "teams": [{"teamId": r["team_id"], "active": bool(r["active"]), "keyCount": r["key_count"], "inflight": inflight.get(r["team_id"], 0), "waiting": waiting.get(r["team_id"], 0),
-                               "used24h": self.spend(db, r["team_id"], since), "usedTotal": self.spend(db, r["team_id"]),
-                               "dailyBudget": r["daily_budget"], "totalBudget": r["total_budget"], "note": r["note"],
-                               "dailyLimit": self.limits(db, r["team_id"], settings)[0]} for r in rows]}
+                               "used24h": self.spend(db, r["team_id"], since), "usedTotal": self.spend(db, r["team_id"])} for r in rows]}
         if method == "GET" and path == "/api/admin/keys/export":
             self.service.audit(db, actor, "api-usage.export")
             return self.export(db)
         if method == "POST" and path == "/api/admin/keys/settings":
-            if not body or not set(body).issubset({"dailyBudget", "totalBudget", "maxKeys", "expiresAt", "logContent", "teamRpm",
+            if not body or not set(body).issubset({"maxKeys", "expiresAt", "logContent", "teamRpm",
                                                    "announcement", "blockedWords", "logRetentionHours", "logMaxMB"}):
                 raise APIError(400, "API 设置字段不正确")
             before = dict(settings)
@@ -858,33 +827,15 @@ class KeyService:
                     ok = type(value) is int and 1 <= value <= 20
                 elif key == "expiresAt":
                     ok = value is None or (type(value) is int and 0 <= value <= 253402300799999)
-                else:
-                    ok = type(value) in (int, float) and 0 <= value <= 100000
                 if not ok:
                     raise APIError(400, {"maxKeys": "每队密钥上限应为1至20的整数", "expiresAt": "到期时间必须是有效的毫秒时间戳或空值", "logContent": "记录内容开关必须为布尔值",
                                                "teamRpm": "每分钟请求上限应为0至10000的整数（0为不限）", "announcement": "公告最多500字",
                                                "blockedWords": "屏蔽词最多200个，每个1至100字",
-                                               "logRetentionHours": "调用内容保留时长应为1至8760小时", "logMaxMB": "调用内容总容量应为50至102400MB"}.get(key, "额度应为0至100000美元"))
+                                               "logRetentionHours": "调用内容保留时长应为1至8760小时", "logMaxMB": "调用内容总容量应为50至102400MB"}.get(key, "API 设置值不正确"))
                 db.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(value), "keys." + key))
             changed = {k: [before.get(k), v] for k, v in self.settings(db).items() if k in body and before.get(k) != v}
             self.service.audit(db, actor, "api-key.settings", metadata=changed)
             return {"ok": True, "settings": self.settings(db)}
-        if method == "POST" and path == "/api/admin/keys/team":
-            if not isinstance(body, dict) or set(body) != {"teamId", "dailyBudget", "totalBudget", "note"}:
-                raise APIError(400, "队伍额度字段不正确")
-            team_id = self.service.team_exists(db, body["teamId"])
-            before = db.execute("SELECT daily_budget,total_budget,note FROM team_api WHERE team_id=?", (team_id,)).fetchone()
-            if not before:
-                raise APIError(409, "该队 API 额度尚未开通")
-            for field in ("dailyBudget", "totalBudget"):
-                value = body[field]
-                if value is not None and (type(value) not in (int, float) or not 0 <= value <= 100000):
-                    raise APIError(400, "队伍额度应为0至100000美元，或留空使用全局设置")
-            note = self.text(body["note"], "备注", 200)
-            db.execute("UPDATE team_api SET daily_budget=?,total_budget=?,note=? WHERE team_id=?", (body["dailyBudget"], body["totalBudget"], note, team_id))
-            self.service.audit(db, actor, "api-key.team-limits", team_id, {"dailyBudget": [before["daily_budget"], body["dailyBudget"]],
-                                                                           "totalBudget": [before["total_budget"], body["totalBudget"]], "note": note})
-            return {"ok": True}
         if method == "POST" and path == "/api/admin/keys/logs/clear":
             deleted = self.prune_logs(db, settings, everything=True)
             self.service.audit(db, actor, "api-log.clear", metadata={"deleted": deleted})
@@ -919,12 +870,12 @@ class KeyService:
             team_id = self.service.team_exists(db, body["teamId"])
             if path.endswith("/revoke"):
                 if not db.execute("UPDATE team_api SET active=0 WHERE team_id=? AND active=1", (team_id,)).rowcount:
-                    raise APIError(409, "该队 API 额度未开通")
+                    raise APIError(409, "该队 API 访问权限未开通")
             else:
                 if self.config is None:
                     raise APIError(409, "尚未配置模型上游，请先在“模型上游”中填写")
                 if self.team_active(db, team_id):
-                    raise APIError(409, "该队 API 额度已开通")
+                    raise APIError(409, "该队 API 访问权限已开通")
                 db.execute("INSERT INTO team_api(team_id,active,created_at) VALUES (?,1,?) ON CONFLICT(team_id) DO UPDATE SET active=1", (team_id, now_ms()))
             self.service.audit(db, actor, "api-key." + path.rsplit("/", 1)[1], team_id)
             return {"ok": True}
@@ -1090,36 +1041,15 @@ class KeyService:
             if slot:
                 self.inflight[team] += 1
 
-    def reserve(self, handler, call, estimate):
-        """After the queue wait: re-check the key, team and access, then atomically reserve the estimated cost.
-
-        sub2api re-checks billing after the slot wait and reserves in-flight budget; this also re-checks the key and team,
-        so a revoke or withdrawal during the wait stops the request before it reaches the upstream.
-        """
-        team = call["key"]["team_id"]
-        with self.lock:
-            team_lock = self.team_locks[team]
-        with team_lock, self.service.db() as db:
+    def recheck_access(self, handler, call):
+        """Re-check key, team and expiry after waiting for a concurrency slot."""
+        with self.service.db() as db:
             row = self.lookup(db, handler)
             if not row or row["id"] != call["key"]["id"]:
                 raise APIError(401, "API 密钥在排队期间已被停用")
             settings = self.settings(db)
-            current = now_ms()
-            if settings["expiresAt"] is not None and current >= settings["expiresAt"]:
-                raise GatewayError("billing", "本活动 API 额度已到期")
-            held = (self.reserved[team] + estimate) / 1e6
-            daily, total = self.limits(db, team, settings)
-            if self.spend(db, team, current - DAY_MS) + held > daily:
-                raise GatewayError("usage_limit", "本队近24小时额度不足以完成本次请求")
-            if self.spend(db, team) + held > total:
-                raise GatewayError("billing", "本队总额度不足以完成本次请求")
-            self.reserved[team] += estimate
-
-    def unreserve(self, team, estimate):
-        with self.lock:
-            team_lock = self.team_locks[team]
-        with team_lock:
-            self.reserved[team] -= estimate
+            if settings["expiresAt"] is not None and now_ms() >= settings["expiresAt"]:
+                raise GatewayError("billing", "本活动 API 访问权限已到期")
 
     def release(self, team):
         with self.lock:
@@ -1181,7 +1111,7 @@ class KeyService:
 
     def prune_logs(self, db, settings, everything=False):
         """Delete stored request content past the retention period, then oldest first above the size cap.
-        Call metadata (tokens, cost, status) is never deleted: budgets are computed from it."""
+        Call metadata (tokens, cost, status) is retained for usage statistics."""
         if everything:
             return db.execute("DELETE FROM api_logs").rowcount
         cutoff = now_ms() - settings["logRetentionHours"] * 3600_000
@@ -1241,11 +1171,11 @@ class KeyService:
         # failed after output started is a 502 for the record but its tokens were still produced.
         incomplete = call["forwarded"] and not call["done"]
         estimated = False
-        if call.get("charge_reserved"):
-            usage, incomplete, estimated = [call.get("input_estimate", call["request_bytes"] // 4), call.get("reserve_out", 0), 0, 0, 0], True, True
+        if call.get("charge_estimate"):
+            usage, incomplete, estimated = [call.get("input_estimate", call["request_bytes"] // 4), call.get("output_estimate", 0), 0, 0, 0], True, True
         elif call["forwarded"]:
-            # sub2api bills only what it observed; a call with no usage would then be free and escape the budget.
-            # Fill gaps with its reservation estimate instead: input ~ request bytes / 4, output ~ reply text bytes / 4.
+            # sub2api bills only what it observed; a call with no usage would then be missing from cost statistics.
+            # Fill gaps with an estimate instead: input ~ request bytes / 4, output ~ reply text bytes / 4.
             est_in, est_out = call.get("input_estimate", call["request_bytes"] // 4), call["reply_bytes"] // 4
             if not any(usage):
                 usage[0], usage[1], estimated = est_in, est_out, True
@@ -1343,13 +1273,7 @@ class KeyService:
             if call is not None:
                 current = now_ms()
                 if settings["expiresAt"] is not None and current >= settings["expiresAt"]:
-                    raise GatewayError("billing", "本活动 API 额度已到期")
-                # Cheap early reject; the binding check is reserve() after the queue wait.
-                daily, total = self.limits(db, row["team_id"], settings)
-                if self.spend(db, row["team_id"], current - DAY_MS) >= daily:
-                    raise GatewayError("usage_limit", "本队近24小时额度已用完")
-                if self.spend(db, row["team_id"]) >= total:
-                    raise GatewayError("billing", "本队总额度已用完")
+                    raise GatewayError("billing", "本活动 API 访问权限已到期")
         return row
 
     def read_body(self, handler):
@@ -1407,7 +1331,7 @@ class KeyService:
                        "first_id": data[0]["id"] if data else None, "last_id": data[-1]["id"] if data else None}
             return self.send(handler, call, 200, "application/json", gateway_json(listing))
         if path == "/v1/messages/count_tokens" and handler.command == "POST" and "anthropic" in self.config:
-            key = self.authenticate(handler, call)  # expiry and budget
+            key = self.authenticate(handler, call)  # expiry
             call["log"] = False  # metadata row only, zero cost
             team = key["team_id"]
             self.admit(team, call["settings"]["teamRpm"] or COUNT_TOKENS_RPM, slot=False)  # no team slot, as sub2api
@@ -1416,7 +1340,7 @@ class KeyService:
                     raise GatewayError("rate_limit", "本队同时进行的 token 计数请求过多，请稍后重试", retry_after=1)
                 self.counting[team] += 1
             try:
-                self.reserve(handler, call, 0)
+                self.recheck_access(handler, call)
                 return self.count_tokens(handler, call)
             finally:
                 with self.lock:
@@ -1452,10 +1376,10 @@ class KeyService:
         tools = body.get("tools") or []
         if BILLED_FIELDS & set(body) or not isinstance(tools, list) or any(
                 not isinstance(t, dict) or ("type" in t and not str(t["type"]).startswith(CLIENT_TOOL_TYPES)) for t in tools):
-            # Server-side tools are billed by the upstream outside token usage, so they would escape team budgets.
+            # Server-side tools are billed by the upstream outside token usage, so their cost cannot be metered here.
             raise APIError(400, "本活动不开放上游服务端工具（网页搜索、代码执行、MCP 等），请在客户端实现工具")
         if body.get("n", 1) != 1 or "best_of" in body:
-            # Several completions per call multiply output cost beyond the reservation; one reply per request.
+            # Several completions per call multiply output cost beyond the usage estimate; one reply per request.
             raise APIError(400, "本活动每次请求只生成一条回复（n 必须为 1，不支持 best_of）")
         if path == "/v1/responses":
             # All teams share one upstream account: stored conversations must not cross teams, and background runs would
@@ -1478,13 +1402,11 @@ class KeyService:
             options = body.get("stream_options")
             body["stream_options"] = {**(options if isinstance(options, dict) else {}), "include_usage": True}
         team = key["team_id"]
-        price = call["price"]
-        call["reserve_out"] = bound_output(body, inject=name == "anthropic")
+        call["output_estimate"] = bound_output(body, inject=name == "anthropic")
         call["input_estimate"] = estimate_input(body)
-        estimate = round(call["input_estimate"] * price[0] + call["reserve_out"] * price[1])
         self.admit(team, settings["teamRpm"])
         try:
-            self.reserve(handler, call, estimate)
+            self.recheck_access(handler, call)
             try:
                 if self.client_gone(handler):
                     # Left while queued: forwarding now would bill a reply nobody receives (sub2api: 499, nothing sent).
@@ -1501,14 +1423,11 @@ class KeyService:
                 traceback.print_exc()
                 internal = GatewayError("internal", f"网关内部错误，请联系组织方（{type(error).__name__}）")
                 if not call.get("recorded"):
-                    call["charge_reserved"] = call["forwarded"]
+                    call["charge_estimate"] = call["forwarded"]
                 self.note_error(call, internal)
                 raise internal from None
             finally:
-                try:
-                    self.safe_record(handler, call)  # the real cost lands before the reservation is dropped
-                finally:
-                    self.unreserve(team, estimate)  # released even if recording failed, or the team budget stays blocked
+                self.safe_record(handler, call)
         finally:
             self.release(team)
 
@@ -1576,7 +1495,7 @@ class KeyService:
         self.send(handler, call, status, content_type, payload)
 
     def upstream_failed(self, call, error):
-        """Turn a network failure into the team's error response, charging the reservation when the upstream may have run."""
+        """Turn a network failure into the team's error response, estimating cost when the upstream may have run."""
         reason = getattr(error, "reason", error)
         timed_out = isinstance(reason, (TimeoutError, socket.timeout))
         if not call["forwarded"] and not request_was_sent(error):
@@ -1585,12 +1504,12 @@ class KeyService:
             raise GatewayError("network", "上游模型服务暂时不可用，请稍后重试（本次不计费）",
                                upstream_message=f"{failure_reason(error)}（请求未发出，不计费）") from None
         # The request was sent (or the reply had started): the upstream may be generating and billing,
-        # so charge the reserved estimate rather than nothing.
-        call["charge_reserved"] = True
-        reason = f"{failure_reason(error)}（请求已发出，按预留额度计费）"
+        # so record the estimated usage rather than nothing.
+        call["charge_estimate"] = True
+        reason = f"{failure_reason(error)}（请求已发出，按估算用量计费）"
         if timed_out:
-            raise GatewayError("timeout", "上游模型服务响应超时，本次按预留额度计费", upstream_message=reason) from None
-        raise GatewayError("network", "上游模型服务连接中断，本次按预留额度计费", upstream_message=reason) from None
+            raise GatewayError("timeout", "上游模型服务响应超时，本次按估算用量计费", upstream_message=reason) from None
+        raise GatewayError("network", "上游模型服务连接中断，本次按估算用量计费", upstream_message=reason) from None
 
     def forward(self, handler, name, upstream, suffix, body, stream, call):
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream" if stream else "application/json"}

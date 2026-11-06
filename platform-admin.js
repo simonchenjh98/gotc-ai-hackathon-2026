@@ -140,7 +140,7 @@ function installAdminData(data,version){
     <button type="button" data-admin-jump="admin-import">CSV 导入</button>
     <button type="button" data-admin-jump="invite-form">身份与凭据</button>
     <button type="button" data-admin-jump="submission-settings">作品提交</button>
-    <button type="button" data-admin-jump="key-admin">AI API 额度</button>
+    <button type="button" data-admin-jump="key-admin">AI API 管理</button>
     <button type="button" data-admin-jump="admin-records">历史与记录</button>
     <button type="button" data-admin-jump="admin-audit">操作记录</button>
   </nav>`);
