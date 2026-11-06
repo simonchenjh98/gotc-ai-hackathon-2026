@@ -347,27 +347,26 @@ class GatewayTests(unittest.TestCase):
             stored = db.execute("SELECT length(request) FROM api_logs WHERE usage_id=?", (item["id"],)).fetchone()[0]
         self.assertLess(stored, sent / 5)  # compressed on disk
 
-    def test_client_header_rules(self):
+    def test_client_headers_are_unrestricted_with_legacy_rules_after_restart(self):
         _, client, key = self.enabled_key()
         rules = [{"action": "allow", "header": "User-Agent", "contains": "claude-cli"},
                  {"action": "deny", "header": "User-Agent", "contains": "openclaw"}]
-        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"clientRules": rules})[0], 200)
-        body = {"model": "cheap"}
-        self.assertEqual(self.call("/v1/chat/completions", body, key, headers={"User-Agent": "claude-cli/2.1 (external)"})[0], 200)
-        status, content = self.call("/v1/chat/completions", body, key, headers={"User-Agent": "python-requests/2"})
-        self.assertEqual(status, 403)
-        self.assertNotIn("claude-cli".encode(), content)  # generic, as sub2api: a fake client learns nothing
-        self.assertIn("未命中任何允许规则", self.admin.post("/api/admin/keys/logs", {})[1]["items"][0]["errorMessage"])  # admins see why
-        self.assertEqual(self.call("/v1/chat/completions", body, key, headers={"User-Agent": "claude-cli openclaw"})[0], 403)
-        self.assertEqual(self.call("/v1/models", None, key, method="GET", headers={"User-Agent": "curl/8"})[0], 403)
-        blocked = self.admin.post("/api/admin/keys/logs", {})[1]["items"]
-        self.assertEqual([i["status"] for i in blocked], [403, 403, 200])  # blocked attempts are visible to admins
-        self.assertEqual(client.get("/api/team/keys")[1]["clientRules"], rules)
-        for bad in [[{"action": "allow", "header": "Authorization", "contains": "x"}],
-                    [{"action": "maybe", "header": "User-Agent", "contains": "x"}],
-                    [{"action": "deny", "header": "User Agent", "contains": "x"}],
-                    [{"action": "deny", "header": "User-Agent", "contains": ""}]]:
-            self.assertEqual(self.admin.post("/api/admin/keys/settings", {"clientRules": bad})[0], 400)
+        with self.service.db() as db:
+            db.execute("INSERT INTO settings VALUES (?,?)", ("keys.clientRules", json.dumps(rules)))
+        restarted = test_api.EventService(data_dir=self.root / "private", origin=self.service.origin, static_root=self.root / "public")
+        self.server.service = self.service = restarted
+        self.service.keys.opener = self.direct
+        for headers in ({}, {"User-Agent": "WorkBuddy/5.8.4"}, {"User-Agent": "claude-cli openclaw"},
+                        {"User-Agent": "python-requests/2", "X-Stainless-Lang": "python"}):
+            with self.subTest(headers=headers):
+                self.assertEqual(self.call("/v1/models", None, key, method="GET", headers=headers)[0], 200)
+                for path, model in (("/v1/chat/completions", "cheap"), ("/v1/responses", "cheap"),
+                                    ("/v1/messages", "claude-x"), ("/v1/messages/count_tokens", "claude-x")):
+                    self.assertEqual(self.call(path, {"model": model}, key, headers=headers)[0], 200)
+        self.assertNotIn("clientRules", client.get("/api/team/keys")[1])
+        self.assertNotIn("clientRules", self.admin.get("/api/admin/keys")[1]["settings"])
+        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"clientRules": rules})[0], 400)
+        self.assertEqual(self.call("/v1/models", None, "gk-invalid", method="GET")[0], 401)
 
     def test_rpm_blocklist_announcement_overview_and_export(self):
         team_id, client, key = self.enabled_key()

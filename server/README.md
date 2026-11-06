@@ -181,7 +181,7 @@ Claude Code 会按自己的默认模型名请求（如 `claude-opus-…`、`clau
   - 同一来源地址（IPv6 按 /64）每分钟无效密钥超过 120 次即封禁 60 秒，封禁期内该地址的无效密钥返回 429 与 `Retry-After`；有效密钥不受影响（比赛现场所有队伍通常共用一个出口地址）。后台概况显示近1小时无效尝试次数与被封禁地址数。
   - 每队最多 4 个并发、另可排队 20 个（排队最长 30 秒），超出立即返回 429；每分钟请求数只计入真正开始执行的请求，排队超时或被拒绝的请求不占用名额；所有 429 都带 `Retry-After`。`count_tokens` 计入每分钟请求数（未设置时默认每分钟 120 次）但不占用并发名额，另有每队 4 个的独立并发上限。
   - 每队每小时最多创建 60 个密钥，删除密钥不返还次数。
-  - 客户端规则拦截时只返回通用提示，命中细节仅记录在后台。屏蔽词检查模型会读取的全部文本：所有消息、系统提示、工具定义、工具参数与结果（不检查 JSON 字段名，只跳过真正的图片与文件数据），先做 NFKC 规范化、去除零宽字符、合并空白、不区分大小写，命中的屏蔽词记录在后台；sub2api 只检查最后一条用户消息，但伪造的历史消息可借此绕过，因此这里更严格。
+  - 屏蔽词检查模型会读取的全部文本：所有消息、系统提示、工具定义、工具参数与结果（不检查 JSON 字段名，只跳过真正的图片与文件数据），先做 NFKC 规范化、去除零宽字符、合并空白、不区分大小写，命中的屏蔽词记录在后台；sub2api 只检查最后一条用户消息，但伪造的历史消息可借此绕过，因此这里更严格。
   - 缺少用量时的输入估算：文本按字节/4 计算且不设上限，每张 base64 图片按 1600 token 计（不按其字节数），其他 base64 内容（如 PDF）按字节/4 计。
   - API 设置的修改记录保存每个改动项的旧值与新值。
 - 异常请求的记录与计费参照 sub2api：
@@ -203,7 +203,6 @@ Claude Code 会按自己的默认模型名请求（如 `claude-opus-…`、`clau
 - 服务器访问不到上游时，在 systemd 单元设置 `HTTPS_PROXY`。Nginx 需为 `/gotc/v1/` 关闭缓冲、放宽超时与请求体（`deploy/install.py` 已包含）。
 - 网关不可用或访问权限到期只影响 API 调用，提交与评分不受影响。
 - 调用记录：每次通过密钥认证的调用（包括被规则、到期时间或模型白名单拒绝的）都会记录时间、队伍、密钥、模型、状态、token、费用、耗时和 User-Agent。开启“记录请求与回复内容”（默认开启）时，另存请求头（去除 Authorization、x-api-key、Cookie）、客户端原样发送的完整请求体（即完整上下文，最大 4MB）和回复（最多 16MB），以 zlib 压缩保存；队伍页会提示正在记录。后台“查看上下文”提供对话视图（system、每条消息、工具调用与结果、由流式事件还原的回复）、原始内容、请求头和 JSON 下载；查看单条内容会写入审计日志。Agent 每次请求都会重发整段对话，存储增长较快，记录没有自动清理，活动结束后按需删除 `api_logs`。
-- 客户端规则：按请求头限制队伍使用的应用或 Agent，如 `allow User-Agent: claude-cli`、`deny x-stainless-lang: python`。不区分大小写的“包含”匹配；命中任一 deny 即拒绝，设置了 allow 时必须命中其中一条；规则对全体队伍生效，`/v1/models` 同样受限。请求头可被客户端伪造，只能约束常规使用，不是安全边界。调用记录中的请求头可用于确定各客户端的特征。
 
 | 方法与路径 | 身份 | 请求及响应 |
 |---|---|---|
@@ -217,7 +216,7 @@ Claude Code 会按自己的默认模型名请求（如 `claude-opus-…`、`clau
 | GET `/api/team/keys/logs` | 队伍 | 本队最近50次调用（不含内容） |
 | GET `/api/admin/keys/export` | 管理员 | 用量 CSV（不含请求内容，防公式注入） |
 | GET `/api/admin/keys` | 管理员 | `{enabled,settings,models,overview,changes,teams:[{teamId,active,keyCount,inflight,used24h,usedTotal}]}` |
-| POST `/api/admin/keys/settings` | 管理员 | `maxKeys` 1–20、`expiresAt` 毫秒或 null、`logContent` 布尔、`clientRules` `[{action:"allow"\|"deny",header,contains}]`（最多30条）、`teamRpm` 0–10000、`announcement` ≤500字、`blockedWords` ≤200个，可单独更新 |
+| POST `/api/admin/keys/settings` | 管理员 | `maxKeys` 1–20、`expiresAt` 毫秒或 null、`logContent` 布尔、`teamRpm` 0–10000、`announcement` ≤500字、`blockedWords` ≤200个，可单独更新 |
 | POST `/api/admin/keys/upstreams` | 管理员 | `{upstreams:{openai?,anthropic?:{url,key,models,aliases?}}}`，整体替换；`key` 留空沿用原值；`{}` 关闭网关 |
 | POST `/api/admin/keys/stats` | 管理员 | `{teamId?,keyId?,days:1–90}` → `{totals,byKey,byModel,byClient,daily}`，按北京时间分日 |
 | POST `/api/admin/keys/logs` | 管理员 | `{teamId?,keyId?,errorsOnly?,beforeId?}` → `{items,more}`，每页50条，按时间倒序 |
