@@ -14,6 +14,20 @@
 
 公众只能通过自身 bearer 凭据读取本申请、申报信息和获批队伍，不能查询私有身份、身份匹配结果或管理员上下文。管理员列表不返回 PIN、领取凭据或提交码。现有身份、登录标记、同源写入、请求大小和速率限制继续适用。
 
+## 管理员审核已停用提交身份并重发
+
+`GET /api/admin/claims` 的 `revokedTeams` 单独列出可审核重发的队伍；普通 `teams` 和自动审核的候选规则保持原样。候选须为有效队伍，已有唯一且停用的 team 账号，没有关联申请或已批准成员。其 `teamContext` 同时核对队伍、登记和停用账号快照；账号曾重发后再停用时，旧上下文也不能使用。
+
+管理员读取最新申请与候选后，向原 `POST /api/admin/claims/approve` 提交以下结构（标识及摘要均为合成示例）。仍须使用当前管理员 cookie、同源请求与 `X-GOTC-Login`：
+
+```json
+{"requestId":"00000000000000000000000000000000","expectedRevision":1,"reviewContext":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","teamId":"synthetic-team","teamContext":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","teamName":"Synthetic retained team","track":"","verificationMethod":"online","applicationReviewed":true,"resolvedIdentity":false,"note":"已核对原停用身份及全部申报成员，审核重新发码","reissueRevoked":true}
+```
+
+`reissueRevoked` 必须为布尔 `true`，必须明确选择队伍并提交上下文，只接受线上管理员审核且备注非空；`teamName`、`track` 必须与候选原值完全相同。此路径保留队伍 ID、队号及项目等元数据，按原审核校验绑定申报成员，在同一事务中重新生成原账号凭据、清除旧会话，并将申请设为 `approved`。响应仅返回 `ok`、`status`、`revision`，不返回临时码。审核审计仍为 `claims.approve-open`，增加 `reissueRevoked: true` 与 `accountId`，同时保留 `team-access.rotate` 审计。失败整笔回滚；相同批准载荷重试不会再次重发。
+
+队长继续使用原领取凭据调用原 `/api/claims/status` 和 `/api/claims/redeem`，由正常领取流程得到新的可登录提交码。旧码保持失效；重复领取返回同一新码。上下文、身份或占用冲突返回 409，需重新读取核对；错误的审核字段返回 400。管理员列表和审计均不含领取凭据、PIN 或提交码。此入口不会更改自动审核开关、名单或规则，也不会开通 API 额度。
+
 ## Trusted relay automatic approval
 
 Automatic review defaults to disabled. Only the current authenticated administrator can import or enable a separate trusted snapshot. Public registration and ordinary `people` imports do not confer eligibility. The captain and every member (3–5 people total) must each have exactly one eligible, complete name+school match in the snapshot, using NFKC, case folding and whitespace normalization only. Duplicate pairs remain ambiguous, including when one duplicate is ineligible. No aliases or fuzzy matching are applied. Matching data does not prove physical identity.

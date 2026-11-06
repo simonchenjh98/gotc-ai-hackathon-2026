@@ -238,18 +238,27 @@ class Claims:
             row['reviewContext'],row['references']=self.review_context(db,row['id'],row['revision'],row['declaration'])
             if row['status']=='pending' and row['expiresAt']<=self.clock():row['status']='expired'
         teams=[team for row in db.execute('SELECT id FROM teams ORDER BY number') if (team:=self.eligible_team(db,row['id']))]
-        return {'requests':requests,'people':self.roster(db),'teams':teams,'trackOptions':TRACK_OPTIONS,'autoReview':self.auto.summary(db)}
+        revoked=[team for row in db.execute('SELECT id FROM teams ORDER BY number') if (team:=self.eligible_team(db,row['id'],reissue_revoked=True))]
+        return {'requests':requests,'people':self.roster(db),'teams':teams,'revokedTeams':revoked,'trackOptions':TRACK_OPTIONS,'autoReview':self.auto.summary(db)}
 
-    def eligible_team(self,db,team_id):
+    def eligible_team(self,db,team_id,*,reissue_revoked=False):
         team=self.s.admin_data.team(db,team_id)
         if not team or team['status']!='active':return None
-        if any(db.execute('SELECT 1 FROM '+table+' WHERE team_id=?',(team_id,)).fetchone()
-               for table in ('team_accounts','claim_requests','claim_memberships')):return None
+        account=None
+        if reissue_revoked:
+            account=db.execute('SELECT a.* FROM accounts a JOIN team_accounts t ON t.account_id=a.id WHERE t.team_id=?',(team_id,)).fetchone()
+            if not account or account['role']!='team' or account['active']!=0:return None
+            if db.execute('SELECT 1 FROM claim_requests WHERE team_id=? OR account_id=?',(team_id,account['id'])).fetchone():return None
+            if db.execute('SELECT 1 FROM claim_memberships WHERE team_id=?',(team_id,)).fetchone():return None
+        elif any(db.execute('SELECT 1 FROM '+table+' WHERE team_id=?',(team_id,)).fetchone()
+                 for table in ('team_accounts','claim_requests','claim_memberships')):return None
         registration=db.execute('SELECT * FROM team_registrations WHERE team_id=?',(team_id,)).fetchone()
         # Hash the complete persisted snapshots; expose only staff review fields, never registration secrets.
         snapshot=[dict(db.execute('SELECT * FROM teams WHERE id=?',(team_id,)).fetchone()),
                   dict(db.execute('SELECT * FROM team_details WHERE team_id=?',(team_id,)).fetchone() or {}),
                   dict(registration) if registration else None]
+        if account:
+            snapshot.append({'id':account['id'],'role':account['role'],'active':account['active'],'fingerprint':fingerprint(account)})
         team['teamContext']=digest('claim-team-context-v1',json.dumps(snapshot,ensure_ascii=False,sort_keys=True))
         team['registration']={'captain':registration['captain'],'school':registration['school'],
             'members':json.loads(registration['members_json']),'revision':registration['revision'],
@@ -279,8 +288,12 @@ class Claims:
         fields={'requestId','expectedRevision','reviewContext','teamName','track','resolvedIdentity','note'}
         online_fields=fields|{'verificationMethod','applicationReviewed'}
         onsite_fields=fields|{'pin','inPersonVerified'}
-        online=set(body) in (online_fields,online_fields|{'teamId','teamContext'})
+        reissue='reissueRevoked' in body
+        online=set(body) in (online_fields,online_fields|{'teamId','teamContext'},online_fields|{'teamId','teamContext','reissueRevoked'})
         if not online and set(body) not in (onsite_fields,onsite_fields|{'teamId','teamContext'}):raise APIError(400,'开放申请审核字段不正确')
+        if reissue:
+            if body['reissueRevoked'] is not True:raise APIError(400,'请明确确认停用提交身份重新发码')
+            self.s.require(actor,'admin')
         if 'teamId' in body and (not isinstance(body['teamId'],str) or not body['teamId'] or not isinstance(body['teamContext'],str) or not re.fullmatch(r'[a-f0-9]{64}',body['teamContext'])):raise APIError(400,'请选择队伍并提交当前队伍核验上下文')
         if not isinstance(body['requestId'],str) or type(body['expectedRevision']) is not int or not isinstance(body['reviewContext'],str) or not re.fullmatch(r'[a-f0-9]{64}',body['reviewContext']):raise APIError(400,'需要申请修订号及核验上下文')
         if type(body['resolvedIdentity']) is not bool:raise APIError(400,'身份区分确认字段不正确')
@@ -290,6 +303,7 @@ class Claims:
             if body['inPersonVerified'] is not True:raise APIError(400,'请当面核实本人和全部组员')
             if not isinstance(body['pin'],str) or not re.fullmatch(r'\d{6}',body['pin']):raise APIError(400,'请输入申请人设备上的六位核验码')
         metadata=self.team_metadata(body);note=self.text(body['note'],'审核备注',2000)
+        if reissue and not note:raise APIError(400,'停用身份重新发码须填写审核备注')
         row=db.execute('SELECT * FROM claim_requests WHERE id=?',(body['requestId'],)).fetchone()
         if not row:raise APIError(404,'申请不存在')
         canonical={**body,**metadata,'note':note,**({} if online else {'pin':digest('pin:'+row['id'],body['pin'])})}
@@ -303,9 +317,11 @@ class Claims:
         self.validate_declaration(row['name'],row['school'],declaration['members'])
         context,references=self.review_context(db,row['id'],row['revision'],declaration)
         if not hmac.compare_digest(context,body['reviewContext']):raise APIError(409,'相关身份或申请已变化，请保留核实备注并刷新，重新核对后批准')
-        selected=self.eligible_team(db,body['teamId']) if 'teamId' in body else None
+        selected=self.eligible_team(db,body['teamId'],reissue_revoked=reissue) if 'teamId' in body else None
         if 'teamId' in body and (not selected or not hmac.compare_digest(selected['teamContext'],body['teamContext'])):
             raise APIError(409,'所选队伍或登记资料已变化、已发码或已归队，请保留输入并刷新核对')
+        if reissue and (metadata['teamName']!=selected['name'] or metadata['track']!=selected['track']):
+            raise APIError(409,'停用身份重新发码须保留原队名和赛道，请刷新核对')
         if any(normalize(t['name'])==normalize(metadata['teamName']) and (not selected or t['id']!=selected['id'])
                for t in db.execute('SELECT id,name FROM teams')):
             raise APIError(409,'这个队名已存在，请明确选择已有队伍进行核验，或填写可区分的队名')
@@ -327,7 +343,7 @@ class Claims:
             if number is None:raise APIError(409,'队号 1–999 已用完，请联系组织方')
             team_values={'number':number,'status':'active'}
         try:
-            team=self.s.admin_data.save_team(db,actor,{**team_values,'name':metadata['teamName'],'track':metadata['track']})
+            team=selected if reissue else self.s.admin_data.save_team(db,actor,{**team_values,'name':metadata['teamName'],'track':metadata['track']})
             member_ids=[]
             for person,exact in zip(people,matches):
                 person_id=exact['id'] if exact else 'P'+secrets.token_hex(16)
@@ -337,7 +353,7 @@ class Claims:
                 db.execute('INSERT INTO claim_memberships VALUES (?,?,?)',(person_id,team['id'],row['id']))
                 member_ids.append(person_id)
             self.s.registration.sync_verified_members(db,actor,team['id'],member_ids[0],member_ids)
-            access=self.s.team_access(db,actor,{'teamId':team['id'],'action':'issue'})
+            access=self.s.team_access(db,actor,{'teamId':team['id'],'action':'rotate' if reissue else 'issue'})
             account=db.execute('SELECT * FROM accounts WHERE id=?',(access['id'],)).fetchone()
             reviewed={**declaration,**metadata}
             self.save_declaration(db,row['id'],row['revision']+1,reviewed)
@@ -347,6 +363,7 @@ class Claims:
         self.s.audit(db,actor,'claims.approve-open',row['id'],{'teamId':team['id'],'memberIds':member_ids,'declaration':reviewed,
             'requestRevision':body['expectedRevision'],'reviewContext':body['reviewContext'],'resolvedIdentity':body['resolvedIdentity'],'note':note,
             **({'verificationMethod':'online','applicationReviewed':True} if online else {'verificationMethod':'onsite','inPersonVerified':True}),
+            **({'reissueRevoked':True,'accountId':account['id']} if reissue else {}),
             **({'selectedTeamId':body['teamId'],'teamContext':body['teamContext']} if selected else {})})
         return {'ok':True,'status':'approved','revision':row['revision']+1}
 
