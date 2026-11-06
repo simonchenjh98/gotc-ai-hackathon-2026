@@ -98,3 +98,17 @@
 .team-reference>.surface{margin:0;border:0;border-top:1px solid var(--line)}
 #team-keys,#team-repository,#submission-form{scroll-margin-top:24px}
 @media(max-width:720px){.participant-actions{grid-template-columns:1fr;gap:10px}.participant-start{padding:22px}.participant-deadline{margin-bottom:12px}.participant-actions li{padding:8px 14px}.participant-success-hint{font-size:12px}.team-reference>summary{padding:16px 22px}}
+
+/* Organizer-only member detail and reversible team lifecycle controls. */
+.admin-team-members{border-top:1px solid var(--line);margin-top:24px;padding-top:18px;min-width:0}
+.admin-team-members h3{margin:0}.admin-member-table caption{text-align:left;padding:12px 0;font-size:13px;font-weight:600}
+.admin-member-table td,.admin-recycle-bin td{overflow-wrap:anywhere;max-width:320px}
+.admin-lifecycle-panel{margin-top:20px;padding:20px;border:1px solid #c78075;background:#fff9f7}
+.admin-lifecycle-panel h3{margin-top:0}.admin-lifecycle-panel textarea{max-width:100%}
+.admin-recycle-bin{scroll-margin-top:24px}.admin-recycle-bin .section-caption{flex-wrap:wrap;gap:12px}
+#team-restore-detail{border-top:1px solid var(--line);margin-top:24px;padding-top:20px;min-width:0}
+.admin-restore-blocking{padding:14px 18px;margin:18px 0;background:#fff1ed;border-left:3px solid #ad302a;font-size:13px;line-height:1.8}
+.admin-restore-advisory{padding:14px 18px;margin:18px 0;background:var(--pale);border-left:3px solid var(--orange);font-size:13px;line-height:1.8}
+.admin-restore-blocking h4,.admin-restore-advisory h4{margin:0}.admin-restore-blocking p,.admin-restore-advisory p{margin-bottom:0}
+#team-recycle-confirm[hidden],#team-recycle-bin[hidden],#team-restore-detail[hidden],#team-restore-result[hidden],#team-recycle-open[hidden],#team-detail-refresh[hidden]{display:none}
+@media(max-width:720px){.admin-lifecycle-panel{padding:16px}.admin-team-members .section-caption{align-items:flex-start;flex-direction:column;gap:12px}.admin-recycle-bin .form-actions{flex-wrap:wrap}.admin-recycle-bin .form-grid{grid-template-columns:1fr}}

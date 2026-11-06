@@ -118,6 +118,7 @@ class AdminDataService:
         before=self.team(db,team_id) if isinstance(team_id,str) else None
         if team_id is not None and before is None:
             raise APIError(404,'队伍不存在')
+        if before:self.s.team_lifecycle.require_available(db,team_id)
         revision=values.get('expectedRevision')
         # Direct administrator HTTP edits must carry the displayed team revision.
         # Internal import commits verify a whole-row fingerprint in this same write
@@ -196,6 +197,7 @@ class AdminDataService:
                     values['number']=int(digits);row['key']=str(values['number'])
                     target=db.execute('SELECT id FROM teams WHERE number=?',(values['number'],)).fetchone()
                     before=self.team(db,target['id']) if target else None
+                    if before:self.s.team_lifecycle.require_available(db,before['id'])
                     if values.get('status')=='':
                         values['status']=before['status'] if before else 'active'
                     if 'roadshowOrder' in values:

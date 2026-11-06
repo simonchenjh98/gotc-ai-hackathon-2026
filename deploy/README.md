@@ -39,6 +39,37 @@ The initial admin access file is transferred through SFTP to
 `.runtime/admin-access.txt`. It is never printed and must never be committed or
 shared publicly. Keep `.runtime/` ignored by Git.
 
+## Team recycle migration and rollback floor
+
+The release includes `server/team_lifecycle.py` and the existing admin assets through
+the normal allowlist. Initialization adds two lifecycle/history tables and an index;
+it does not rebuild existing tables or backfill identities. Use the installer's
+SQLite backup and normal health checks before activation. Keep the data directory
+outside the release tree. Initial production smoke should be read-only; this feature
+does not authorize recycling any real team as a deployment test.
+
+Recycling preserves the original team ID/number, submissions, scores, votes, frozen
+rosters, repository records and usage, but releases current memberships and revokes
+team credentials/sessions. A recycled name is available for new approval. Restore
+is atomic and rejects current name or verified-member conflicts; it cannot replace
+another team's members. Successful restore retains the previous eligibility status
+and leaves old access inactive. Operators must separately reissue submission codes,
+enable API access/create new keys, and rotate existing registration management codes
+when access is needed. Review and explicitly republish affected stage results.
+
+**After the first real recycle, rollback must retain lifecycle-aware code.** An older
+binary cannot interpret tombstones or archived memberships and may permit ordinary
+editing/reactivation to bypass restore checks. The installer's automatic health
+rollback is not proof of semantic safety after feature use. Prefer a forward fix or
+a reviewed compatible rollback; never overwrite later event activity with an old
+whole-database backup. Before any lifecycle mutation, unused additive tables alone
+do not introduce this post-use incompatibility. No destructive rollback or real
+data deletion is part of the synthetic release verification.
+
+Gateway revocation takes effect at the existing final admission recheck after a
+queue wait. Requests already admitted may complete and remain billed/auditable;
+there is no network-instant cancellation or erasure of incurred usage.
+
 ## Optional private source backup worker
 
 The sealed Gitee source worker additionally requires the system Git executable (production baseline: Git 2.43.0) and Python 3.12; no pip dependency is added. Configure `GOTC_REPO_GITEE_ENABLED=1`, the existing private Gitee organization/token settings, and `GOTC_REPO_GITEE_SEAL_ENABLED=1` for sealed previews. Set `GOTC_REPO_BACKUP_ENABLED=1` in the private service environment to start one worker from `main()` after HTTP server initialization. The GOTC event deployment uses GOTC_REPO_BACKUP_ENABLED=0 with Gitee sealing enabled: new versions have no archive job and existing private downloads remain available. Any other value than 1 leaves the worker stopped; constructing EventService in tests starts no threads. The Gitee token's mandatory user_info scope supports validating its login via `/user`; no additional scope is requested here.

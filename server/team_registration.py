@@ -110,18 +110,18 @@ class TeamRegistration:
 
     def listing(self, db, admin=False):
         rows = [self.row(db, r[0]) for r in db.execute('SELECT team_id FROM team_registrations')]
-        return {'teams': [self.private(r) if admin else self.public(r) for r in sorted(rows, key=lambda r: r['number'])
-                          if admin or r['status'] == 'active']}
+        return {'teams': [{**self.private(r),'recycled':self.s.team_lifecycle.is_recycled(db,r['team_id'])} if admin else self.public(r)
+                          for r in sorted(rows, key=lambda r: r['number'])
+                          if admin or (r['status'] == 'active' and not self.s.team_lifecycle.is_recycled(db,r['team_id']))]}
 
     def check_duplicates(self, db, value, team_id=None, *, check_members=True):
-        for row in db.execute('SELECT id,name FROM teams'):
-            if row['id'] != team_id and normalize(row['name']) == normalize(value['name']):
-                raise APIError(409, '这个队名已登记，请在名单中查找；如是本队，请用管理码修改')
+        if self.s.team_lifecycle.name_collisions(db,value['name'],team_id):
+            raise APIError(409, '这个队名已登记，请在名单中查找；如是本队，请用管理码修改')
         if not check_members:
             return
         names = {normalize(n) for n in value['members']}
         for row in db.execute('SELECT team_id,school,members_json FROM team_registrations'):
-            if row['team_id'] != team_id and normalize(row['school']) == normalize(value['school']) and names.intersection(normalize(n) for n in json.loads(row['members_json'])):
+            if row['team_id'] != team_id and not self.s.team_lifecycle.is_recycled(db,row['team_id']) and normalize(row['school']) == normalize(value['school']) and names.intersection(normalize(n) for n in json.loads(row['members_json'])):
                 raise APIError(409, '同校同名队员已在其他队登记，请先联系组织方核对，避免重复组队')
 
     def sync_people(self, db, value):
@@ -164,10 +164,12 @@ class TeamRegistration:
         self.s.audit(db, actor, 'registration.verified-members', team_id, metadata)
 
     def insert(self, db, value, secret, source_key=None, raw=None):
-        if db.execute('SELECT COUNT(*) FROM teams').fetchone()[0] >= 200:
+        if sum(not self.s.team_lifecycle.is_recycled(db,row[0]) for row in db.execute('SELECT id FROM teams')) >= 200:
             raise APIError(409, '登记队伍已达上限，请联系组织方')
         used = {r[0] for r in db.execute('SELECT number FROM teams')}
-        number = next(n for n in range(1, 1000) if n not in used)
+        number = next((n for n in range(1, 1000) if n not in used),None)
+        if number is None:
+            raise APIError(409, '队号 1–999 已用完，请联系组织方')
         display_name = value['name'] or value['captain']+'的队伍（待命名）'
         team = self.s.admin_data.save_team(db, None, {'number': number, 'name': display_name, 'project': value['project'], 'track': ''})
         db.execute('''INSERT INTO team_registrations
@@ -277,6 +279,7 @@ class TeamRegistration:
                     row = self.row(db, body['teamId']) if isinstance(body['teamId'], str) else None
                     if not row or type(body['expectedRevision']) is not int or row['revision'] != body['expectedRevision']:
                         raise APIError(409, '资料已变化，请刷新后重发')
+                    self.s.team_lifecycle.require_available(db,row['team_id'])
                     code = secrets.token_urlsafe(32)
                     db.execute('UPDATE team_registrations SET secret_hash=?,revision=revision+1 WHERE team_id=?', (code_hash(code),row['team_id']))
                     self.s.audit(db, actor, 'registration.rotate', row['team_id'])

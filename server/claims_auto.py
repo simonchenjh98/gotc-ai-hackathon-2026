@@ -81,7 +81,7 @@ class AutoReview:
             matches=list(db.execute('SELECT * FROM claim_auto_people WHERE normalized_name=? AND normalized_school=?',identity))
             if len(matches)!=1 or not matches[0]['eligible'] or not all(identity):return
             matched.append(matches[0]['id'])
-        collisions=[r for r in db.execute('SELECT id,name FROM teams') if self.normalize(r['name'])==self.normalize(declaration['teamName'])]
+        collisions=c.s.team_lifecycle.name_collisions(db,declaration['teamName'])
         selected=None
         if collisions:
             if len(collisions)!=1:return

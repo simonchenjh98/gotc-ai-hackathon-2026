@@ -958,6 +958,7 @@ class KeyService:
                 if not db.execute("UPDATE team_api SET active=0 WHERE team_id=? AND active=1", (team_id,)).rowcount:
                     raise APIError(409, "该队 API 访问权限未开通")
             else:
+                self.service.team_lifecycle.require_available(db,team_id)
                 if self.config is None:
                     raise APIError(409, "尚未配置模型上游，请先在“模型上游”中填写")
                 if self.team_active(db, team_id):
