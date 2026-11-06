@@ -77,11 +77,11 @@ function installRoadshowRoster(view,data){
   const valid=()=>{if(!current())return false;if(session!==view.owner || !ownsBrowserLogin(view.owner)){save.disabled=true;error.textContent='管理员登录已失效或切换。当前名单输入已保留，请复制后重新登录。';return false;}return true;};
   const changed=()=>{edit++;dirtyAdminForms.add(form);};field.addEventListener('input',changed);
   view.cleanups.push(()=>field.removeEventListener('input',changed));
-  form.querySelector('[data-roadshow-reload]').onclick=()=>{if(!valid())return;if(dirtyAdminForms.has(form) && !confirm('重新读取会替换当前未保存名单。请先复制要保留的内容，继续？'))return;dirtyAdminForms.delete(form);renderRoute();};
+  form.querySelector('[data-roadshow-reload]').onclick=()=>{if(!valid())return;if(busy || [...dirtyAdminForms,...(typeof activeFinalsView!=='undefined' && activeFinalsView?activeFinalsView.forms:[])].some(item=>item.isConnected && item.finalsBusy)){error.textContent='正在保存，请等待结果返回后再重新读取。';return;}if([...dirtyAdminForms].some(item=>item.isConnected) && !confirm('重新读取会替换此页未保存的评委或队伍名单。请先复制要保留的内容，继续？'))return;dirtyAdminForms.delete(form);renderRoute();};
   form.onsubmit=async event=>{
     event.preventDefault();if(!valid() || busy || blocked || !editable)return;
     const epoch=edit,names=field.value.split(/\r?\n/).map(value=>value.trim()).filter(Boolean);
-    busy=true;save.disabled=true;error.textContent='';
+    busy=true;form.roadshowBusy=true;save.disabled=true;error.textContent='';
     try{
       const result=await api('admin/roadshow-access',{expectedRevision:revision,runId,names},{loginId:view.owner.loginId});
       if(!valid())return;revision=result.revision;runId=result.runId;editable=result.editable===true;
@@ -92,7 +92,7 @@ function installRoadshowRoster(view,data){
       if(!valid())return;
       if(failure.status===409){blocked=true;error.textContent=failure.message+' 当前输入已保留，请复制后重新读取名单，再核对保存。';}
       else error.textContent=failure.message+' 当前输入已保留，没有自动重试保存。';
-    }finally{busy=false;if(valid())save.disabled=blocked || !editable;}
+    }finally{busy=false;form.roadshowBusy=false;if(valid())save.disabled=blocked || !editable;}
   };
   view.container.querySelector('[data-roadshow-stage]').onclick=()=>{adminStage='roadshow';};
 }

@@ -154,7 +154,7 @@ test('90-minute controls reject unsaved setup and block retry after a conflict',
 test('private roadshow endpoints carry X-GOTC-Login and routes select numeric renderers',async()=>{
   const requests=[],main={innerHTML:''},ctx=vm.createContext({document:{getElementById:()=>main,querySelectorAll:()=>[],body:{classList:{remove(){},add(){}}}},location:{href:'https://example.test/platform.html',hash:'#judge-roadshow'},URL,setTimeout,clearTimeout,fetch:async(url,options)=>{requests.push({url,options});return {ok:true,json:async()=>({})};}});
   vm.runInContext(platform+"\nsession={role:'judge',loginId:'ordinary-login'};account=()=>{};globalThis.calls=[];renderRoadshowJudge=async()=>calls.push('numeric-judge');renderRoadshowBoard=async()=>calls.push('numeric-board');renderExhibitionJudge=async()=>calls.push('legacy');",ctx);
-  for(const path of ['roadshow/scoring','roadshow/score','admin/roadshow/scoring','admin/roadshow/publish','admin/judging/roadshow/window'])await vm.runInContext(`api(${JSON.stringify(path)})`,ctx);
+  for(const path of ['roadshow/scoring','roadshow/score','admin/roadshow/scoring','admin/roadshow/publish','admin/roadshow/teams','admin/judging/roadshow/window'])await vm.runInContext(`api(${JSON.stringify(path)})`,ctx);
   assert.ok(requests.every(item=>item.options.headers['X-GOTC-Login']==='ordinary-login'));
   await vm.runInContext('renderRoute()',ctx);ctx.location.hash='#board-roadshow';await vm.runInContext('renderRoute()',ctx);assert.deepEqual([...ctx.calls],['numeric-judge','numeric-board']);
 });

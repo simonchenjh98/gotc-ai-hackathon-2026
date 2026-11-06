@@ -129,6 +129,18 @@ test('roster conflicts retain input and block resubmission until an explicit rer
   h.ctx.confirm=()=>false;h.reload.onclick();assert.equal(rereads,0);h.ctx.confirm=()=>true;h.reload.onclick();assert.equal(rereads,1);
 });
 
+test('name-roster reload protects a clean sibling team form while its save is pending',()=>{
+  const h=adminHarness();let reloads=0;h.ctx.renderRoute=()=>reloads++;
+  h.ctx.activeFinalsView={forms:new Set([{isConnected:true,finalsBusy:true}])};h.reload.onclick();
+  assert.equal(reloads,0);assert.match(h.error.textContent,/正在保存/);
+});
+
+test('name-roster reload checks dirty connected sibling forms while ignoring departed forms',()=>{
+  const h=adminHarness();let reloads=0;h.ctx.renderRoute=()=>reloads++;h.ctx.confirm=()=>false;
+  const sibling={isConnected:true};h.ctx.dirtyAdminForms.add(sibling);h.reload.onclick();assert.equal(reloads,0);
+  sibling.isConnected=false;h.reload.onclick();assert.equal(reloads,1);
+});
+
 test('a switched administrator cannot receive or resend the old roster save response',async()=>{
   const gate=deferred(),h=adminHarness(()=>gate.promise);const pending=h.form.onsubmit({preventDefault(){}});
   h.ctx.session={role:'admin',loginId:'admin-two'};gate.resolve({revision:5,runId:'RUN1',editable:true,names:['OTHER']});await pending;
