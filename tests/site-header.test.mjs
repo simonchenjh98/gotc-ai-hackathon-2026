@@ -26,8 +26,8 @@ function fixture(href,page){
 }
 
 test('all local pages share destinations and stay inside the gotc mount',()=>{
-  const pages=[fixture('https://example.test/gotc/','home'),fixture('https://example.test/gotc/teams.html','teams'),fixture('https://example.test/gotc/platform.html#team','platform')];
-  const destinations=pages.map(f=>f.links.map(a=>new URL(a.href,f.location.href).href));
+  const pages=[fixture('https://example.test/gotc/index.html','home'),fixture('https://example.test/gotc/teams.html','teams'),fixture('https://example.test/gotc/platform.html#team','platform')];
+  const destinations=pages.map(f=>f.links.map(a=>{const url=new URL(a.href,f.location.href);return url.origin+url.pathname+url.search+url.hash;}));
   assert.deepEqual(destinations[0],destinations[1]);assert.deepEqual(destinations[1],destinations[2]);
   assert.ok(destinations[0].every(href=>href.startsWith('https://example.test/gotc/')));
   assert.deepEqual(pages.map(f=>f.links.find(a=>a.getAttribute('aria-current')==='page').dataset.headerPage),['home','teams','team']);
@@ -38,10 +38,28 @@ test('all local pages share destinations and stay inside the gotc mount',()=>{
 
 test('the static homepage keeps event links local and platform links on the live service',()=>{
   const f=fixture('https://example.github.io/gotc-ai-hackathon-2026/index.html','home');
-  assert.equal(f.links.find(a=>a.dataset.headerPage==='home').href,'https://example.github.io/gotc-ai-hackathon-2026/index.html');
-  assert.equal(f.links.find(a=>a.dataset.headerPage==='schedule').href,'https://example.github.io/gotc-ai-hackathon-2026/index.html#schedule');
+  assert.equal(f.links.find(a=>a.dataset.headerPage==='home').href,'#');
+  assert.equal(f.links.find(a=>a.dataset.headerPage==='schedule').href,'#schedule');
   assert.equal(f.links.find(a=>a.dataset.headerPage==='teams').href,'https://8.141.114.201/gotc/teams.html');
   assert.equal(f.links.find(a=>a.dataset.headerPage==='team').href,'https://8.141.114.201/gotc/platform.html#team');
+});
+
+test('homepage section navigation keeps the same document including root paths and query strings',()=>{
+  for(const href of ['https://etownyouthai.com/','https://etownyouthai.com/index.html?from=group#teams',
+    'https://example.test/gotc/?from=group#teams','https://example.test/gotc/index.html',
+    'https://example.github.io/gotc-ai-hackathon-2026/','https://example.github.io/gotc-ai-hackathon-2026/index.html?from=group']){
+    const f=fixture(href,'home'),current=new URL(href);
+    for(const key of ['home','about','schedule','judging','participants']){
+      const destination=new URL(f.links.find(a=>a.dataset.headerPage===key).href,href);
+      assert.equal(destination.origin+destination.pathname+destination.search,current.origin+current.pathname+current.search,`${href}: ${key} must not reload the form document`);
+      assert.equal(destination.hash,key==='home'?'':`#${key}`);
+    }
+  }
+  for(const page of ['teams','platform']){
+    const f=fixture(`https://example.test/gotc/${page}.html?from=group`,page);
+    assert.equal(f.links.find(a=>a.dataset.headerPage==='home').href,'https://example.test/gotc/index.html');
+    assert.equal(f.links.find(a=>a.dataset.headerPage==='schedule').href,'https://example.test/gotc/index.html#schedule');
+  }
 });
 
 test('menu state closes on Escape, navigation and outside clicks',()=>{

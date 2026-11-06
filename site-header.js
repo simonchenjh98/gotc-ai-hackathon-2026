@@ -8,7 +8,8 @@
   const platform = page === 'home' && !local.pathname.startsWith('/gotc/')
     ? new URL(header.dataset.platformBase, local) : local;
   const entry = hash => page === 'platform' ? `#${hash}` : new URL(`platform.html#${hash}`, platform).href;
-  const home = hash => new URL(`index.html${hash ? `#${hash}` : ''}`, local).href;
+  // Stay in the current homepage document so section navigation keeps unsaved form input.
+  const home = hash => page === 'home' ? `#${hash}` : new URL(`index.html${hash ? `#${hash}` : ''}`, local).href;
   const link = (label, href, key, route = '') => `<a href="${href}" data-header-page="${key}"${route ? ` data-route="${route}"` : ''}>${label}</a>`;
   header.innerHTML = `
     <a class="gotc-brand" href="${home('')}" aria-label="GOTC 2026 活动首页">
