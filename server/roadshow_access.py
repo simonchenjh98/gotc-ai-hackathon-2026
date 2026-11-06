@@ -1,4 +1,4 @@
-"""Roster-bound roadshow invitation claiming; never exposes the public roster."""
+"""Roster-bound roadshow name login and legacy invitation claiming."""
 import base64
 from contextlib import closing
 import hashlib
@@ -67,7 +67,7 @@ class RoadshowAccess:
     @staticmethod
     def supports(path):
         return any(path == endpoint or path.startswith(endpoint + '/') for endpoint in
-                   ('/api/roadshow/access', '/api/roadshow/claim', '/api/admin/roadshow-access'))
+                   ('/api/roadshow/access', '/api/roadshow/login', '/api/roadshow/claim', '/api/admin/roadshow-access'))
 
     @staticmethod
     def normalized(name):
@@ -108,9 +108,9 @@ class RoadshowAccess:
         configured = any(row['granted'] for row in rows)
         available = any(self.claimable(row) for row in rows)
         message = ('名单待配置，请等待主办方录入路演评委名单。' if not configured else
-                   '请输入名单中的完整姓名领取本人的专属邀请码。' if available else
-                   '评委邀请码暂不可领取，请联系组织方。')
-        return {'configured': configured, 'claimAvailable': available, 'message': message}
+                   '请输入名单中的完整真实姓名作为邀请码，直接登录路演评分。' if available else
+                   '姓名登录暂不可用，请联系组织方。')
+        return {'configured': configured, 'claimAvailable': available, 'nameLoginAvailable': available, 'message': message}
 
     def editable(self, db, state):
         numeric_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadshow_scores'").fetchone()
@@ -124,7 +124,8 @@ class RoadshowAccess:
                 'runId': state['run_id'], 'editable': bool(self.editable(db, state)),
                 'names': [row['name'] for row in rows],
                 'judges': [{'id': row['judge_id'], 'name': row['name'], 'active': bool(row['active']),
-                            'claimed': row['claimed_at'] is not None, 'canClaim': self.claimable(row)} for row in rows]}
+                            'claimed': row['claimed_at'] is not None, 'canClaim': self.claimable(row),
+                            'canLogin': self.claimable(row)} for row in rows]}
 
     def save_names(self, db, actor, state, body):
         if not isinstance(body, dict) or set(body) != {'expectedRevision', 'runId', 'names'}:
@@ -172,7 +173,7 @@ class RoadshowAccess:
         self.s.touch(db)
         return {'ok': True, **self.admin_view(db, self.s.judging.state(db, 'roadshow'))}
 
-    def claim(self, db, state, body):
+    def resolve_name(self, db, state, body):
         if not isinstance(body, dict) or set(body) != {'name'}:
             raise APIError(400, '请输入评委完整姓名')
         canonical = self.normalized(self.clean_name(body['name']))
@@ -185,6 +186,15 @@ class RoadshowAccess:
             raise APIError(403, '该评委身份已停用，请联系组织方')
         if not self.claimable(row):
             raise APIError(409, '该评委凭据或姓名已由组织方调整，请联系组织方领取新的登录方式')
+        return row
+
+    def login(self, db, state, body):
+        row = self.resolve_name(db, state, body)
+        account = db.execute('SELECT * FROM accounts WHERE id=?', (row['judge_id'],)).fetchone()
+        return self.s.issue_session(db, account)
+
+    def claim(self, db, state, body):
+        row = self.resolve_name(db, state, body)
         code = self.code(row)
         if row['claimed_at'] is None:
             salt = secrets.token_bytes(16)
@@ -198,14 +208,18 @@ class RoadshowAccess:
 
     def dispatch(self, method, path, body, cookie, ip, expected_login_id, query=None):
         if query:
-            raise APIError(400, '领码接口不接受查询参数')
+            raise APIError(400, '路演身份接口不接受查询参数')
         if method == 'POST' and path == '/api/roadshow/claim':
             self.s.rate_limit(ip, 'roadshow-claim')
+        if method == 'POST' and path == '/api/roadshow/login':
+            self.s.rate_limit(ip, 'roadshow-name-login')
         with self.s.db() as db:
             db.execute('BEGIN IMMEDIATE' if method == 'POST' else 'BEGIN')
             state = self.s.judging.state(db, 'roadshow')
             if method == 'GET' and path == '/api/roadshow/access':
                 return self.public_view(db, state)
+            if method == 'POST' and path == '/api/roadshow/login':
+                return self.login(db, state, body)
             if method == 'POST' and path == '/api/roadshow/claim':
                 return self.claim(db, state, body)
             if path == '/api/admin/roadshow-access':

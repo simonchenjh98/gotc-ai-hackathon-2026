@@ -548,6 +548,14 @@ class EventService:
         if actor["role"] != role:
             raise APIError(403, "当前身份无权访问")
 
+    def issue_session(self, db, account):
+        """Issue a session only after the caller authenticates inside its write transaction."""
+        token = secrets.token_urlsafe(32)
+        db.execute("DELETE FROM sessions WHERE expires_at<=?", (now_ms(),))
+        db.execute("INSERT INTO sessions VALUES (?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), account["id"], now_ms() + SESSION_SECONDS * 1000))
+        self.audit(db, account, "login")
+        return {"ok": True, **self.admin_team_access.session_view(account, f"{COOKIE_NAME}={token}")}, token, "set"
+
     def login(self, body, ip):
         """Verify outside the writer lock, then recheck the proof before issuing a session."""
         role = body.get("role")
@@ -582,11 +590,7 @@ class EventService:
             current = db.execute("SELECT * FROM accounts WHERE id=? AND role=? AND active=1", (account["id"], role)).fetchone()
             if not current or not hmac.compare_digest(current["salt"], account["salt"]) or not hmac.compare_digest(current["code_hash"], account["code_hash"]):
                 raise APIError(401, "邀请码无效或已停用")
-            token = secrets.token_urlsafe(32)
-            db.execute("DELETE FROM sessions WHERE expires_at<=?", (now_ms(),))
-            db.execute("INSERT INTO sessions VALUES (?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), current["id"], now_ms() + SESSION_SECONDS * 1000))
-            self.audit(db, current, "login")
-            return {"ok": True, **self.admin_team_access.session_view(current, f"{COOKIE_NAME}={token}")}, token, "set"
+            return self.issue_session(db, current)
 
     def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None, server_received_at=None, finals_judge_id=None):
         """Return (JSON object or CSV bytes, optional session token, cookie action)."""
@@ -594,7 +598,8 @@ class EventService:
         if self.roadshow_scoring.supports(path):
             return self.roadshow_scoring.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
         if self.roadshow_access.supports(path):
-            return self.roadshow_access.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
+            result = self.roadshow_access.dispatch(method,path,body,cookie,ip,expected_login_id,query)
+            return result if method == 'POST' and path == '/api/roadshow/login' else (result,None,None)
         if path.startswith(("/api/registration", "/api/admin/registration")):
             return self.registration.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
         if path.startswith(("/api/claims/","/api/admin/claims")):

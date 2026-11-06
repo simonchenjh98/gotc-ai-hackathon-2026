@@ -7,74 +7,103 @@ const source=fs.readFileSync(new URL('../platform-roadshow-access.js',import.met
 const platform=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8').split("window.addEventListener('hashchange'")[0];
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};};
+const flush=()=>new Promise(resolve=>setImmediate(resolve));
 function element(value=''){
   const listeners=new Map();
-  return {value,disabled:false,hidden:false,textContent:'',isConnected:true,addEventListener(name,fn){listeners.set(name,fn);},removeEventListener(name){listeners.delete(name);},dispatchEvent(event){listeners.get(event.type)?.(event);},focus(){this.focused=true;},select(){this.selected=true;}};
+  return {value,disabled:false,hidden:false,textContent:'',isConnected:true,addEventListener(name,fn){listeners.set(name,fn);},removeEventListener(name){listeners.delete(name);},dispatchEvent(event){listeners.get(event.type)?.(event);},focus(){this.focused=true;}};
 }
 function runtime(extra={}){
   const owner={role:'admin',loginId:'admin-one'},ctx=vm.createContext({AbortController,Event,URL,Set,setTimeout,clearTimeout,esc,base:new URL('https://example.test/gotc/'),session:owner,dirtyAdminForms:new Set(),ownsBrowserLogin:()=>true,confirm:()=>true,renderRoute(){},...extra});
-  vm.runInContext(source+'\nglobalThis.helpers={makeRoadshowClaimController,roadshowPublicRequest,roadshowClaimMarkup,roadshowRosterMarkup,installRoadshowRoster};',ctx);return ctx;
+  vm.runInContext(source+'\nglobalThis.helpers={makeRoadshowNameLoginController,roadshowNameRequest,roadshowNameLoginMarkup,roadshowRosterMarkup,installRoadshowRoster};',ctx);return ctx;
 }
-function claimHarness(extra={}){
-  const controls=Object.fromEntries(['.form-error','[data-roadshow-availability]','[data-roadshow-result]','[data-roadshow-name]','[data-roadshow-claim-button]','[data-roadshow-refresh]','[data-roadshow-copy]','[data-roadshow-fill]'].map(key=>[key,element()]));
-  controls['[data-roadshow-result]'].hidden=true;
-  const form={isConnected:true,elements:{judgeName:element(),claimedCode:element()},querySelector:key=>controls[key]};
-  const login={isConnected:true,elements:{code:element()}},calls=[];let active=true;
-  const ctx=runtime();const controller=ctx.helpers.makeRoadshowClaimController({form,loginForm:login,isCurrent:()=>active,load:async()=>({configured:true,claimAvailable:true,message:'Ready'}),claim:async(body,signal)=>{calls.push({body,signal});return {name:body.name,code:'GJ.DEDICATED'};},copy:async code=>calls.push({copied:code}),...extra});
-  return {ctx,controller,form,login,controls,calls,name:form.elements.judgeName,code:form.elements.claimedCode,setActive:value=>active=value,error:controls['.form-error'],button:controls['[data-roadshow-claim-button]']};
+function loginHarness(extra={},runtimeExtra={}){
+  const controls=Object.fromEntries(['.form-error','[data-roadshow-availability]','[data-roadshow-login-button]','[data-roadshow-refresh]'].map(key=>[key,element()]));
+  const form={isConnected:true,elements:{judgeName:element()},querySelector:key=>controls[key]},calls=[];let active=true;
+  const ctx=runtime(runtimeExtra),controller=ctx.helpers.makeRoadshowNameLoginController({form,isCurrent:()=>active,load:async()=>({configured:true,nameLoginAvailable:true,message:'Ready'}),login:async(body,signal)=>{calls.push({body,signal});return {ok:true,role:'judge',name:body.name,loginId:'judge-epoch'};},accept:async(result,signal,valid)=>{if(valid())calls.push({accepted:result,signal});},...extra});
+  return {ctx,controller,form,controls,calls,name:form.elements.judgeName,setActive:value=>active=value,error:controls['.form-error'],button:controls['[data-roadshow-login-button]']};
 }
 
-test('an empty roadshow roster cannot issue an invitation or accept an arbitrary name',async()=>{
-  const h=claimHarness({load:async()=>({configured:false,claimAvailable:false,message:'名单待配置'})});await h.controller.reload();
+test('empty or unavailable roadshow rosters cannot submit arbitrary names',async()=>{
+  const h=loginHarness({load:async()=>({configured:false,nameLoginAvailable:false,message:'名单待配置'})});await h.controller.reload();
   assert.equal(h.name.disabled,true);assert.equal(h.button.disabled,true);assert.match(h.controls['[data-roadshow-availability]'].textContent,/名单待配置/);
-  h.name.value='Unknown';await h.controller.claim();assert.equal(h.calls.length,0);assert.equal(h.code.value,'');h.controller.dispose();
+  h.name.value='Unknown';await h.controller.login();assert.equal(h.calls.length,0);h.controller.dispose();
 });
 
-test('claiming returns a private code without logging in; fill and copy require explicit clicks',async()=>{
-  const h=claimHarness();await h.controller.reload();h.name.value='  Judge One  ';await h.controller.claim();
-  assert.equal(h.calls.length,1);assert.equal(h.calls[0].body.name,'Judge One');assert.equal(h.login.elements.code.value,'');assert.equal(h.code.value,'GJ.DEDICATED');
-  h.controls['[data-roadshow-fill]'].onclick();assert.equal(h.login.elements.code.value,'GJ.DEDICATED');assert.equal(h.login.elements.code.focused,true);
-  await h.controls['[data-roadshow-copy]'].onclick();assert.equal(h.calls.at(-1).copied,'GJ.DEDICATED');h.controller.dispose();
-  assert.equal(h.code.value,'');assert.equal(h.login.elements.code.value,'');assert.equal(h.controls['[data-roadshow-result]'].hidden,true);
+test('roadshow login is one real-name invitation field and never asks for a random code or identity selection',()=>{
+  const html=runtime().helpers.roadshowNameLoginMarkup();assert.match(html,/邀请码（真实姓名）/);assert.match(html,/验证姓名并登录/);assert.equal((html.match(/<input /g)||[]).length,1);
+  assert.ok(!html.includes('<select'));assert.ok(!html.includes('领取'));assert.ok(!html.includes('复制'));assert.ok(!html.includes('type="password"'));
 });
 
-test('duplicate claim submits stay single flight and editing the name discards a late code',async()=>{
-  const gate=deferred();let sent=0;
-  const h=claimHarness({claim:()=>{sent++;return gate.promise;}});await h.controller.reload();h.name.value='Judge One';const saving=h.controller.claim();await h.controller.claim();
-  h.name.value='Judge Two';h.name.dispatchEvent(new Event('input'));gate.resolve({name:'Judge One',code:'OLD.CODE'});await saving;
-  assert.equal(sent,1);assert.equal(h.name.value,'Judge Two');assert.equal(h.code.value,'');assert.match(h.error.textContent,/姓名已变化/);assert.equal(h.button.disabled,false);h.controller.dispose();
+test('only the roadshow login branch delegates to the real-name form',()=>{
+  const calls=[],main={innerHTML:''},ctx=vm.createContext({document:{getElementById:()=>main},location:{href:'https://example.test/platform.html#judge-roadshow'},URL,setTimeout,clearTimeout,calls});
+  vm.runInContext(platform+"\nroute='judge-roadshow';routeVersion=7;renderRoadshowNameLogin=version=>calls.push(version);renderLogin('judge');",ctx);
+  assert.deepEqual(calls,[7]);assert.equal(main.innerHTML,'');
 });
 
-test('leaving the page aborts a pending claim and a late response never restores secrets',async()=>{
-  const gate=deferred();let signal;
-  const h=claimHarness({claim:(_body,input)=>{signal=input;return gate.promise;}});await h.controller.reload();h.name.value='Judge One';const saving=h.controller.claim();
-  h.controller.dispose();assert.equal(signal.aborted,true);gate.resolve({name:'Judge One',code:'LATE.CODE'});await saving;
-  assert.equal(h.code.value,'');assert.equal(h.controls['[data-roadshow-name]'].textContent,'');assert.equal(h.login.elements.code.value,'');
+test('a listed full name submits once and passes the verified judge result to session confirmation',async()=>{
+  const h=loginHarness();await h.controller.reload();h.name.value='  陈计宏  ';await h.controller.login();
+  assert.equal(h.calls[0].body.name,'陈计宏');assert.equal(h.calls[1].accepted.role,'judge');assert.equal(h.calls[1].accepted.loginId,'judge-epoch');assert.equal(h.name.value,'  陈计宏  ');h.controller.dispose();assert.equal(h.name.value,'');
 });
 
-test('changing a name clears only a code inserted by the claim flow, preserving manual login input',async()=>{
-  const h=claimHarness();await h.controller.reload();h.name.value='Judge One';await h.controller.claim();h.controls['[data-roadshow-fill]'].onclick();
-  h.login.elements.code.value='MANUALLY_TYPED';h.name.value='Judge Two';h.name.dispatchEvent(new Event('input'));
-  assert.equal(h.code.value,'');assert.equal(h.login.elements.code.value,'MANUALLY_TYPED');h.controller.dispose();
+test('double clicks stay single flight and a name changed while pending cannot choose an old identity',async()=>{
+  const gate=deferred();let writes=0,accepted=0;const h=loginHarness({login:()=>{writes++;return gate.promise;},accept:async()=>accepted++});
+  await h.controller.reload();h.name.value='Judge One';const pending=h.controller.login();await h.controller.login();assert.equal(h.name.disabled,true);
+  h.name.value='Judge Two';h.name.dispatchEvent(new Event('input'));gate.resolve({role:'judge',loginId:'old-epoch'});await pending;
+  assert.equal(writes,1);assert.equal(accepted,0);assert.match(h.error.textContent,/姓名已变化/);h.controller.dispose();
 });
 
-test('claim failures retain the name, report the error, and never automatically retry a write',async()=>{
-  let writes=0;const h=claimHarness({claim:async()=>{writes++;throw new Error('network disconnected');}});await h.controller.reload();h.name.value='Judge One';await h.controller.claim();
-  assert.equal(writes,1);assert.equal(h.name.value,'Judge One');assert.match(h.error.textContent,/network disconnected/);assert.equal(h.button.disabled,false);assert.equal(h.code.value,'');h.controller.dispose();
+test('departure aborts pending login and cannot apply its late identity',async()=>{
+  const gate=deferred();let signal,accepted=0;const h=loginHarness({login:(_body,input)=>{signal=input;return gate.promise;},accept:async()=>accepted++});
+  await h.controller.reload();h.name.value='Judge One';const pending=h.controller.login();h.controller.dispose();assert.equal(signal.aborted,true);
+  gate.resolve({role:'judge',loginId:'late-epoch'});await pending;assert.equal(accepted,0);assert.equal(h.name.value,'');
 });
 
-test('public claim calls omit cookies and cannot be reused for a management endpoint',async()=>{
-  const calls=[],ctx=runtime({fetch:async(url,options)=>{calls.push({url:String(url),options});return {ok:true,json:async()=>({configured:false})};}});
-  await ctx.helpers.roadshowPublicRequest('roadshow/access');await ctx.helpers.roadshowPublicRequest('roadshow/claim',{name:'Judge One'});
-  assert.ok(calls.every(call=>call.options.credentials==='omit' && call.options.cache==='no-store'));
-  assert.equal(calls[1].options.headers['Content-Type'],'application/json');assert.deepEqual(JSON.parse(calls[1].options.body),{name:'Judge One'});
-  await assert.rejects(ctx.helpers.roadshowPublicRequest('admin/roadshow-access',{}));assert.equal(calls.length,2);
+test('unknown or disabled names retain input and never retry automatically',async()=>{
+  for(const status of [404,403,429]){let writes=0;const h=loginHarness({login:async()=>{writes++;throw Object.assign(new Error('请核对名单'),{status});}});await h.controller.reload();h.name.value='Judge One';await h.controller.login();assert.equal(writes,1);assert.equal(h.name.value,'Judge One');assert.match(h.error.textContent,/请核对名单/);assert.equal(h.button.disabled,false);h.controller.dispose();}
 });
 
-test('clipboard failure offers manual selection and an unavailable roster hides an already claimed code',async()=>{
-  let available=true;const h=claimHarness({load:async()=>({configured:available,claimAvailable:available}),copy:async()=>{throw new Error('denied');}});
-  await h.controller.reload();h.name.value='Judge One';await h.controller.claim();await h.controls['[data-roadshow-copy]'].onclick();assert.equal(h.code.selected,true);assert.match(h.error.textContent,/自动复制不可用/);
-  available=false;await h.controller.reload();assert.equal(h.code.value,'');assert.equal(h.controls['[data-roadshow-result]'].hidden,true);h.controller.dispose();
+test('name login has an eight-second abort deadline and does not automatically resend',async()=>{
+  const tasks=new Map();let seq=0,writes=0;const h=loginHarness({login:(_body,signal)=>{writes++;return new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>reject(Object.assign(new Error('abort'),{name:'AbortError'}))));}},{setTimeout:(fn,ms)=>{tasks.set(++seq,{fn,ms});return seq;},clearTimeout:id=>tasks.delete(id)});
+  await h.controller.reload();h.name.value='Judge One';const pending=h.controller.login();assert.equal([...tasks.values()][0].ms,8000);[...tasks.values()][0].fn();await pending;
+  assert.equal(writes,1);assert.match(h.error.textContent,/没有自动重发/);assert.equal(h.name.value,'Judge One');assert.equal(tasks.size,0);h.controller.dispose();
+});
+
+test('login transport accepts cookies only on the dedicated name endpoint and rejects management paths',async()=>{
+  const sent=[],ctx=runtime({fetch:async(url,options)=>{sent.push({url,options});return {ok:true,json:async()=>({})};}});
+  await ctx.helpers.roadshowNameRequest('roadshow/access');await ctx.helpers.roadshowNameRequest('roadshow/login',{name:'陈计宏'});
+  assert.equal(sent[0].options.credentials,'omit');assert.equal(sent[1].options.credentials,'same-origin');assert.equal(sent[1].options.method,'POST');assert.equal(JSON.parse(sent[1].options.body).name,'陈计宏');
+  await assert.rejects(ctx.helpers.roadshowNameRequest('admin/roadshow-access',{}),/入口不正确/);assert.equal(sent.length,2);
+});
+
+function realLoginHarness({post,confirm,storageBlocked=false}={}){
+  const controls=Object.fromEntries(['.form-error','[data-roadshow-availability]','[data-roadshow-login-button]','[data-roadshow-refresh]'].map(key=>[key,element()])),form={isConnected:true,elements:{judgeName:element()},querySelector:key=>controls[key]};
+  let marker='before-login';const published=[],renders=[];const ctx=runtime({route:'judge-roadshow',routeVersion:4,session:{role:null},root:{innerHTML:'',querySelector:()=>form},browserLoginOwner:()=>marker,publishLogin:result=>{published.push(result.loginId);if(!storageBlocked)marker=result.loginId;},renderRoute:async()=>renders.push('scoring'),api:confirm || (async()=>({role:'judge',loginId:'new-login',name:'陈计宏'})),fetch:async(url,options)=>({ok:true,json:async()=>String(url).endsWith('/login')?(post?post():{ok:true,role:'judge',loginId:'new-login',name:'陈计宏'}):{configured:true,nameLoginAvailable:true}})});
+  const controller=ctx.renderRoadshowNameLogin(4);return {ctx,controller,form,published,renders,error:controls['.form-error'],setMarker:value=>marker=value};
+}
+
+test('real-name login publishes its marker then verifies the matching judge cookie before opening scoring',async()=>{
+  const h=realLoginHarness();await flush();h.form.elements.judgeName.value='陈计宏';await h.controller.login();
+  assert.deepEqual(h.published,['new-login']);assert.equal(h.ctx.session.role,'judge');assert.equal(h.ctx.session.loginId,'new-login');assert.deepEqual(h.renders,['scoring']);h.controller.dispose();
+});
+
+test('a failed storage write with a readable old marker still accepts the matching verified judge cookie',async()=>{
+  const h=realLoginHarness({storageBlocked:true});await flush();h.form.elements.judgeName.value='陈计宏';await h.controller.login();
+  assert.deepEqual(h.published,['new-login']);assert.equal(h.ctx.browserLoginOwner(),'before-login');assert.equal(h.ctx.session.loginId,'new-login');assert.deepEqual(h.renders,['scoring']);h.controller.dispose();
+});
+
+test('storage failure never bypasses marker changes while the judge cookie is being verified',async()=>{
+  const check=deferred(),h=realLoginHarness({storageBlocked:true,confirm:()=>check.promise});await flush();h.form.elements.judgeName.value='陈计宏';const pending=h.controller.login();await flush();
+  h.setMarker('new-login-in-another-tab');check.resolve({role:'judge',loginId:'new-login'});await pending;assert.equal(h.ctx.session.role,null);assert.deepEqual(h.renders,[]);h.controller.dispose();
+});
+
+test('a mismatched cookie confirmation cannot open scoring or adopt the other identity',async()=>{
+  const h=realLoginHarness({confirm:async()=>({role:'judge',loginId:'someone-else'})});await flush();h.form.elements.judgeName.value='陈计宏';await h.controller.login();
+  assert.equal(h.ctx.session.role,null);assert.deepEqual(h.renders,[]);assert.match(h.error.textContent,/身份与刚验证的姓名不一致/);h.controller.dispose();
+});
+
+test('late name login and confirmation cannot overwrite a new route or another tab login',async()=>{
+  const post=deferred(),h=realLoginHarness({post:()=>post.promise});await flush();h.form.elements.judgeName.value='陈计宏';const pending=h.controller.login();h.ctx.routeVersion++;post.resolve({role:'judge',loginId:'new-login'});await pending;assert.deepEqual(h.published,[]);assert.deepEqual(h.renders,[]);h.controller.dispose();
+  const check=deferred(),other=realLoginHarness({confirm:()=>check.promise});await flush();other.form.elements.judgeName.value='陈计宏';const waiting=other.controller.login();await flush();other.setMarker('other-tab');check.resolve({role:'judge',loginId:'new-login'});await waiting;assert.deepEqual(other.renders,[]);assert.equal(other.ctx.session.role,null);other.controller.dispose();
 });
 
 function adminHarness(api){
@@ -107,8 +136,8 @@ test('a switched administrator cannot receive or resend the old roster save resp
 });
 
 test('roster rendering escapes stored judge names and never contains invitation material',()=>{
-  const ctx=runtime(),html=ctx.helpers.roadshowRosterMarkup({configured:true,editable:true,names:['<img src=x onerror=alert(1)>'],judges:[{name:'<script>evil</script>',active:true,claimed:true,canClaim:true}]});
-  assert.ok(!html.includes('<img'));assert.ok(!html.includes('<script>'));assert.match(html,/&lt;img/);assert.match(html,/&lt;script&gt;/);assert.ok(!html.includes('claimedCode'));
+  const ctx=runtime(),html=ctx.helpers.roadshowRosterMarkup({configured:true,editable:true,names:['<img src=x onerror=alert(1)>'],judges:[{name:'<script>evil</script>',active:true,canLogin:true}]});
+  assert.ok(!html.includes('<img'));assert.ok(!html.includes('<script>'));assert.match(html,/&lt;img/);assert.match(html,/&lt;script&gt;/);assert.ok(!html.includes('claimedCode'));assert.match(html,/登录资格/);assert.match(html,/可用真实姓名登录/);assert.ok(!html.includes('领取进度'));assert.ok(!html.includes('首次登录'));
 });
 
 test('the roadshow administrator route requires an administrator while the finals route remains independent',async()=>{
