@@ -18,11 +18,15 @@ class Client:
     def __init__(self, server):
         self.server = server
         self.cookie = ""
+        self.login_id = ""
 
     def request(self, method, path, payload=None, raw=None, origin=True, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=20)
         body = raw if raw is not None else (json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None)
         request_headers = {"Cookie": self.cookie}
+        if self.login_id and path in {"/api/audience", "/api/vote", "/api/judging/exhibition", "/api/judging/exhibition/review",
+                                     "/api/judging/roadshow", "/api/judging/roadshow/review"}:
+            request_headers["X-GOTC-Login"] = self.login_id
         if method == "POST":
             request_headers["Content-Type"] = "application/json"
             if origin:
@@ -36,6 +40,8 @@ class Client:
             self.cookie = response_headers["Set-Cookie"].split(";", 1)[0]
         conn.close()
         data = json.loads(content) if response_headers.get("Content-Type", "").startswith("application/json") else content
+        if path == "/api/login" and response.status == 200 and isinstance(data, dict) and data.get("loginId"):
+            self.login_id = data["loginId"]
         return response.status, data, response_headers
 
     def get(self, path):
