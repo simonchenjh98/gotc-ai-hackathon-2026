@@ -40,6 +40,11 @@ function makeClaimController({store,request,isCurrent,onChange}){
     finally{if(operation===generation){busy=false;publish();}}
   }
   return {
+    navigationState(){
+      if(!isCurrent())return {pendingInitial:false,dirty:false};
+      const saved=copyDraft({...state.captain,teamName:state.declaration?.teamName,track:state.declaration?.track,members:state.declaration?.members??emptyClaimMembers()});
+      return {pendingInitial:busy && !receipt,dirty:receipt?state.editing && JSON.stringify(draft)!==JSON.stringify(saved):[draft.name,draft.school,draft.teamName,draft.track,...draft.members.flatMap(p=>[p.name,p.school])].some(value=>value.trim())};
+    },
     start(){publish();if(receipt)return this.status();},
     setDraft(value){if(!isCurrent() || (busy && !receipt))return;draft=copyDraft(value);},
     addMember(){if(!isCurrent() || (busy && !receipt))return;if(draft.members.length<4){draft={...draft,members:[...draft.members,{name:'',school:''}]};publish();}},
@@ -65,6 +70,7 @@ function makeClaimController({store,request,isCurrent,onChange}){
 }
 function claimReceiptStore(){return makeClaimReceiptStore(()=>sessionStorage,base.pathname);}
 let currentClaimController=null;
+function hasClaimReceipt(){return !!claimReceiptStore().read().receipt;}
 function clearClaimReceipt(){currentClaimController?.clear();return claimReceiptStore().clear();}
 function claimTeamMarkup(value,options=CLAIM_TRACK_OPTIONS){
   return `<label class="field">队伍名称<input name="teamName" required maxlength="80" value="${esc(value.teamName??'')}" autocomplete="off"></label><label class="field">参赛赛道<select name="track"><option value="">待定</option>${options.map(track=>`<option value="${esc(track)}" ${value.track===track?'selected':''}>${esc(track)}</option>`).join('')}</select></label>`;
@@ -91,7 +97,7 @@ function claimStateMarkup(state){
   if(!receipt){
     body=`<form id="claim-request-form"><fieldset ${state.busy?'disabled':''}><label class="field">队长姓名<input name="name" required maxlength="100" autocomplete="name" value="${esc(draft.name)}"></label><label class="field">队长学校<input name="school" required maxlength="200" autocomplete="organization" value="${esc(draft.school)}"></label>${claimTeamMarkup(draft)}${claimMembersMarkup(draft.members)}<button class="btn" ${state.busy?'disabled':''}>提交领取申请</button></fieldset></form>`;
   }else{
-    body=`<h2>${esc(labels[state.status] || '等待审核')}</h2><p>申请已提交至组织方后台。请在本页查询审核状态，批准后即可领取提交码。</p><p class="small-note">申请编号：<code>${esc(receipt.requestId)}</code><br>有效期至 ${esc(beijingTime(receipt.expiresAt))}（北京时间）<br>凭据只保存在此标签页，请勿转发或共享设备。</p>${claimDeclarationMarkup(state.declaration)}${claimUpdateMarkup(state,draft)}${state.team?`<p>已批准队伍：<strong>${esc(teamLabel(state.team))}</strong></p>`:''}<div class="actions"><button class="btn secondary" id="claim-status" ${state.busy?'disabled':''}>查询审核状态</button>${state.status==='pending' && !state.editing && state.captain && Number.isSafeInteger(state.requestRevision)?`<button class="btn secondary" id="claim-edit" ${state.busy?'disabled':''}>${state.declaration?'修改队伍与组员':'补充队伍与组员'}</button>`:''}${['approved','issued'].includes(state.status)?`<button class="btn" id="claim-redeem" ${state.busy?'disabled':''}>${state.status==='issued'?'再次显示本队提交码':'领取本队提交码'}</button>`:''}</div>${state.code?`<div class="code-output"><strong>本队提交码</strong><code>${esc(state.code)}</code><p>请队长保存，只与本队成员共享。</p><button class="btn secondary small" type="button" data-copy-value="${esc(state.code)}">复制提交码</button> <a href="#team">前往作品提交 ↗</a></div>`:''}<button class="btn secondary small" id="claim-clear" type="button">清除此设备上的领取凭据</button>`;
+    body=`<h2>${esc(labels[state.status] || '等待审核')}</h2><p>申请已提交至组织方后台。请在本页查询审核状态，批准后即可领取提交码。</p><p class="small-note">申请编号：<code>${esc(receipt.requestId)}</code><br>有效期至 ${esc(beijingTime(receipt.expiresAt))}（北京时间）<br>凭据只保存在此标签页，请勿转发或共享设备。</p>${claimDeclarationMarkup(state.declaration)}${claimUpdateMarkup(state,draft)}${state.team?`<p>已批准队伍：<strong>${esc(teamLabel(state.team))}</strong></p>`:''}<div class="actions"><button class="btn secondary" id="claim-status" ${state.busy?'disabled':''}>查询审核状态</button>${state.status==='pending' && !state.editing && state.captain && Number.isSafeInteger(state.requestRevision)?`<button class="btn secondary" id="claim-edit" ${state.busy?'disabled':''}>${state.declaration?'修改队伍与组员':'补充队伍与组员'}</button>`:''}${['approved','issued'].includes(state.status)?`<button class="btn" id="claim-redeem" ${state.busy?'disabled':''}>${state.status==='issued'?'再次显示本队提交码':'领取本队提交码'}</button>`:''}</div>${state.code?`<div class="code-output"><strong>本队提交码</strong><code>${esc(state.code)}</code><p>请队长保存，只与本队成员共享。</p><button class="btn secondary small" type="button" data-copy-value="${esc(state.code)}">复制提交码</button> <a href="#team" id="claim-workbench">前往选手工作台 ↗</a><p class="small-note">进入后使用本队提交码登录；切换原登录身份会保留申请凭据，可返回申请页再次查看提交码。</p></div>`:''}<button class="btn secondary small" id="claim-clear" type="button">清除此设备上的领取凭据</button>`;
   }
   return heading('TEAM / 队伍申请','申请队伍提交码','所有参赛者均可申请。填写队名、赛道及全体成员姓名和学校，提交后由组织方在后台审核。每人只参加一个队，每队一个提交码。')+`<section class="surface claim-panel"><p class="form-error" role="alert">${esc(state.error)}</p>${body}</section>`;
 }
@@ -108,6 +114,7 @@ async function renderClaim(version){
       const add=document.getElementById('claim-member-add');if(add)add.onclick=()=>{controller.setDraft(read());controller.addMember();};
       form.querySelectorAll('[data-claim-remove]').forEach(button=>button.onclick=()=>{controller.setDraft(read());controller.removeMember(Number(button.dataset.claimRemove));});
     }
+    const workbench=document.getElementById('claim-workbench');if(workbench)workbench.onclick=event=>openClaimWorkbench(event);
     const edit=document.getElementById('claim-edit');if(edit)edit.onclick=()=>controller.edit();
     const reload=document.getElementById('claim-edit-reload');if(reload)reload.onclick=()=>controller.reviewLatest();
     const confirmEdit=document.getElementById('claim-edit-confirm');if(confirmEdit)confirmEdit.onclick=()=>controller.confirmReview();

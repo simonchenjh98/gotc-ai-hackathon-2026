@@ -31,3 +31,13 @@ test('registration fill preserves same-name captain teammates and card labels on
   const html=context.ui.card(saved);assert.equal([...html.matchAll(/ · 队长/g)].length,1);
   assert.equal([...html.matchAll(/class="captain"/g)].length,1);assert.match(html,/>Alex<\/span>/);
 });
+
+test('registration success offers an uncredentialed application link and distinguishes management code from workbench login',()=>{
+  const source=fs.readFileSync(new URL('../team-registration.js',import.meta.url),'utf8');
+  const receipt={hidden:true,innerHTML:''},copy={};
+  const scope=vm.createContext({remember:()=>true,receipt,escape:context.ui.escape,editing:{name:'Fixture team'},code:'synthetic-private-code',q:()=>copy});
+  const fn=source.slice(source.indexOf('    function showReceipt() {'),source.indexOf('    function lock('));vm.runInContext(fn+'\nshowReceipt();',scope);
+  assert.match(receipt.innerHTML,/管理码不能登录选手工作台/);assert.match(receipt.innerHTML,/href="https:\/\/8\.141\.114\.201\/gotc\/platform.html#claim">申请提交码/);
+  assert.ok(![...receipt.innerHTML.matchAll(/href="([^"]+)"/g)].some(match=>match[1].includes('synthetic-private-code')));
+  for(const path of ['index.html','teams.html']){const html=fs.readFileSync(new URL('../'+path,import.meta.url),'utf8');assert.match(html,/组队登记为选填/);assert.match(html,/可直接申请提交码/);}
+});

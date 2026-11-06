@@ -47,7 +47,7 @@ const RegistrationUI = (() => {
     }
     function showReceipt() {
       const stored=remember();receipt.hidden=false;
-      receipt.innerHTML=`<strong>已保存：${escape(editing.name)}</strong><p>请队长保存本队管理码，之后可以补充姓名、修改队名。</p><code>${escape(code)}</code><button class="reg-button secondary" type="button" data-reg-copy>复制管理码</button><p class="registration-note">${stored?'本标签页已记住管理码；关闭页面前仍请另行保存。':'浏览器无法记住管理码，请立即复制保存。'} 管理码只用于组队资料，请勿公开转发。</p>`;
+      receipt.innerHTML=`<strong>已保存：${escape(editing.name)}</strong><p>请队长保存本队管理码，之后可以补充姓名、修改队名。管理码不能登录选手工作台。</p><code>${escape(code)}</code><button class="reg-button secondary" type="button" data-reg-copy>复制管理码</button><a class="reg-button" href="https://8.141.114.201/gotc/platform.html#claim">申请提交码 ↗</a><p class="registration-note">${stored?'本标签页已记住管理码；关闭页面前仍请另行保存。':'浏览器无法记住管理码，请立即复制保存。'} 管理码只用于组队资料，请勿公开转发。</p>`;
       q('[data-reg-copy]').onclick=async()=>{try {await navigator.clipboard.writeText(code);q('[data-reg-copy]').textContent='已复制';}catch {q('[data-reg-copy]').textContent='请选中上方管理码手动复制';}};
     }
     function lock(value) {pending=value;form.querySelector('fieldset').disabled=value;for(const el of host.querySelectorAll('[data-reg-new],[data-reg-manage],[data-reg-code-form] button,[data-reg-code-form] input'))el.disabled=value;}
