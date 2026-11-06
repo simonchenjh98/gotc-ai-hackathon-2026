@@ -71,7 +71,7 @@ class RegistrationTests(unittest.TestCase):
 
     def test_validation_and_duplicate_person(self):
         code,_=self.create()
-        for changes in [{'name':'待定'},{'captain':'无'},{'targetSize':True},{'targetSize':2},{'phone':'115600902583'},
+        for changes in [{'name':'待定'},{'captain':'无'},{'targetSize':True},{'targetSize':2},{'phone':'123456789012'},
                         {'members':['One','Two','Three','Four','Five']},{'members':'One'},{'name':'x'*81}]:
             r=self.public.post('/api/registration/create',{'code':secrets.token_urlsafe(32),'team':self.payload(**changes)})
             self.assertEqual(r[0],400,r[1])
