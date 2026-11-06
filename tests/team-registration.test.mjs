@@ -41,3 +41,30 @@ test('registration success offers an uncredentialed application link and disting
   assert.ok(![...receipt.innerHTML.matchAll(/href="([^"]+)"/g)].some(match=>match[1].includes('synthetic-private-code')));
   for(const path of ['index.html','teams.html']){const html=fs.readFileSync(new URL('../'+path,import.meta.url),'utf8');assert.match(html,/组队登记为选填/);assert.match(html,/可直接申请提交码/);}
 });
+
+async function submitRegistration(targetSize,members){
+  const source=fs.readFileSync(new URL('../team-registration.js',import.meta.url),'utf8');
+  const values={name:'Five-person team',captain:'Captain',school:'Fixture School',phone:'',project:'',summary:'',targetSize:String(targetSize)};
+  for(let i=1;i<=4;i++)values['member'+i]=members[i-1]??'';
+  const form={elements:Object.fromEntries(Object.entries(values).map(([key,value])=>[key,{value}]))};
+  const calls=[],error={textContent:''};
+  const scope=vm.createContext({form,error,pending:false,editing:null,code:'synthetic-fixture-code',
+    lock:()=>{},remember:()=>true,fill:()=>{},showReceipt:()=>{},refresh:async()=>{},
+    request:async(action,body)=>{calls.push({action,body:JSON.parse(JSON.stringify(body))});return {team:{}};}});
+  const handler=source.slice(source.indexOf('    form.onsubmit=async e=>{'),source.indexOf("    q('[data-reg-search]')"));
+  vm.runInContext(handler,scope);await form.onsubmit({preventDefault(){}});
+  return {calls,error:error.textContent,target:form.elements.targetSize.value};
+}
+
+test('five-person registration raises the default target instead of blocking four teammates',async()=>{
+  const result=await submitRegistration(3,['One','Two','Three','Four']);
+  assert.equal(result.error,'');assert.equal(result.calls.length,1);
+  assert.equal(result.calls[0].action,'create');assert.equal(result.calls[0].body.team.targetSize,5);
+  assert.equal(result.calls[0].body.team.members.length,4);assert.equal(result.target,'5');
+});
+
+test('registration retains a larger recruitment target when fewer members are filled',async()=>{
+  const result=await submitRegistration(5,['One','Two']);
+  assert.equal(result.error,'');assert.equal(result.calls[0].body.team.targetSize,5);
+  assert.equal(result.calls[0].body.team.members.length,2);
+});
