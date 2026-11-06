@@ -1,0 +1,60 @@
+html{scroll-padding-top:110px;scrollbar-gutter:stable}
+.skip-link{z-index:100}
+.gotc-header{position:sticky;top:0;z-index:50;min-height:86px;display:flex;align-items:center;gap:24px;padding:16px 32px;border-bottom:1px solid #dce5f1;background:#fffffff5;backdrop-filter:blur(18px);color:#09254d;font-family:"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;line-height:1.5}
+.gotc-header a{text-decoration:none;color:inherit}
+.gotc-brand{display:inline-flex;align-items:center;gap:12px;flex-shrink:0;line-height:1;white-space:nowrap}
+.gotc-brand-mark{display:grid;grid-template-columns:repeat(2,12px);gap:4px}
+.gotc-brand-mark i{width:12px;height:12px;background:#073bcf}
+.gotc-brand-mark i:nth-child(2){background:#00adc6}
+.gotc-brand-mark i:last-child{background:#ff8a19}
+.gotc-brand strong{font:800 24px/1 "Trebuchet MS",sans-serif;letter-spacing:-1px}
+.gotc-brand b{font-size:16px;letter-spacing:0;color:#61728a;font-weight:400}
+.gotc-brand small{display:block;margin-top:8px;font-size:10px;letter-spacing:1px;font-weight:600}
+.gotc-nav{display:flex;align-items:center;justify-content:flex-end;gap:20px;margin-left:auto;font-size:13px;font-weight:600}
+.gotc-nav>a,.gotc-more>summary{display:flex;align-items:center;min-height:44px;padding:10px 0;border-bottom:2px solid transparent;white-space:nowrap}
+.gotc-nav a:hover,.gotc-nav summary:hover{color:#073bcf}
+.gotc-nav a.active{color:#073bcf;border-color:#073bcf}
+.gotc-more{position:relative}
+.gotc-more>summary{cursor:pointer;list-style:none;gap:7px}
+.gotc-more>summary::-webkit-details-marker{display:none}
+.gotc-more>summary:after{content:'＋';color:#073bcf}
+.gotc-more[open]>summary:after{content:'−'}
+.gotc-more:has([aria-current="page"])>summary{color:#073bcf;border-color:#073bcf}
+.gotc-more-links{position:absolute;right:0;top:100%;width:230px;max-height:calc(100dvh - 110px);overflow:auto;display:grid;gap:2px;padding:10px 16px;border:1px solid #dce5f1;background:#fff;box-shadow:0 12px 30px #0b21481a}
+.gotc-more-links a{display:block;min-height:44px;padding:12px 4px;border-bottom:2px solid transparent;font-size:13px}
+.gotc-menu-toggle{display:none}
+.gotc-header #account{display:flex;align-items:center;gap:8px;min-width:0;font-size:12px;white-space:nowrap}
+.gotc-header #account:empty{display:none}
+.gotc-header #account>span{max-width:160px;overflow:hidden;text-overflow:ellipsis}
+.gotc-header #account button{min-height:44px;padding:8px;border:0;background:transparent;color:#61728a;font-size:12px}
+.gotc-header :is(a,button,summary):focus-visible{outline:3px solid #ff8a19;outline-offset:4px}
+.screen-mode .gotc-header{display:none}
+@media(max-width:1180px){
+  .gotc-header{min-height:76px;gap:18px;padding:12px 24px}
+  .gotc-header #account{margin-left:auto}
+  .gotc-menu-toggle{display:flex;align-items:center;gap:10px;margin-left:auto;min-height:44px;padding:8px;border:0;background:transparent;color:#09254d;font:inherit;font-size:13px;font-weight:600;order:3;flex-shrink:0}
+  .gotc-header:has(#account:not(:empty)) .gotc-menu-toggle{margin-left:0}
+  .gotc-menu-toggle span{font-size:22px;line-height:1;color:#073bcf}
+  .gotc-menu-toggle[aria-expanded=true] span{transform:rotate(45deg)}
+  .gotc-nav{display:none;position:absolute;top:100%;left:0;right:0;margin:0;padding:12px 24px 20px;border-bottom:1px solid #dce5f1;background:#fff;box-shadow:0 10px 20px #08285815;max-height:calc(100dvh - 76px);overflow:auto}
+  .gotc-nav.is-open{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 24px}
+  .gotc-nav>a{padding:12px 4px}
+  .gotc-more{grid-column:1/-1}
+  .gotc-more>summary{padding:12px 4px}
+  .gotc-more-links{position:static;width:auto;max-height:none;box-shadow:none;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px 24px}
+}
+@media(max-width:600px){
+  .gotc-header{gap:10px;padding-inline:16px}
+  .gotc-brand{gap:9px}
+  .gotc-brand strong{font-size:22px}
+  .gotc-brand small{font-size:8px;letter-spacing:.4px}
+  .gotc-brand-mark{grid-template-columns:repeat(2,10px);gap:3px}
+  .gotc-brand-mark i{width:10px;height:10px}
+  .gotc-header #account{gap:2px}
+  .gotc-header #account>span{max-width:72px}
+  .gotc-header #account button{padding-inline:4px}
+  .gotc-menu-toggle{gap:4px;padding-inline:4px}
+  .gotc-nav{padding-inline:16px}
+  .gotc-more-links{grid-template-columns:1fr}
+}
+@media print{.gotc-header{display:none}}

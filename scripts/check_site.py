@@ -19,7 +19,7 @@ class Page(HTMLParser):
         if attrs.get('data-day'):
             self.tabs.append(attrs['data-day'])
 
-for file in ('index.html', 'platform.html'):
+for file in ('index.html', 'platform.html', 'teams.html'):
     page = Page()
     page.feed((ROOT / file).read_text(encoding='utf-8'))
     assert len(page.ids) == len(set(page.ids)), f'Duplicate IDs in {file}'
