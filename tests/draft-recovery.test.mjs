@@ -8,6 +8,36 @@ class Storage{map=new Map();get length(){this.onLength?.();return this.map.size;
 const fields=[['projectName',140],['summary',600],['codeUrl',1024]],empty={projectName:'',summary:'',codeUrl:''},raw={projectName:'  Raw title  ',summary:'\nline one\n ',codeUrl:'https://unfinished/'};
 let serial=0;
 function make(storage,more={}){return h.create({storage:()=>storage,namespace:'/gotc/',teamId:'T1',writerId:'writer-'+(++serial),baseVersion:0,baseMaterials:empty,fields,now:()=>1000,id:()=>'slot-'+(++serial),...more});}
+const filesUpgrade={fields:[...fields,['filesUrl',1024]],baseMaterials:{...empty,filesUrl:''},optionalFieldsWithDefaults:{filesUrl:''}};
+
+test('explicit optional filesUrl upgrade reads legacy material and baseline without rewriting stored bytes',()=>{
+  const storage=new Storage(),saved=make(storage).write(raw);let writes=0;const set=storage.setItem.bind(storage);storage.setItem=(...args)=>{writes++;set(...args);};
+  const candidate=make(storage,filesUpgrade).candidates().items[0];assert.ok(candidate);
+  assert.deepEqual({...candidate.record.materials},{...raw,filesUrl:''});assert.deepEqual({...candidate.record.baseMaterials},{...empty,filesUrl:''});
+  assert.equal(candidate.raw,saved.raw);assert.equal(storage.getItem(saved.key),saved.raw);assert.equal(writes,0);
+  assert.equal(make(storage,{fields:filesUpgrade.fields,baseMaterials:filesUpgrade.baseMaterials}).candidates().items.length,0);
+});
+
+test('optional filesUrl migration still rejects other missing fields, unknown fields and invalid supplied values',()=>{
+  for(const section of ['materials','baseMaterials'])for(const change of ['missing','unknown','invalid-files']){
+    const storage=new Storage(),saved=make(storage).write(raw),record=JSON.parse(saved.raw);
+    if(change==='missing')delete record[section].summary;else if(change==='unknown')record[section].unexpected='extra';else record[section].filesUrl=123;
+    const damaged=JSON.stringify(record);storage.setItem(saved.key,damaged);const read=make(storage,filesUpgrade).candidates();assert.equal(read.items.length,0,section+'/'+change);assert.equal(read.ignored,1);assert.equal(storage.getItem(saved.key),damaged);
+  }
+});
+
+test('migrated snapshots retain exact raw compare-and-delete and acknowledgement semantics',()=>{
+  const storage=new Storage(),writer=make(storage),saved=writer.write(raw),reader=make(storage,filesUpgrade),snapshot=reader.candidates().items[0];
+  writer.write({...raw,summary:'NEWER RAW'});assert.equal(reader.discard(snapshot),false);assert.ok(storage.getItem(saved.key));assert.equal(reader.discard(reader.candidates().items[0]),true);
+  const pending=writer.write(raw,'pending','submitted','legacy-request-12345'),resumed=make(storage,{...filesUpgrade,writerId:pending.record.writerId}),sent=resumed.candidates().items[0];
+  assert.equal(sent.raw,pending.raw);assert.equal(storage.getItem(pending.key),pending.raw);assert.equal(resumed.acknowledge(sent),true);assert.equal(storage.getItem(pending.key),null);
+});
+
+test('logout captures legacy filesUrl-free snapshots and only purges unchanged historical records',()=>{
+  const storage=new Storage(),first=make(storage),changing=make(storage),old=first.write(raw),changed=changing.write({...raw,summary:'BEFORE'}),other=make(storage,{teamId:'T2'}).write(raw);
+  const current=make(storage,{...filesUpgrade,loginId:'new-login'}),captured=current.capturePurge();assert.ok(captured.some(item=>item.key===old.key && item.raw===old.raw));
+  changing.write({...raw,summary:'AFTER CAPTURE'});assert.equal(current.purge(captured),true);assert.equal(storage.getItem(old.key),null);assert.ok(storage.getItem(changed.key));assert.ok(storage.getItem(other.key));
+});
 test('no initial candidate is written and raw incomplete inputs survive new documents without credentials or confirmation',()=>{
   const storage=new Storage(),first=make(storage);assert.equal(storage.length,0);const saved=first.write(raw);assert.ok(saved);const reader=make(storage),candidate=reader.candidates().items[0];assert.deepEqual({...candidate.record.materials},raw);assert.equal(candidate.record.id,saved.record.id);assert.equal(candidate.record.updatedAt,1000);assert.ok(!candidate.raw.includes('confirmed'));assert.ok(!candidate.raw.includes('token'));assert.equal(first.write({...raw,confirmed:true}),null);assert.equal(first.write({...raw,token:'must-not-persist'}),null);
 });
