@@ -85,6 +85,21 @@ test('missing title, mismatched file extension and oversized file fail before se
 test('authorized same-version recovery preserves raw strings, clears confirmation and never sends a POST',async()=>{
   const f=fixture();f.context.seed('T1','  local\nraw  ');await f.context.render();assert.equal(f.slots().length,1);assert.ok(!f.node('local-draft-candidates').innerHTML.includes('副本编号'));await f.inspect();assert.match(f.node('local-restore-actions').innerHTML,/confirm-local-restore/);await f.node('confirm-local-restore').onclick({currentTarget:f.node('confirm-local-restore')});assert.equal(f.node('material-summary').value,'  local\nraw  ');assert.equal(f.node('material-confirmed').checked,false);assert.equal(f.calls.filter(c=>c.body).length,0);assert.equal(f.slots().length,2);assert.equal(f.context.dirty(),true);
 });
+
+test('pre-upload schema-1 draft remains visible and restores every original field before normal save',async()=>{
+  const f=fixture(),seed=f.context.seed('T1','OLD RAW SUMMARY'),legacy=JSON.parse(seed.raw);
+  delete legacy.materials.filesUrl;delete legacy.baseMaterials.filesUrl;
+  for(const key of Object.keys(legacy.materials))legacy.materials[key]=key.endsWith('Url')?'https://example.test/'+key:key==='codeVersion'?'a'.repeat(40):`  ${key} 原始文字\n第二行  `;
+  const original=JSON.stringify(legacy);f.storage.setItem(seed.key,original);
+  await f.context.render();assert.match(f.node('local-draft-candidates').innerHTML,/本地副本/);assert.equal(f.storage.getItem(seed.key),original);assert.equal(f.slots().length,1);
+  await f.inspect();assert.match(f.node('local-restore-actions').innerHTML,/confirm-local-restore/);assert.equal(f.storage.getItem(seed.key),original);
+  await f.node('confirm-local-restore').onclick({currentTarget:f.node('confirm-local-restore')});
+  for(const [key,value] of Object.entries(legacy.materials))assert.equal(f.node('material-'+key).value,value,key);
+  assert.equal(f.node('material-filesUrl').value,'');assert.equal(f.node('material-confirmed').checked,false);assert.equal(f.storage.getItem(seed.key),original);assert.equal(f.calls.filter(c=>c.path==='submission').length,0);
+  await f.node('save-submission-draft').onclick();const sent=f.calls.find(c=>c.path==='submission').body.materials;
+  for(const [key,value] of Object.entries(legacy.materials))assert.equal(sent[key],value.trim(),key);
+  assert.equal(sent.filesUrl,'');assert.equal(f.storage.getItem(seed.key),original);
+});
 test('server-version changes and closed windows only offer comparison/copy instead of whole-form restore',async()=>{
   const f=fixture();f.context.seed('T1','LOCAL');f.data={...f.data,submission:{...f.data.submission,version:1,draft:{summary:'TEAMMATE'}}};await f.context.render();await f.inspect();assert.match(f.node('local-draft-comparison').innerHTML,/服务器版本已更新/);assert.match(f.node('local-draft-comparison').innerHTML,/TEAMMATE/);assert.ok(!f.node('local-restore-actions').innerHTML.includes('confirm-local-restore'));
   f.data.window.canEdit=false;await f.inspect();assert.match(f.node('local-draft-comparison').innerHTML,/提交窗口只读/);assert.equal(f.node('fieldset').disabled,true);assert.equal(f.calls.filter(c=>c.body).length,0);
