@@ -20,7 +20,7 @@ function element(){
     dispatch(name,target){for(const fn of listeners[name] || [])fn({target,stopPropagation(){}});},
     input(){for(const fn of listeners.input || [])fn({target:{}});},
     get innerHTML(){return html;},set innerHTML(value){html=value;},
-    querySelectorAll(){return [];},insertAdjacentHTML(){},scrollIntoView(){}};
+    querySelectorAll(){return [];},closest(){return null;},insertAdjacentHTML(){},scrollIntoView(){}};
 }
 function form(values={}){
   const node=element();node.elements=Object.fromEntries(Object.entries(values).map(([key,value])=>[key,Object.assign(element(),{value})]));node.button=element();node.error=element();node.querySelector=selector=>selector==='.form-error'?node.error:node.button;return node;
@@ -119,4 +119,83 @@ test('switching teams closes the editor and a stale draft cannot be saved to the
   h.elements['team-form'].elements.id.value='T2';h.elements['team-form'].editSession=1;await h.select();
   assert.equal(h.node('editor').hidden,true);
   await h.node('save').onclick();assert.equal(h.posts().length,0);
+});
+
+test('member drafts guard navigation independently of the parent team fields',async()=>{
+  const h=harness(async()=>ok(detail()));await h.select();h.node('edit').onclick();
+  h.node('reason').value='Unsaved reason';h.node('reason').input();
+  let prompts=0;h.context.confirm=()=>{prompts++;return false;};
+  assert.equal(vm.runInContext('dirtyAdminForms.has(config.form)',h.context),false);
+  assert.equal(vm.runInContext('dirtyAdminForms.has(document.getElementById("team-member-editor"))',h.context),true);
+  assert.equal(vm.runInContext('confirmLeave()',h.context),false);assert.equal(prompts,1);
+  assert.equal(vm.runInContext('controller.hasUnsaved()',h.context),true);
+  h.node('cancel').onclick();assert.equal(vm.runInContext('confirmLeave()',h.context),true);
+  assert.equal(vm.runInContext('dirtyAdminForms.size',h.context),0);
+});
+
+test('member edits during a pending save survive success and use the refreshed roster context',async()=>{
+  const pending=deferred();let posts=0,reads=0;
+  const h=harness(async(_url,options)=>options.method==='POST'?(++posts===1?pending.promise:ok({ok:true})):ok(detail('T1',{rosterContext:(++reads===1?'c':'d').repeat(64)})));
+  await h.select();h.node('edit').onclick();h.type(0,'name','Submitted name');h.node('reason').value='Submitted reason';
+  const saving=h.node('save').onclick();
+  h.type(0,'name','Later name');h.node('reason').value='Later reason';h.node('reason').input();
+  pending.resolve(ok({ok:true}));await saving;
+  assert.equal(h.node('editor').hidden,false);assert.equal(h.node('reason').value,'Later reason');
+  assert.match(h.node('error').textContent,/新输入已保留/);
+  assert.equal(vm.runInContext('controller.hasUnsaved()',h.context),true);
+  await h.node('save').onclick();
+  assert.equal(h.posts()[0].body.members[0].name,'Submitted name');assert.equal(h.posts()[0].body.reason,'Submitted reason');
+  assert.equal(h.posts()[1].body.members[0].name,'Later name');assert.equal(h.posts()[1].body.reason,'Later reason');
+  assert.equal(h.posts()[1].body.rosterContext,'d'.repeat(64));assert.equal(h.node('editor').hidden,true);
+  assert.equal(vm.runInContext('dirtyAdminForms.size',h.context),0);
+});
+
+for(const change of ['session','browser owner','401'])test(`losing ${change} clears all member editor data`,async()=>{
+  let denied=false;
+  const h=harness(async()=>denied?{ok:false,status:401,json:async()=>({error:'Synthetic login expired'})}:ok(detail()));
+  await h.select();h.node('edit').onclick();h.type(0,'name','Private edit');h.node('reason').value='Private reason';h.node('reason').input();
+  if(change==='session')vm.runInContext("session={role:'team',loginId:'TEAM'};controller.valid();",h.context);
+  else if(change==='browser owner'){h.context.localStorage.getItem=()=> 'OTHER';vm.runInContext('controller.valid()',h.context);}
+  else{denied=true;await h.select();}
+  assert.equal(h.node('editor').hidden,true);assert.equal(h.node('rows').innerHTML,'');assert.equal(h.node('reason').value,'');
+  assert.equal(vm.runInContext('dirtyAdminForms.has(document.getElementById("team-member-editor"))',h.context),false);
+  await h.node('save').onclick();assert.equal(h.posts().length,0);
+});
+
+test('a failed member refresh keeps draft and reason but blocks saving until a successful reread',async()=>{
+  let reads=0;
+  const h=harness(async(_url,options)=>{
+    if(options.method==='POST')return ok({ok:true});
+    if(++reads===2)return {ok:false,status:500,json:async()=>({error:'Synthetic read failure'})};
+    return ok(detail('T1',{rosterContext:(reads===1?'c':'d').repeat(64)}));
+  });
+  await h.select();h.node('edit').onclick();h.type(1,'name','Kept member');h.node('reason').value='Kept reason';h.node('reason').input();
+  await h.select();assert.equal(h.node('editor').hidden,false);assert.equal(h.node('reason').value,'Kept reason');
+  assert.equal(h.node('save').disabled,true);await h.node('save').onclick();assert.equal(h.posts().length,0);
+  assert.equal(vm.runInContext('controller.hasUnsaved()',h.context),true);
+  await h.select();assert.equal(h.node('save').disabled,false);await h.node('save').onclick();
+  assert.equal(h.posts()[0].body.members[1].name,'Kept member');assert.equal(h.posts()[0].body.reason,'Kept reason');
+  assert.equal(h.posts()[0].body.rosterContext,'d'.repeat(64));
+});
+
+test('a late member save cannot restore data or refresh an administrator who changed identity',async()=>{
+  const pending=deferred(),h=harness(async(_url,options)=>options.method==='POST'?pending.promise:ok(detail()));
+  await h.select();h.node('edit').onclick();h.type(0,'name','Private change');h.node('reason').value='Private reason';
+  const saving=h.node('save').onclick();
+  vm.runInContext("session={role:'team',loginId:'TEAM'};controller.valid();",h.context);
+  pending.resolve(ok({ok:true}));await saving;
+  assert.equal(h.node('rows').innerHTML,'');assert.equal(h.node('reason').value,'');assert.equal(h.node('editor').hidden,true);
+  assert.equal(h.context.refreshes,0);assert.equal(h.elements['platform-toast'].textContent,'');
+  assert.equal(vm.runInContext('dirtyAdminForms.size',h.context),0);
+});
+
+test('administrator member edits retain the five-person roster limit',async()=>{
+  const h=harness(async(_url,options)=>options.method==='POST'?ok({ok:true}):ok(detail()));
+  await h.select();h.node('edit').onclick();
+  for(let index=2;index<5;index++){h.node('add').onclick();h.type(index,'name','Member '+index);h.type(index,'school','School '+index);}
+  assert.equal(h.node('add').disabled,true);h.node('add').onclick();
+  assert.equal([...h.node('rows').innerHTML.matchAll(/data-member-field="name"/g)].length,5);
+  h.node('reason').value='Five members';await h.node('save').onclick();assert.equal(h.posts()[0].body.members.length,5);
+  const six=members.concat(Array.from({length:4},(_,index)=>({personId:null,name:'Extra '+index,school:'School '+index})));
+  h.context.six=six;assert.match(vm.runInContext('adminMemberPayload(six,"approved").error',h.context),/最多 5 名/);
 });

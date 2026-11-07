@@ -16,7 +16,7 @@ from claims import normalize, ensure_roster_capacity
 from errors import APIError
 
 PATH='/api/admin/data/team/members'
-MAX_MEMBERS=8
+MAX_MEMBERS=5
 FIELDS={'teamId','rosterContext','reason','members'}
 MEMBER_FIELDS={'personId','name','school'}
 
@@ -27,6 +27,12 @@ class TeamMembers:
 
     def mode(self,db,team_id):
         return 'approved' if db.execute('SELECT 1 FROM claim_memberships WHERE team_id=?',(team_id,)).fetchone() else 'registration'
+
+    @staticmethod
+    def target_size(count,previous=None):
+        # A partial roster can have one or two people, but the contestant form's
+        # planned size remains 3–5. Repair legacy missing/invalid targets here.
+        return count if 3<=count<=MAX_MEMBERS else previous if type(previous) is int and 3<=previous<=MAX_MEMBERS else 3
 
     def context(self,db,team_id):
         lifecycle=self.s.team_lifecycle
@@ -122,7 +128,12 @@ class TeamMembers:
             if person in current:db.execute('UPDATE claim_memberships SET request_id=? WHERE person_id=?',(request_id,person))
             else:db.execute('INSERT INTO claim_memberships VALUES (?,?,?)',(person,team_id,request_id))
         db.execute('UPDATE claim_requests SET captain_id=? WHERE id=?',(resolved[0],request_id))
-        if not self.s.registration.row(db,team_id):self.insert_registration(db,team_id,members)
+        registration=self.s.registration.row(db,team_id)
+        if not registration:self.insert_registration(db,team_id,members)
+        elif type(registration['target_size']) is not int or not 3<=registration['target_size']<=MAX_MEMBERS:
+            # sync_verified_members increments the revision immediately below.
+            db.execute('UPDATE team_registrations SET target_size=? WHERE team_id=?',
+                       (self.target_size(len(members)),team_id))
         self.s.registration.sync_verified_members(db,actor,team_id,resolved[0],resolved)
         return {'memberIds':resolved,'removed':removed,'created':created,'edited':edited}
 
@@ -133,25 +144,37 @@ class TeamMembers:
         names=[m['name'] for m in members]
         if len({normalize(n) for n in names})!=len(names):raise APIError(400,'成员名单中有重名')
         captain,school=members[0]['name'],members[0]['school']
+        other=db.execute('''SELECT t.name,t.number FROM claim_people p
+            JOIN claim_memberships m ON m.person_id=p.id JOIN teams t ON t.id=m.team_id
+            WHERE p.normalized_name=? AND p.normalized_school=? AND m.team_id!=?''',
+            (normalize(captain),normalize(school),team_id)).fetchone()
+        if other:
+            raise APIError(409,f'{captain}（{school}）已属于 {other["number"]} 号队「{other["name"]}」，请先从原队移出','member_assigned')
         reg=self.s.registration
         value={'name':self.s.admin_data.team(db,team_id)['name'],'captain':captain,'school':school,'members':names}
         reg.check_duplicates(db,value,team_id)
         row=reg.row(db,team_id)
+        detail={'members':names}
         if not row:
             self.insert_registration(db,team_id,members)
         else:
-            target=len(names) if 3<=len(names)<=5 else row['target_size']
-            phone=row['phone'] if (normalize(row['captain']),normalize(row['school']))==(normalize(captain),normalize(school)) else ''
+            target=self.target_size(len(names),row['target_size'])
+            same_captain=(normalize(row['captain']),normalize(row['school']))==(normalize(captain),normalize(school))
+            phone=row['phone'] if same_captain else ''
+            if not same_captain and row['phone']:
+                # Match the verified-roster path: retain contact history only in
+                # the private organizer audit, never as the new captain's phone.
+                detail['previousContact']={key:row[key] for key in ('captain','school','phone')}
             flags=reg.flags({'name':row['name'],'members':names,'targetSize':target})
             db.execute('''UPDATE team_registrations SET captain=?,school=?,phone=?,target_size=?,members_json=?,
                 flags_json=?,revision=revision+1 WHERE team_id=?''',(captain,school,phone,target,
                 json.dumps(names,ensure_ascii=False),json.dumps(flags,ensure_ascii=False),team_id))
         reg.sync_people(db,value)
-        return {'members':names}
+        return detail
 
     def insert_registration(self,db,team_id,members):
         names=[m['name'] for m in members]
         db.execute('''INSERT INTO team_registrations(team_id,captain,school,target_size,members_json,secret_hash,created_at)
-            VALUES (?,?,?,?,?,?,?)''',(team_id,members[0]['name'],members[0]['school'],len(names) if 3<=len(names)<=5 else None,
+            VALUES (?,?,?,?,?,?,?)''',(team_id,members[0]['name'],members[0]['school'],self.target_size(len(names)),
             json.dumps(names,ensure_ascii=False),'disabled:'+secrets.token_hex(32),self.s.admin_data.now()))
         db.execute('INSERT OR IGNORE INTO team_profile_visibility(team_id,directory_visible) VALUES (?,0)',(team_id,))
