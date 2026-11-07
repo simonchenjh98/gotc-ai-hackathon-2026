@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS api_logs (
 );
 """
 DEFAULTS = {"keys.maxKeys": 5, "keys.expiresAt": None,
-            "keys.logContent": True, "keys.teamRpm": 60, "keys.announcement": "", "keys.blockedWords": [],
+            "keys.logContent": True, "keys.teamRpm": 120, "keys.announcement": "", "keys.blockedWords": [],
             "keys.logRetentionHours": 72, "keys.logMaxMB": 2048}  # request content is bounded (sub2api keeps no bodies at all)
 # Public path -> (upstream name, path appended to that upstream's base URL)
 ROUTES = {"/v1/chat/completions": ("openai", "/chat/completions"), "/v1/messages": ("anthropic", "/messages"),
@@ -98,7 +98,7 @@ STREAM_IDLE_TIMEOUT = 180  # silence between stream events before giving up (sub
 SSE_EVENT_CAP = 1024 * 1024  # inspect at most 1 MiB per event before any of its bytes reach the client
 QUEUE_CAP = 20  # waiting requests per team beyond its running ones (sub2api defaultExtraWaitSlots)
 AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW, AUTH_BLOCK = 120, 60, 60  # per client IP, as sub2api's invalid-auth limiter
-COUNT_TOKENS_CONCURRENCY, COUNT_TOKENS_RPM = 4, 120  # count_tokens is free but uses our upstream key's rate limit
+COUNT_TOKENS_CONCURRENCY, COUNT_TOKENS_RPM = 15, 120  # count_tokens is free but uses our upstream key's rate limit
 KEY_CREATE_PER_HOUR = 60  # as sub2api; deleting a key does not give the quota back
 QUEUE_WAIT = 30  # seconds a request waits for a free team slot before 429 (agent tools send bursts)
 OUTPUT_DEFAULT = 8192  # default output tokens for Anthropic requests without max_tokens
@@ -113,7 +113,7 @@ PRICING_FIELDS = ("service_tier", "speed", "inference_geo")  # dropped so reques
 # ponytail: denylist of beta prefixes that add upstream charges; extend when providers add more.
 BILLED_BETAS = ("mcp-client", "code-execution", "files-api", "context-1m", "skills", "web-fetch", "web-search")
 RETRY_DELAYS = (0.3, 0.6, 1.2, 2.4)  # sub2api: 5 attempts, 300 ms doubling, 3 s cap  # seconds; retried only before any byte reaches the client
-TEAM_CONCURRENCY = 4
+TEAM_CONCURRENCY = 15
 DAY_MS = 86_400_000
 RESPONSE_LOG_CAP = 16 * 1024 * 1024  # bytes of a reply kept for the content viewer; requests are already capped by BODY_LIMIT
 SECRET_HEADERS = {"authorization", "x-api-key", "cookie", "proxy-authorization"}
