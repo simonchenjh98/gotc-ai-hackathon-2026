@@ -44,8 +44,10 @@ test('same-view exact terminal lookup clears the old uncertainty message while n
 
 test('participant shortcuts preserve the current draft and team route without saving or navigation',async()=>{
   const f=fixture();await f.context.render();f.fill();
+  assert.match(f.root.innerHTML,/id="jump-team-project-intro">填写作品名称与介绍/);
+  assert.ok(f.root.innerHTML.indexOf('id="jump-team-project-intro"')<f.root.innerHTML.indexOf('<h2>本队资料与成员</h2>'));
   const requestsBefore=f.calls.length;
-  for(const [button,target] of [['jump-team-tools','team-keys'],['jump-team-repository','team-repository'],['jump-team-submission','submission-form']]){
+  for(const [button,target] of [['jump-team-tools','team-keys'],['jump-team-repository','team-repository'],['jump-team-submission','submission-form'],['jump-team-project-intro','material-projectName']]){
     f.node(button).onclick();
     assert.equal(f.node(target).focused,true);
     assert.equal(f.node(target).scrolled,true);
@@ -54,4 +56,17 @@ test('participant shortcuts preserve the current draft and team route without sa
   }
   assert.equal(f.calls.length,requestsBefore);
   assert.equal(f.calls.filter(call=>call.body).length,0);
+});
+
+test('project introduction shortcut keeps a closed or busy form disabled while locating its contents',async()=>{
+  const f=fixture();await f.context.render();f.fill();
+  f.node('fieldset').disabled=true;
+  const requestsBefore=f.calls.length;
+  f.node('jump-team-project-intro').onclick();
+  assert.equal(f.node('submission-form').focused,true);
+  assert.equal(f.node('submission-form').scrolled,true);
+  assert.equal(f.node('material-projectName').focused,undefined);
+  assert.equal(f.node('fieldset').disabled,true);
+  assert.equal(f.node('material-summary').value,'Summary');
+  assert.equal(f.calls.length,requestsBefore);
 });

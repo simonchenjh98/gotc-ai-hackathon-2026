@@ -83,6 +83,8 @@
 
 
 .participant-start{border-top:4px solid var(--blue)}
+.team-project-intro{min-height:56px;padding:16px 24px;font-size:17px;font-weight:700;line-height:1.5;white-space:normal;text-align:center}
+@media(max-width:720px){.page-heading:has(.team-project-intro) .heading-tools{width:100%}.team-project-intro{width:100%}}
 .participant-start-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px 24px;flex-wrap:wrap}
 .participant-start-heading h2{margin-bottom:12px}
 .participant-deadline{margin:0 0 18px;font-size:13px;line-height:1.8;color:var(--muted)}
