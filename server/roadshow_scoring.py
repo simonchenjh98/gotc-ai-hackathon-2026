@@ -5,6 +5,7 @@ import json
 
 from errors import APIError
 from finals import DIMENSIONS as FINALS_DIMENSIONS, MAX_REVISION
+import roadshow_progress as progress
 
 DIMENSIONS = [{key: value for key, value in item.items() if key != 'award'} for item in FINALS_DIMENSIONS]
 MINIMUM_SCORES = 3
@@ -45,6 +46,7 @@ for _table in ('judging_roster', 'judging_grants', 'roadshow_scores'):
 class RoadshowScoring:
     def __init__(self, service, clock, text):
         self.s, self.clock, self.text = service, clock, text
+        progress.backup_before_upgrade(service, clock)
 
     @staticmethod
     def supports(path):
@@ -56,6 +58,8 @@ class RoadshowScoring:
         for statement in DDL:
             db.execute(statement)
         db.execute('INSERT OR IGNORE INTO roadshow_scoring_config(id) VALUES (1)')
+        if progress.migrate(db):
+            db.execute('UPDATE roadshow_scoring_config SET revision=revision+1 WHERE id=1')
         existing = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
         if any('roadshow_scoring_' + name not in existing for name, _, _ in TRIGGERS):
             db.execute('UPDATE roadshow_scoring_config SET revision=revision+1 WHERE id=1')
@@ -72,13 +76,15 @@ class RoadshowScoring:
         matches = bool(not self.s.judging.window(state)['canEdit'] and saved['publication_json']
                        and saved['publication_run_id'] == state['run_id']
                        and saved['publication_revision'] == saved['revision'])
-        return matches and json.loads(saved['publication_json']).get('minimumScores') == MINIMUM_SCORES
+        return (matches and json.loads(saved['publication_json']).get('minimumScores') == MINIMUM_SCORES
+                and json.loads(saved['publication_json']).get('scoringRuleVersion') == progress.VERSION)
 
     def config(self, db, state, public=False):
         saved = self.publication_state(db)
         published = self.published(db, state)
         result = {'runId': state['run_id'], 'published': published, 'minimumScores': MINIMUM_SCORES,
-                  'durationMinutes': 90, 'publishedAt': saved['published_at'] if published else None}
+                  'durationMinutes': 90, 'publishedAt': saved['published_at'] if published else None,
+                  'scoringRuleVersion': progress.VERSION, 'progressRule': dict(progress.RULE)}
         if not public:
             result.update(revision=saved['revision'], stageRevision=state['revision'],
                           publicationStale=bool(saved['publication_json']) and not published,
@@ -108,7 +114,8 @@ class RoadshowScoring:
     @staticmethod
     def score_view(row):
         return {'teamId': row['team_id'], 'revision': row['revision'], 'status': row['status'],
-                'scores': json.loads(row['scores_json']), 'feedback': row['feedback'], 'updatedAt': row['updated_at']}
+                'scores': json.loads(row['scores_json']), 'feedback': row['feedback'], 'updatedAt': row['updated_at'],
+                **progress.view(row)}
 
     @staticmethod
     def fields(body, expected):
@@ -137,17 +144,22 @@ class RoadshowScoring:
     def summary(self, db, state):
         teams, judges = self.teams(db, state), self.judges(db, state)
         active_ids = {judge['id'] for judge in judges if judge['active']}
-        scores = [row for row in db.execute('SELECT * FROM roadshow_scores WHERE run_id=?', (state['run_id'],))
+        scores = [row for row in db.execute(progress.READ_SQL + ' WHERE s.run_id=?', (state['run_id'],))
                   if row['judge_id'] in active_ids]
         rows, exact_scores = [], {}
         for team in teams:
-            submitted = [row for row in scores if row['team_id'] == team['id'] and row['status'] == 'submitted'] if team['eligible'] else []
+            all_submitted = [row for row in scores if row['team_id'] == team['id'] and row['status'] == 'submitted'] if team['eligible'] else []
+            submitted = [row for row in all_submitted if progress.weighted_milli(row) is not None]
+            pending = len(all_submitted) - len(submitted)
             recused = sum(row['team_id'] == team['id'] and row['status'] == 'recused' for row in scores) if team['eligible'] else 0
             count = len(submitted)
             valid = bool(team['eligible'] and count >= MINIMUM_SCORES)
-            exact = Fraction(sum(row['total_tenths'] for row in submitted), 10 * count) if count else None
+            exact = Fraction(sum(progress.weighted_milli(row) for row in submitted), 1000 * count) if count else None
+            raw = Fraction(sum(row['total_tenths'] for row in submitted), 10 * count) if count else None
             dimensions = [round(sum(json.loads(row['scores_json'])[i] for row in submitted) / count, 2) if count else None for i in range(6)]
-            rows.append({**team, 'score': round(float(exact), 2) if exact is not None else None,
+            rows.append({**team, 'score': progress.display(exact.numerator, exact.denominator) if exact is not None else None,
+                         'rawScore': progress.display(raw.numerator, raw.denominator) if raw is not None else None,
+                         'submittedCount': len(all_submitted), 'pendingProgressCount': pending,
                          'scoreCount': count, 'recusedCount': recused, 'valid': valid, 'complete': valid,
                          'missing': max(0, MINIMUM_SCORES - count), 'rank': None, 'dimensions': dimensions})
             if valid:
@@ -161,14 +173,18 @@ class RoadshowScoring:
             row['rank'], previous = rank, value
         qualified = len(ranked)
         can_edit = self.s.judging.window(state)['canEdit']
+        pending_count = sum(row['pendingProgressCount'] for row in rows)
         blockers = []
         if can_edit:
             blockers.append('路演评分窗口尚未关闭或截止')
         if not qualified:
             blockers.append('尚无队伍获得至少3位不同评委的有效正式评分')
-        can_publish = not can_edit and qualified > 0
+        if pending_count:
+            blockers.append(f'有{pending_count}份正式评分缺少进展分，须由评委补全后发布')
+        can_publish = not can_edit and qualified > 0 and not pending_count
         return {'teams': sorted(rows, key=lambda row: (not row['valid'], row['rank'] or 0, row['number'])),
                 'expectedJudges': len(judges), 'activeJudges': len(active_ids), 'minimumScores': MINIMUM_SCORES,
+                'pendingProgressCount': pending_count, 'scoringRuleVersion': progress.VERSION,
                 'qualifiedCount': qualified, 'complete': bool(rows) and all(row['valid'] for row in rows),
                 'canPublish': can_publish, 'final': can_publish, 'blockers': blockers}
 
@@ -178,15 +194,32 @@ class RoadshowScoring:
         for row in summary['teams']:
             public = dict(row)
             if not row['valid']:
-                public.update(score=None, rank=None, dimensions=[None] * len(DIMENSIONS))
+                public.update(score=None, rawScore=None, rank=None, dimensions=[None] * len(DIMENSIONS))
             result['teams'].append(public)
         return result
 
     def admin_view(self, db, state):
         return {'config': self.config(db, state), 'dimensions': DIMENSIONS, 'summary': self.summary(db, state),
+                'scoreDetails': self.score_details(db, state),
                 'availableTeams': [team for team in self.s.finals.teams(db) if not self.s.team_lifecycle.is_recycled(db,team['id'])],
                 'roster': {'teamIds': [team['id'] for team in self.teams(db, state)],
                            'editable': self.s.judging.stage_view(state)['rosterEditable']}}
+
+    def score_details(self, db, state):
+        teams = {team['id']: team for team in self.teams(db, state)}
+        judges = {judge['id']: judge for judge in self.judges(db, state)}
+        result = []
+        for row in db.execute(progress.READ_SQL + ' WHERE s.run_id=? ORDER BY s.team_id,s.judge_id', (state['run_id'],)):
+            team, judge = teams.get(row['team_id']), judges.get(row['judge_id'])
+            if not team or not judge:
+                continue
+            record = self.score_view(row)
+            record.pop('feedback')
+            result.append({**record, 'teamNumber': team['number'], 'teamName': team['name'],
+                           'judgeId': judge['id'], 'judgeName': judge['name'], 'judgeActive': judge['active'],
+                           'teamEligible': team['eligible'], 'validForAverage': bool(team['eligible'] and judge['active']
+                             and row['status'] == 'submitted' and progress.weighted_milli(row) is not None)})
+        return result
 
     def save_teams(self, db, actor, state, body):
         self.fields(body, {'runId', 'expectedRevision', 'teamIds'})
@@ -207,14 +240,15 @@ class RoadshowScoring:
 
     def save_score(self, db, actor, state, body):
         self.require_judge(db, actor, state)
-        self.fields(body, {'runId', 'teamId', 'expectedRevision', 'status', 'scores', 'feedback'})
+        self.fields(body, {'runId', 'teamId', 'expectedRevision', 'status', 'scores', 'feedback'}
+                    | (set(body) & {'progressScore', 'progressNote'} if isinstance(body, dict) else set()))
         if not isinstance(body['runId'], str) or body['runId'] != state['run_id']:
             raise APIError(409, '路演轮次已更新，请核对最新页面', 'roadshow_run_conflict')
         if not self.s.judging.window(state)['canEdit']:
             raise APIError(409, '路演评分尚未开放、已截止或已关闭', 'roadshow_closed')
         if not isinstance(body['teamId'], str) or body['teamId'] not in {team['id'] for team in self.teams(db, state) if team['eligible']}:
             raise APIError(403, '该队伍不在本轮有效路演名单中')
-        before = db.execute('SELECT * FROM roadshow_scores WHERE run_id=? AND judge_id=? AND team_id=?',
+        before = db.execute(progress.READ_SQL + ' WHERE s.run_id=? AND s.judge_id=? AND s.team_id=?',
                             (state['run_id'], actor['id'], body['teamId'])).fetchone()
         revision = self.next_revision(body, before['revision'] if before else 0)
         status = body['status']
@@ -222,6 +256,7 @@ class RoadshowScoring:
             raise APIError(400, '评分状态不正确')
         if before and before['status'] == 'submitted' and status == 'draft':
             raise APIError(409, '已有正式评分，请修改后重新正式提交')
+        progress_score, progress_note = progress.parse(body, status, self.text)
         feedback = self.text(body['feedback'], '评语', 2000)
         values, total = [], None
         if status == 'recused':
@@ -242,14 +277,20 @@ class RoadshowScoring:
                     raise APIError(400, dimension['name'] + '分值须在0至' + str(dimension['max']) + '之间，最多一位小数')
                 values.append(float(value))
                 total += int(value * 10)
-        db.execute('''INSERT INTO roadshow_scores VALUES (?,?,?,?,?,?,?,?,?)
+        db.execute('''INSERT INTO roadshow_scores
+                      (run_id,judge_id,team_id,revision,status,scores_json,total_tenths,feedback,updated_at)
+                      VALUES (?,?,?,?,?,?,?,?,?)
                       ON CONFLICT(run_id,judge_id,team_id) DO UPDATE SET revision=excluded.revision,status=excluded.status,
                       scores_json=excluded.scores_json,total_tenths=excluded.total_tenths,feedback=excluded.feedback,updated_at=excluded.updated_at''',
                    (state['run_id'], actor['id'], body['teamId'], revision, status, json.dumps(values), total, feedback, self.clock()))
-        self.s.audit(db, actor, 'roadshow.score.' + status, body['teamId'], {'runId': state['run_id'], 'revision': revision})
+        progress.save(db, state['run_id'], actor['id'], body['teamId'], revision, progress_score, progress_note)
         self.s.touch(db)
-        row = db.execute('SELECT * FROM roadshow_scores WHERE run_id=? AND judge_id=? AND team_id=?',
+        row = db.execute(progress.READ_SQL + ' WHERE s.run_id=? AND s.judge_id=? AND s.team_id=?',
                          (state['run_id'], actor['id'], body['teamId'])).fetchone()
+        self.s.audit(db, actor, 'roadshow.score.' + status, body['teamId'], {
+            'runId': state['run_id'], 'revision': revision, 'scoringRuleVersion': progress.VERSION,
+            'before': {'revision': before['revision'], **progress.view(before)} if before else None,
+            'after': progress.view(row)})
         return {'ok': True, 'score': self.score_view(row)}
 
     def publish(self, db, actor, state, body):
@@ -264,6 +305,8 @@ class RoadshowScoring:
             if self.s.judging.window(state)['canEdit']:
                 raise APIError(409, '请等待路演评分截止或先关闭窗口，再发布成绩')
             summary = self.summary(db, state)
+            if summary['pendingProgressCount']:
+                raise APIError(409, '存在待补全进展分的正式评分，请由评委补全后发布', 'roadshow_progress_incomplete')
             if not summary['qualifiedCount']:
                 raise APIError(409, '至少一支队伍须有3位不同评委正式评分后才能发布')
             public=self.public_summary(summary)
@@ -303,10 +346,11 @@ class RoadshowScoring:
                 return self.save_teams(db, actor, state, body)
             if method == 'POST' and path == '/api/admin/roadshow/publish':
                 return self.publish(db, actor, state, body)
+            self.s.judge_login_schedule.require_open(db, 'roadshow')
             self.require_judge(db, actor, state)
             if method == 'GET' and path == '/api/roadshow/scoring':
                 return {'config': self.config(db, state), 'dimensions': DIMENSIONS, 'teams': [team for team in self.teams(db, state, materials=True) if not self.s.team_lifecycle.is_recycled(db,team['id'])],
-                        'myScores': [self.score_view(row) for row in db.execute('SELECT * FROM roadshow_scores WHERE run_id=? AND judge_id=? ORDER BY team_id', (state['run_id'], actor['id'])) if not self.s.team_lifecycle.is_recycled(db,row['team_id'])]}
+                        'myScores': [self.score_view(row) for row in db.execute(progress.READ_SQL + ' WHERE s.run_id=? AND s.judge_id=? ORDER BY s.team_id', (state['run_id'], actor['id'])) if not self.s.team_lifecycle.is_recycled(db,row['team_id'])]}
             if method == 'POST' and path == '/api/roadshow/score':
                 return self.save_score(db, actor, state, body)
             raise APIError(404, '路演评分接口不存在')

@@ -52,6 +52,7 @@ async function renderApiAdmin(version){
   const [event,data]=await Promise.all([api('admin',undefined,{loginId:owner.loginId}),api('admin/keys',undefined,{loginId:owner.loginId})]);
   if(route!=='admin-api' || version!==routeVersion || session!==owner || !ownsBrowserLogin(owner))return;
   data.upstreams ||= {};
+  apiCurrency=data.currency || 'USD';
   root.innerHTML=`<div class="api-console"><nav class="api-sidebar" aria-label="AI API 管理"><div class="api-brand"><strong>AI API</strong><small>GOTC 2026 内置网关</small></div>${apiPages.map(([id,name])=>`<a href="#admin-api/${id}" ${id===page[0]?'aria-current="page"':''}>${name}</a>`).join('')}<a class="api-back" href="#admin">← 返回活动后台</a></nav><div class="api-main"><header class="api-header"><div><h1>${page[1]}</h1><p>${page[2]}</p></div><div class="form-actions" id="api-actions"></div></header><div id="api-page"></div></div></div>`;
   const c={version,data,owner,active:true,teams:event.teams || [],box:document.getElementById('api-page'),actions:document.getElementById('api-actions')};
   currentApiAdmin=c;
@@ -78,7 +79,7 @@ const apiPageRenderers={
     const o=c.data.overview,models=Object.values(c.data.models || {}).flat().length;
     c.actions.innerHTML='<a class="btn secondary small" href="api/admin/keys/export" download>导出用量 CSV ↓</a>';
     c.box.innerHTML=(c.data.enabled?'':'<div class="info-banner warning">尚未配置模型账号，队伍暂时无法调用。请先到 <a href="#admin-api/accounts">账号管理</a> 添加账号。</div>')+
-      apiCards([['已开通队伍',c.data.teams.filter(t=>t.active).length,`共 ${c.teams.length} 支队伍`],['账号',Object.keys(c.data.upstreams).length,`${models} 个可用模型`],['今日请求',Number(o.requests),`失败 ${Number(o.errors)}`],['今日费用',usd(o.cost),`${Number(o.teams)} 支队伍调用`]])+
+      billingNote(o.billing)+apiCards([['已开通队伍',c.data.teams.filter(t=>t.active).length,`共 ${c.teams.length} 支队伍`],['账号',Object.keys(c.data.upstreams).length,`${models} 个可用模型`],['今日请求',Number(o.requests),`失败 ${Number(o.errors)}`],['今日费用',usd(o.cost),`${Number(o.teams)} 支队伍调用`]])+
       apiCards([['今日 Token',tokens(Number(o.input)+Number(o.output)),`输入 ${tokens(o.input)} · 输出 ${tokens(o.output)}`],['性能指标',`${o.rpm ?? 0} RPM`,`${tokens(o.tpm ?? 0)} TPM（近5分钟）`],['平均响应',msText(o.avgMs),`P95 ${msText(o.p95Ms)}`],['首字耗时',msText(o.avgFirstTokenMs),'今日平均']])+
       `<section class="api-card"><h2>近24小时消耗排行</h2>${apiRanking(c)}</section><section class="api-card"><h2>今日模型分布（北京时间）</h2><div id="api-models"><p class="small-note">读取中…</p></div></section>`;
     c.request('admin/keys/stats',{days:1,granularity:'day'}).then(s=>{if(c.alive())document.getElementById('api-models').innerHTML=apiTable(['模型','请求','输入 / 输出 tokens','费用'],s.byModel.map(r=>[esc(r.model || '（被拦截，未到达模型）'),Number(r.requests),`${tokens(r.input)} / ${tokens(r.output)}`,usd(r.cost)]));})
@@ -165,7 +166,7 @@ function apiAccountDialog(c,kind,editing){
         <div class="api-custom"><input data-custom placeholder="输入自定义模型名称" aria-label="自定义模型名称"><button type="button" class="btn secondary small" data-add-custom>填入</button></div><div data-catalog></div></div>
       <div data-pane="mapping" hidden><div class="info-banner">将请求模型映射到实际模型。以 * 结尾表示前缀匹配，例如 <code>${esc(p.alias)}</code> 让客户端写死的默认模型名也能使用。</div><div data-aliases></div>
         <div class="form-actions"><button type="button" class="btn secondary small api-dashed" data-alias-add>+ 添加映射</button><button type="button" class="btn secondary small" data-alias-preset>+ ${esc(p.alias)} → 第一个模型</button></div></div></div>
-    <div class="field"><span>计费</span><label class="field">默认单价（美元 / 百万 tokens）<span class="api-price-pair"><input name="defaultIn" inputmode="decimal" placeholder="输入价" value="${esc(u.defaultPrice?.[0] ?? '')}" aria-label="默认输入价"><input name="defaultOut" inputmode="decimal" placeholder="输出价" value="${esc(u.defaultPrice?.[1] ?? '')}" aria-label="默认输出价"></span><small>未单独定价的模型按此计费；留空则这些模型不计费，队伍额度不扣减。缓存写入按输入价 1.25 倍、读取 0.1 倍计。人民币价格请按汇率换算。</small></label>
+    <div class="field"><span>计费</span><label class="field">${u.url==='https://ai.gitee.com/v1'?'Gitee 固定价占位（实际使用官方目录计费）':'默认单价（美元 / 百万 tokens）'}<span class="api-price-pair"><input name="defaultIn" inputmode="decimal" placeholder="输入价" value="${esc(u.defaultPrice?.[0] ?? '')}" aria-label="默认输入价"><input name="defaultOut" inputmode="decimal" placeholder="输出价" value="${esc(u.defaultPrice?.[1] ?? '')}" aria-label="默认输出价"></span><small>${u.url==='https://ai.gitee.com/v1'?'模力方舟按官方操作、阶梯、缓存及时段价格以人民币计费；图片、音视频等按各自单位或上游实际费用结算。这里的 token 固定价不覆盖官方目录。费用无法核实时显示待核价。':'未单独定价的模型按此固定价计费；缓存写入按输入价 1.25 倍、读取 0.1 倍计。'}</small></label>
       <details class="api-prices"><summary>按模型单独定价（可选）</summary><div data-prices></div></details></div>
   </div><footer><p class="form-error" role="alert"></p><button type="button" class="btn secondary small" data-close>取消</button><button type="submit" class="btn small">${editing?'更新':'创建'}</button></footer></form>`);
   const form=d.querySelector('form'),f=form.elements,q=sel=>d.querySelector(sel),alive=()=>d.open && c.alive() && session===owner && ownsBrowserLogin(owner);

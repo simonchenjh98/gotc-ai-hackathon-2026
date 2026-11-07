@@ -19,8 +19,8 @@ function runtime(extra={}){
   vm.runInContext(finals+'\n'+source,ctx);return ctx;
 }
 function scoreFixture(ctx,options={}){
-  const selectors={'.form-error':{textContent:''},'[data-finals-draft]':{},'[data-finals-recuse]':{},'[type=submit]':{},'[data-finals-total]':{},'[data-finals-saved]':{},'[data-finals-recovery]':{innerHTML:'',querySelector:()=>({})},fieldset:{disabled:false}};
-  const elements={feedback:{value:' Synthetic feedback '},...Object.fromEntries(dimensions.map(d=>['score-'+d.id,{value:String(d.max)}]))},listeners={};
+  const selectors={'.form-error':{textContent:''},'[data-finals-draft]':{},'[data-finals-recuse]':{},'[type=submit]':{},'[data-finals-total]':{},'[data-finals-saved]':{},'[data-finals-recovery]':{innerHTML:'',querySelector:()=>({})},fieldset:{disabled:false},'[data-roadshow-weighted]':{textContent:''}};
+  const elements={feedback:{value:' Synthetic feedback '},progressScore:{value:options.progress ?? '10'},progressNote:{value:''},...Object.fromEntries(dimensions.map(d=>['score-'+d.id,{value:String(d.max)}]))},listeners={};
   const form={isConnected:true,elements,addEventListener(type,fn){(listeners[type]??=[]).push(fn);},emit:type=>listeners[type]?.forEach(fn=>fn()),querySelector:selector=>selectors[selector],querySelectorAll:()=>[selectors['[type=submit]'],selectors['[data-finals-draft]'],selectors['[data-finals-recuse]']]};
   const host={innerHTML:'',querySelector:()=>form},option={value:'a',textContent:''},select={value:'a',options:[option]},windowNotice={classList:{toggle(){}}},changed={},auth={};
   const container={isConnected:true,querySelector:selector=>({'[data-roadshow-editor]':host,'[data-roadshow-team]':select,'[data-roadshow-window]':windowNotice,'[data-roadshow-changed]':changed,'[data-finals-auth]':auth,'[data-roadshow-reload-score]':{}})[selector],querySelectorAll:()=>form.querySelectorAll()};
@@ -45,7 +45,7 @@ test('two formal scores plus recusals stay unranked and hidden publicly, while t
   const ctx=runtime(),data=snapshot(4,true);data.summary.teams=[{...team('a',1),score:93.25,scoreCount:2,recusedCount:6,rank:1},{...team('b',2),score:88.5,scoreCount:3,rank:2}];
   const publicHtml=ctx.roadshowScoreSummaryMarkup(data,true),adminHtml=ctx.roadshowScoreSummaryMarkup(data);
   assert.ok(!publicHtml.includes('93.25'));assert.match(publicHtml,/88\.50/);assert.match(publicHtml,/已收 2 \/ 至少 3/);assert.match(publicHtml,/评分不足/);
-  assert.match(adminHtml,/93\.25/);assert.match(adminHtml,/暂定均分 · 不参与排名/);assert.match(adminHtml,/平均分纳入所有已交正式评分/);
+  assert.match(adminHtml,/93\.25/);assert.match(adminHtml,/暂定加权均分 · 不参与排名/);assert.match(adminHtml,/六维原始总分 × 进展系数/);assert.match(adminHtml,/0\.5 \+ 0\.05 × 两天进展分/);
   assert.ok(publicHtml.indexOf('02 · Team 2')<publicHtml.indexOf('01 · Team 1'));
 });
 
@@ -56,6 +56,18 @@ test('countdown follows server time, expires locally, and cancels on departure w
   local+=5399000;let [id,fn]=[...tasks][0];tasks.delete(id);fn();assert.match(applied.at(-1).text,/00:01/);assert.equal(applied.at(-1).canEdit,true);
   local+=1000;[id,fn]=[...tasks][0];tasks.delete(id);fn();assert.equal(applied.at(-1).canEdit,false);assert.match(applied.at(-1).text,/已截止/);assert.equal(tasks.size,0);
   clock.update({open:true,canEdit:true,serverTime:1000,deadline:5401000});active=false;[id,fn]=[...tasks][0];tasks.delete(id);const count=applied.length;fn();assert.equal(applied.length,count);clock.stop();assert.equal(tasks.size,0);
+});
+
+test('formal roadshow submission requires an integer progress score and sends it with the scores',async()=>{
+  const sent=[],ctx=runtime({api:async(path,payload)=>{sent.push(payload);return {score:{...payload,revision:payload.expectedRevision+1}};}});
+  for(const bad of ['','11','2.5']){
+    const h=scoreFixture(ctx,{progress:bad});h.form.emit('input');await h.form.onsubmit({preventDefault(){}});
+    assert.equal(sent.length,0);assert.match(h.selectors['.form-error'].textContent,/进展评分/);
+  }
+  const h=scoreFixture(ctx,{progress:'4'});h.form.emit('input');await h.form.onsubmit({preventDefault(){}});
+  assert.equal(sent.length,1);assert.equal(sent[0].progressScore,4);assert.equal(sent[0].status,'submitted');assert.equal(sent[0].progressNote,'');
+  assert.deepEqual(JSON.parse(JSON.stringify(ctx.roadshowWeightedPreview([20,15,20,20,15,10],4))),{rawTotal:100,multiplier:0.7,weightedTotal:70});
+  ctx.disposeFinalsView();
 });
 
 test('roadshow form sends six values totaling 100 with its captured ordinary login, run, and score revision',async()=>{

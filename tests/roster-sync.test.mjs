@@ -11,7 +11,7 @@ function runtime(extra={}){
   const ctx=vm.createContext({AbortController,Map,Set,Number,Object,Date,JSON,esc,setTimeout,clearTimeout,confirm:()=>true,toast(){},dirtyAdminForms:new Set(),
     sessionStorage:{getItem:()=>null,setItem(){},removeItem(){}},window:{addEventListener(){},removeEventListener(){}},document:{addEventListener(){},removeEventListener(){},hidden:false},
     session:{role:'admin',loginId:'admin-a'},route:'admin-roadshow',routeVersion:1,ownsBrowserLogin:()=>true,...extra});
-  vm.runInContext(sources,ctx);ctx.finalsSetAccess({accessToken:'synthetic-finals-authorization-0123456789',expiresAt:Date.now()+3600000});return ctx;
+  vm.runInContext(sources,ctx);return ctx;
 }
 function choices(kind='teamIds'){
   let html='';return {inputs:[],contains:()=>false,get innerHTML(){return html;},set innerHTML(value){html=value;this.inputs=[...value.matchAll(/<input\b([^>]+)>/g)].map(match=>({value:match[1].match(/value="([^"]*)"/)?.[1],checked:/\bchecked\b/.test(match[1]),disabled:/\bdisabled\b/.test(match[1]),kind}));},querySelectorAll(){return this.inputs;}};

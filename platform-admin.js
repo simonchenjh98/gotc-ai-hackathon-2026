@@ -153,7 +153,7 @@ function installAdminData(data,version){
     <button type="button" data-admin-jump="admin-records">历史与记录</button>
     <button type="button" data-admin-jump="admin-audit">操作记录</button>
   </nav>`);
-  root.insertAdjacentHTML('beforeend',adminImportMarkup()+adminRecordsMarkup()+adminAuditMarkup()+`<section class="surface admin-unavailable"><h2>展示阶段待配置功能</h2><p class="small-note">展示阶段的数值评分、汇总算法、晋级与综合排名、奖项及 GOTC 资格、正式成绩发布尚未实现；当前保存工作名单、材料和定性评审记录。下方禁用按钮仅对应展示阶段。路演已支持六维100分，每队至少3位不同评委正式评分后成绩有效，均分纳入所有已交正式评分；后台开始后计时90分钟，到时停止评分。路演实时成绩与发布请前往<a href="#admin-roadshow">路演独立后台 →</a>。现有六维专业评分与成绩发布仍可在上方使用。</p><button class="btn secondary small" disabled>配置阶段计分与汇总</button> <button class="btn secondary small" disabled>发布阶段结果</button></section>`);
+  root.insertAdjacentHTML('beforeend',adminImportMarkup()+adminRecordsMarkup()+adminAuditMarkup()+`<section class="surface admin-unavailable"><h2>展示阶段待配置功能</h2><p class="small-note">展示阶段的数值评分、汇总算法、晋级与综合排名、奖项及 GOTC 资格、正式成绩发布尚未实现；当前保存工作名单、材料和定性评审记录。下方禁用按钮仅对应展示阶段。路演采用六维100分乘以两天作品进展系数（0.5 + 0.05 × 进展分），按各评委加权分的均分排名；进展分为0—10整数，正式提交必填，每队至少3位不同评委完整正式评分才有效。后台开始后计时90分钟，到时停止评分。路演实时成绩与发布请前往<a href="#admin-roadshow">路演独立后台 →</a>。现有六维专业评分与成绩发布仍可在上方使用。</p><button class="btn secondary small" disabled>配置阶段计分与汇总</button> <button class="btn secondary small" disabled>发布阶段结果</button></section>`);
   document.querySelectorAll('[data-admin-jump]').forEach(button=>button.onclick=()=>document.getElementById(button.dataset.adminJump)?.scrollIntoView({behavior:'smooth',block:'start'}));
 
   async function refreshDirectory(){

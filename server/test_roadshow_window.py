@@ -52,7 +52,7 @@ class RoadshowWindowTests(unittest.TestCase):
     def score(self, revision=0):
         return self.judge.request('POST', '/api/roadshow/score', {
             'runId': self.run_id, 'teamId': self.team_id, 'expectedRevision': revision,
-            'status': 'submitted', 'scores': [20, 15, 20, 20, 15, 10], 'feedback': ''},
+            'status': 'submitted', 'scores': [20, 15, 20, 20, 15, 10], 'feedback': '', 'progressScore': 10},
             headers={'X-GOTC-Login': self.judge.login_id})
 
     def review(self, version=0):

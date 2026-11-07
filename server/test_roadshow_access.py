@@ -63,7 +63,7 @@ class RoadshowAccessTests(unittest.TestCase):
     def test_empty_roster_is_explicit_and_never_creates_arbitrary_accounts(self):
         status, public, headers = self.public.get('/api/roadshow/access')
         self.assertEqual(status, 200)
-        self.assertEqual(set(public), {'configured', 'claimAvailable', 'nameLoginAvailable', 'message'})
+        self.assertEqual(set(public), {'configured', 'claimAvailable', 'nameLoginAvailable', 'message', 'loginSchedule'})
         self.assertFalse(public['configured'])
         self.assertFalse(public['claimAvailable'])
         self.assertNotIn('Set-Cookie', headers)
@@ -122,7 +122,7 @@ class RoadshowAccessTests(unittest.TestCase):
         self.assertEqual(judge.get('/api/judging/exhibition')[0], 403)
         self.assertEqual(judge.post('/api/judging/exhibition/review', {})[0], 403)
         self.assertEqual(judge.get('/api/admin')[0], 403)
-        self.assertEqual(judge.get('/api/finals/judge')[0], 503)  # Finals invitation is not configured in this fixture.
+        self.assertEqual(judge.get('/api/finals/judge')[0], 400)
         self.assertEqual(judge.get('/api/board')[0], 200)
         ordinary, _ = self.invitation(name='ordinary-existing-judge')
         self.assertEqual(ordinary.get('/api/judge')[0], 200)
