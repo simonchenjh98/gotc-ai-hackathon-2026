@@ -232,3 +232,14 @@ test('a stale 401 does not clear the private roster of a newly mounted admin log
   assert.match(h.node('member-detail').innerHTML,/Current member/);
   assert.equal(vm.runInContext('controller.canSave()',h.context),true);
 });
+
+test('admin directory member cell lists captain and teammates with escaping',()=>{
+  const admin=fs.readFileSync(new URL('../platform-admin.js',import.meta.url),'utf8');
+  const cellSource=admin.slice(admin.indexOf('function adminTeamMembersCell('),admin.indexOf('function adminTeamRosterMarkup('));
+  const escSource=platform.match(/const esc = [^\n]*/)[0];
+  const context=vm.createContext({});vm.runInContext(escSource+'\n'+cellSource+'\nglobalThis.cell=adminTeamMembersCell;',context);
+  const html=context.cell([{name:'张三',role:'captain',school:'一中'},{name:'<b>x</b>',role:'member',school:null}]);
+  assert.match(html,/<strong>张三<\/strong><small>（队长）<\/small><br><small>一中<\/small>/);
+  assert.match(html,/&lt;b&gt;x&lt;\/b&gt;/);
+  assert.match(context.cell([]),/暂无成员资料/);assert.match(context.cell(undefined),/暂无成员资料/);
+});

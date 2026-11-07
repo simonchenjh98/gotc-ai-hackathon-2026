@@ -49,7 +49,7 @@ class UpstreamError(APIError):
 
 class ProviderOperations:
     """Single-process operation permits and bounded rolling team request quotas."""
-    LIMITS = {'preview': 10, 'confirmation': 20}
+    LIMITS = {'preview': 10, 'confirmation': 20, 'refresh': 6}
     WINDOW_SECONDS = 60
     MAX_BUCKETS = 4096
 
@@ -224,6 +224,10 @@ class Repositories:
             token = os.environ.get(prefix + '_TOKEN', '')
             enabled = valid and bool(token) and (name != 'gitee' or os.environ.get(prefix + '_ENABLED') == '1')
             self.providers[name] = Provider(name, org, token, branch, enabled)
+        # Opt-in: provision immediately when a team applies, without waiting for an admin click.
+        self.auto_approve = os.environ.get('GOTC_REPO_AUTO_APPROVE') == '1'
+        join = os.environ.get('GOTC_REPO_GITEE_JOIN_URL', '')
+        self.join_urls = {'gitee': join if re.fullmatch(r'https://gitee\.com/[A-Za-z0-9._~:/?#\[\]@!$&\'()*+,;=%-]{1,400}', join) else ''}
 
     def initialize(self, db):
         db.executescript(SCHEMA)
@@ -244,11 +248,12 @@ class Repositories:
                 'state': row['state'], 'revision': row['revision'], 'protection': row['protection'],
                 'message': row['message'], 'updatedAt': row['updated_at'], 'externalId': row['external_id'],
                 'codeUrl': provider.web + '/' + row['organization'] + '/' + row['slug'] if row['external_id'] else None,
-                'archived': False}
+                'canSubmit': self.can_submit(row), 'archived': False}
 
     def availability(self):
         return [{'provider': key, 'enabled': bool(p.enabled), 'organization': p.organization, 'branch': p.branch,
-                 'message': '已配置；真实组织权限仍需上线验收' if p.enabled else '尚未启用，请联系组织方'} for key, p in self.providers.items()]
+                 'autoApprove': bool(p.enabled and self.auto_approve), 'joinUrl': self.join_urls.get(key, '') or None,
+                 'message': '已启用' if p.enabled else '尚未启用，请联系组织方'} for key, p in self.providers.items()]
 
     def usernames(self, name, values):
         if not isinstance(values, list) or not 1 <= len(values) <= 5:
@@ -325,7 +330,14 @@ class Repositories:
                 db.execute('INSERT INTO repository_bindings VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
                            (team['id'], p.name, p.organization, slug, p.branch, json.dumps(usernames), 'requested', secrets.token_hex(24), None, 1, 'unverified', '等待管理员核对用户名归属并批准', self.now()))
                 self.s.audit(db, actor, 'repository.requested', team['id'], {'provider': p.name, 'slug': slug})
-                return {'repository': self.public(self.get(db, team['id']))}
+                result = {'repository': self.public(self.get(db, team['id']))}
+            if self.auto_approve:
+                return self.team_provision(cookie, expected_login_id, result)
+            return result
+        if path == '/api/team/repository/refresh':
+            if body:
+                raise APIError(400, '刷新仓库授权不接受额外字段')
+            return self.team_provision(cookie, expected_login_id)
         if path == '/api/team/repository/preview':
             if body:
                 raise APIError(400, 'SHA 预览不接受仓库地址或分支输入')
@@ -349,12 +361,40 @@ class Repositories:
                 raise APIError(404, '仓库申请不存在')
             p = self.provider(row)
         with self.operations.operation(p.name):
-            return self._provision(reconcile, body, cookie, login_id)
+            return self._provision(reconcile, body, lambda db: self.identity(cookie, login_id, 'admin', db))
 
-    def _provision(self, reconcile, body, cookie, login_id):
+    def team_provision(self, cookie, login_id, fallback=None):
+        """Let a team create (when auto-approve is on) or re-check its own repository access.
+
+        Same state machine and remote checks as the admin path; the team can only act
+        on its own binding, and each attempt is quota-limited per team."""
+        def team_actor(db):
+            actor = self.identity(cookie, login_id, 'team', db)
+            return actor, self.s.bound_submission_team(db, actor)
+        with self.s.db() as db:
+            actor, team = team_actor(db)
+            row = self.get(db, team['id'])
+            if not row:
+                raise APIError(404, '本队尚未申请仓库')
+            if row['state'] == 'ready' or (row['state'] == 'requested' and not self.auto_approve):
+                return fallback or {'repository': self.public(row)}
+            if row['state'] == 'provisioning' and self.now() - row['updated_at'] < 120000:
+                return fallback or {'repository': self.public(row)}
+            p = self.provider(row)
+            body = {'teamId': team['id'], 'expectedRevision': row['revision']}
+            reconcile = row['state'] != 'requested'
+        def resolver(db):
+            actor, current = team_actor(db)
+            if current['id'] != team['id']:
+                raise APIError(409, '登录队伍已变化，请刷新后重试')
+            return actor
+        with self.operations.operation(p.name, team['id'], 'refresh'):
+            return self._provision(reconcile, body, resolver)
+
+    def _provision(self, reconcile, body, resolve_actor):
         with self.s.db() as db:
             db.execute('BEGIN IMMEDIATE')
-            actor = self.identity(cookie, login_id, 'admin', db)
+            actor = resolve_actor(db)
             if not isinstance(body['teamId'], str):
                 raise APIError(400, '队伍编号不正确')
             row = self.get(db, body['teamId'])
@@ -394,11 +434,15 @@ class Repositories:
                 row = dict(self.update(db, actor, current, 'provisioning', external_id=external_id))
             p.prepare_branch(row, data)
             protection = p.protect(row)
-            state = 'ready'
+            # Each developer is granted independently: one wrong or pending account must
+            # not leave the rest of the team without access.
+            outcomes = {}
             for username in json.loads(row['usernames_json']):
-                if self.invite(p,row,username) == 'invited':
-                    state = 'invited'
-            message = ('仓库已创建；Gitee 企业成员邀请待确认或账号尚未激活，请开发者检查邀请，管理员核对恢复后确认仓库写权限' if p.name=='gitee' else '仓库已创建，等待开发者接受邀请；管理员可核对恢复') if state == 'invited' else '仓库写权限已确认'
+                try:
+                    outcomes[username] = self.invite(p, row, username)
+                except APIError as error:
+                    outcomes[username] = error
+            state, message = self.invite_summary(p, outcomes)
         except APIError as error:
             state, protection, message = 'reconcile', row['protection'], error.message
         with self.s.db() as db:
@@ -409,9 +453,50 @@ class Repositories:
             result = self.update(db, actor, current, state, protection=protection, message=message)
             return {'repository': self.public(result)}
 
+    @staticmethod
+    def invite_summary(p, outcomes):
+        ready = [u for u, r in outcomes.items() if r == 'ready']
+        invited = [u for u, r in outcomes.items() if r == 'invited']
+        failed = [(u, r) for u, r in outcomes.items() if isinstance(r, APIError)]
+        if not invited and not failed:
+            return 'ready', '仓库写权限已确认，可以 push 代码并提交作品'
+        parts = ['仓库已创建，可以提交作品。']
+        if ready:
+            parts.append('已获得写权限：' + '、'.join(ready) + '。')
+        if invited:
+            parts.append('待接受邀请：' + '、'.join(invited) + ('（请登录 Gitee 接受企业邀请，再点“我已加入，刷新授权”）' if p.name == 'gitee' else '（请到 GitHub 接受邀请后刷新）') + '。')
+        if failed:
+            reason = lambda e: '找不到该用户名' if isinstance(e, UpstreamError) and e.upstream_status == 404 else e.message
+            parts.append('未能确认：' + '；'.join(u + '（' + reason(e) + '）' for u, e in failed) + '。请核对用户名或联系主办方。')
+        return ('reconcile' if failed else 'invited'), ''.join(parts)
+
     def invite(self,p,row,username):
         if p.name!='gitee':
             return p.invite(row,username)
+        try:
+            outcome=self.enterprise_invite(p,row,username)
+        except UpstreamError:
+            # Enterprise member APIs may be unavailable to this token (scope/plan/seats).
+            return self.direct_grant(p,row,username,None)
+        except APIError as error:
+            if error.code!='repository_membership_unknown':
+                raise
+            return self.direct_grant(p,row,username,error)
+        return outcome if outcome=='ready' else self.direct_grant(p,row,username,outcome)
+
+    @staticmethod
+    def direct_grant(p,row,username,fallback):
+        """Try a repository-level push grant; success is still verified by permission readback."""
+        try:
+            return p.invite(row,username)
+        except UpstreamError:
+            if fallback is None:
+                raise
+            if isinstance(fallback,APIError):
+                raise fallback from None
+            return fallback
+
+    def enterprise_invite(self,p,row,username):
         # Provisioning has already verified and persisted the enterprise repository.
         # Check this account directly before any repository permission mutation.
         path='/enterprises/'+quote(row['organization'],safe='')+'/members'
@@ -470,7 +555,9 @@ class Repositories:
         return row if row and row['external_id'] else None
 
     def can_submit(self,row):
-        return bool(row and (row['state']=='ready' or row['provider']!='gitee' and row['state']=='invited'))
+        # Once the repository identity is persisted, submission reads (and re-verifies)
+        # that exact repository. Member access problems must not block the whole team.
+        return bool(row and row['external_id'] and row['state'] in {'ready','invited','reconcile'})
 
     def preview_row(self, db, team_id, session_hash, preview_id, reference_time=None):
         if not isinstance(preview_id, str) or not re.fullmatch(r'[0-9a-f]{48}', preview_id):

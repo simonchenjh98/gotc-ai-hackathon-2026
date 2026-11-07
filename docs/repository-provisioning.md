@@ -1,5 +1,7 @@
 # 组织仓库申请与固定 SHA 提交
 
+**2026-11-07 修订：成员授权失败不再阻断提交。** 每位开发者独立授权，一个用户名出错或待接受邀请不影响其他队员。企业成员查询或邀请失败（令牌缺少企业权限、免费企业席位已满等）时，改为直接给本队仓库授予 push，并照旧以权限回读精确为 push 才算成功；不会重复发送企业邀请。仓库数字身份一旦持久化，状态为 ready / invited / reconcile 的队伍都可以“读取最新 commit 并提交”，预览时仍重新核对仓库身份。队伍可在工作台点“我已加入，刷新授权”（`POST /api/team/repository/refresh`，每队每分钟 6 次）自助重新核对，无需等待管理员；开启 `GOTC_REPO_AUTO_APPROVE=1` 后申请即建仓。后台队伍名录直接显示成员姓名与学校（仅管理员可见）。
+
 **当前赛事授权流程（2026-11-06 修订）**：Gitee 在核对并持久化企业仓库身份后，先用 `GET /enterprises/{enterprise}/members/{username}` 查询每位已核实开发者，不拉取整份企业成员名单。只有该单成员查询明确返回 404 时，才通过 `POST /enterprises/{enterprise}/members` 按用户名邀请普通成员（`role=member`）；403、429、超时等不确定查询不触发邀请或仓库授权。已有 member / outsourced / admin 企业角色均不修改；成员身份、企业和激活状态核对通过后，才调用仓库协作者 API 授予 push。身份/权限不确定时由管理员核对，不把“请求成功”当作写权限已生效。当前凭据可查企业成员和仓库有效权限；尚未用外部普通账号实测入企或席位占用。
 
 绑定 Gitee 的正式版本由服务端提供指向该 SHA 的仓库材料入口；README、许可证、第三方来源和局限由队伍写入仓库，不要求重复填写。官网不推断这些文件存在，也不判定许可证。封存开启、自动源码备份关闭：不为新版本创建任务；老版本已生成的私有文件和回执保留。下文 worker 说明仅适用于显式开启备份的部署。
@@ -22,6 +24,8 @@
 | `GOTC_REPO_GITEE_ENABLED` | 仅精确的 `1` 显式启用；同时需要令牌 |
 | `GOTC_REPO_GITEE_SEAL_ENABLED` | 仅精确的 `1` 启用新的 Gitee 封存预览，默认关闭；已签发的封存预览仍在有效期内本地确认 |
 | `GOTC_REPO_BACKUP_ENABLED` | 仅精确的 `1` 在主进程启动单个私有源码备份 worker，默认关闭 |
+| `GOTC_REPO_AUTO_APPROVE` | 仅精确的 `1` 在队伍申请时立即建仓并授权，无需管理员点“批准建仓”；默认关闭 |
+| `GOTC_REPO_GITEE_JOIN_URL` | 空；填 `https://gitee.com/...` 的企业/组织加入链接后，选手面板显示“加入赛事 Gitee 组织”按钮 |
 
 组织和分支只允许 1–100 位 ASCII 字母、数字、下划线与连字符，首位须为字母或数字。修改配置不会改变已有申请/绑定的组织或分支；组织不匹配时停止远端访问，由管理员人工核对。分支创建以初始化 README 的默认分支为起点，不覆盖已有分支。仓库公开，初始化只含非敏感 README，不自动选择项目许可证。
 
@@ -94,6 +98,7 @@ worker 从不可变封存关联读取原仓库数字 ID、命名空间、仓库�
 | --- | --- |
 | GET `/api/team/repository` | 本队状态与渠道可用性 |
 | POST `/api/team/repository/apply` | `{provider, usernames}` |
+| POST `/api/team/repository/refresh` | `{}`，本队自助核对授权；开启自动建仓时也会为待批准申请建仓 |
 | POST `/api/team/repository/preview` | `{}`，不允许 URL/分支输入 |
 | GET `/api/admin/repositories` | 管理员申请列表与渠道可用性 |
 | POST `/api/admin/repositories/approve` | `{teamId, expectedRevision, usernamesVerified: true}` |

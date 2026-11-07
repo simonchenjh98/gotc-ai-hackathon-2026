@@ -165,7 +165,7 @@ function installAdminData(data,version){
   function renderDirectory(){
     const table=document.querySelector('.admin-team-table');
     const status={active:'参赛中',withdrawn:'已退出',disqualified:'取消资格'};
-    table.innerHTML=`<table class="board-table"><thead><tr><th>编号</th><th>队伍 / 作品</th><th>赛道</th><th>状态</th><th>展位 / 路演顺序</th><th>操作</th></tr></thead><tbody>${ctx.data.teams.map(team=>`<tr><td>${esc(team.number)}</td><td><strong>${esc(team.name)}</strong><br><small>${esc(team.project || '待补充')}</small></td><td>${esc(team.track || '未填写')}${team.trackKnown===false?'<br><span class="status-chip closed">历史赛道，尚未归类</span>':''}</td><td>${esc(status[team.status] || team.status || '参赛中')}<br><small>${esc(team.statusReason || '')}</small></td><td>${esc(team.booth || '未安排')} / ${esc(team.roadshowOrder ?? '未安排')}</td><td><button class="btn secondary small" type="button" data-edit-team="${esc(team.id)}">编辑</button></td></tr>`).join('') || '<tr><td colspan="6">尚未录入队伍。</td></tr>'}</tbody></table>`;
+    table.innerHTML=`<table class="board-table"><thead><tr><th>编号</th><th>队伍 / 作品</th><th>成员</th><th>赛道</th><th>状态</th><th>展位 / 路演顺序</th><th>操作</th></tr></thead><tbody>${ctx.data.teams.map(team=>`<tr><td>${esc(team.number)}</td><td><strong>${esc(team.name)}</strong><br><small>${esc(team.project || '待补充')}</small></td><td>${adminTeamMembersCell(team.members)}</td><td>${esc(team.track || '未填写')}${team.trackKnown===false?'<br><span class="status-chip closed">历史赛道，尚未归类</span>':''}</td><td>${esc(status[team.status] || team.status || '参赛中')}<br><small>${esc(team.statusReason || '')}</small></td><td>${esc(team.booth || '未安排')} / ${esc(team.roadshowOrder ?? '未安排')}</td><td><button class="btn secondary small" type="button" data-edit-team="${esc(team.id)}">编辑</button></td></tr>`).join('') || '<tr><td colspan="6">尚未录入队伍。</td></tr>'}</tbody></table>`;
     table.querySelectorAll('[data-edit-team]').forEach(button=>button.onclick=()=>{
       const form=formFrom('team-form');
       if(!lifecycle.valid()){formError(form,adminTeamLifecycleLoginNotice);return;}
@@ -230,6 +230,10 @@ function installAdminData(data,version){
   installAuditTools(ctx,{alive,next,fresh,track});
 }
 
+function adminTeamMembersCell(members){
+  if(!Array.isArray(members) || !members.length)return '<small>暂无成员资料</small>';
+  return members.map(member=>`${member.role==='captain'?'<strong>':''}${esc(member.name)}${member.role==='captain'?'</strong><small>（队长）</small>':''}${member.school?`<br><small>${esc(member.school)}</small>`:''}`).join('<br>');
+}
 function adminTeamRosterMarkup(detail){
   const members=detail.roster?.members || [],archived=detail.recycle?'<p class="small-note">删除时记录 · 恢复冲突另列于下方。</p>':'';
   if(!members.length)return archived+'<p class="small-note">暂无成员资料</p>';
