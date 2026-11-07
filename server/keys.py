@@ -92,9 +92,9 @@ ERROR_KINDS = {
 }
 STATUS_KINDS = {400: "invalid", 401: "auth", 403: "forbidden", 404: "not_found", 411: "invalid", 413: "too_large",
                 415: "invalid", 429: "rate_limit", 499: "client_closed"}
-UPSTREAM_TIMEOUT = 300  # waiting for the reply to start
-CONNECT_TIMEOUT = 10  # connect + TLS handshake (sub2api dial and TLS timeouts), so a dead upstream frees the slot fast
-STREAM_IDLE_TIMEOUT = 180  # silence between stream events before giving up (sub2api stream_data_interval_timeout)
+UPSTREAM_TIMEOUT = 1200  # waiting for the reply to start
+CONNECT_TIMEOUT = 20  # connect + TLS handshake (sub2api dial and TLS timeouts), so a dead upstream frees the slot fast
+STREAM_IDLE_TIMEOUT = 360  # silence between stream events before giving up (sub2api stream_data_interval_timeout)
 SSE_EVENT_CAP = 1024 * 1024  # inspect at most 1 MiB per event before any of its bytes reach the client
 QUEUE_CAP = 20  # waiting requests per team beyond its running ones (sub2api defaultExtraWaitSlots)
 AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW, AUTH_BLOCK = 120, 60, 60  # per client IP, as sub2api's invalid-auth limiter
