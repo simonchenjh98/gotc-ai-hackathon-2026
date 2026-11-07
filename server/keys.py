@@ -113,7 +113,7 @@ PRICING_FIELDS = ("service_tier", "speed", "inference_geo")  # dropped so reques
 # ponytail: denylist of beta prefixes that add upstream charges; extend when providers add more.
 BILLED_BETAS = ("mcp-client", "code-execution", "files-api", "context-1m", "skills", "web-fetch", "web-search")
 RETRY_DELAYS = (0.3, 0.6, 1.2, 2.4)  # sub2api: 5 attempts, 300 ms doubling, 3 s cap  # seconds; retried only before any byte reaches the client
-TEAM_CONCURRENCY = 4
+TEAM_CONCURRENCY = 10
 DAY_MS = 86_400_000
 RESPONSE_LOG_CAP = 16 * 1024 * 1024  # bytes of a reply kept for the content viewer; requests are already capped by BODY_LIMIT
 SECRET_HEADERS = {"authorization", "x-api-key", "cookie", "proxy-authorization"}
