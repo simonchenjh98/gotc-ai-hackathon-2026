@@ -240,7 +240,7 @@ function adminRestoredAccessMessage(result){
   const access=result.access || {},parts=['队伍已恢复。'];
   if(access.submissionAccess==='inactive')parts.push('原提交码仍已停用；需要参赛访问时，请重发提交码。');
   if(access.apiAccess==='inactive')parts.push('原 API key 仍已停用；请重新开通 API 并创建新 key。');
-  if(access.registrationAccess==='reissue_required')parts.push('原登记管理码仍已停用；已有组队登记需重发管理码。');
+  if(access.registrationAccess==='reissue_required')parts.push('本队资料与成员继续使用参赛码登录。');
   const status={active:'参赛中',withdrawn:'已退出',disqualified:'取消资格'};
   parts.push(`恢复后的参赛状态：${status[result.team?.status] || result.team?.status || '请核对'}。`);
   return parts.join('');

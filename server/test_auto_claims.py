@@ -1,4 +1,5 @@
 """Synthetic trusted snapshot regression tests; no participant records."""
+from test_registration_fixtures import registration_fixture_open
 import json
 import unittest
 from unittest.mock import patch
@@ -76,7 +77,7 @@ class AutoClaimsTests(unittest.TestCase):
         self.source()
         claim=self.application()
         self.assertEqual(claim['status'],'approved');self.assertEqual(claim['team']['id'],registered['id']);self.assertEqual(self.counts()['teams'],1)
-        self.assertEqual(self.public.post('/api/registration/open',{'code':code})[0],200)
+        self.assertEqual(registration_fixture_open(self,{'code':code})[0],200)
 
     def test_update_pending_claim_and_generic_reference_separation(self):
         entries,_=self.source(enable=False)
