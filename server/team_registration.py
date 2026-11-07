@@ -1,4 +1,4 @@
-"""Own-team profiles and the public directory; authentication belongs to team sessions."""
+"""Own-team profiles via contestant sessions or existing registration-code capability."""
 import hashlib
 import json
 import re
@@ -8,8 +8,8 @@ from collections import Counter
 from claims import normalize, ensure_roster_capacity
 from errors import APIError
 
-PUBLIC_PATHS = {'/api/registration'}
-RETIRED_PATHS = {'/api/registration/create','/api/registration/open','/api/registration/save'}
+PUBLIC_PATHS = {'/api/registration','/api/registration/open','/api/registration/save'}
+RETIRED_PATHS = {'/api/registration/create'}
 PUBLIC_ORIGINS = {'https://etownyouthai.com', 'https://www.etownyouthai.com', 'https://simonchenjh98.github.io'}
 FIELDS = {'name', 'captain', 'school', 'phone', 'targetSize', 'members', 'project', 'summary'}
 PLACEHOLDERS = {'', '欢迎', '欢迎加入', '待定', '暂无', '无'}
@@ -221,7 +221,25 @@ class TeamRegistration:
                 'incomplete':bool(incomplete),'incompleteReason':incomplete,'projectEditable':not bool(submitted),
                 'listedPublicly':bool(row and not db.execute('SELECT 1 FROM team_profile_visibility WHERE team_id=? AND directory_visible=0',(team_id,)).fetchone())}
 
-    def save_profile(self,db,actor,team_id,body):
+    def legacy_registration(self,db,code):
+        if not isinstance(code,str) or not re.fullmatch(r'[A-Za-z0-9_-]{43}',code):
+            raise APIError(403,'队伍管理码不正确，请核对原有管理码；参赛码请在选手工作台登录')
+        found=db.execute('SELECT team_id FROM team_registrations WHERE secret_hash=?',(code_hash(code),)).fetchone()
+        if not found:raise APIError(403,'队伍管理码不正确或已作废，请联系组织方核对')
+        self.s.team_lifecycle.require_available(db,found['team_id'])
+        row=self.row(db,found['team_id'])
+        if row['status']!='active':raise APIError(409,'本队登记已暂停，请联系组织方')
+        return row
+
+    def legacy_save(self,db,body):
+        if set(body)!={'code','expectedRevision','team'}:raise APIError(400,'登记字段不正确')
+        row=self.legacy_registration(db,body['code'])
+        team=self.s.admin_data.team(db,row['team_id'])
+        self.save_profile(db,None,row['team_id'],{'team':body['team'],'expectedRevision':body['expectedRevision'],
+            'expectedTeamRevision':team['revision']},legacy=True)
+        return {'ok':True,'team':self.private(self.row(db,row['team_id']))}
+
+    def save_profile(self,db,actor,team_id,body,*,legacy=False):
         if set(body)!={'team','expectedRevision','expectedTeamRevision'}:raise APIError(400,'本队资料字段不正确')
         current=self.profile(db,team_id)
         if type(body['expectedRevision']) is not int or body['expectedRevision']!=current['revision'] or type(body['expectedTeamRevision']) is not int or body['expectedTeamRevision']!=current['teamRevision']:
@@ -257,7 +275,9 @@ class TeamRegistration:
         if not verified:
             self.sync_people(db, value)
         saved=self.profile(db,team_id)
-        self.s.audit(db,actor,'team.profile.save',team_id,{'revision':saved['revision'],'teamRevision':saved['teamRevision']})
+        self.s.audit(db,actor,'registration.save' if legacy else 'team.profile.save',team_id,
+                     {'revision':saved['revision'],'teamRevision':saved['teamRevision'],
+                      **({'accessMethod':'legacy-registration-code'} if legacy else {})})
         return {'ok':True,**saved}
 
     def import_rows(self, db, actor, rows):
@@ -306,4 +326,9 @@ class TeamRegistration:
             else:
                 if method == 'GET' and path == '/api/registration':
                     return self.listing(db)
+                if method=='POST' and path=='/api/registration/open':
+                    if set(body)!={'code'}:raise APIError(400,'读取登记只接受原队伍管理码')
+                    return {'team':self.private(self.legacy_registration(db,body['code']))}
+                if method=='POST' and path=='/api/registration/save':
+                    return self.legacy_save(db,body)
             raise APIError(404, '接口不存在')

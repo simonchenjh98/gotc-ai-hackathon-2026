@@ -1,4 +1,4 @@
-"""Public directory and retired registration credential HTTP contracts."""
+"""Public directory, existing registration-code compatibility and no new issuance."""
 import json
 import secrets
 import unittest
@@ -31,24 +31,28 @@ class RegistrationTests(unittest.TestCase):
         with self.service.db() as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM team_accounts').fetchone()[0],0)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM claim_memberships').fetchone()[0],0)
-        self.assertEqual(self.public.post('/api/registration/open',{'code':code})[0],410)
+        self.assertEqual(self.public.post('/api/registration/open',{'code':code})[0],200)
     def test_cors_is_directory_only_and_never_allows_cross_site_profile_writes(self):
         origin='https://etownyouthai.com'
         headers={'Origin':origin,'Access-Control-Request-Method':'GET','Access-Control-Request-Headers':'content-type'}
         response=self.public.request('OPTIONS','/api/registration',headers=headers)
         self.assertEqual(response[0],204);self.assertEqual(response[2]['Access-Control-Allow-Origin'],origin)
         self.assertNotIn('Access-Control-Allow-Credentials',response[2])
-        for path in ['/api/registration/create','/api/registration/open','/api/registration/save','/api/team/profile','/api/admin/registration']:
+        for path in ['/api/registration/create','/api/team/profile','/api/admin/registration']:
             self.assertEqual(self.public.request('OPTIONS',path,headers=headers)[0],403)
             self.assertEqual(self.public.request('POST',path,{'code':'x'*43},origin=origin,headers={'Sec-Fetch-Site':'cross-site'})[0],403)
         self.assertEqual(self.public.request('POST','/api/team/profile',{},origin=False)[0],403)
+        for path in ['/api/registration/open','/api/registration/save']:
+            self.assertEqual(self.public.request('OPTIONS',path,headers={**headers,'Access-Control-Request-Method':'POST'})[0],204)
     def test_legacy_fixture_validation_and_retired_credential_paths(self):
         for changes in [{'name':'无'},{'captain':''},{'phone':'wrong'},{'targetSize':2},{'members':['A','B','C','D','E']},{'members':'One'}]:
             result=registration_fixture_create(self,{'code':secrets.token_urlsafe(32),'team':self.payload(**changes)})
             self.assertEqual(result[0],400,result[1])
-        for path in ['create','open','save']:
+        for path in ['create']:
             result=self.public.post('/api/registration/'+path,{'code':'x'*43})
             self.assertEqual(result[0],410);self.assertEqual(result[1]['code'],'registration_code_retired')
+        self.assertEqual(self.public.post('/api/registration/open',{'code':'x'*43})[0],403)
+        self.assertEqual(self.public.post('/api/registration/save',{'code':'x'*43,'expectedRevision':1,'team':self.payload()})[0],403)
         self.assertEqual(self.public.post('/api/registration/create',{'code':'x'*20000})[0],413)
     def test_import_retains_raw_records_without_management_code_exports(self):
         row={'sourceKey':'synthetic-import','team':self.payload(),'raw':{'Original':'Synthetic source'}}

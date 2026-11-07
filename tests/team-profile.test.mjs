@@ -41,7 +41,7 @@ function fixture(transport=async()=>ok(model())){
 
 test('profile reads with unchanged team login, shows exact same-name members and truthful missing schools',async()=>{
   const f=fixture();await f.render();assert.equal(f.requests.length,1);assert.equal(f.requests[0].path,'team/profile');assert.equal(f.requests[0].headers['X-GOTC-Login'],'LOGIN1');
-  assert.deepEqual(f.removed,['gotc-registration-code:v1:https://example.test/gotc/api/registration']);assert.match(f.panel().innerHTML,/本队查分/);assert.match(f.panel().innerHTML,/#team"/);assert.match(f.panel().innerHTML,/School B/);assert.match(f.panel().innerHTML,/学校待补充（原登记未提供）/);
+  assert.deepEqual(f.removed,[]);assert.match(f.panel().innerHTML,/本队查分/);assert.match(f.panel().innerHTML,/#team"/);assert.match(f.panel().innerHTML,/School B/);assert.match(f.panel().innerHTML,/学校待补充（原登记未提供）/);
   assert.equal(f.form().elements.member1.value,'Alex');assert.equal(f.form().elements.member2.value,'Alex');assert.equal(f.form().elements.captain.disabled,true);assert.equal(f.form().elements.targetSize.disabled,true);assert.match(f.panel().innerHTML,/已审核成员变更请联系组织方/);
 });
 test('verified save sends exact full approved roster and both revisions, ignoring tampered disabled inputs',async()=>{

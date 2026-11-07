@@ -4,7 +4,7 @@
 
 提交后，申请自动进入组织方后台。队长保留当前标签页的领取凭据，在本页查询状态即可，无需私信、交换核验码或到场。组织方在后台「队伍申请审核」读取申请，审核申报成员与相关私有身份参考，可修改队名或赛道，然后点击批准或拒绝。批准表示组织方基于申报信息作出的审核决定，不表示已核实本人到场。默认在同一写事务中分配 1–999 中最小的未使用队号，创建有效队伍、登记或复用人员、绑定成员并发放提交码领取权限。失败全部回滚。队长查询状态后点击领取；重复领取保持同一码。此流程不自动开通 API 网关权限或额度。
 
-如本队已有历史组队登记，组织方可以在「归队方式」主动选择已有队伍。此项可选，默认仍为新建，系统不会按队名自动绑定。候选只包含有效且未发提交码、未绑定领取申请、未绑定已批准成员的队伍。选择后展示登记队长、学校、成员、版本和项目；批准明确确认该登记属于本申请，并按审核通过的申报更新登记队长、学校与成员。原队伍 ID、队号、项目、来源及原始记录保留；历史队伍管理码已停用，资料管理改用原参赛码登录。队长及学校不变时保留联系电话，变更时清空旧电话并将原联系信息保存到私有审计。人数同步为实际批准人数，已确认的成员与人数不能由参赛者自行改写。新建路径遇到规范化后相同的队名会拒绝，请主动选择已有队伍或填写可区分的队名。
+如本队已有历史组队登记，组织方可以在「归队方式」主动选择已有队伍。此项可选，默认仍为新建，系统不会按队名自动绑定。候选只包含有效且未发提交码、未绑定领取申请、未绑定已批准成员的队伍。选择后展示登记队长、学校、成员、版本和项目；批准明确确认该登记属于本申请，并按审核通过的申报更新登记队长、学校与成员。原队伍 ID、队号、项目、来源及原始记录保留；原参赛码可统一本队资料与参赛功能，已有有效队伍管理码仍仅保留原登记资料修改能力。队长及学校不变时保留联系电话，变更时清空旧电话并将原联系信息保存到私有审计。人数同步为实际批准人数，已确认的成员与人数不能由参赛者自行改写。新建路径遇到规范化后相同的队名会拒绝，请主动选择已有队伍或填写可区分的队名。
 
 私有参考记录仅用于去重，不决定报名资格。同名同校且未归队的记录会复用；已有队伍的同名同校记录会阻止重复归队。同名但不同学校且已归队时，组织方必须区分相关人员，勾选确认并填写说明。旧记录的待核实标记是参考，不要求新参赛者先导入或改写名单。原始记录与备注保留，参考管理和导入入口收在折叠区域内。
 
@@ -22,9 +22,9 @@
 
 没有登记行的队伍，读取资料不写数据库；首次合法保存仅为原队伍建立资料行，不另建队伍或账号。已审核人员来自原精确成员记录和关联申请；缺少可靠队长资料时只读提示核对。新增私有资料在 `team_profile_visibility` 中明确记为不公开，保存、审核同步和恢复不会将其自动加入公开组队名单；既存公开登记范围保持不变，手机号码不公开。
 
-旧公开创建、管理码读取及保存入口 `/api/registration/create|open|save` 一律退役为 410；正确旧码也不能再访问。管理员重发登记管理码入口同样退役；导入仅返回资料标识，不再发放管理码。公开目录 GET 保留，尚无参赛码的队伍继续通过 `#claim` 申请及修改待审成员。历史 hash 和原始资料保留，但没有普通路由继续用它们鉴权。
+已有有效管理码仍可通过原 `/api/registration/open|save` 读取和修改其既有登记行，保持原 43 字符 hash 校验、官方来源 CORS、无 Cookie 和限速规则。回包不包含新 profile 的私有人员 ID 或队友个体学校，不建立参赛会话，不授予作品、查分、AI 或后台权限；已作废/回收队伍的旧码不会自动恢复。两入口共用资料修订和原审核锁、正式项目保护及私有目录标记。旧码存储保留，冲突需显式重读；详情见 `team-registration.md`。
 
-回滚必须同时保留旧路由退役检查与私有资料目录过滤。旧版本会重新接受保留的历史管理码，并可能把新增私有资料公开；不可仅凭无破坏性迁移就回滚旧二进制或还原整库。
+公开创建新码 `/api/registration/create` 和管理员重发入口仍为 410；导入仍不发放管理码。新申请继续通过 `#claim`。兼容旧码不代表可以回滚旧二进制：回滚必须保留私有目录过滤和现有权限/冻结保护，旧版本可能把新增私有资料公开；不得仅凭无破坏性迁移就回滚旧程序或还原整库。
 
 ## 管理员审核已停用提交身份并重发
 
@@ -56,4 +56,4 @@ Use the protected `POST /api/admin/claims/roster` ingress with this alternate co
 
 New applications, pending edits and valid pending bearer status/redemption checks may attempt automatic approval. Rejected, expired and processed receipts are unchanged. Approval uses the existing atomic team/membership/account pipeline and frozen declaration; ordinary conflicts roll back to pending manual review. Snapshot revision, source digest and matched source IDs are recorded in a distinct `claims.approve-auto` audit event. The ordinary bearer redemption and credential fingerprint checks still govern delivery. Automatic approval does not provision API access.
 
-An existing name collision is reusable only for one active, unissued eligible registered team with the exact normalized team name, captain name/school and full member-name multiset. Registration collects only the captain school; teammate schools are established by the trusted snapshot. A name spanning different schools in the trusted snapshot leaves existing-registration reuse manual because the registration cannot distinguish those identities. Reuse preserves the team ID, project and original records, and applies authoritative membership/contact/target-size synchronization. Historical registration credentials remain retired. Other collisions remain manual.
+An existing name collision is reusable only for one active, unissued eligible registered team with the exact normalized team name, captain name/school and full member-name multiset. Registration collects only the captain school; teammate schools are established by the trusted snapshot. A name spanning different schools in the trusted snapshot leaves existing-registration reuse manual because the registration cannot distinguish those identities. Reuse preserves the team ID, project and original records, and applies authoritative membership/contact/target-size synchronization. Existing valid registration credentials retain only their original profile-edit capability. Other collisions remain manual.

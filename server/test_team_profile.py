@@ -191,9 +191,9 @@ class TeamProfileTests(unittest.TestCase):
         after=self.snapshot(list(before));after['settings']=[row for row in after['settings'] if row[0]!='updatedAt']
         self.assertEqual(after,before)
 
-    def test_retired_management_endpoints_ignore_even_correct_old_codes_and_admin_import_never_issues_one(self):
+    def test_new_management_code_creation_is_retired_and_admin_import_never_issues_one(self):
         _,_,_,legacy=self.owned(registered=True);before=self.snapshot(['accounts','sessions','teams','team_registrations','audit'])
-        for path in ['create','open','save']:
+        for path in ['create']:
             for code in [legacy,'invalid']:
                 result=self.public.post('/api/registration/'+path,{'code':code,'team':self.value()})
                 self.assertEqual(result[0],410,result[1]);self.assertEqual(result[1]['code'],'registration_code_retired')

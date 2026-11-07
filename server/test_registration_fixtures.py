@@ -2,7 +2,7 @@
 
 Claims/recycle regressions need preexisting registrations without issuing team
 accounts. These helpers build/read those fixtures directly; current authorization
-is exercised over HTTP in test_team_profile and the retired-route tests.
+is exercised over HTTP in test_team_profile and test_legacy_registration_access.
 """
 import sqlite3
 

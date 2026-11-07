@@ -298,7 +298,7 @@ class TeamLifecycleTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT status FROM team_details WHERE team_id=?',(team_id,)).fetchone()[0],'withdrawn')
             self.assertEqual(db.execute('SELECT snapshot_json FROM judging_roster').fetchone()[0],snapshot)
 
-    def test_retired_registration_code_stays_unusable_and_stale_context_rejects_profile_change(self):
+    def test_revoked_registration_code_stays_unusable_and_stale_context_rejects_profile_change(self):
         code=secrets.token_urlsafe(32)
         status,registered,_=registration_fixture_create(self,{'code':code,'team':{
             'name':'Synthetic Registered Access','captain':'Synthetic Captain','school':'Synthetic School',
@@ -311,9 +311,9 @@ class TeamLifecycleTests(unittest.TestCase):
         with self.service.db() as db:db.execute('UPDATE team_registrations SET phone=?,revision=revision+1 WHERE team_id=?',('13900000001',team_id))
         self.assertEqual(self.recycle(team_id,stale)[1]['code'],'team_context_conflict')
         self.assertEqual(self.recycle(team_id)[0],200)
-        self.assertEqual(self.public.post('/api/registration/open',{'code':code})[0],410)
+        self.assertEqual(self.public.post('/api/registration/open',{'code':code})[0],403)
         self.assertEqual(self.restore(team_id)[0],200)
-        self.assertEqual(self.public.post('/api/registration/open',{'code':code})[0],410)
+        self.assertEqual(self.public.post('/api/registration/open',{'code':code})[0],403)
 
     def test_gateway_final_recheck_rejects_recycled_and_restored_old_key(self):
         team_id=self.team(name='Synthetic Gateway')
