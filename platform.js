@@ -832,7 +832,7 @@ function installParticipantShortcuts(){
     const target=name && !name.disabled && !form?.querySelector('fieldset')?.disabled?name:form;
     if(!target)return;
     if(target===form)target.setAttribute('tabindex','-1');
-    target.focus({preventScroll:true});target.scrollIntoView({block:'center'});
+    target.focus({preventScroll:true});(name || form).scrollIntoView({block:'center'});
   };
 }
 

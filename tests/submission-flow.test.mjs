@@ -64,7 +64,7 @@ test('project introduction shortcut keeps a closed or busy form disabled while l
   const requestsBefore=f.calls.length;
   f.node('jump-team-project-intro').onclick();
   assert.equal(f.node('submission-form').focused,true);
-  assert.equal(f.node('submission-form').scrolled,true);
+  assert.equal(f.node('material-projectName').scrolled,true);
   assert.equal(f.node('material-projectName').focused,undefined);
   assert.equal(f.node('fieldset').disabled,true);
   assert.equal(f.node('material-summary').value,'Summary');
