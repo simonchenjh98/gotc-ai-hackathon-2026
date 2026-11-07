@@ -196,6 +196,48 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(status, 200, created)
         return team_id, client, created["key"]
 
+    def test_recorded_currencies_are_never_summed_or_relabelled_by_current_config(self):
+        team_id, client, _ = self.enabled_key()
+        at = keys.now_ms()
+        with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
+            key_id = db.execute("SELECT id FROM api_keys WHERE team_id=?", (team_id,)).fetchone()[0]
+            for currency, amount, timestamp in (("USD", 1_000_000, at), ("CNY", 1_000_000, at),
+                                                 ("legacy", 3_000_000, at - 2 * keys.DAY_MS)):
+                db.execute("""INSERT INTO api_usage(key_id,team_id,at,model,input_tokens,output_tokens,
+                  cache_write_tokens,cache_read_tokens,cost_micro,status,path,stream,duration_ms,user_agent,currency,billing_status)
+                  VALUES(?,?,?,'mixed-model',10,5,0,0,?,200,'/v1/chat/completions',0,10,'test',?,'settled')""",
+                           (key_id, team_id, timestamp, amount, currency))
+            db.commit()
+        # A later upstream configuration must not change the currency of history.
+        self.service.keys.config = {"openai": {"url": "https://ai.gitee.com/v1", "key": "synthetic",
+                                               "models": {"GLM-5": []}, "aliases": {}}}
+        status, listing, _ = client.get("/api/team/keys")
+        self.assertEqual(status, 200, listing)
+        self.assertEqual(listing["currency"], "CNY")
+        self.assertIsNone(listing["usage"]["usedTotal"])
+        self.assertIsNone(listing["usage"]["used24h"])
+        self.assertEqual({r["currency"]: r["cost"] for r in listing["billing24h"]}, {"CNY": 1, "USD": 1})
+        self.assertEqual({r["currency"]: r["cost"] for r in listing["keys"][0]["billing"]}, {"CNY": 1, "USD": 1, "legacy": 3})
+        self.assertIsNone(listing["keys"][0]["usedTotal"])
+        status, overview, _ = self.admin.get("/api/admin/keys")
+        self.assertEqual(status, 200, overview)
+        self.assertIsNone(overview["overview"]["cost"])
+        self.assertIsNone(overview["teams"][0]["used24h"])
+        self.assertEqual(overview["teams"][0]["billing24h"], listing["billing24h"])
+        status, stats, _ = self.admin.post("/api/admin/keys/stats", {"teamId": team_id, "days": 7})
+        self.assertEqual(status, 200, stats)
+        for row in (stats["totals"], stats["byKey"][0], stats["byModel"][0], stats["byClient"][0], stats["daily"][-1]):
+            self.assertIsNone(row["cost"])
+            self.assertEqual(row["currency"], "MIXED")
+        self.assertEqual(stats["daily"][0]["currency"], "legacy")
+        self.assertEqual(stats["daily"][0]["cost"], 3)
+        status, logs, _ = client.get("/api/team/keys/logs")
+        self.assertEqual(status, 200)
+        self.assertEqual({row["currency"] for row in logs["items"]}, {"USD", "CNY", "legacy"})
+        status, exported, _ = self.admin.get("/api/admin/keys/export")
+        self.assertEqual(status, 200)
+        self.assertTrue(all(currency in str(exported) for currency in ("USD", "CNY", "legacy")))
+
     def test_dispense_once_show_once_and_hash_only(self):
         team_id = self.team()
         client = self.team_client(team_id)

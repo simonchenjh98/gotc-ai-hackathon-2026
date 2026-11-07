@@ -14,6 +14,7 @@ import wave
 
 from errors import APIError
 import keys
+import gateway_uploads as uploads
 from gateway_media import MediaGateway, parse_multipart, _wav_duration
 
 
@@ -219,6 +220,101 @@ class TransportTests(unittest.TestCase):
         self.media.serve(handler, path.split("?", 1)[0], call, self.upstream)
         return call, handler.wfile.getvalue(), sent
 
+    def local_gitee_connection(self):
+        """Keep the guarded host, dial only the local fake provider."""
+        port = self.provider.server_port
+        class LocalConnection(keys._HTTPConnection):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._create_connection = lambda address, timeout, source_address=None: socket.create_connection(
+                    ("127.0.0.1", port), timeout=timeout)
+        self.upstream["url"] = "http://ai.gitee.com/v1"
+        return mock.patch.object(keys, "_HTTPConnection", LocalConnection)
+
+    def large_uploads(self):
+        return (
+            ("application/json", json.dumps({"model": "valid", "input": "x" * (2 * 1024 * 1024)}, separators=(",", ":")).encode()),
+            ("multipart/form-data; boundary=test-boundary",
+             multipart([("model", "valid", None), ("file", b"x" * (2 * 1024 * 1024), "input.wav")]))
+        )
+
+    def test_large_json_and_disk_spooled_multipart_use_global_upload_pool(self):
+        slots = threading.BoundedSemaphore(2)
+        with self.local_gitee_connection(), mock.patch.object(uploads, "_UPLOAD_SLOTS", slots), \
+                mock.patch.object(uploads, "QUEUE_TIMEOUT", 0), mock.patch.object(uploads, "wait_for_drain") as drain:
+            for mime, raw in self.large_uploads():
+                with self.subTest(mime=mime):
+                    Provider.calls = []
+                    slots.acquire(); slots.acquire()
+                    try:
+                        with self.assertRaises(keys.GatewayError) as caught:
+                            self.request(raw=raw, mime=mime)
+                        self.assertEqual(caught.exception.status, 429)
+                        self.assertEqual(Provider.calls, [])
+                        self.assertFalse(self.last_call["forwarded"])
+                        drain.assert_not_called()
+                    finally:
+                        slots.release(); slots.release()
+                    before = self.gw.rechecked
+                    call, _, _ = self.request(raw=raw, mime=mime)
+                    self.assertTrue(call["forwarded"])
+                    self.assertEqual(Provider.calls[-1][2], raw)
+                    self.assertEqual(self.gw.rechecked - before, 2)  # team queue and upload queue
+                    drain.assert_called_once()
+                    drain.reset_mock()
+                    self.assertTrue(slots.acquire(blocking=False))
+                    self.assertTrue(slots.acquire(blocking=False))
+                    self.assertFalse(slots.acquire(blocking=False))
+                    slots.release(); slots.release()
+            self.assertEqual(self.gw.admitted, self.gw.released)
+
+    def test_revocation_while_waiting_for_media_upload_sends_nothing(self):
+        slots = threading.BoundedSemaphore(2)
+        slots.acquire(); slots.acquire()
+        waiting = threading.Event()
+        revoked = threading.Event()
+        errors = []
+        class ObservedSlots:
+            def acquire(self, timeout):
+                waiting.set()
+                return slots.acquire(timeout=timeout)
+
+            def release(self):
+                slots.release()
+
+        def recheck(*_):
+            if revoked.is_set():
+                raise APIError(401, "key revoked while queued")
+
+        def submit():
+            try:
+                mime, raw = self.large_uploads()[1]
+                self.request(raw=raw, mime=mime)
+            except Exception as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=submit)
+        with self.local_gitee_connection(), mock.patch.object(uploads, "_UPLOAD_SLOTS", ObservedSlots()), \
+                mock.patch.object(uploads, "QUEUE_TIMEOUT", 3), mock.patch.object(self.gw, "recheck_access", side_effect=recheck):
+            worker.start()
+            try:
+                self.assertTrue(waiting.wait(2))
+                revoked.set()
+            finally:
+                slots.release()  # let the queued request recheck before connecting
+                worker.join(timeout=5)
+                slots.release()
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], APIError)
+            self.assertEqual(errors[0].status, 401)
+            self.assertEqual(Provider.calls, [])
+            self.assertFalse(self.last_call["forwarded"])
+            self.assertEqual(self.gw.admitted, self.gw.released)
+            self.assertTrue(slots.acquire(blocking=False))
+            self.assertTrue(slots.acquire(blocking=False))
+            slots.release(); slots.release()
+
     def test_json_model_route_and_credentials(self):
         call, raw, sent = self.request()
         self.assertEqual(call["usage"], [12, 0, 0, 0, 0])
@@ -298,7 +394,7 @@ class TransportTests(unittest.TestCase):
         call, raw, _ = self.request("/v1/completions", data={"model": "valid", "prompt": "hi", "stream": True})
         self.assertIn(b"[DONE]", raw)
         self.assertEqual(call["usage"][:2], [9, 3])
-        self.assertEqual(self.quotes[-1][1]["usage"][:2], [9, 3])
+        self.assertEqual(self.quotes[-1][1]["usage"], {"prompt_tokens": 9, "completion_tokens": 3})
 
     def test_provider_error_secret_redacted_and_never_retried(self):
         Provider.reply = (400, "application/json", b'{"error":{"message":"bad private-upstream-key"}}')

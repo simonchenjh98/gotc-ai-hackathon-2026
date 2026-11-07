@@ -170,8 +170,19 @@ def _tokens(usage):
     # prompt_tokens is OpenAI's inclusive count. Anthropic input_tokens excludes
     # cache creation/read tokens. Responses input_tokens is inclusive instead.
     anthropic = "prompt_tokens" not in usage and any(k in usage for k in ("cache_creation_input_tokens", "cache_read_input_tokens", "cache_creation"))
-    prompt = first((usage, "prompt_tokens"), (usage, "input_tokens"), (usage, "total_tokens"))
+    prompt = first((usage, "prompt_tokens"), (usage, "input_tokens"))
     output = first((usage, "completion_tokens"), (usage, "output_tokens"))
+    if "prompt_tokens" not in usage and "input_tokens" not in usage:
+        # A total includes output. It cannot be priced as input and output again.
+        # Anthropic cache-inclusive totals are ambiguous without input_tokens.
+        if "total_tokens" not in usage or anthropic:
+            return None
+        total = _decimal(usage["total_tokens"])
+        if output > total:
+            raise PricingError("Output tokens exceed the total token count")
+        if not any(k in usage for k in ("completion_tokens", "output_tokens")):
+            return None
+        prompt = total - output
     if not anthropic:
         if cached + written > prompt:
             raise PricingError("Cache tokens exceed the inclusive input token count")

@@ -332,13 +332,21 @@ def serve_websocket(gateway, handler, path, call, upstream):
             response.close()
         if worker and worker.is_alive():
             try:
-                handler.connection.shutdown(socket.SHUT_RD)
+                # End both directions after the last flushed frame. On Windows,
+                # SHUT_RD alone can leave the reader blocked while the peer waits
+                # for our EOF, delaying handler cleanup until its idle timeout.
+                handler.connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             worker.join(timeout=1)
         try:
             if call['forwarded']:
                 call['pricing_quantities'] = {'characters': request_characters}
+                if problems or not call['done']:
+                    # Preserve the outcome for pricing, without retaining provider
+                    # error text. Only an explicit upstream final cost can settle
+                    # a failed/incomplete session; sent text is not proof of work.
+                    provider_data['error'] = True
                 try:
                     call['billing'] = quote(snapshot, request=call['pricing_request'], response=provider_data,
                                             headers=dict(response.headers) if response else {}, started_at=call['requested_at'],

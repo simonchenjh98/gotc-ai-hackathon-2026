@@ -480,7 +480,13 @@ class FinalsService:
             raise APIError(404, '决赛接口不存在')
         if path == '/api/finals/login-status' and method == 'GET':
             return self.s.judge_login_schedule.view(db, 'finals')
-        if path in {'/api/finals/entry', '/api/finals/judge', '/api/finals/score', '/api/finals/nominations'}:
+        if path == '/api/finals/access':
+            if method != 'POST':
+                raise APIError(404, '决赛接口不存在')
+            self.s.judge_login_schedule.require_open(db, 'finals')
+            return self.grant_access(db, body, ip)
+        if path in FINALS_ACCESS_PATHS:
+            self.require_access(db, access_token)
             self.s.judge_login_schedule.require_open(db, 'finals')
         state = self.state(db)
         if path == '/api/finals/entry' and method == 'GET':

@@ -13,6 +13,7 @@ const msText=v=>v===null || v===undefined?'—':`${Number(v)}ms`;
 const apiTable=(head,rows,empty='暂无数据')=>`<div class="table-wrap"><table class="board-table api-table"><thead><tr>${head.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('') || `<tr><td colspan="${head.length}">${empty}</td></tr>`}</tbody></table></div>`;
 const apiCards=cards=>`<div class="api-cards">${cards.map(([label,value,sub])=>`<div class="api-stat"><span>${label}</span><strong>${value}</strong><small>${sub}</small></div>`).join('')}</div>`;
 const apiBadge=(text,tone='gray')=>`<span class="api-badge ${tone}">${esc(text)}</span>`;
+const apiGiteeAccount=u=>String(u.url || '').replace(/\/+$/,'')==='https://ai.gitee.com/v1';
 const apiAccountName=(kind,u)=>u.name || apiPresets.find(([,k,url])=>k===kind && url===u.url)?.[0] || (()=>{try{return new URL(u.url).host;}catch{return u.url;}})();
 let currentApiAdmin=null;
 const apiAdminDialogs=new Set();
@@ -70,8 +71,15 @@ async function renderApiAdmin(version){
 }
 
 function apiRanking(c){
-  const ranked=[...c.data.teams].sort((a,b)=>b.used24h-a.used24h);
-  return apiTable(['#','队伍','近24小时','累计','进行中 / 排队'],ranked.map((r,i)=>[i+1,esc(c.team(r.teamId))+(r.active?'':' '+apiBadge('已停用')),usd(r.used24h),usd(r.usedTotal),`${Number(r.inflight)} / ${Number(r.waiting || 0)}`]),'尚未开通队伍');
+  // Rank only amounts recorded in the same currency; never imply an exchange rate.
+  const currencies=[...new Set(c.data.teams.flatMap(t=>(t.billing24h || []).map(r=>r.currency)))].sort();
+  if(!currencies.length)return '<p class="small-note">近24小时尚无已记录费用。</p>';
+  return currencies.map(currency=>{
+    const amount=(r,field)=>(r[field] || []).find(x=>x.currency===currency)?.cost || 0;
+    const ranked=c.data.teams.filter(r=>(r.billing24h || []).some(x=>x.currency===currency))
+      .sort((a,b)=>amount(b,'billing24h')-amount(a,'billing24h'));
+    return `<h3>${esc(currency==='legacy'?'历史原计价':currency)}</h3>`+apiTable(['#','队伍','近24小时','累计（同币种）','进行中 / 排队'],ranked.map((r,i)=>[i+1,esc(c.team(r.teamId))+(r.active?'':' '+apiBadge('已停用')),usd(amount(r,'billing24h'),currency),usd(amount(r,'billing'),currency),`${Number(r.inflight)} / ${Number(r.waiting || 0)}`]),'尚未开通队伍');
+  }).join('');
 }
 
 const apiPageRenderers={
@@ -79,10 +87,10 @@ const apiPageRenderers={
     const o=c.data.overview,models=Object.values(c.data.models || {}).flat().length;
     c.actions.innerHTML='<a class="btn secondary small" href="api/admin/keys/export" download>导出用量 CSV ↓</a>';
     c.box.innerHTML=(c.data.enabled?'':'<div class="info-banner warning">尚未配置模型账号，队伍暂时无法调用。请先到 <a href="#admin-api/accounts">账号管理</a> 添加账号。</div>')+
-      billingNote(o.billing)+apiCards([['已开通队伍',c.data.teams.filter(t=>t.active).length,`共 ${c.teams.length} 支队伍`],['账号',Object.keys(c.data.upstreams).length,`${models} 个可用模型`],['今日请求',Number(o.requests),`失败 ${Number(o.errors)}`],['今日费用',usd(o.cost),`${Number(o.teams)} 支队伍调用`]])+
+      billingNote(o.billing)+apiCards([['已开通队伍',c.data.teams.filter(t=>t.active).length,`共 ${c.teams.length} 支队伍`],['账号',Object.keys(c.data.upstreams).length,`${models} 个可用模型`],['今日请求',Number(o.requests),`失败 ${Number(o.errors)}`],['今日费用',billingAmount(o.billing,o.cost),`${Number(o.teams)} 支队伍调用`]])+
       apiCards([['今日 Token',tokens(Number(o.input)+Number(o.output)),`输入 ${tokens(o.input)} · 输出 ${tokens(o.output)}`],['性能指标',`${o.rpm ?? 0} RPM`,`${tokens(o.tpm ?? 0)} TPM（近5分钟）`],['平均响应',msText(o.avgMs),`P95 ${msText(o.p95Ms)}`],['首字耗时',msText(o.avgFirstTokenMs),'今日平均']])+
       `<section class="api-card"><h2>近24小时消耗排行</h2>${apiRanking(c)}</section><section class="api-card"><h2>今日模型分布（北京时间）</h2><div id="api-models"><p class="small-note">读取中…</p></div></section>`;
-    c.request('admin/keys/stats',{days:1,granularity:'day'}).then(s=>{if(c.alive())document.getElementById('api-models').innerHTML=apiTable(['模型','请求','输入 / 输出 tokens','费用'],s.byModel.map(r=>[esc(r.model || '（被拦截，未到达模型）'),Number(r.requests),`${tokens(r.input)} / ${tokens(r.output)}`,usd(r.cost)]));})
+    c.request('admin/keys/stats',{days:1,granularity:'day'}).then(s=>{if(c.alive())document.getElementById('api-models').innerHTML=apiTable(['模型','请求','输入 / 输出 tokens','费用'],s.byModel.map(r=>[esc(r.model || '（被拦截，未到达模型）'),Number(r.requests),`${tokens(r.input)} / ${tokens(r.output)}`,usd(r.cost,r.currency || 'legacy')]));})
       .catch(e=>{if(c.alive())document.getElementById('api-models').innerHTML=`<p class="small-note">${esc(e.message)}</p>`;});
   },
   ops(c){
@@ -95,7 +103,7 @@ const apiPageRenderers={
   },
   teams(c){
     c.actions.innerHTML='<input type="search" class="api-search" placeholder="搜索队伍…" aria-label="搜索队伍">';
-    const rows=c.teams.map(t=>{const r=c.data.teams.find(x=>x.teamId===t.id);return `<tr data-team-row="${esc(teamLabel(t).toLowerCase())}"><td>${esc(teamLabel(t))}</td><td>${r?r.active?apiBadge('已开通','success'):apiBadge('已停用','danger'):apiBadge('未开通')}</td><td>${r?Number(r.keyCount):'—'}</td><td>${r?usd(r.used24h):'—'}</td><td>${r?usd(r.usedTotal):'—'}</td><td>${r?`${Number(r.inflight)} / ${Number(r.waiting || 0)}`:'—'}</td><td class="api-row-actions">${r?`<button type="button" class="link-button" data-key-stats="${esc(t.id)}">用量</button><button type="button" class="link-button" data-key-logs="${esc(t.id)}">调用记录</button>`:''}${r?.active?`<button type="button" class="link-button danger" data-key-revoke="${esc(t.id)}">停用 API</button>`:`<button type="button" class="link-button" data-key-provision="${esc(t.id)}">${r?'重新开通':'开通 API'}</button>`}</td></tr>`;}).join('');
+    const rows=c.teams.map(t=>{const r=c.data.teams.find(x=>x.teamId===t.id);return `<tr data-team-row="${esc(teamLabel(t).toLowerCase())}"><td>${esc(teamLabel(t))}</td><td>${r?r.active?apiBadge('已开通','success'):apiBadge('已停用','danger'):apiBadge('未开通')}</td><td>${r?Number(r.keyCount):'—'}</td><td>${r?billingAmount(r.billing24h,r.used24h):'—'}</td><td>${r?billingAmount(r.billing,r.usedTotal):'—'}</td><td>${r?`${Number(r.inflight)} / ${Number(r.waiting || 0)}`:'—'}</td><td class="api-row-actions">${r?`<button type="button" class="link-button" data-key-stats="${esc(t.id)}">用量</button><button type="button" class="link-button" data-key-logs="${esc(t.id)}">调用记录</button>`:''}${r?.active?`<button type="button" class="link-button danger" data-key-revoke="${esc(t.id)}">停用 API</button>`:`<button type="button" class="link-button" data-key-provision="${esc(t.id)}">${r?'重新开通':'开通 API'}</button>`}</td></tr>`;}).join('');
     c.box.innerHTML=`${c.data.enabled?'':'<div class="info-banner warning">尚未配置模型账号：开通后队伍可以创建密钥，但调用会失败。</div>'}<section class="api-card flush"><div class="table-wrap"><table class="board-table api-table"><thead><tr><th>队伍</th><th>状态</th><th>密钥</th><th>近24小时</th><th>累计</th><th>进行中 / 排队</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="7">录入队伍后可开通。</td></tr>'}</tbody></table></div></section><div id="key-detail" aria-live="polite"></div>`;
     c.actions.querySelector('input').oninput=e=>{const q=e.target.value.trim().toLowerCase();c.box.querySelectorAll('[data-team-row]').forEach(row=>row.hidden=!!q && !row.dataset.teamRow.includes(q));};
     c.box.querySelectorAll('[data-key-stats]').forEach(b=>b.onclick=()=>withBusy(b,()=>c.alive() && showKeyStats({teamId:b.dataset.keyStats},c.team(b.dataset.keyStats),7)));
@@ -105,7 +113,7 @@ const apiPageRenderers={
   accounts(c){
     const saved=c.data.upstreams,free=Object.keys(apiPlatforms).filter(k=>!saved[k]);
     c.actions.innerHTML=`<button type="button" class="btn secondary small" data-refresh>刷新</button><button type="button" class="btn small" data-add ${free.length?'':'disabled title="每个平台最多一个账号"'}>添加账号</button>`;
-    const pricing=u=>u.defaultPrice?`默认 $${Number(u.defaultPrice[0])} / $${Number(u.defaultPrice[1])}`:Object.values(u.models).some(p=>!p.length)?apiBadge('部分模型未定价，不计费','warning'):'按模型定价';
+    const pricing=u=>apiGiteeAccount(u)?apiBadge('人民币 · 目录计价'):u.defaultPrice?`默认 $${Number(u.defaultPrice[0])} / $${Number(u.defaultPrice[1])}`:Object.values(u.models).some(p=>!p.length)?apiBadge('部分模型未定价，不计费','warning'):'按模型定价';
     c.box.innerHTML=`<section class="api-card flush">${apiTable(['名称','平台/类型','状态','接口地址','模型','计费','操作'],Object.entries(saved).map(([kind,u])=>{const names=Object.keys(u.models);return [
       `<strong>${esc(apiAccountName(kind,u))}</strong>`,`<span class="api-platform ${kind}"><b>${esc(apiPlatforms[kind].label)}</b><i>Key</i></span>`,apiBadge('正常','success'),`<code>${esc(u.url)}</code>`,
       `${names.slice(0,3).map(m=>`<span class="api-chip">${esc(m)}</span>`).join('')}${names.length>3?`<small> 等 ${names.length} 个</small>`:''}${Object.keys(u.aliases || {}).length?`<br><small>${Object.keys(u.aliases).length} 条映射</small>`:''}`,pricing(u),
@@ -166,7 +174,7 @@ function apiAccountDialog(c,kind,editing){
         <div class="api-custom"><input data-custom placeholder="输入自定义模型名称" aria-label="自定义模型名称"><button type="button" class="btn secondary small" data-add-custom>填入</button></div><div data-catalog></div></div>
       <div data-pane="mapping" hidden><div class="info-banner">将请求模型映射到实际模型。以 * 结尾表示前缀匹配，例如 <code>${esc(p.alias)}</code> 让客户端写死的默认模型名也能使用。</div><div data-aliases></div>
         <div class="form-actions"><button type="button" class="btn secondary small api-dashed" data-alias-add>+ 添加映射</button><button type="button" class="btn secondary small" data-alias-preset>+ ${esc(p.alias)} → 第一个模型</button></div></div></div>
-    <div class="field"><span>计费</span><label class="field">${u.url==='https://ai.gitee.com/v1'?'Gitee 固定价占位（实际使用官方目录计费）':'默认单价（美元 / 百万 tokens）'}<span class="api-price-pair"><input name="defaultIn" inputmode="decimal" placeholder="输入价" value="${esc(u.defaultPrice?.[0] ?? '')}" aria-label="默认输入价"><input name="defaultOut" inputmode="decimal" placeholder="输出价" value="${esc(u.defaultPrice?.[1] ?? '')}" aria-label="默认输出价"></span><small>${u.url==='https://ai.gitee.com/v1'?'模力方舟按官方操作、阶梯、缓存及时段价格以人民币计费；图片、音视频等按各自单位或上游实际费用结算。这里的 token 固定价不覆盖官方目录。费用无法核实时显示待核价。':'未单独定价的模型按此固定价计费；缓存写入按输入价 1.25 倍、读取 0.1 倍计。'}</small></label>
+    <div class="field"><span>计费</span><p class="small-note">Base URL 为 Gitee AI 时按人民币目录计费，以下手工固定价不覆盖目录；金额暂时无法核实的请求显示待核价。</p><label class="field">${apiGiteeAccount(u)?'Gitee 固定价占位（实际使用官方目录计费）':'默认单价（美元 / 百万 tokens）'}<span class="api-price-pair"><input name="defaultIn" inputmode="decimal" placeholder="输入价" value="${esc(u.defaultPrice?.[0] ?? '')}" aria-label="默认输入价"><input name="defaultOut" inputmode="decimal" placeholder="输出价" value="${esc(u.defaultPrice?.[1] ?? '')}" aria-label="默认输出价"></span><small>${apiGiteeAccount(u)?'模力方舟按官方操作、阶梯、缓存及时段价格以人民币计费；图片、音视频等按各自单位或上游实际费用结算。这里的 token 固定价不覆盖官方目录。费用无法核实时显示待核价。':'未单独定价的模型按此固定价计费；缓存写入按输入价 1.25 倍、读取 0.1 倍计。'}</small></label>
       <details class="api-prices"><summary>按模型单独定价（可选）</summary><div data-prices></div></details></div>
   </div><footer><p class="form-error" role="alert"></p><button type="button" class="btn secondary small" data-close>取消</button><button type="submit" class="btn small">${editing?'更新':'创建'}</button></footer></form>`);
   const form=d.querySelector('form'),f=form.elements,q=sel=>d.querySelector(sel),alive=()=>d.open && c.alive() && session===owner && ownsBrowserLogin(owner);
@@ -216,7 +224,7 @@ function apiAccountDialog(c,kind,editing){
     if(!editing && !f.key.value.trim())throw new Error('请填写 API Key');
     const body=apiAccountPayload(saved,kind,{name:f.name.value,url:f.url.value,key:f.key.value,models:s.models,prices:s.prices,aliases:s.aliases,defaultPrice:[f.defaultIn.value,f.defaultOut.value]});
     await c.request('admin/keys/upstreams',{upstreams:body.upstreams});if(!alive())return;
-    const free=!body.upstreams[kind].defaultPrice && Object.values(body.upstreams[kind].models).some(x=>!x.length);
+    const free=!apiGiteeAccount(body.upstreams[kind]) && !body.upstreams[kind].defaultPrice && Object.values(body.upstreams[kind].models).some(x=>!x.length);
     toast(free?'账号已保存。注意：未设默认单价，未单独定价的模型不计费。':editing?'账号已更新，立即生效。':'账号已创建，立即生效。');d.close();await c.reload();
   }catch(error){formError(form,error.message);}});};
   drawChips();

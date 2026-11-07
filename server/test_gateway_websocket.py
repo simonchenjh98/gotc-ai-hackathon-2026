@@ -87,7 +87,9 @@ class Provider(socketserver.StreamRequestHandler):
         response = ("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n")
         if self.mode == "bad-protocol":
             response += "Sec-WebSocket-Protocol: surprise\r\n"
-        response += "Inference-Cost: 0.123\r\nInference-Currency: CNY\r\n\r\n"
+        if not self.mode.startswith("billing-") or self.mode == "billing-error-zero":
+            response += "Inference-Cost: " + ("0" if self.mode == "billing-error-zero" else "0.123") + "\r\nInference-Currency: CNY\r\n"
+        response += "\r\n"
         if self.mode in ("immediate", "error-close"):
             content = frame(1, b'{"usage":{"prompt_tokens":10,"completion_tokens":2}}')
             reason = b"private-upstream-key" if self.mode == "error-close" else b"done"
@@ -101,6 +103,14 @@ class Provider(socketserver.StreamRequestHandler):
             for opcode, payload in messages(self.rfile, True):
                 type(self).frames.append((opcode, payload))
                 if opcode in (1, 2):
+                    if self.mode.startswith("billing-"):
+                        if self.mode == "billing-disconnect":
+                            return
+                        event = b'{"error":{"message":"synthetic failure"}}' if self.mode in ("billing-error", "billing-error-zero") else b'{}'
+                        code = 1008 if self.mode == "billing-error-close" else 1000
+                        self.wfile.write(frame(1, event) + frame(8, struct.pack("!H", code)))
+                        self.wfile.flush()
+                        return
                     self.wfile.write(frame(1, b'{"usage":{"prompt_tokens":5,"completion_tokens":3}}') +
                                      frame(8, struct.pack("!H", 1000)))
                     self.wfile.flush()
@@ -149,7 +159,9 @@ class BridgeTests(unittest.TestCase):
     def bridge(self, outgoing=None, browser_auth=False):
         server_side, client = socket.socketpair()
         server_side.settimeout(2)
-        client.settimeout(2)
+        # Allow the bridge's bounded worker shutdown to finish before the test
+        # reader times out on abrupt upstream disconnects.
+        client.settimeout(5)
         headers = handshake_headers(not browser_auth)
         if browser_auth:
             headers["Sec-WebSocket-Protocol"] = "realtime, openai-insecure-api-key.client-key"
@@ -205,6 +217,30 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.call["billing"]["cost_micro"], 123000)
         self.assertEqual(self.gateway.admitted, self.gateway.released)
         self.assertEqual(len(self.gateway.records), 1)
+
+    def test_failed_speech_without_final_fee_is_pending_but_explicit_zero_settles(self):
+        from gateway_pricing import Catalog as PriceCatalog
+        self.patch.stop()  # Exercise actual pricing, rather than the fixed-fee stub.
+        catalog = PriceCatalog()
+        self.gateway.catalog = types.SimpleNamespace(resolve=lambda model, path, body:
+            catalog.resolve("TeleTTS-Mandarin", path, body))
+        for mode in ("billing-error", "billing-error-close", "billing-disconnect", "billing-error-zero", "billing-success"):
+            with self.subTest(mode=mode):
+                Provider.mode = mode
+                self.bridge(frame(1, b'{"input":"hello world!"}', True))
+                result = self.call["billing"]
+                failed_without_cost = mode not in ("billing-success", "billing-error-zero")
+                self.assertEqual(result["pending"], failed_without_cost)
+                if failed_without_cost:
+                    self.assertIsNone(result["cost_micro"])
+                    self.assertFalse(result["estimated"])
+                elif mode == "billing-error-zero":
+                    self.assertEqual(result["cost_micro"], 0)
+                    self.assertFalse(result["estimated"])
+                else:
+                    self.assertEqual(result["cost_micro"], 2880)
+                    self.assertTrue(result["estimated"])
+                self.assertEqual(self.gateway.admitted, self.gateway.released)
 
     def test_client_messages_masked_and_credentials_only_in_upstream_authorization(self):
         self.bridge(frame(1, b'{"model":"valid","input":"hello"}', True), browser_auth=True)

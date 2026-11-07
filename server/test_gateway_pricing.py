@@ -67,6 +67,26 @@ class PricingTests(unittest.TestCase):
         self.assertTrue(r["pending"])
         self.assertIsNone(r["cost_micro"])
 
+    def test_partial_total_does_not_double_count_output_or_invent_input(self):
+        snapshot = self.snapshot("GLM-5")
+        complete = quote(snapshot, usage={"prompt_tokens": 60, "completion_tokens": 40})
+        for output_name in ("completion_tokens", "output_tokens"):
+            result = quote(snapshot, usage={"total_tokens": 100, output_name: 40})
+            self.assertFalse(result["pending"])
+            self.assertEqual(result["cost_micro"], complete["cost_micro"])
+        for usage in ({"total_tokens": 100}, {"completion_tokens": 40},
+                      {"total_tokens": 30, "completion_tokens": 40},
+                      {"total_tokens": 100, "completion_tokens": 40, "cache_read_input_tokens": 20}):
+            self.assertTrue(quote(snapshot, usage=usage)["pending"], usage)
+
+    def test_partial_total_preserves_inclusive_cached_input(self):
+        snapshot = self.snapshot("GLM-5")
+        partial = {"total_tokens": 100, "completion_tokens": 40,
+                   "prompt_tokens_details": {"cached_tokens": 20}}
+        complete = {**partial, "prompt_tokens": 60}
+        self.assertEqual(quote(snapshot, usage=partial)["cost_micro"],
+                         quote(snapshot, usage=complete)["cost_micro"])
+
     def test_off_peak_boundaries_and_timezone(self):
         s = self.snapshot("deepseek-v4.1-flash")
         for local, expected in (("08:59:59", 0.5), ("09:00:00", 1), ("12:00:00", 0.5),

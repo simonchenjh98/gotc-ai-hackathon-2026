@@ -20,6 +20,7 @@ from urllib.parse import parse_qsl, urlsplit
 import wave
 
 from errors import APIError
+from gateway_uploads import SizedUpload
 
 UPLOAD_LIMIT = 32 * 1024 * 1024
 REPLY_LIMIT = 64 * 1024 * 1024
@@ -287,7 +288,7 @@ class MediaGateway:
         from gateway_pricing import PricingError, quote
         try:
             call["billing"] = quote(call["pricing_snapshot"], request=call["pricing_request"], response=response,
-                                    usage=call["usage"] if any(call["usage"]) else None,
+                                    usage=call.get("pricing_usage"),
                                     headers=call.get("pricing_headers"),
                                     started_at=call["requested_at"])
         except PricingError:
@@ -376,7 +377,8 @@ class MediaGateway:
         if "X-Compute-Id" in headers:
             headers["X-Failover-Enabled"] = "false"
         request = urllib.request.Request(upstream["url"].rstrip("/") + path[len("/v1"):],
-                                         data=payload, headers=headers, method="POST")
+                                         data=SizedUpload(payload, length), headers=headers, method="POST")
+        request._gotc_upload_admitted = lambda: gateway.upload_ready(handler, call)
         handler.connection.settimeout(core.UPSTREAM_TIMEOUT)
         try:
             # Generations can have side effects. A submitted request is never automatically replayed.
@@ -434,7 +436,7 @@ class MediaGateway:
                         call["forwarded"], call["billing"] = False, _zero("provider_rejected")
                         raise core.GatewayError("upstream", "上游模型服务返回错误", upstream_status=response.status,
                                                 upstream_message=core.upstream_message(raw, gateway.error_secrets(call)))
-                    core.read_usage("openai", data, call["usage"])
+                    core.read_usage("openai", data, call["usage"], call)
                     if path.startswith("/v1/async/"):
                         data = self.tasks.register(call, upstream, data, request=body, headers=dict(response.headers))
                         raw = core.gateway_json(data)
