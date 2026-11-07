@@ -7,7 +7,7 @@ const source=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8').s
 const sha='a'.repeat(40),previewId='b'.repeat(48);
 const repository={teamId:'T1',provider:'github',organization:'GOTC-AI-HACKATHON',slug:'gotc-2026-team-1-123',branch:'main',codeUrl:'https://github.com/GOTC-AI-HACKATHON/gotc-2026-team-1-123',state:'invited',revision:3,usernames:['Developer'],protection:'unverified',message:'等待接受邀请',archived:false};
 const providers=[{provider:'github',organization:'GOTC-AI-HACKATHON',enabled:true,message:'已配置'},{provider:'gitee',organization:'gotc-ai-hackathon',enabled:false,message:'尚未启用'}];
-const materials={projectName:'Synthetic',summary:'Summary',codeUrl:'',codeVersion:'',readmeUrl:'https://example.test/readme',license:'MIT',licenseUrl:'',demoUrl:'',demoInstructions:'Run locally',slidesUrl:'https://example.test/slides',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
+const materials={projectName:'Synthetic',summary:'Summary',codeUrl:'',codeVersion:'',readmeUrl:'https://example.test/readme',license:'MIT',licenseUrl:'',demoUrl:'https://example.test/demo',demoInstructions:'Run locally',slidesUrl:'https://example.test/slides',filesUrl:'',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
 function fixture(options={}){
   const boundRepository=options.repository || repository;
   const nodes=new Map(),calls=[];

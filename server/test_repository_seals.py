@@ -91,6 +91,20 @@ class SealedTests(unittest.TestCase):
         self.assertIn('repositorySeal', preview)
         return preview
 
+    def test_reconcile_binding_can_seal_preview_and_submit(self):
+        with self.service.db() as db:
+            db.execute("UPDATE repository_bindings SET state='reconcile' WHERE team_id=?", (self.team_id,))
+        status, data, _ = self.request(self.client, '/api/team/repository')
+        self.assertEqual(status, 200, data)
+        repository = data['repository']
+        self.assertEqual(repository['state'], 'reconcile')
+        self.assertTrue(repository['canSubmit'])
+        preview = self.sealed_preview()
+        status, result, _ = self.formal_submit(preview)
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result['receipt']['materials']['codeVersion'], preview['sha'])
+        self.assertEqual(result['receipt']['repositorySeal']['sha'], preview['sha'])
+
     def test_local_confirmation_and_exact_receipt_replay(self):
         preview = self.sealed_preview()
         seal = preview['repositorySeal']

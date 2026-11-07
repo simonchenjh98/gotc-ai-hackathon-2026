@@ -9,7 +9,7 @@ import secrets
 import sqlite3
 from errors import APIError
 
-URL_FIELDS=('codeUrl','readmeUrl','licenseUrl','demoUrl','slidesUrl','videoUrl','repositoryMaterialsUrl')
+URL_FIELDS=('codeUrl','readmeUrl','licenseUrl','demoUrl','slidesUrl','videoUrl','filesUrl','repositoryMaterialsUrl')
 CHECK_STATUSES={'unchecked','accessible','permission_required','unavailable'}
 DDL=[
 '''CREATE TABLE IF NOT EXISTS submission_records_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL)''',

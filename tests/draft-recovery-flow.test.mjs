@@ -10,14 +10,95 @@ function fixture(storage=new Storage(),options={}){
   const nodes=new Map(),calls=[],hooks={},consumedReceipts=[];let data={team:{id:'T1',number:1,name:'One',project:''},submission:{version:0,draft:null,submitted:null,submittedVersion:null},window:{canEdit:true,submissionDeadline:null},judgingMaterials:{},...(options.repository?{repository:options.repository}:{})};
   function node(id){if(nodes.has(id))return nodes.get(id);const item={id,isConnected:true,hidden:false,value:'',checked:false,disabled:false,readOnly:false,type:'text',dataset:{},listeners:{},classList:{add(){},remove(){}},focus(){},scrollIntoView(){},insertAdjacentHTML(position,value){this.innerHTML=position==='afterbegin'?value+this.innerHTML:this.innerHTML+value;},addEventListener(event,fn){this.listeners[event]=fn;},querySelector(){return null;},querySelectorAll(selector){return (this.buttons || []).filter(button=>selector===`[data-${button.attribute}]`);}};let html='';Object.defineProperty(item,'innerHTML',{configurable:true,get:()=>html,set(value){html=value;for(const match of value.matchAll(/id="([^"]+)"/g))node(match[1]);item.buttons=[...value.matchAll(/data-(local-view|local-discard)="(\d+)"/g)].map(match=>({attribute:match[1],disabled:false,isConnected:true,dataset:{[match[1]==='local-view'?'localView':'localDiscard']:match[2]}}));}});nodes.set(id,item);return item;}
   const root=node('platform-main'),setRoot=Object.getOwnPropertyDescriptor(root,'innerHTML').set;
-  Object.defineProperty(root,'innerHTML',{get:()=>root.html || '',set(value){for(const n of nodes.values())if(n!==root)n.isConnected=false;nodes.clear();nodes.set(root.id,root);root.html=value;setRoot(value);const form=node('submission-form');form.elements={};const formHtml=value.match(/<form id="submission-form"[\s\S]*?<\/form>/)?.[0] || '';for(const key of ['projectName','summary','codeUrl','codeVersion','readmeUrl','license','licenseUrl','demoUrl','demoInstructions','slidesUrl','videoUrl','sourcesAndLimitations','confirmed']){if(!formHtml.includes(`name="${key}"`))continue;const field=node('material-'+key);field.value=data.submission.draft?.[key] || '';field.checked=key==='confirmed'?!!data.submission.draft?.confirmed:false;field.type=key==='confirmed'?'checkbox':'text';form.elements[key]=field;}const fieldset=node('fieldset');form.querySelector=selector=>selector==='fieldset'?fieldset:selector==='.form-error'?node('form-error'):null;form.querySelectorAll=selector=>selector==='input,textarea'?Object.values(form.elements):selector==='button'?[node('save-submission-draft')]:[];node('submission-preview').querySelectorAll=selector=>selector==='button'?[node('confirm-submission'),node('cancel-submission-preview')]:[];}});
+  Object.defineProperty(root,'innerHTML',{get:()=>root.html || '',set(value){for(const n of nodes.values())if(n!==root)n.isConnected=false;nodes.clear();nodes.set(root.id,root);root.html=value;setRoot(value);const form=node('submission-form');form.elements={};const formHtml=value.match(/<form id="submission-form"[\s\S]*?<\/form>/)?.[0] || '';for(const key of ['projectName','summary','codeUrl','codeVersion','readmeUrl','license','licenseUrl','demoUrl','demoInstructions','slidesUrl','filesUrl','videoUrl','sourcesAndLimitations','confirmed']){if(!formHtml.includes(`name="${key}"`))continue;const field=node('material-'+key);field.value=data.submission.draft?.[key] || '';field.checked=key==='confirmed'?!!data.submission.draft?.confirmed:false;field.type=key==='confirmed'?'checkbox':'text';form.elements[key]=field;}const fieldset=node('fieldset');form.querySelector=selector=>selector==='fieldset'?fieldset:selector==='.form-error'?node('form-error'):null;form.querySelectorAll=selector=>selector==='input,textarea'?Object.values(form.elements):selector==='button'?[node('save-submission-draft')]:[];node('submission-preview').querySelectorAll=selector=>selector==='button'?[node('confirm-submission'),node('cancel-submission-preview')]:[];}});
   const response=(body,status=200)=>({ok:status<400,status,json:async()=>{if(body?.receipt?.status==='succeeded')consumedReceipts.push(body.receipt.requestId);return structuredClone(body);}});
-  const fetch=async(url,options={})=>{const path=new URL(url).pathname.split('/api/')[1],body=options.body?JSON.parse(options.body):undefined;calls.push({path,body,method:options.method,headers:options.headers});if(hooks[path])return hooks[path](body);if(path==='team')return response(data);if(path==='logout')return response({ok:true});if(path==='submission'){const nextVersion=data.submission.version+1;data={...data,submission:{...data.submission,version:nextVersion,draft:body.materials,submitted:body.status==='submitted'?body.materials:data.submission.submitted,submittedVersion:body.status==='submitted'?nextVersion:data.submission.submittedVersion,submittedAt:1234,updatedAt:1234}};return response({ok:true,...data,receipt:{requestId:body.requestId,status:'succeeded',action:body.status,baseVersion:body.expectedVersion,version:nextVersion,savedAt:1234,materials:body.materials,historyVersion:body.status==='submitted'?nextVersion:null}});}throw new Error(path);};
+  const fetch=async(url,options={})=>{const path=new URL(url).pathname.split('/api/')[1],body=options.body?(path.startsWith('team/uploads/')?options.body:JSON.parse(options.body)):undefined;calls.push({path,body,method:options.method,headers:options.headers,credentials:options.credentials});if(hooks[path])return hooks[path](body);if(path==='team')return response(data);if(path==='logout')return response({ok:true});if(path==='submission'){const nextVersion=data.submission.version+1;data={...data,submission:{...data.submission,version:nextVersion,draft:body.materials,submitted:body.status==='submitted'?body.materials:data.submission.submitted,submittedVersion:body.status==='submitted'?nextVersion:data.submission.submittedVersion,submittedAt:1234,updatedAt:1234}};return response({ok:true,...data,receipt:{requestId:body.requestId,status:'succeeded',action:body.status,baseVersion:body.expectedVersion,version:nextVersion,savedAt:1234,materials:body.materials,historyVersion:body.status==='submitted'?nextVersion:null}});}throw new Error(path);};
   const context=vm.createContext({document:{getElementById:node},location:{href:'https://example.test/gotc/platform.html#team'},URL,TextEncoder,Intl,Date,Math,setTimeout,clearTimeout,AbortController,localStorage:storage,fetch,confirm:()=>true});vm.runInContext(helper,context);vm.runInContext(source+'\nrouteVersion=1;route="team";session={role:"team"};globalThis.render=()=>renderTeam(1);globalThis.current=()=>currentTeamRecovery;globalThis.establish=login=>{publishLogin(login);session=login;};globalThis.invokeApi=api;globalThis.dirty=()=>submissionDirty;globalThis.logout=()=>{account();return document.getElementById("logout").listeners.click();};globalThis.seed=(teamId,summary,baseVersion=0,state="editing",at=Date.now())=>{const fields=materialFields.map(([key,,limit])=>[key,limit]),materials=Object.fromEntries(fields.map(([key])=>[key,key==="summary"?summary:""]));return GotcDraftRecovery.create({storage:()=>localStorage,namespace:base.pathname,teamId,baseVersion,baseMaterials:Object.fromEntries(fields.map(([key])=>[key,""])),fields,now:()=>at}).write(materials,state,state==="editing"?null:"draft");};renderRoute=async()=>{};',context);
   return {context,storage,nodes,node,root,calls,hooks,response,consumedReceipts,savedResponse(next){const sent=calls.filter(call=>call.path==='submission').at(-1).body;const receipt={requestId:sent.requestId,status:'succeeded',action:sent.status,baseVersion:sent.expectedVersion,version:next.submission.version,savedAt:1234,materials:sent.materials,historyVersion:sent.status==='submitted'?next.submission.version:null};assert.equal(vm.runInContext('matchingSubmissionReceipt',context)(receipt,sent.requestId,sent.status,sent.expectedVersion),true);return response({...next,receipt});},get data(){return data;},set data(next){data=next;},edit(key,value,event='input'){node('submission-form').elements[key].value=value;node('submission-form').listeners[event]();},inspect(index=0){return node('local-draft-candidates').querySelectorAll('[data-local-view]')[index].onclick();},slots(){return [...storage.map.values()].filter(value=>value.startsWith('{')).map(value=>JSON.parse(value));}};
 }
+
+const uploaded=(kind,ext)=>({kind,url:'https://example.test/gotc/materials/'+('u'.repeat(43))+'/'+encodeURIComponent('One+作品.'+ext),filename:'One+作品.'+ext,size:12});
+async function uploadFixture(){const f=fixture();f.context.establish({role:'team',loginId:'upload-login'});await f.context.render();f.edit('projectName','作品');f.edit('summary','Keep this summary');return f;}
+function chooseUpload(f,kind,name,size=12){f.node(`upload-${kind}-file`).files=[{name,size}];f.node(`upload-${kind}-file`).listeners.change();}
+
+test('binary upload fills the matching URL and local recovery without submitting or storing file bytes',async()=>{
+  for(const [kind,ext,field] of [['slides','pptx','slidesUrl'],['files','zip','filesUrl'],['demo','html','demoUrl']]){
+    const f=await uploadFixture(),result=uploaded(kind,ext);chooseUpload(f,kind,'原文件.'+ext);f.node('material-confirmed').checked=true;
+    f.hooks['team/uploads/'+kind]=()=>f.response(result);await f.node(`upload-${kind}-button`).onclick();
+    const request=f.calls.find(c=>c.path==='team/uploads/'+kind);
+    assert.equal(request.body,f.node(`upload-${kind}-file`).files[0]);assert.equal(request.method,'POST');assert.equal(request.credentials,'same-origin');
+    assert.equal(request.headers['Content-Type'],'application/octet-stream');assert.equal(request.headers['X-GOTC-Login'],'upload-login');assert.equal(request.headers['X-GOTC-Project'],encodeURIComponent('作品'));assert.equal(request.headers['X-GOTC-Filename'],encodeURIComponent('原文件.'+ext));
+    assert.equal(f.node('material-'+field).value,result.url);assert.equal(f.node('material-confirmed').checked,false);assert.equal(f.node('material-summary').value,'Keep this summary');
+    assert.ok(f.slots().some(record=>record.materials[field]===result.url));assert.ok(f.slots().every(record=>!JSON.stringify(record).includes('原文件')));assert.match(f.node(`upload-${kind}-status`).textContent,/尚未保存草稿或正式提交/);
+    assert.match(f.node(`upload-${kind}-result`).innerHTML,/One\+作品/);assert.equal(f.calls.filter(c=>c.path==='submission').length,0);
+    await f.node('save-submission-draft').onclick();assert.equal(f.data.submission.draft[field],result.url);
+  }
+});
+
+test('an upload is single-flight and blocks draft save, preview and an already-rendered confirmation',async()=>{
+  const f=await uploadFixture(),gate=deferred();
+  for(const [key,value] of Object.entries({codeUrl:'https://github.com/team/project',codeVersion:'a'.repeat(40),readmeUrl:'https://example.test/readme',license:'MIT',demoUrl:'https://example.test/demo',slidesUrl:'https://example.test/slides',sourcesAndLimitations:'Synthetic only'}))f.edit(key,value);
+  f.node('material-confirmed').checked=true;await f.node('submission-form').onsubmit({preventDefault(){}});const oldConfirm=f.node('confirm-submission').onclick;assert.equal(typeof oldConfirm,'function');
+  chooseUpload(f,'slides','slides.pptx');chooseUpload(f,'files','files.zip');f.hooks['team/uploads/slides']=()=>gate.promise;
+  const pending=f.node('upload-slides-button').onclick();assert.equal(f.node('save-submission-draft').disabled,true);assert.equal(f.node('check-submission').disabled,true);assert.equal(f.node('submission-preview').innerHTML,'');
+  await f.node('upload-slides-button').onclick();await f.node('upload-files-button').onclick();await f.node('save-submission-draft').onclick();await f.node('submission-form').onsubmit({preventDefault(){}});await oldConfirm();
+  assert.equal(f.calls.filter(c=>c.path.startsWith('team/uploads/')).length,1);assert.equal(f.calls.filter(c=>c.path==='submission').length,0);
+  gate.resolve(f.response(uploaded('slides','pptx')));await pending;assert.equal(f.node('save-submission-draft').disabled,false);assert.equal(f.node('check-submission').disabled,false);assert.equal(f.node('material-confirmed').checked,false);
+});
+
+test('upload failures and invalid receipts preserve the old URL and unrelated input',async()=>{
+  for(const failure of ['network','server','receipt']){
+    const f=await uploadFixture();f.edit('filesUrl','https://example.test/old.zip');chooseUpload(f,'files','files.zip');
+    f.hooks['team/uploads/files']=()=>{if(failure==='network')throw new TypeError('Network failure');return failure==='server'?f.response({error:'上传未成功'},413):f.response({...uploaded('files','zip'),url:'https://other.test/file.zip'});};
+    await f.node('upload-files-button').onclick();assert.equal(f.node('material-filesUrl').value,'https://example.test/old.zip');assert.equal(f.node('material-summary').value,'Keep this summary');assert.equal(f.node('save-submission-draft').disabled,false);assert.equal(f.calls.filter(c=>c.path==='submission').length,0);assert.ok(!f.node('upload-files-status').textContent.includes('文件已上传'));
+  }
+});
+
+test('editing project name or target link during upload keeps the new input and offers the uploaded file separately',async()=>{
+  for(const key of ['projectName','slidesUrl']){
+    const f=await uploadFixture(),gate=deferred();f.edit('slidesUrl','https://example.test/old');chooseUpload(f,'slides','slides.pptx');f.hooks['team/uploads/slides']=()=>gate.promise;
+    const pending=f.node('upload-slides-button').onclick();f.edit(key,key==='projectName'?'新作品':'https://example.test/new');gate.resolve(f.response(uploaded('slides','pptx')));await pending;
+    assert.equal(f.node('material-slidesUrl').value,key==='slidesUrl'?'https://example.test/new':'https://example.test/old');assert.match(f.node('upload-slides-status').textContent,/未替换当前输入/);assert.match(f.node('upload-slides-result').innerHTML,/查看 \/ 下载/);
+  }
+});
+
+test('renaming a project retains uploaded links and explicitly asks for a renamed upload',async()=>{
+  const f=await uploadFixture();chooseUpload(f,'demo','demo.html');f.hooks['team/uploads/demo']=()=>f.response(uploaded('demo','html'));await f.node('upload-demo-button').onclick();const url=f.node('material-demoUrl').value;
+  f.edit('projectName','新作品');assert.equal(f.node('material-demoUrl').value,url);assert.match(f.node('upload-demo-status').textContent,/作品名称已变化.*重新上传/);
+  f.edit('projectName','作品');assert.ok(!f.node('upload-demo-status').textContent.includes('作品名称已变化'));
+});
+
+test('late upload success and denial cannot paint or lock a new team login',async()=>{
+  for(const status of [200,403]){
+    const f=await uploadFixture(),gate=deferred();chooseUpload(f,'demo','demo.html');f.hooks['team/uploads/demo']=()=>gate.promise;
+    const pending=f.node('upload-demo-button').onclick();f.context.establish({role:'team',loginId:'new-login'});f.data={...f.data,team:{id:'T2',number:2,name:'Two'}};await f.context.render();f.edit('demoUrl','https://example.test/new-team');
+    gate.resolve(f.response(status===200?uploaded('demo','html'):{error:'expired'},status));await pending;
+    assert.equal(f.node('material-demoUrl').value,'https://example.test/new-team');assert.equal(f.node('fieldset').disabled,false);assert.ok(!f.node('upload-demo-result').innerHTML.includes('One+作品'));assert.ok(f.slots().filter(r=>r.teamId==='T2').every(r=>r.materials.demoUrl==='https://example.test/new-team'));
+  }
+});
+
+test('missing title, mismatched file extension and oversized file fail before sending bytes',async()=>{
+  for(const [project,kind,name,size] of [['','slides','slides.pptx',12],['作品','demo','site.zip',12],['作品','files','files.zip',100*1024*1024+1],['作品','slides','empty.pdf',0]]){
+    const f=await uploadFixture();f.edit('projectName',project);chooseUpload(f,kind,name,size);await f.node(`upload-${kind}-button`).onclick();assert.equal(f.calls.filter(c=>c.path.startsWith('team/uploads/')).length,0);assert.ok(f.node(`upload-${kind}-status`).textContent);
+  }
+});
 test('authorized same-version recovery preserves raw strings, clears confirmation and never sends a POST',async()=>{
   const f=fixture();f.context.seed('T1','  local\nraw  ');await f.context.render();assert.equal(f.slots().length,1);assert.ok(!f.node('local-draft-candidates').innerHTML.includes('副本编号'));await f.inspect();assert.match(f.node('local-restore-actions').innerHTML,/confirm-local-restore/);await f.node('confirm-local-restore').onclick({currentTarget:f.node('confirm-local-restore')});assert.equal(f.node('material-summary').value,'  local\nraw  ');assert.equal(f.node('material-confirmed').checked,false);assert.equal(f.calls.filter(c=>c.body).length,0);assert.equal(f.slots().length,2);assert.equal(f.context.dirty(),true);
+});
+
+test('pre-upload schema-1 draft remains visible and restores every original field before normal save',async()=>{
+  const f=fixture(),seed=f.context.seed('T1','OLD RAW SUMMARY'),legacy=JSON.parse(seed.raw);
+  delete legacy.materials.filesUrl;delete legacy.baseMaterials.filesUrl;
+  for(const key of Object.keys(legacy.materials))legacy.materials[key]=key.endsWith('Url')?'https://example.test/'+key:key==='codeVersion'?'a'.repeat(40):`  ${key} 原始文字\n第二行  `;
+  const original=JSON.stringify(legacy);f.storage.setItem(seed.key,original);
+  await f.context.render();assert.match(f.node('local-draft-candidates').innerHTML,/本地副本/);assert.equal(f.storage.getItem(seed.key),original);assert.equal(f.slots().length,1);
+  await f.inspect();assert.match(f.node('local-restore-actions').innerHTML,/confirm-local-restore/);assert.equal(f.storage.getItem(seed.key),original);
+  await f.node('confirm-local-restore').onclick({currentTarget:f.node('confirm-local-restore')});
+  for(const [key,value] of Object.entries(legacy.materials))assert.equal(f.node('material-'+key).value,value,key);
+  assert.equal(f.node('material-filesUrl').value,'');assert.equal(f.node('material-confirmed').checked,false);assert.equal(f.storage.getItem(seed.key),original);assert.equal(f.calls.filter(c=>c.path==='submission').length,0);
+  await f.node('save-submission-draft').onclick();const sent=f.calls.find(c=>c.path==='submission').body.materials;
+  for(const [key,value] of Object.entries(legacy.materials))assert.equal(sent[key],value.trim(),key);
+  assert.equal(sent.filesUrl,'');assert.equal(f.storage.getItem(seed.key),original);
 });
 test('server-version changes and closed windows only offer comparison/copy instead of whole-form restore',async()=>{
   const f=fixture();f.context.seed('T1','LOCAL');f.data={...f.data,submission:{...f.data.submission,version:1,draft:{summary:'TEAMMATE'}}};await f.context.render();await f.inspect();assert.match(f.node('local-draft-comparison').innerHTML,/服务器版本已更新/);assert.match(f.node('local-draft-comparison').innerHTML,/TEAMMATE/);assert.ok(!f.node('local-restore-actions').innerHTML.includes('confirm-local-restore'));

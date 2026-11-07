@@ -37,7 +37,9 @@ from judge_login_schedule import JudgeLoginSchedule
 from admin_data import AdminDataService, TRACK_OPTIONS
 from admin_team_access import AdminTeamAccess, PATHS as ADMIN_TEAM_PATHS, operator_for
 from keys import KeyService, load_config
+from gateway_cors import origin_allowed, preflight_allowed, response_headers as gateway_cors_headers
 from team_lifecycle import TeamLifecycle, PATHS as TEAM_LIFECYCLE_PATHS
+from material_uploads import MaterialUploads
 
 DIMENSIONS = [
     {"id": "problem", "name": "问题价值与理解", "max": 20},
@@ -272,6 +274,7 @@ class EventService:
         self.claims=Claims(self,now_ms,text_field,scrypt_hash)
         self.registration=TeamRegistration(self,now_ms,text_field)
         self.submission_records=SubmissionRecords(self)
+        self.material_uploads=MaterialUploads(self)
         self.repositories=Repositories(self)
         self.repository_backups=RepositoryBackups(self)
         self.write_conflicts=WriteConflicts(self)
@@ -330,6 +333,7 @@ class EventService:
         os.chmod(self.db_path, 0o600)
         self.submission_records.initialize(backup=database_existed)
         with self.db() as db:self.repository_backups.initialize(db)
+        with self.db() as db:self.material_uploads.initialize(db)
         self.write_conflicts.initialize()
         self.finals.initialize()
         with self.db() as db:self.team_lifecycle.initialize(db)
@@ -958,7 +962,7 @@ class EventService:
     def check_materials(self, materials, submitted, lean_gitee=False):
         limits={"projectName": 140, "summary": 600, "license": 200, "demoInstructions": 2000,
                 "sourcesAndLimitations": 2000, "codeVersion": 1024}
-        urls=("codeUrl", "readmeUrl", "licenseUrl", "demoUrl", "slidesUrl", "videoUrl")
+        urls=("codeUrl", "readmeUrl", "licenseUrl", "demoUrl", "slidesUrl", "videoUrl", "filesUrl")
         if not isinstance(materials, dict) or not set(materials).issubset({*limits, *urls, "confirmed"}):
             raise APIError(400, "项目材料字段不正确")
         if lean_gitee:
@@ -985,13 +989,13 @@ class EventService:
             raise APIError(400, "提交确认必须为布尔值")
         result["confirmed"]=confirmed
         if submitted:
-            required=("projectName", "summary", "codeUrl", "readmeUrl", "license", "slidesUrl", "videoUrl", "sourcesAndLimitations")
+            required=("projectName", "summary", "codeUrl", "readmeUrl", "license", "slidesUrl", "sourcesAndLimitations")
             if lean_gitee:
                 required=tuple(key for key in required if key not in {'readmeUrl','license','sourcesAndLimitations'})
             if any(not result[key] for key in required):
                 raise APIError(400, "正式提交请填写全部必填项目材料")
-            if not result["demoUrl"] and not result["demoInstructions"]:
-                raise APIError(400, "请填写原型演示链接或本地演示说明")
+            if not result["demoUrl"]:
+                raise APIError(400, "请上传HTML作品展示，或填写可以直接打开的HTTPS分享链接")
             if not confirmed:
                 raise APIError(400, "正式提交前请完成材料自查确认")
             result['codeVersion']=normalize_code_version(result['codeUrl'],result['codeVersion'])
@@ -1017,6 +1021,7 @@ class EventService:
                     or raw_materials.get('codeUrl')!=url or reference!=url+'/tree/'+sha):
                 raise APIError(400,'仓库材料定位必须对应绑定仓库的完整版本','repository_override')
         materials=self.check_materials(raw_materials, submitted,lean_gitee=lean_gitee)
+        self.material_uploads.validate_materials(db,team['id'],materials)
         if lean_gitee:
             for key in ('readmeUrl','license','licenseUrl','sourcesAndLimitations'):
                 materials[key]=''
@@ -1059,7 +1064,7 @@ class EventService:
                  "judgingMaterials":self.judging_materials(db,row['team_id'])} for row in rows]
 
     def submission_csv(self, db):
-        fields=("projectName", "summary", "codeUrl", "readmeUrl", "license", "licenseUrl", "demoUrl", "demoInstructions", "slidesUrl", "videoUrl", "sourcesAndLimitations", "codeVersion", "confirmed", "repositoryMaterialsUrl")
+        fields=("projectName", "summary", "codeUrl", "readmeUrl", "license", "licenseUrl", "demoUrl", "demoInstructions", "slidesUrl", "videoUrl", "filesUrl", "sourcesAndLimitations", "codeVersion", "confirmed", "repositoryMaterialsUrl")
         output=io.StringIO(newline="")
         writer=csv.writer(output)
         writer.writerow(["队号", "队名", "赛道", "展示作品名", "提交状态", "编辑版本", "正式版本", "首次提交时间", "正式提交时间", "更新时间", "有未提交修改",
@@ -1131,22 +1136,27 @@ class EventHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         request_path = urlsplit(self.path).path
         origin = self.headers.get("Origin")
+        if getattr(self, "_gateway_cors", False):
+            for name, value in gateway_cors_headers(self.headers, self.server.service.origin,
+                                                   preflight=self.command == "OPTIONS" and status == 204).items():
+                self.send_header(name, value)
         if request_path in {self.server.service.base_path + p for p in PUBLIC_PATHS} and origin in PUBLIC_ORIGINS:
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
             if self.command == "OPTIONS":
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        self.send_header("Referrer-Policy", (extra or {}).get("Referrer-Policy", "strict-origin-when-cross-origin"))
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://8.141.114.201; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+        self.send_header("Content-Security-Policy", (extra or {}).get("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://8.141.114.201; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"))
         if self.server.service.secure:
             self.send_header("Strict-Transport-Security", "max-age=31536000")
         if cookie:
             self.send_header("Set-Cookie", cookie)
         if extra:
             for key, value in extra.items():
-                self.send_header(key, value)
+                if key not in {"Content-Security-Policy", "Referrer-Policy"}:
+                    self.send_header(key, value)
         self.end_headers()
 
     def respond(self, status, value, cookie=None):
@@ -1162,7 +1172,16 @@ class EventHandler(BaseHTTPRequestHandler):
         self.handle_route()
 
     def do_OPTIONS(self):
-        path = urlsplit(self.path).path
+        self._gateway_cors = False
+        try:
+            path = urlsplit(self.path).path
+            gateway_path = unquote(path, errors="strict")
+        except (UnicodeError, ValueError):
+            self.respond(400, {"error": "请求路径编码不正确"})
+            return
+        if gateway_path.startswith(self.server.service.base_path + "/v1/"):
+            self.handle_route()
+            return
         if (path in {self.server.service.base_path + p for p in PUBLIC_PATHS}
                 and self.headers.get("Origin") in PUBLIC_ORIGINS
                 and self.headers.get("Access-Control-Request-Method") in {"GET", "POST"}
@@ -1176,6 +1195,7 @@ class EventHandler(BaseHTTPRequestHandler):
 
     def handle_route(self):
         service = self.server.service
+        self._gateway_cors = False
         try:
             parsed = urlsplit(self.path)
             if parsed.scheme or parsed.netloc or parsed.fragment:
@@ -1193,7 +1213,16 @@ class EventHandler(BaseHTTPRequestHandler):
                 raise APIError(404, "页面不存在")
             path = path[len(service.base_path):] if service.base_path else path
             if path.startswith("/v1/"):
-                # AI gateway: authenticated by API key, called by SDKs without cookies or Origin.
+                # Check browser origins before reading uploads, authorizing keys, or opening upstreams.
+                # Native SDKs without Origin remain supported; every actual request still needs a key.
+                self._gateway_cors = True
+                if not origin_allowed(self.headers, service.origin):
+                    raise APIError(403, "此浏览器来源不允许调用中转 API", code="origin_not_allowed")
+                if self.command == "OPTIONS":
+                    if not preflight_allowed(self.headers, service.origin):
+                        raise APIError(403, "中转 API 不允许此跨域预检请求", code="cors_preflight_not_allowed")
+                    self.headers_out(204, "text/plain", 0)
+                    return
                 service.keys.gateway(self, path)
                 return
             query={}
@@ -1222,6 +1251,11 @@ class EventHandler(BaseHTTPRequestHandler):
                         length = int(self.headers.get("Content-Length", "-1"))
                     except ValueError:
                         raise APIError(400, "请求长度不正确")
+                    upload_kind = service.material_uploads.kind(path)
+                    if upload_kind:
+                        result = service.material_uploads.upload(self, upload_kind, length)
+                        self.respond(200, result)
+                        return
                     limit=CLAIM_REVIEW_BODY_LIMIT if path=='/api/admin/claims/review' else SUBMISSION_BODY_LIMIT if path=='/api/submission' else IMPORT_BODY_LIMIT if path in {'/api/admin/data/import/preview','/api/admin/claims/roster'} else BODY_LIMIT
                     if length < 0 or length > limit:
                         raise APIError(413,'请求内容超过端点大小限制')
@@ -1262,6 +1296,9 @@ class EventHandler(BaseHTTPRequestHandler):
                 else:
                     self.respond(200, value, cookie)
             elif self.command in {"GET", "HEAD"}:
+                if path.startswith('/materials/'):
+                    service.material_uploads.serve(self, path)
+                    return
                 relative = path.lstrip("/") or "index.html"
                 candidate = (service.root / relative).resolve()
                 if not candidate.is_relative_to(service.root):

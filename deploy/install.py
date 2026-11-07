@@ -56,6 +56,19 @@ LOCATIONS = BEGIN + '''    location = /gotc { return 308 /gotc/; }
         proxy_send_timeout 30s;
         client_max_body_size 128k;
     }
+    location ^~ /gotc/api/team/uploads/ {
+        proxy_pass http://127.0.0.1:5274;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_request_buffering off;
+        proxy_read_timeout 330s;
+        proxy_send_timeout 330s;
+        client_body_timeout 30s;
+        client_max_body_size 100m;
+    }
     location ^~ /gotc/v1/ {
         # Realtime model sessions (gateway_websocket) need the WebSocket upgrade.
         proxy_set_header Upgrade $http_upgrade;

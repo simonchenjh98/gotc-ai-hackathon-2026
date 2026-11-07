@@ -3,7 +3,7 @@
 (() => {
   const TTL=7*24*60*60*1000;
   const freshId=()=>globalThis.crypto?.randomUUID?.() || `local-${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-  function create({storage,namespace,teamId,writerId=freshId(),baseVersion,baseMaterials,fields,now=()=>Date.now(),id=freshId,expectedEpoch,loginId=""}){
+  function create({storage,namespace,teamId,writerId=freshId(),baseVersion,baseMaterials,fields,optionalFieldsWithDefaults={},now=()=>Date.now(),id=freshId,expectedEpoch,loginId=""}){
     const prefix=`gotc-material-recovery:v1:${encodeURIComponent(namespace)}:${encodeURIComponent(teamId)}:`,epochKey=prefix+(loginId?'auth:'+encodeURIComponent(loginId)+':':'')+'epoch';
     let activeId=id(),revision=0,error='',revoked=false,epoch=expectedEpoch ?? '';
     const object=value=>value!==null && typeof value==='object' && !Array.isArray(value);
@@ -11,9 +11,17 @@
     try{if(expectedEpoch===undefined)epoch=access().getItem(epochKey) || '';checkEpoch();}catch{error='本地恢复不可用，请保存服务器草稿或复制当前输入。';}
     function fail(){error='本地恢复不可用，请保存服务器草稿或复制当前输入。';return null;}
     function validMaterials(value){return object(value) && Object.keys(value).length===fields.length && fields.every(([key,limit])=>Object.hasOwn(value,key) && typeof value[key]==='string' && Array.from(value[key]).length<=limit);}
+    function readMaterials(value){
+      if(!object(value))return value;
+      const normalized={...value};
+      for(const [key,fallback] of Object.entries(optionalFieldsWithDefaults))if(fields.some(([name])=>name===key) && !Object.hasOwn(normalized,key))normalized[key]=fallback;
+      return normalized;
+    }
     function read(key,raw){
       if(typeof raw!=='string' || raw.length>131072)return null;
       let value;try{value=JSON.parse(raw);}catch{return null;}
+      // Normalize explicitly added optional fields in memory; keep raw bytes for CAS cleanup.
+      if(object(value)){value.materials=readMaterials(value.materials);value.baseMaterials=readMaterials(value.baseMaterials);}
       if(!object(value) || value.schema!==1 || value.teamId!==teamId || typeof value.id!=='string' || key!==prefix+'slot:'+value.id || !/^[a-zA-Z0-9_-]{6,160}$/.test(value.id)
           || typeof value.writerId!=='string' || !Number.isSafeInteger(value.localRevision) || value.localRevision<1 || !Number.isSafeInteger(value.baseVersion) || value.baseVersion<0
           || !Number.isSafeInteger(value.updatedAt) || value.updatedAt<0 || typeof value.epoch!=='string' || (value.loginId!==undefined && typeof value.loginId!=='string') || !['editing','pending','unknown','conflict'].includes(value.state)
