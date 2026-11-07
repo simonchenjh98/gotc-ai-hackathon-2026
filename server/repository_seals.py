@@ -60,7 +60,7 @@ class RepositorySeals:
 
     def check_binding(self, db, binding):
         current = self.repos.binding(db, binding['team_id'])
-        if (not current or current['state'] not in {'invited', 'ready'} or
+        if (not self.repos.can_submit(current) or
                 any(current[k] != binding[k] for k in ('revision','provider','organization','slug','external_id'))):
             raise invalid_proof()
 
