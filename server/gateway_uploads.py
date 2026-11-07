@@ -1,8 +1,8 @@
 """Bound simultaneous large Gitee uploads without holding slots during inference.
 
 Place UploadLimitedConnectionMixin before HTTPConnection/HTTPSConnection in the
-MRO (it can also be a base of the existing connect-timeout mixin). Only finite
-bytes bodies sent to the exact Gitee host use the global upload pool.
+MRO (it can also be a base of the existing connect-timeout mixin). Finite bytes
+and explicitly sized seekable streams sent to the exact Gitee host use the pool.
 """
 from __future__ import annotations
 
@@ -46,9 +46,34 @@ class UploadDrainTimeout(UploadPostSendError):
     pass
 
 
+class SizedUpload:
+    """A checked finite binary stream, read in HTTPConnection's normal chunks.
+
+    Media bodies are already bounded and spooled by the request parser. Inspect
+    their length without copying them into memory or consuming any upload bytes.
+    Arbitrary iterators and unknown-length streams remain ineligible for the pool.
+    """
+    def __init__(self, stream, length):
+        if type(length) is not int or length < 0 or not stream.seekable():
+            raise ValueError("Upload must be a finite seekable stream")
+        start = stream.tell()
+        try:
+            stream.seek(0, 2)
+            actual = stream.tell() - start
+        finally:
+            stream.seek(start)
+        if actual != length:
+            raise ValueError("Upload length does not match the remaining stream")
+        self.stream, self.length = stream, length
+
+    def read(self, size=-1):
+        return self.stream.read(size)
+
+
 def eligible(connection, body):
     destination = getattr(connection, "_tunnel_host", None) or getattr(connection, "host", "")
-    return destination == "ai.gitee.com" and isinstance(body, (bytes, bytearray)) and len(body) >= MIN_UPLOAD_BYTES
+    length = len(body) if isinstance(body, (bytes, bytearray)) else body.length if isinstance(body, SizedUpload) else 0
+    return destination == "ai.gitee.com" and length >= MIN_UPLOAD_BYTES
 
 
 def set_low_water(sock):

@@ -440,7 +440,7 @@ def _count(value):
         return 0
 
 
-def read_usage(upstream, data, usage):
+def read_usage(upstream, data, usage, call=None):
     """Update usage from one response object or stream event, merging like sub2api.
 
     Anthropic: message_start sets input and cache counts (even 0) and ignores its placeholder output; message_delta
@@ -457,6 +457,12 @@ def read_usage(upstream, data, usage):
             u = data["response"].get("usage")  # Responses API: response.completed carries the usage
         if not isinstance(u, dict):
             return
+        if call is not None and call.get("pricing_snapshot"):
+            if not u and call.get("pricing_usage"):
+                return  # a later empty SSE placeholder cannot erase known usage
+            # Catalog pricing must distinguish a missing counter from a reported
+            # zero and reject inconsistent cache totals before lossy normalization.
+            call["pricing_usage"] = u
         details = u.get("prompt_tokens_details") if isinstance(u.get("prompt_tokens_details"), dict) else {}
         alt = u.get("input_tokens_details") if isinstance(u.get("input_tokens_details"), dict) else {}
         cached = next((_count(src[k]) for src, k in ((details, "cached_tokens"), (alt, "cached_tokens"), (u, "cache_read_input_tokens"),
@@ -471,6 +477,31 @@ def read_usage(upstream, data, usage):
     u = (data.get("message") or {}).get("usage") if start else data.get("usage")
     if not isinstance(u, dict):
         return
+    if call is not None and call.get("pricing_snapshot"):
+        # Anthropic's input excludes caches. A nonstandard total cannot recover
+        # a missing input counter as though this were OpenAI's inclusive total.
+        evidence = {k: v for k, v in u.items() if k != "total_tokens"}
+        if start:
+            # message_start's output is a protocol placeholder, not final usage.
+            call["pricing_usage"] = {k: v for k, v in evidence.items() if k != "output_tokens"}
+        elif data.get("type") == "message_delta":
+            # Anthropic splits the real input/cache counters and output count
+            # across events. Merge evidence without inventing absent counters;
+            # zero placeholders must not erase a previously positive counter.
+            def merge(previous, incoming):
+                result = dict(previous)
+                for key, value in incoming.items():
+                    prior = result.get(key)
+                    if isinstance(value, dict) and isinstance(prior, dict):
+                        result[key] = merge(prior, value)
+                    elif type(value) in (int, float) and value == 0 and type(prior) in (int, float) and prior > 0:
+                        continue
+                    else:
+                        result[key] = value
+                return result
+            call["pricing_usage"] = merge(call.get("pricing_usage", {}), evidence)
+        else:
+            call["pricing_usage"] = evidence
     split = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else None
     written = _count(u.get("cache_creation_input_tokens"))
     one_hour = _count(split.get("ephemeral_1h_input_tokens")) if split else 0
@@ -740,8 +771,13 @@ class KeyService:
                 clause += " AND " + column + "=?"
                 values.append(value)
         rows = db.execute("SELECT currency,SUM(cost_micro)/1e6 AS cost,SUM(billing_status='pending') AS pending "
-                          "FROM api_usage WHERE at>=?" + clause + " GROUP BY currency", values)
+                          "FROM api_usage WHERE at>=?" + clause + " GROUP BY currency ORDER BY currency", values)
         return [dict(r) for r in rows]
+
+    @staticmethod
+    def billing_total(rows):
+        """A scalar is meaningful only within a single recorded currency."""
+        return None if len(rows) > 1 else (rows[0]["cost"] if rows else 0)
 
     def digest(self, token):
         return hashlib.pbkdf2_hmac("sha256", token.encode(), self.pepper, KEY_HASH_ITERATIONS).hex()
@@ -829,7 +865,7 @@ class KeyService:
         return current + tuple((call or {}).get("secrets", ()))
 
     def spend(self, db, team_id, since=0):
-        return db.execute("SELECT COALESCE(SUM(cost_micro),0) FROM api_usage WHERE team_id=? AND at>=?", (team_id, since)).fetchone()[0] / 1e6
+        return self.billing_total(self.billing_summary(db, team_id, since))
 
     def team_active(self, db, team_id):
         row = db.execute("SELECT active FROM team_api WHERE team_id=?", (team_id,)).fetchone()
@@ -849,16 +885,19 @@ class KeyService:
                 return {"enabled": False, "keys": []}
             since = now_ms() - DAY_MS
             keys = [{"id": r["id"], "name": r["name"], "masked": r["masked"], "createdAt": r["created_at"], "lastUsedAt": r["last_used_at"],
-                     "used24h": r["day"] / 1e6, "usedTotal": r["total"] / 1e6, "requests": r["requests"]}
-                    for r in db.execute("""SELECT k.*, COALESCE(SUM(CASE WHEN u.at>=? THEN u.cost_micro END),0) AS day,
-                      COALESCE(SUM(u.cost_micro),0) AS total, COUNT(u.id) AS requests
+                     "used24h": self.billing_total(day), "usedTotal": self.billing_total(total),
+                     "billing24h": day, "billing": total, "requests": r["requests"]}
+                    for r in db.execute("""SELECT k.*, COUNT(u.id) AS requests
                       FROM api_keys k LEFT JOIN api_usage u ON u.key_id=k.id WHERE k.team_id=? AND k.active=1
-                      GROUP BY k.id ORDER BY k.created_at""", (since, team_id))]
+                      GROUP BY k.id ORDER BY k.created_at""", (team_id,))
+                    for day, total in [(self.billing_summary(db, team_id, since, r["id"]),
+                                        self.billing_summary(db, team_id, key_id=r["id"]))]]
             return {"enabled": True, "baseUrl": self.service.origin + self.service.base_path, "models": self.models(), "currency": self.currency(),
                     "maxKeys": settings["maxKeys"], "keys": keys, "logContent": settings["logContent"],
                     "announcement": settings["announcement"],
                     "usage": {"used24h": self.spend(db, team_id, since), "usedTotal": self.spend(db, team_id)},
                     "billing": self.billing_summary(db, team_id),
+                    "billing24h": self.billing_summary(db, team_id, since),
                     "expiresAt": settings["expiresAt"]}
         if not enabled:
             raise APIError(409, "本队 API 访问权限尚未开通或已停用")
@@ -924,11 +963,15 @@ class KeyService:
                                  "blockedClients": sum(1 for t in self.auth_blocked.values() if t > time.monotonic())}
             overview.update(overview_auth)
             overview["billing"] = self.billing_summary(db, since=today)
+            overview["cost"] = self.billing_total(overview["billing"])
             return {"enabled": self.config is not None, "settings": settings, "models": self.models(), "overview": overview, "currency": self.currency(),
                     "upstreams": self.public_config(db), "storage": storage,
                     "changes": changes,
                     "teams": [{"teamId": r["team_id"], "active": bool(r["active"]), "keyCount": r["key_count"], "inflight": inflight.get(r["team_id"], 0), "waiting": waiting.get(r["team_id"], 0),
-                               "used24h": self.spend(db, r["team_id"], since), "usedTotal": self.spend(db, r["team_id"])} for r in rows]}
+                               "used24h": self.billing_total(day), "usedTotal": self.billing_total(total),
+                               "billing24h": day, "billing": total} for r in rows
+                              for day, total in [(self.billing_summary(db, r["team_id"], since),
+                                                  self.billing_summary(db, r["team_id"]))]]}
         if method == "GET" and path == "/api/admin/keys/export":
             self.service.audit(db, actor, "api-usage.export")
             return self.export(db)
@@ -1110,7 +1153,8 @@ class KeyService:
         clause = " AND ".join(where)
         sums = ("COUNT(*) AS requests, COALESCE(SUM(u.input_tokens),0) AS input, COALESCE(SUM(u.output_tokens),0) AS output, "
                 "COALESCE(SUM(u.cache_write_tokens),0) AS cacheWrite, COALESCE(SUM(u.cache_read_tokens),0) AS cacheRead, "
-                "COALESCE(SUM(u.cost_micro),0)/1e6 AS cost")
+                "CASE WHEN COUNT(DISTINCT u.currency)>1 THEN NULL ELSE COALESCE(SUM(u.cost_micro),0)/1e6 END AS cost, "
+                "CASE WHEN COUNT(DISTINCT u.currency)>1 THEN 'MIXED' ELSE COALESCE(MIN(u.currency),'legacy') END AS currency")
         rows = lambda sql: [dict(r) for r in db.execute(sql, params)]
         return {
             "days": days, "currency": self.currency(),
@@ -1120,8 +1164,8 @@ class KeyService:
                            f"CAST(AVG(u.first_token_ms) AS INTEGER) AS avgFirstTokenMs FROM api_usage u WHERE {clause}")[0],
             "byKey": rows(f"""SELECT u.key_id AS keyId, k.name, k.masked, k.active, t.number AS teamNumber, t.name AS teamName, {sums},
               MAX(u.at) AS lastAt FROM api_usage u JOIN api_keys k ON k.id=u.key_id JOIN teams t ON t.id=u.team_id
-              WHERE {clause} GROUP BY u.key_id ORDER BY cost DESC"""),
-            "byModel": rows(f"SELECT u.model, {sums} FROM api_usage u WHERE {clause} GROUP BY u.model ORDER BY cost DESC"),
+              WHERE {clause} GROUP BY u.key_id ORDER BY currency, cost DESC"""),
+            "byModel": rows(f"SELECT u.model, {sums} FROM api_usage u WHERE {clause} GROUP BY u.model ORDER BY currency, cost DESC"),
             "byFailure": rows(f"""SELECT u.error_owner AS owner, u.error_phase AS phase, u.error_type AS type, u.upstream_status AS upstreamStatus,
               {sums} FROM api_usage u WHERE {clause} AND (u.status>=400 OR u.incomplete=1) GROUP BY owner, phase, type, upstreamStatus
               ORDER BY requests DESC"""),
@@ -1340,9 +1384,9 @@ class KeyService:
         estimated = False
         if call.get("metered_media"):
             estimated = bool((call.get("billing") or {}).get("estimated"))
-        elif call.get("charge_estimate"):
+        elif call.get("charge_estimate") and not call.get("pricing_snapshot"):
             usage, incomplete, estimated = [call.get("input_estimate", call["request_bytes"] // 4), call.get("output_estimate", 0), 0, 0, 0], True, True
-        elif call["forwarded"]:
+        elif call["forwarded"] and not call.get("pricing_snapshot"):
             # sub2api bills only what it observed; a call with no usage would then be missing from cost statistics.
             # Fill gaps with an estimate instead: input ~ request bytes / 4, output ~ reply text bytes / 4.
             est_in, est_out = call.get("input_estimate", call["request_bytes"] // 4), call["reply_bytes"] // 4
@@ -1353,9 +1397,8 @@ class KeyService:
         cost = round(sum(t * p for t, p in zip(usage, price)))
         billing = call.get("billing")
         if not billing and not call.get("metered_media") and call.get("pricing_snapshot") and (call["forwarded"] or call.get("charge_estimate")):
-            billing = quote(call["pricing_snapshot"], request=call.get("pricing_request"), usage=usage,
+            billing = quote(call["pricing_snapshot"], request=call.get("pricing_request"), usage=call.get("pricing_usage"),
                             headers=call.get("pricing_headers"), started_at=call["requested_at"])
-            billing["estimated"] = bool(billing.get("estimated") or estimated)
         if not billing and call.get("metered_media"):
             pending = bool(call["forwarded"] or call.get("charge_estimate"))
             billing = {"cost_micro": None if pending else 0, "currency": "CNY", "pending": pending,
@@ -1363,6 +1406,11 @@ class KeyService:
         if billing:
             cost = billing.get("cost_micro") or 0
             estimated = bool(billing.get("estimated"))
+            billed_tokens = billing.get("details", {}).get("tokens")
+            if billed_tokens is not None:
+                # Use the same validated split for statistics and price, including
+                # input derived from an authoritative total minus output count.
+                usage = list(billed_tokens)
         currency = (billing or {}).get("currency", call.get("currency", "USD"))
         error = call.get("error") or {"type": "", "phase": "", "owner": "", "upstream_status": None, "upstream_message": "", "message": ""}
         at = now_ms()
@@ -1824,7 +1872,7 @@ class KeyService:
                 kind = "overloaded" if "overload" in json.dumps(data.get("error")).lower() else "upstream"
                 raise GatewayError(kind, "上游模型服务返回错误，请稍后重试（本次不计费）", upstream_status=response.status,
                                    upstream_message=message) from None
-            read_usage(name, data, usage)
+            read_usage(name, data, usage, call)
             call["done"] = True  # a complete JSON body is a finished reply
             self.keep(call, payload)
             self.safe_record(handler, call)
@@ -1928,7 +1976,7 @@ class KeyService:
             if payload.strip() == b"[DONE]":
                 call["done"] = True
             else:
-                read_usage(name, parsed, usage)
+                read_usage(name, parsed, usage, call)
                 stream_progress(name, parsed, call)
                 if call["reply_bytes"] and call.get("stream_first_ms") is None:
                     call["stream_first_ms"] = int((time.monotonic() - call["started"]) * 1000)
