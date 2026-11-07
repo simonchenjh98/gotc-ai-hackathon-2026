@@ -137,7 +137,10 @@ def open_upstream(upstream, path, model, protocols):
     sock = socket.create_connection((parts.hostname, parts.port or (443 if parts.scheme == 'https' else 80)), timeout=10)
     try:
         if parts.scheme == 'https':
-            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=parts.hostname)
+            context = ssl.create_default_context()
+            # Upstream model providers all support TLS 1.2+; never negotiate TLS 1.0/1.1.
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            sock = context.wrap_socket(sock, server_hostname=parts.hostname)
         sock.settimeout(IDLE_SECONDS)
         nonce = base64.b64encode(os.urandom(16)).decode()
         target = parts.path.rstrip('/') + path.removeprefix('/v1') + '?' + urlencode({'model': model})

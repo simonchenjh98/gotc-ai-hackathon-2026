@@ -261,3 +261,18 @@ class BridgeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UpstreamTlsTests(unittest.TestCase):
+    def test_https_upstream_refuses_tls_below_1_2(self):
+        import ssl
+        from unittest import mock
+        import gateway_websocket
+        raw, context = mock.MagicMock(), mock.MagicMock()
+        context.wrap_socket.side_effect = OSError('stop after TLS setup')
+        with mock.patch.object(gateway_websocket.socket, 'create_connection', return_value=raw), \
+                mock.patch.object(gateway_websocket.ssl, 'create_default_context', return_value=context):
+            with self.assertRaises(OSError):
+                gateway_websocket.open_upstream({'url': 'https://upstream.example/v1', 'key': 'synthetic'}, '/v1/realtime', 'm', [])
+        self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+        context.wrap_socket.assert_called_once_with(raw, server_hostname='upstream.example')
