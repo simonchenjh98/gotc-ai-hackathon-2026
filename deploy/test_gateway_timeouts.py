@@ -37,6 +37,8 @@ class GatewayProxyTimeoutTests(unittest.TestCase):
                 self.assertGreater(read_seconds, initial_wait, 'Nginx would end the initial gateway wait first')
                 self.assertGreater(read_seconds, waits['STREAM_IDLE_TIMEOUT'], 'Nginx would hide the terminal SSE error')
                 self.assertRegex(location.group(1), r'\bproxy_send_timeout\s+330s\s*;', 'Request upload timeout must remain unchanged')
+                self.assertRegex(location.group(1), r'proxy_set_header\s+Upgrade\s+\$http_upgrade\s*;', 'Realtime WebSocket sessions need the upgrade header')
+                self.assertRegex(location.group(1), r'proxy_set_header\s+Connection\s+"upgrade"\s*;', 'Realtime WebSocket sessions need the upgrade header')
 
 
 if __name__ == '__main__':
