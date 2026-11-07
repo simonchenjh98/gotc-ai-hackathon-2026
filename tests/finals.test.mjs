@@ -7,7 +7,9 @@ const source=fs.readFileSync(new URL('../platform-finals.js',import.meta.url),'u
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};};
 function runtime(extra={}){
+  const storage=new Map(extra.authorized===false?[]:[['gotc-finals-access-v1',JSON.stringify({accessToken:'synthetic-finals-token-0123456789abcdef',expiresAt:Date.now()+3600000})]]);
   const ctx=vm.createContext({AbortController,Map,Set,Number,Object,Date,esc,setTimeout,clearTimeout,URL,base:new URL('https://example.test/gotc/'),
+    sessionStorage:{getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,value),removeItem:key=>storage.delete(key)},
     fetch:async(url,options)=>{
       try{const result=await extra.api(String(url).split('/api/')[1],options.body?JSON.parse(options.body):undefined,{accessToken:options.headers['X-GOTC-Finals-Access'],judgeId:options.headers['X-GOTC-Finals-Judge'],credentials:options.credentials,signal:options.signal});return {ok:true,status:200,json:async()=>result};}
       catch(error){if(!error.status)throw error;return {ok:false,status:error.status,json:async()=>({error:error.message,code:error.code})};}
@@ -15,7 +17,7 @@ function runtime(extra={}){
     metrics:items=>items.map(([value,label])=>`<span>${esc(value)} ${esc(label)}</span>`).join(''),
     dirtyAdminForms:new Set(),window:{addEventListener(){},removeEventListener(){}},document:{addEventListener(){},removeEventListener(){},hidden:false},
     session:{role:'judge',loginId:'owner-a',name:'Judge A'},route:'judge-finals',routeVersion:1,ownsBrowserLogin:()=>true,...extra});
-  vm.runInContext(source+'\nglobalThis.testHelpers={makeFinalsPoller,finalsSummaryMarkup,finalsSave,finalsTrack,createFinalsView,disposeFinalsView,finalsRequest,finalsRenderScore,finalsRenderNominations,finalsPatchSummary,finalsInstallAdmin,renderFinalsJudge};',ctx);
+  vm.runInContext(source+'\nglobalThis.testHelpers={makeFinalsPoller,finalsSummaryMarkup,finalsSave,finalsTrack,createFinalsView,disposeFinalsView,finalsRequest,finalsRenderScore,finalsRenderNominations,finalsPatchSummary,finalsInstallAdmin,renderFinalsJudge,renderFinalsAccess,finalsHasAccess,finalsSetAccess};',ctx);
   return ctx;
 }
 const team=(id,number,name='Team '+number)=>({id,number,name,project:'Synthetic',eligible:true,score:81.25,scoreCount:8,recusedCount:0,complete:true,rank:number,dimensions:[16,12,17,16,12,8.25]});
@@ -223,14 +225,14 @@ function directEntryPage(api,extra={}){
   const nodes={'[data-finals-entry]':form,'[data-finals-login-status]':notice,'[data-finals-entry-state]':state,'[data-finals-login-refresh]':refresh,'[data-finals-team]':{value:'',options:[]},'[data-finals-switch-judge]':{},'[data-finals-refresh-judge]':{},'[data-finals-sync]':{textContent:''}};
   const container={isConnected:true,querySelector:selector=>nodes[selector] || null,querySelectorAll:()=>[]};main.querySelector=()=>container;
   const calls=[],ctx=runtime({root:main,heading:(_a,title,description)=>`<h1>${esc(title)}</h1><p>${esc(description)}</p>`,session:{role:null},api:async(path,payload,options)=>{calls.push({path,payload,options});return api(path,payload,options);},...extra});
-  return {ctx,main,form,select,submit,notice,state,refresh,error,calls,submitForm:()=>form.onsubmit({preventDefault(){}})};
+  return {ctx,main,container,form,select,submit,notice,state,refresh,error,calls,submitForm:()=>form.onsubmit({preventDefault(){}})};
 }
 const seats=()=>({config:{runId:'r',open:false,rosterReady:true},judges:[{id:'seat-a',name:'Synthetic Judge'}]});
 const openLogin={loginAvailable:true,loginOpensAt:1,message:''};
 const entryApi=(entry=seats,schedule=()=>openLogin,other=()=>({config:{runId:'r',open:true,revision:1},teams:[team('a',1)],dimensions,myScores:[],myNominations:null}))=>
   path=>path==='finals/login-status'?schedule():path==='finals/entry'?entry():other(path);
 
-test('open judge login lists seats without changing the ordinary session or asking for a code',async()=>{
+test('verified open judge login lists seats without changing the ordinary session',async()=>{
   const p=directEntryPage(entryApi(()=>({config:{runId:'r',open:true,rosterReady:true},judges:[{id:'seat-a',name:'评委一'},{id:'seat-b',name:'<评委二>'}]})),{session:{role:'team',loginId:'unrelated-team'}});
   const before=p.ctx.session;await p.ctx.testHelpers.renderFinalsJudge(1);
   assert.deepEqual(p.calls.map(c=>c.path),['finals/login-status','finals/entry']);assert.equal(p.ctx.session,before);
@@ -257,7 +259,7 @@ test('a network failure while reading login status offers a retry and disables e
   p.ctx.testHelpers.disposeFinalsView();
 });
 
-test('a fresh visitor explicitly chooses the scoring identity after login opens',async()=>{
+test('a verified visitor explicitly chooses the scoring identity after login opens',async()=>{
   const p=directEntryPage(entryApi());
   let scoreView,nominationView;p.ctx.finalsRenderScore=view=>scoreView=view;p.ctx.finalsRenderNominations=view=>nominationView=view;
   const ordinary=p.ctx.session;await p.ctx.testHelpers.renderFinalsJudge(1);
@@ -270,12 +272,12 @@ test('a fresh visitor explicitly chooses the scoring identity after login opens'
   p.ctx.testHelpers.disposeFinalsView();
 });
 
-test('direct entry neither reads stored credentials nor sends cookie, login, seat or access headers',async()=>{
-  const requests=[],storage={getItem(){assert.fail('entry must not read stored credentials');},setItem(){assert.fail('entry must not persist credentials');},removeItem(){assert.fail('entry must not mutate account storage');}};
-  const p=directEntryPage(()=>assert.fail('ordinary API must not receive direct entry'),{session:{role:'admin',loginId:'ordinary-admin'},sessionStorage:storage,localStorage:storage,ownsBrowserLogin:()=>false,fetch:async(url,options)=>{requests.push({url:String(url),options});return {ok:true,status:200,json:async()=>String(url).endsWith('login-status')?openLogin:seats()};}});
+test('verified entry sends its finals token independently of ordinary credentials',async()=>{
+  const requests=[],storage={getItem(){assert.fail('entry must not read ordinary credentials');},setItem(){assert.fail('entry must not persist ordinary credentials');},removeItem(){assert.fail('entry must not mutate ordinary account storage');}};
+  const p=directEntryPage(()=>assert.fail('ordinary API must not receive direct entry'),{session:{role:'admin',loginId:'ordinary-admin'},localStorage:storage,ownsBrowserLogin:()=>false,fetch:async(url,options)=>{requests.push({url:String(url),options});return {ok:true,status:200,json:async()=>String(url).endsWith('login-status')?openLogin:seats()};}});
   const ordinary=p.ctx.session;await p.ctx.testHelpers.renderFinalsJudge(1);
   assert.deepEqual(requests.map(r=>r.url.split('/api/')[1]),['finals/login-status','finals/entry']);
-  for(const {options} of requests){assert.equal(options.method,'GET');assert.equal(options.credentials,'omit');assert.equal(options.cache,'no-store');assert.deepEqual(Object.keys(options.headers),[]);}
+  for(const {options} of requests){assert.equal(options.method,'GET');assert.equal(options.credentials,'omit');assert.equal(options.cache,'no-store');assert.equal(options.headers['X-GOTC-Finals-Access'],'synthetic-finals-token-0123456789abcdef');assert.deepEqual(Object.keys(options.headers),['X-GOTC-Finals-Access']);}
   assert.equal(p.ctx.session,ordinary);p.ctx.testHelpers.disposeFinalsView();
 });
 
@@ -298,7 +300,7 @@ test('each tab keeps its own seat header even after cookie login changes, and ca
   first.session={role:'admin',loginId:'new-admin'};first.ownsBrowserLogin=()=>false;
   await first.testHelpers.finalsRequest(a,'finals/score',{teamId:'a'});await second.testHelpers.finalsRequest(b,'finals/nominations',{});
   assert.equal(calls[0].options.headers['X-GOTC-Finals-Judge'],'seat-a');assert.equal(calls[1].options.headers['X-GOTC-Finals-Judge'],'seat-b');
-  for(const {options} of calls){assert.equal(options.credentials,'omit');assert.equal(options.headers['X-GOTC-Finals-Access'],undefined);assert.equal(options.headers['X-GOTC-Login'],undefined);assert.equal(options.headers.Cookie,undefined);}
+  for(const {options} of calls){assert.equal(options.credentials,'omit');assert.equal(options.headers['X-GOTC-Finals-Access'],'synthetic-finals-token-0123456789abcdef');assert.equal(options.headers['X-GOTC-Login'],undefined);assert.equal(options.headers.Cookie,undefined);}
   await assert.rejects(first.testHelpers.finalsRequest(a,'admin/finals',{}));assert.equal(calls.length,2);
   first.testHelpers.disposeFinalsView();second.testHelpers.disposeFinalsView();
 });
@@ -324,4 +326,94 @@ test('entry scope and an empty seat cannot send scoring or administrator request
 test('public finals board remains accessible without a judge or account',async()=>{
   const calls=[],ctx=runtime({session:{role:null},api:async path=>{calls.push(path);return {summary:null};}}),view=ctx.testHelpers.createFinalsView(1,null);
   await ctx.testHelpers.finalsRequest(view,'finals/board');assert.deepEqual(calls,['finals/board']);ctx.testHelpers.disposeFinalsView();
+});
+
+function invitePage(api,extra={},schedule=()=>openLogin){
+  const page=directEntryPage((path,payload,options)=>path==='finals/login-status'?schedule():api(path,payload,options),{authorized:false,...extra});
+  const error={textContent:''},button={disabled:true},exit={onclick:null};
+  const form={elements:{code:{value:'synthetic-invitation',disabled:true}},get isConnected(){return page.main.innerHTML.includes('data-finals-access>');},querySelector:selector=>selector==='.form-error'?error:button};
+  const query=page.container.querySelector;
+  page.container.querySelector=selector=>selector==='[data-finals-access]'?form:selector==='[data-finals-access-exit]'?exit:query(selector);
+  return {...page,form,error,button,exit,submit:()=>form.onsubmit({preventDefault(){}})};
+}
+const grant=()=>({accessToken:'new-synthetic-finals-token-0123456789',expiresAt:Date.now()+3600000});
+
+test('unverified entry reads only public login status before showing invitation verification',async()=>{
+  const p=invitePage(()=>assert.fail('seat or score data must remain protected'));
+  await p.ctx.testHelpers.renderFinalsJudge(1);
+  assert.deepEqual(p.calls.map(c=>c.path),['finals/login-status']);assert.match(p.main.innerHTML,/name="code" type="password"/);
+  assert.match(p.main.innerHTML,/验证并选择评委席位/);assert.ok(!p.main.innerHTML.includes('name="judgeId"'));
+  assert.ok(!p.main.innerHTML.includes('synthetic-invitation'));assert.equal(p.button.disabled,false);p.ctx.testHelpers.disposeFinalsView();
+});
+
+test('wrong invitation stays retryable and successful access stores only a finals token',async()=>{
+  let attempts=0;const issued=grant(),p=invitePage(path=>{
+    if(path==='finals/entry')return seats();
+    assert.equal(path,'finals/access');
+    if(++attempts===1)throw Object.assign(new Error('邀请码不正确'),{status:401,code:'finals_access_required'});
+    return issued;
+  });
+  const ordinary=p.ctx.session;await p.ctx.testHelpers.renderFinalsJudge(1);await p.submit();
+  assert.match(p.error.textContent,/邀请码不正确/);assert.equal(p.button.disabled,false);assert.equal(p.form.elements.code.disabled,false);
+  assert.equal(p.form.elements.code.value,'');assert.equal(p.ctx.testHelpers.finalsHasAccess(),false);
+  p.form.elements.code.value='synthetic-invitation';await p.submit();
+  assert.deepEqual(p.calls.map(c=>c.path),['finals/login-status','finals/access','finals/access','finals/login-status','finals/entry']);
+  assert.equal(p.calls[1].options.accessToken,undefined);assert.equal(p.calls[4].options.accessToken,issued.accessToken);
+  assert.equal(p.calls[1].options.credentials,'omit');assert.equal(p.ctx.session,ordinary);assert.match(p.main.innerHTML,/邀请码已验证/);assert.match(p.select.innerHTML,/Synthetic Judge/);
+  const stored=p.ctx.sessionStorage.getItem('gotc-finals-access-v1');assert.ok(!stored.includes('synthetic-invitation'));
+  assert.equal(JSON.parse(stored).accessToken,issued.accessToken);assert.equal(p.form.elements.code.value,'');
+  await p.exit.onclick();assert.equal(p.ctx.testHelpers.finalsHasAccess(),false);assert.equal(p.ctx.sessionStorage.getItem('gotc-finals-access-v1'),null);
+  assert.match(p.main.innerHTML,/决赛评委验证/);p.ctx.testHelpers.disposeFinalsView();
+});
+
+test('future schedule prevents invitation submission and polling enables it without a reload',async()=>{
+  let open=false;const issued=grant(),p=invitePage(path=>path==='finals/access'?issued:seats(),{},()=>({loginAvailable:open,loginOpensAt:2,message:open?'':'评委登录将在周日开放。'}));
+  await p.ctx.testHelpers.renderFinalsJudge(1);assert.equal(p.button.disabled,true);assert.equal(p.form.elements.code.disabled,true);
+  assert.match(p.notice.textContent,/周日开放/);await p.submit();assert.deepEqual(p.calls.map(c=>c.path),['finals/login-status']);
+  open=true;await vm.runInContext('activeFinalsView.poller.refresh()',p.ctx);
+  assert.equal(p.button.disabled,false);await p.submit();assert.equal(p.ctx.testHelpers.finalsHasAccess(),true);assert.match(p.select.innerHTML,/Synthetic Judge/);
+  assert.deepEqual(p.calls.filter(c=>c.path==='finals/access').map(c=>c.payload.code),['synthetic-invitation']);p.ctx.testHelpers.disposeFinalsView();
+});
+
+test('time closing between status and invitation submission preserves input flow for later retry',async()=>{
+  let closed=true;const p=invitePage(path=>{
+    if(path==='finals/access' && closed)throw Object.assign(new Error('评委登录尚未开放'),{status:403,code:'judge_login_not_open'});
+    return path==='finals/access'?grant():seats();
+  });
+  await p.ctx.testHelpers.renderFinalsJudge(1);await p.submit();assert.equal(p.ctx.testHelpers.finalsHasAccess(),false);assert.match(p.error.textContent,/尚未开放/);assert.equal(p.form.elements.code.value,'');
+  closed=false;await vm.runInContext('activeFinalsView.poller.refresh()',p.ctx);p.form.elements.code.value='synthetic-invitation';await p.submit();
+  assert.equal(p.ctx.testHelpers.finalsHasAccess(),true);p.ctx.testHelpers.disposeFinalsView();
+});
+
+test('late invitation success after departure cannot install access or fetch seats',async()=>{
+  const gate=deferred(),p=invitePage(()=>gate.promise);await p.ctx.testHelpers.renderFinalsJudge(1);const pending=p.submit();
+  p.ctx.testHelpers.disposeFinalsView();p.ctx.routeVersion=2;gate.resolve(grant());await pending;
+  assert.equal(p.ctx.testHelpers.finalsHasAccess(),false);assert.equal(p.ctx.sessionStorage.getItem('gotc-finals-access-v1'),null);assert.equal(p.calls.length,2);
+});
+
+test('expired access cannot fetch a captured seat and returns entry to invitation verification',async()=>{
+  const p=invitePage(()=>assert.fail('no protected data may be fetched'),{authorized:true});
+  const view=p.ctx.testHelpers.createFinalsView(1,'seat',{id:'seat-a',name:'A'});p.ctx.testHelpers.finalsSetAccess({...grant(),expiresAt:Date.now()-1});
+  await assert.rejects(p.ctx.testHelpers.finalsRequest(view,'finals/judge'));assert.equal(view.locked,true);assert.equal(p.calls.length,0);
+  await p.ctx.testHelpers.renderFinalsJudge(1);assert.match(p.main.innerHTML,/决赛评委验证/);p.ctx.testHelpers.disposeFinalsView();
+});
+
+test('server revocation clears cached finals access and asks for the invitation again',async()=>{
+  const p=invitePage(()=>{throw Object.assign(new Error('验证已失效'),{status:401,code:'finals_access_required'});},{authorized:true});
+  const ordinary=p.ctx.session;await p.ctx.testHelpers.renderFinalsJudge(1);
+  assert.equal(p.ctx.testHelpers.finalsHasAccess(),false);assert.equal(p.ctx.sessionStorage.getItem('gotc-finals-access-v1'),null);
+  assert.match(p.main.innerHTML,/决赛评委验证/);assert.equal(p.ctx.session,ordinary);p.ctx.testHelpers.disposeFinalsView();
+});
+
+test('malformed access responses cannot unlock the finals entry',async()=>{
+  for(const result of [{accessToken:'short',expiresAt:Date.now()+1000},{...grant(),expiresAt:Date.now()-1},{...grant(),expiresAt:'tomorrow'}]){
+    const p=invitePage(()=>result);await p.ctx.testHelpers.renderFinalsJudge(1);await p.submit();
+    assert.equal(p.ctx.testHelpers.finalsHasAccess(),false);assert.match(p.error.textContent,/验证结果无效/);
+    assert.equal(p.calls.filter(c=>c.path==='finals/access').length,1);p.ctx.testHelpers.disposeFinalsView();
+  }
+});
+
+test('public finals board remains accessible without an invitation',async()=>{
+  const calls=[],ctx=runtime({authorized:false,api:async path=>{calls.push(path);return {summary:null};}}),view=ctx.testHelpers.createFinalsView(1,null);
+  await ctx.testHelpers.finalsRequest(view,'finals/board');assert.deepEqual(calls,['finals/board']);assert.equal(ctx.testHelpers.finalsHasAccess(),false);ctx.testHelpers.disposeFinalsView();
 });

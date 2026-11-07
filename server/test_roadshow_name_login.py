@@ -112,10 +112,10 @@ class RoadshowNameLoginTests(unittest.TestCase):
                 response = client.request(method, path, {} if method == 'POST' else None,
                                           headers={'X-GOTC-Login': client.login_id})
                 self.assertEqual(response[0], 403, response)
-        # A roadshow session never substitutes for explicit finals seat selection.
+        # A roadshow session cannot bypass the independent finals invitation gate.
         finals = client.get('/api/finals/judge')
-        self.assertEqual(finals[0], 400)
-        self.assertEqual(finals[1]['code'], 'finals_seat_required')
+        self.assertEqual(finals[0], 503)
+        self.assertEqual(finals[1]['code'], 'finals_access_unavailable')
         self.assertEqual(client.get('/api/judging/roadshow')[0], 200)
         self.assertEqual(client.get('/api/board')[0], 200)
         ordinary, _ = self.invitation(name='Ordinary existing judge')

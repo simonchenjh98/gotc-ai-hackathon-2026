@@ -2,8 +2,10 @@
 import errno
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import socket
 import threading
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -86,6 +88,31 @@ class UploadTests(unittest.TestCase):
         finally:
             self.slots.release()
             self.slots.release()
+
+    def test_sized_stream_length_is_checked_without_reading_or_moving_cursor(self):
+        with tempfile.SpooledTemporaryFile(max_size=1, mode="w+b") as stream:
+            stream.write(b"prefix" + self.body)
+            stream.seek(6)
+            with mock.patch.object(stream, "read", wraps=stream.read) as read:
+                body = uploads.SizedUpload(stream, len(self.body))
+                self.assertEqual(stream.tell(), 6)
+                read.assert_not_called()
+                self.assertTrue(uploads.eligible(Connection(), body))
+                self.assertFalse(uploads.eligible(Connection("other.example"), body))
+                with self.assertRaises(ValueError):
+                    uploads.SizedUpload(stream, len(self.body) + 1)
+                self.assertEqual(stream.tell(), 6)
+                self.assertEqual(body.read(7), self.body[:7])
+                read.assert_called_once_with(7)
+        self.assertFalse(uploads.eligible(Connection(), io.BytesIO(self.body)))
+
+    def test_sized_stream_failure_releases_slot(self):
+        body = uploads.SizedUpload(io.BytesIO(self.body), len(self.body))
+        connection = Connection()
+        connection.on_request = lambda: (_ for _ in ()).throw(OSError("write failed"))
+        with self.assertRaises(OSError):
+            connection.request("POST", "/v1/images/edits", body, {"Content-Length": str(len(self.body))})
+        self.assert_slots_free()
 
     def test_full_queue_times_out_before_any_connect_or_send(self):
         self.slots.acquire()
