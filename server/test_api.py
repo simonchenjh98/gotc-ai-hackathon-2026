@@ -134,6 +134,15 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.public.get("/assets/secret.json")[0], 404)
         self.assertEqual(self.public.get("/platform.css")[0], 200)
 
+    def test_admin_finals_assets_are_served_without_exposing_private_statistics(self):
+        for filename in ('platform-admin-finals.js', 'platform-admin-finals.css'):
+            content = b'/* Synthetic public dashboard asset */'
+            (self.service.root / filename).write_bytes(content)
+            status, body, _ = self.public.get('/' + filename)
+            self.assertEqual(status, 200)
+            self.assertEqual(body, content)
+        self.assertEqual(self.public.get('/api/admin/finals')[0], 401)
+
     def test_authorization_cookie_origin_and_revocation(self):
         judge, invitation = self.invitation()
         for path in ["/api/admin", "/api/judge", "/api/audience", "/api/admin/export"]:
