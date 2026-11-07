@@ -37,6 +37,7 @@ from judge_login_schedule import JudgeLoginSchedule
 from admin_data import AdminDataService, TRACK_OPTIONS
 from admin_team_access import AdminTeamAccess, PATHS as ADMIN_TEAM_PATHS, operator_for
 from keys import KeyService, load_config
+from gateway_cors import origin_allowed, preflight_allowed, response_headers as gateway_cors_headers
 from team_lifecycle import TeamLifecycle, PATHS as TEAM_LIFECYCLE_PATHS
 from material_uploads import MaterialUploads
 
@@ -1135,6 +1136,10 @@ class EventHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         request_path = urlsplit(self.path).path
         origin = self.headers.get("Origin")
+        if getattr(self, "_gateway_cors", False):
+            for name, value in gateway_cors_headers(self.headers, self.server.service.origin,
+                                                   preflight=self.command == "OPTIONS" and status == 204).items():
+                self.send_header(name, value)
         if request_path in {self.server.service.base_path + p for p in PUBLIC_PATHS} and origin in PUBLIC_ORIGINS:
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
@@ -1167,7 +1172,16 @@ class EventHandler(BaseHTTPRequestHandler):
         self.handle_route()
 
     def do_OPTIONS(self):
-        path = urlsplit(self.path).path
+        self._gateway_cors = False
+        try:
+            path = urlsplit(self.path).path
+            gateway_path = unquote(path, errors="strict")
+        except (UnicodeError, ValueError):
+            self.respond(400, {"error": "请求路径编码不正确"})
+            return
+        if gateway_path.startswith(self.server.service.base_path + "/v1/"):
+            self.handle_route()
+            return
         if (path in {self.server.service.base_path + p for p in PUBLIC_PATHS}
                 and self.headers.get("Origin") in PUBLIC_ORIGINS
                 and self.headers.get("Access-Control-Request-Method") in {"GET", "POST"}
@@ -1181,6 +1195,7 @@ class EventHandler(BaseHTTPRequestHandler):
 
     def handle_route(self):
         service = self.server.service
+        self._gateway_cors = False
         try:
             parsed = urlsplit(self.path)
             if parsed.scheme or parsed.netloc or parsed.fragment:
@@ -1198,7 +1213,16 @@ class EventHandler(BaseHTTPRequestHandler):
                 raise APIError(404, "页面不存在")
             path = path[len(service.base_path):] if service.base_path else path
             if path.startswith("/v1/"):
-                # AI gateway: authenticated by API key, called by SDKs without cookies or Origin.
+                # Check browser origins before reading uploads, authorizing keys, or opening upstreams.
+                # Native SDKs without Origin remain supported; every actual request still needs a key.
+                self._gateway_cors = True
+                if not origin_allowed(self.headers, service.origin):
+                    raise APIError(403, "此浏览器来源不允许调用中转 API", code="origin_not_allowed")
+                if self.command == "OPTIONS":
+                    if not preflight_allowed(self.headers, service.origin):
+                        raise APIError(403, "中转 API 不允许此跨域预检请求", code="cors_preflight_not_allowed")
+                    self.headers_out(204, "text/plain", 0)
+                    return
                 service.keys.gateway(self, path)
                 return
             query={}
