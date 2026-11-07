@@ -116,3 +116,23 @@
 @media(max-width:720px){.admin-lifecycle-panel{padding:16px}.admin-team-members .section-caption{align-items:flex-start;flex-direction:column;gap:12px}.admin-recycle-bin .form-actions{flex-wrap:wrap}.admin-recycle-bin .form-grid{grid-template-columns:1fr}}
 .repository-steps{margin:16px 0;padding-left:20px;font-size:13px;line-height:1.9}.repository-steps li{margin-bottom:6px}.repository-panel>.btn.small{margin:8px 8px 0 0}
 .admin-team-table td small{color:var(--muted)}
+
+/* Participant materials: one visible entry, three independently reachable sections. */
+.submission-entry{border:2px solid var(--blue);background:linear-gradient(115deg,#f2f8ff,#fff);padding:28px}
+.submission-entry-heading{display:flex;align-items:center;justify-content:space-between;gap:24px}
+.submission-entry-heading h2{margin:6px 0 10px}.submission-entry-heading p{margin:0}
+.submission-entry-heading>.btn{flex-shrink:0;min-height:52px;padding:16px 30px;font-size:17px}
+.submission-entry-parts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:24px}
+.submission-entry-parts button{padding:16px;text-align:left;min-height:88px;background:#fff;border:1px solid var(--line);color:var(--navy);cursor:pointer;font:inherit}
+.submission-entry-parts span{display:block;font-weight:700}.submission-entry-parts small{display:block;margin-top:8px;line-height:1.7;color:var(--muted)}
+.submission-entry button:focus-visible,.submission-part:focus-visible{outline:3px solid var(--orange);outline-offset:4px}
+.submission-part{border-top:1px solid var(--line);padding-top:12px;margin-top:24px;scroll-margin-top:24px;min-width:0}
+.submission-part h3 span{font:13px Consolas,monospace;color:var(--blue);margin-right:10px}
+.submission-upload{background:var(--pale);padding:18px;margin-bottom:20px;min-width:0}
+.submission-upload input[type=file]{padding:12px;background:#fff;max-width:100%;font:inherit}
+.submission-upload input[type=file]::file-selector-button{padding:9px 12px;margin-right:12px;border:1px solid var(--line);background:#fff;color:var(--blue);cursor:pointer}
+.upload-filename,.upload-result,.upload-status{overflow-wrap:anywhere;font-size:13px;line-height:1.8}
+.upload-status:empty,.upload-result:empty,#submission-upload-pending:empty{display:none}
+.upload-status{margin:14px 0 0}.upload-result{margin:8px 0 0}
+.submission-form .submission-part .form-grid{grid-template-columns:1fr}
+@media(max-width:720px){.submission-entry{padding:22px}.submission-entry-heading{align-items:stretch;flex-direction:column;gap:18px}.submission-entry-heading>.btn{width:100%}.submission-entry-parts{grid-template-columns:1fr;gap:8px;margin-top:18px}.submission-entry-parts button{min-height:68px;padding:12px 14px}.submission-upload{padding:14px}.submission-upload>.btn{width:100%}.submission-form .form-actions{display:flex;flex-direction:column;gap:10px}.submission-form .form-actions>.btn{flex:0 0 auto;min-height:48px;width:100%}}

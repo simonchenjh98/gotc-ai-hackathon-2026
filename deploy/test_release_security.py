@@ -256,7 +256,7 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
         self.assertTrue((extract / 'platform-claims.js').is_file())
         self.assertTrue((extract / 'server' / 'claims.py').is_file())
         self.assertTrue((extract / 'server' / 'write_conflicts.py').is_file())
-        with urllib.request.urlopen('file://' + str(extract / 'index.html')) as page:
+        with urllib.request.urlopen((extract / 'index.html').as_uri()) as page:
             self.assertIn(b'<!doctype html', page.read(200).lower())
         env = os.environ | {'GOTC_DATA_DIR': str(self.root / 'data'), 'GOTC_HOST': '127.0.0.1', 'GOTC_PORT': '55991', 'GOTC_BASE_PATH': '/gotc', 'GOTC_PUBLIC_ORIGIN': 'https://example.invalid'}
         process = subprocess.Popen([sys.executable, '-u', '-B', str(extract / 'server' / 'app.py')], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -302,7 +302,7 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
                         def http_json(path, payload, cookie):
                             request = urllib.request.Request(f'http://127.0.0.1:{port}/gotc{path}', data=json.dumps(payload).encode(), headers={'Content-Type':'application/json','Origin':'https://example.invalid','Cookie':cookie})
                             with urllib.request.urlopen(request) as result: return json.load(result), result.headers
-                        materials = {'projectName':'Tar Synthetic','summary':'Tar test','codeUrl':'https://example.test/code','readmeUrl':'https://example.test/readme','license':'MIT','licenseUrl':'','demoUrl':'','demoInstructions':'Run','slidesUrl':'https://example.test/slides','videoUrl':'https://example.test/video','sourcesAndLimitations':'Synthetic','codeVersion':'a'*40,'confirmed':True}
+                        materials = {'projectName':'Tar Synthetic','summary':'Tar test','codeUrl':'https://example.test/code','readmeUrl':'https://example.test/readme','license':'MIT','licenseUrl':'','demoUrl':'https://example.test/demo','demoInstructions':'Run','slidesUrl':'https://example.test/slides','videoUrl':'https://example.test/video','sourcesAndLimitations':'Synthetic','codeVersion':'a'*40,'confirmed':True}
                         saved, _ = http_json('/api/submission', {'expectedVersion':0,'status':'submitted','materials':materials}, cookie)
                         self.assertEqual(saved['submission']['submitted']['projectName'], 'Tar Synthetic')
                         self.assertEqual(saved['submission']['submitted']['codeVersion'], 'a'*40)

@@ -208,6 +208,7 @@ Claude Code 会按自己的默认模型名请求（如 `claude-opus-…`、`clau
 
 - 队伍使用：OpenAI 兼容 SDK `base_url=https://<域名>/gotc/v1`；Anthropic SDK `base_url=https://<域名>/gotc`。支持 `Authorization: Bearer` 或 `x-api-key`，支持流式输出。
 - 网页端密钥管理（`/api/team/keys` 及子路由）必须携带页面打开时的 `X-GOTC-Login`，不能从后续登录自动换取新标识继续旧操作。缺失标识返回 428，标识与当前会话不符返回 401；旧标签须刷新并核对登录身份。网页会在切换账号后清除已展示的完整密钥并锁定旧卡片；SDK `/v1/*` 仍仅使用 API Key，无需此请求头。
+- 中转 API 的浏览器来源必须精确匹配 `GOTC_PUBLIC_ORIGIN`；空值、`null`、重复或外站 Origin，以及跨站 `Sec-Fetch-Site` 在读取请求体、转发和计费前返回 403。无 Origin 的 WorkBuddy、SDK 保持支持。预检仅允许明确的方法和请求头，无通配来源或 Cookie credentials；同一规则覆盖 WebSocket 升级。CORS 不能阻止拿到密钥的人通过脚本省略/伪造 Origin，泄露的密钥仍需停用或轮换。
 - 后台设置每队密钥上限、统一到期时间、每队每分钟请求上限（新安装默认为 120，0为不限；已有数据库保留已保存的设置，可在后台调整）、屏蔽词和队伍公告。每队最多 15 个并发请求，超出时排队最多 30 秒再返回 429。
 - 每次请求在排队取得并发名额后会再次校验密钥、队伍状态与到期时间。非 Gitee 上游调用按实际 token 用量统计费用，缺少用量时进行估算。Gitee 按上述目录与可信上游证据计价，证据不足时待核价。Anthropic 请求未设置输出上限时补 `max_tokens: 8192`，显式输出上限最多 128000。
 - 后台管理参照 sub2api：

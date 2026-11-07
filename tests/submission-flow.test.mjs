@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 const source=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8').split("window.addEventListener('hashchange'")[0];
 const sha='a'.repeat(40);
-const materials={projectName:'Project',summary:'Summary',codeUrl:'https://github.com/team/project',codeVersion:'https://github.com/team/project/commit/'+sha,readmeUrl:'https://example.test/readme',license:'MIT',licenseUrl:'',demoUrl:'',demoInstructions:'Run locally',slidesUrl:'https://example.test/slides',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
+const materials={projectName:'Project',summary:'Summary',codeUrl:'https://github.com/team/project',codeVersion:'https://github.com/team/project/commit/'+sha,readmeUrl:'https://example.test/readme',license:'MIT',licenseUrl:'',demoUrl:'https://example.test/demo',demoInstructions:'Run locally',slidesUrl:'https://example.test/slides',filesUrl:'',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
 function fixture(mode='success'){
   const nodes=new Map(),calls=[];let lastReceipt,latest={team:{id:'T1',number:1,name:'Synthetic'},window:{canEdit:true,submissionDeadline:null},submission:{version:0,draft:null,submitted:null,submittedVersion:null,submittedAt:null},judgingMaterials:{}};
   function node(id){if(nodes.has(id))return nodes.get(id);const item={id,isConnected:true,disabled:false,readOnly:false,dataset:{},classList:{add(){},remove(){}},listeners:{},value:'',type:'text',focus(){this.focused=true;},scrollIntoView(){this.scrolled=true;},setAttribute(name,value){this[name]=value;},addEventListener(event,fn){this.listeners[event]=fn;},querySelector(){return null;},querySelectorAll(){return [];}};let html='';Object.defineProperty(item,'innerHTML',{configurable:true,get:()=>html,set(value){html=value;for(const match of value.matchAll(/id="([^"]+)"/g))node(match[1]);}});nodes.set(id,item);return item;}
@@ -47,7 +47,8 @@ test('participant shortcuts preserve the current draft and team route without sa
   assert.match(f.root.innerHTML,/id="jump-team-project-intro">填写作品名称与介绍/);
   assert.ok(f.root.innerHTML.indexOf('id="jump-team-project-intro"')<f.root.innerHTML.indexOf('<h2>本队资料与成员</h2>'));
   const requestsBefore=f.calls.length;
-  for(const [button,target] of [['jump-team-tools','team-keys'],['jump-team-repository','team-repository'],['jump-team-submission','submission-form'],['jump-team-project-intro','material-projectName']]){
+  assert.ok(f.root.innerHTML.indexOf('id="jump-submit-work"')<f.root.innerHTML.indexOf('本队资料与成员'));
+  for(const [button,target] of [['jump-team-tools','team-keys'],['jump-team-repository','team-repository'],['jump-team-submission','submission-form'],['jump-team-project-intro','material-projectName'],['jump-submit-work','submission-form'],['jump-submit-slides','submission-slides'],['jump-submit-files','submission-files'],['jump-submit-demo','submission-demo']]){
     f.node(button).onclick();
     assert.equal(f.node(target).focused,true);
     assert.equal(f.node(target).scrolled,true);
