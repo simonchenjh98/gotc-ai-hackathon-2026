@@ -1059,7 +1059,7 @@ class GatewayTests(unittest.TestCase):
             keys.QUEUE_WAIT = wait
 
     def test_settings_audit_keeps_before_and_after(self):
-        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"maxKeys": 7, "teamRpm": 60})[0], 200)
+        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"maxKeys": 7, "teamRpm": 120})[0], 200)
         change = next(c for c in self.admin.get("/api/admin/keys")[1]["changes"] if c["action"] == "api-key.settings")
         self.assertEqual(change["metadata"], {"maxKeys": [5, 7]})  # unchanged teamRpm is not listed
 
