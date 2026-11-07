@@ -116,6 +116,19 @@ class PreflightTests(unittest.TestCase):
                 self.assertFalse(preflight_allowed(request, TRUSTED))
                 self.assertEqual(response_headers(request, TRUSTED, preflight=True), {})
 
+    def test_requested_header_ascii_controls_and_length_are_bounded(self):
+        invalid = ["Authorization\r\nX-Evil: yes", "Authorization\x00", "Authorization\x7f",
+                   "X-API-Key", "\u00a0Authorization", "Authorization\u00a0", "授权",
+                   "!" * 8192, "!" * 8193, "Authorization" + " " * 8192]
+        for value in invalid:
+            with self.subTest(length=len(value), prefix=value[:30]):
+                request = preflight(requested=value)
+                self.assertFalse(preflight_allowed(request, TRUSTED))
+                self.assertEqual(response_headers(request, TRUSTED, preflight=True), {})
+        # The finite boundary still permits a valid ASCII name with ordinary spaces.
+        boundary = "Authorization" + " " * (8192 - len("Authorization"))
+        self.assertTrue(preflight_allowed(preflight(requested=boundary), TRUSTED))
+
     def test_duplicate_acr_header_fields_rejected(self):
         request = preflight()
         request["access-control-request-headers"] = "authorization"
@@ -139,6 +152,19 @@ class ResponseTests(unittest.TestCase):
         self.assert_private_origin_only(result)
         self.assertEqual(result["Access-Control-Expose-Headers"], "X-Client-Request-ID, Retry-After")
         self.assertNotIn("Access-Control-Allow-Headers", result)
+
+    def test_origin_response_comes_from_validated_configuration_not_request_object(self):
+        class RequestOrigin(str):
+            pass
+        incoming = RequestOrigin(TRUSTED)
+        request = headers(("Origin", incoming))
+        self.assertIs(request.get_all("Origin")[0], incoming)
+        result = response_headers(request, TRUSTED)
+        self.assertIs(result["Access-Control-Allow-Origin"], TRUSTED)
+        self.assertIsNot(result["Access-Control-Allow-Origin"], incoming)
+        request = preflight(origin=incoming)
+        self.assertIs(response_headers(request, TRUSTED, preflight=True)["Access-Control-Allow-Origin"], TRUSTED)
+        self.assertEqual(response_headers(headers(("Origin", TRUSTED + "\r\nX-Evil: yes")), TRUSTED), {})
 
     def test_preflight_response_uses_static_allowlist_not_reflection(self):
         result = response_headers(preflight(requested="authorization"), TRUSTED, preflight=True)

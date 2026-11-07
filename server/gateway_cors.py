@@ -23,7 +23,6 @@ ALLOWED_HEADERS = (
     "X-Client-Request-ID",
 )
 _ALLOWED_HEADER_NAMES = frozenset(name.lower() for name in ALLOWED_HEADERS)
-_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _BAD_VALUE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -86,14 +85,12 @@ def preflight_allowed(headers, trusted_origin):
         return False
     if value is None:
         return True
-    if len(value) > 8192:
+    if len(value) > 8192 or not value.isascii():
         return False
-    raw_names = [name.strip() for name in value.split(",") if name.strip()]
-    # Validate ASCII token syntax before case folding (e.g. Unicode Kelvin sign
-    # lowercases to ASCII k and must not become an allowed X-API-Key spelling).
-    if any(not _TOKEN.fullmatch(name) for name in raw_names):
-        return False
-    names = [name.lower() for name in raw_names]
+    # Reject non-ASCII before trimming or case folding (e.g. Kelvin sign -> k).
+    # Every allowlisted name is already a valid ASCII token, so membership also
+    # rejects punctuation/invalid syntax without matching untrusted input to a regex.
+    names = [name.strip().lower() for name in value.split(",") if name.strip()]
     # Reject duplicate requested names too: browser-generated lists are unique,
     # and accepting ambiguous manual preflights has no compatibility benefit.
     return len(names) == len(set(names)) and all(name in _ALLOWED_HEADER_NAMES for name in names)
@@ -107,7 +104,9 @@ def response_headers(headers, trusted_origin, preflight=False):
     _, origin = _single(headers, "Origin")
     if origin is None:
         return {}
-    result = {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+    # The checks above require exact equality with the validated configuration.
+    # Emit that configuration, never data copied from an incoming HTTP header.
+    result = {"Access-Control-Allow-Origin": trusted_origin, "Vary": "Origin"}
     if preflight:
         result["Access-Control-Allow-Methods"] = "GET, HEAD, POST, OPTIONS"
         result["Access-Control-Allow-Headers"] = ", ".join(ALLOWED_HEADERS)
