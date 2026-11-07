@@ -1,4 +1,5 @@
 """Cross-module roster invariants using synthetic people and temporary databases."""
+from test_registration_fixtures import registration_fixture_create, registration_fixture_open, registration_fixture_save
 import json
 import secrets
 import sqlite3
@@ -35,12 +36,12 @@ class RegistrationClaimConsistencyTests(unittest.TestCase):
         return code, team, request, body
 
     def open_team(self, code):
-        status, result, _ = self.public.post('/api/registration/open', {'code': code})
+        status, result, _ = registration_fixture_open(self, {'code': code})
         self.assertEqual(status, 200, result)
         return result['team']
 
     def save_team(self, code, current, **changes):
-        return self.public.post('/api/registration/save', {
+        return registration_fixture_save(self, {
             'code': code, 'expectedRevision': current['revision'],
             'team': {**{key: current[key] for key in FIELDS}, **changes}})
 
@@ -54,7 +55,7 @@ class RegistrationClaimConsistencyTests(unittest.TestCase):
         self.assertEqual(current['targetSize'], 4)
         self.assertEqual(current['phone'], '13900000001')
         self.assertGreater(current['revision'], original['revision'])
-        self.assertEqual(self.public.post('/api/registration/save', {
+        self.assertEqual(registration_fixture_save(self, {
             'code': code, 'expectedRevision': original['revision'], 'team': self.payload()})[0], 409)
         self.assertEqual(self.save_team(code, current, summary='Verified team introduction')[0], 200)
         current = self.open_team(code)
@@ -122,7 +123,7 @@ class RegistrationClaimConsistencyTests(unittest.TestCase):
                     with self.service.db() as db:
                         db.executemany('INSERT INTO claim_people(id,name,school,normalized_name,normalized_school) VALUES (?,?,?,?,?)',
                                        [(f'full-{i}', f'Person {i}', 'Fixture School', normalize(f'Person {i}'), normalize('Fixture School')) for i in (498, 499)])
-                status, result, _ = self.public.post('/api/registration/create', {'code': secrets.token_urlsafe(32), 'team': self.payload()})
+                status, result, _ = registration_fixture_create(self, {'code': secrets.token_urlsafe(32), 'team': self.payload()})
                 self.assertEqual(status, 409, result)
                 with self.service.db() as db:
                     self.assertEqual(db.execute('SELECT COUNT(*) FROM claim_people').fetchone()[0], count)

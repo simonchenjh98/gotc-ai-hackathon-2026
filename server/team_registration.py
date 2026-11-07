@@ -1,13 +1,15 @@
-"""Student-maintained rosters; never grants submission or model access."""
+"""Own-team profiles and the public directory; authentication belongs to team sessions."""
 import hashlib
 import json
 import re
 import secrets
+from collections import Counter
 
 from claims import normalize, ensure_roster_capacity
 from errors import APIError
 
-PUBLIC_PATHS = {'/api/registration', '/api/registration/create', '/api/registration/open', '/api/registration/save'}
+PUBLIC_PATHS = {'/api/registration'}
+RETIRED_PATHS = {'/api/registration/create','/api/registration/open','/api/registration/save'}
 PUBLIC_ORIGINS = {'https://etownyouthai.com', 'https://www.etownyouthai.com', 'https://simonchenjh98.github.io'}
 FIELDS = {'name', 'captain', 'school', 'phone', 'targetSize', 'members', 'project', 'summary'}
 PLACEHOLDERS = {'', '欢迎', '欢迎加入', '待定', '暂无', '无'}
@@ -21,6 +23,10 @@ CREATE TABLE IF NOT EXISTS team_registrations (
  flags_json TEXT NOT NULL DEFAULT '[]', raw_json TEXT, created_at INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS registration_secret_hash ON team_registrations(secret_hash);
+CREATE TABLE IF NOT EXISTS team_profile_visibility (
+ team_id TEXT PRIMARY KEY REFERENCES team_registrations(team_id),
+ directory_visible INTEGER NOT NULL CHECK(directory_visible IN (0,1))
+);
 CREATE TRIGGER IF NOT EXISTS registration_team_changed AFTER UPDATE OF name,project ON teams
 WHEN OLD.name != NEW.name OR OLD.project != NEW.project BEGIN
  UPDATE team_registrations SET revision=revision+1 WHERE team_id=NEW.id;
@@ -112,11 +118,12 @@ class TeamRegistration:
         rows = [self.row(db, r[0]) for r in db.execute('SELECT team_id FROM team_registrations')]
         return {'teams': [{**self.private(r),'recycled':self.s.team_lifecycle.is_recycled(db,r['team_id'])} if admin else self.public(r)
                           for r in sorted(rows, key=lambda r: r['number'])
-                          if admin or (r['status'] == 'active' and not self.s.team_lifecycle.is_recycled(db,r['team_id']))]}
+                          if admin or (r['status'] == 'active' and not self.s.team_lifecycle.is_recycled(db,r['team_id']) and
+                              not db.execute('SELECT 1 FROM team_profile_visibility WHERE team_id=? AND directory_visible=0',(r['team_id'],)).fetchone())]}
 
     def check_duplicates(self, db, value, team_id=None, *, check_members=True):
         if self.s.team_lifecycle.name_collisions(db,value['name'],team_id):
-            raise APIError(409, '这个队名已登记，请在名单中查找；如是本队，请用管理码修改')
+            raise APIError(409, '这个队名已登记，请核对队伍；本队资料请用参赛码登录选手工作台修改')
         if not check_members:
             return
         names = {normalize(n) for n in value['members']}
@@ -175,65 +182,83 @@ class TeamRegistration:
         db.execute('''INSERT INTO team_registrations
             (team_id,source_key,captain,school,phone,target_size,members_json,summary,secret_hash,flags_json,raw_json,created_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''', (team['id'], source_key, value['captain'], value['school'], value['phone'],
-              value['targetSize'], json.dumps(value['members'], ensure_ascii=False), value['summary'], code_hash(secret),
+              value['targetSize'], json.dumps(value['members'], ensure_ascii=False), value['summary'], code_hash(secret) if secret else 'disabled:'+secrets.token_hex(32),
               json.dumps(self.flags(value), ensure_ascii=False), json.dumps(raw, ensure_ascii=False) if raw else None, self.clock()))
         self.sync_people(db, value)
         return self.row(db, team['id'])
 
-    def authorize(self, db, code):
-        if not isinstance(code, str) or not re.fullmatch(r'[A-Za-z0-9_-]{43}', code):
-            raise APIError(403, '管理码不正确，请向队长或组织方获取')
-        row = db.execute('SELECT team_id FROM team_registrations WHERE secret_hash=?', (code_hash(code),)).fetchone()
-        if not row:
-            raise APIError(403, '管理码不正确，请向队长或组织方获取')
-        result = self.row(db, row[0])
-        if result['status'] != 'active':
-            raise APIError(409, '本队登记已暂停，请联系组织方')
-        return result
+    def profile(self,db,team_id):
+        team=self.s.admin_data.team(db,team_id)
+        row=self.row(db,team_id)
+        members=list(self.s.team_lifecycle.memberships(db,team_id))
+        stored=self.private(row) if row else None
+        value=({key:stored[key] for key in FIELDS} if row else
+               {'name':team['name'],'project':team['project'],'captain':'','school':'','phone':'',
+                'members':[],'targetSize':3,'summary':''})
+        incomplete=''
+        if members:
+            captain_ids={member['captain_id'] for member in members if member['captain_id']}
+            captain=next((member for member in members if len(captain_ids)==1 and member['person_id'] in captain_ids),None)
+            ordered=([captain]+[member for member in members if member['person_id']!=captain['person_id']]) if captain else members
+            if captain and not row:
+                declaration=self.s.claims.declaration(db,captain['request_id'])
+                declared=[declaration['captain'],*declaration['members']] if declaration else []
+                exact={(normalize(member['name']),normalize(member['school'])):member for member in members}
+                identities=[(normalize(member['name']),normalize(member['school'])) for member in declared]
+                if len(identities)==len(exact) and set(identities)==set(exact):ordered=[exact[identity] for identity in identities]
+            value.update(captain=captain['name'] if captain else '',school=captain['school'] if captain else '',
+                         members=stored['members'] if row else [member['name'] for member in ordered],targetSize=row['target_size'] if row else len(members))
+            if not captain or not captain['school'] or (not row and not 3<=len(members)<=5):
+                incomplete='已审核成员的队长或学校资料不完整，请联系组织方核对；此处不会推断身份'
+            if row and (row['captain']!=value['captain'] or row['school']!=value['school'] or
+                        Counter(stored['members'])!=Counter(member['name'] for member in members) or
+                        not stored['members'] or stored['members'][0]!=value['captain']):
+                incomplete='登记与已审核成员记录不一致，请联系组织方核对；此处不会改写已审核身份'
+        submitted=db.execute('SELECT 1 FROM submissions WHERE team_id=? AND submitted_json IS NOT NULL',(team_id,)).fetchone()
+        return {'team':{key:team[key] for key in ('id','number','name','project','track','status')},'profile':value,
+                'revision':row['revision'] if row else 0,'teamRevision':team['revision'],
+                'roster':self.s.team_lifecycle.member_view(db,team_id),'membersEditable':not bool(members),
+                'incomplete':bool(incomplete),'incompleteReason':incomplete,'projectEditable':not bool(submitted),
+                'listedPublicly':bool(row and not db.execute('SELECT 1 FROM team_profile_visibility WHERE team_id=? AND directory_visible=0',(team_id,)).fetchone())}
 
-    def create(self, db, body):
-        if set(body) != {'team', 'code'} or not isinstance(body['code'], str) or not re.fullmatch(r'[A-Za-z0-9_-]{43}', body['code']):
-            raise APIError(400, '请刷新登记页面后重试')
-        value = self.clean(body['team'])
-        old = db.execute('SELECT team_id FROM team_registrations WHERE secret_hash=?', (code_hash(body['code']),)).fetchone()
-        if old:
-            return {'ok': True, 'team': self.private(self.authorize(db, body['code'])), 'replayed': True}
-        self.check_duplicates(db, value)
-        row = self.insert(db, value, body['code'])
-        self.s.audit(db, None, 'registration.create', row['team_id'])
-        return {'ok': True, 'team': self.private(row), 'replayed': False}
-
-    def save(self, db, body):
-        if set(body) != {'team', 'code', 'expectedRevision'}:
-            raise APIError(400, '登记字段不正确')
-        row = self.authorize(db, body['code'])
-        if type(body['expectedRevision']) is not int or body['expectedRevision'] != row['revision']:
+    def save_profile(self,db,actor,team_id,body):
+        if set(body)!={'team','expectedRevision','expectedTeamRevision'}:raise APIError(400,'本队资料字段不正确')
+        current=self.profile(db,team_id)
+        if type(body['expectedRevision']) is not int or body['expectedRevision']!=current['revision'] or type(body['expectedTeamRevision']) is not int or body['expectedTeamRevision']!=current['teamRevision']:
             raise APIError(409, '队伍资料已变化，本次未保存。请复制当前输入，再重新读取本队资料')
+        if current['incomplete']:raise APIError(409,current['incompleteReason'])
+        team=current['team'];baseline=current['profile'];row=self.row(db,team_id)
         value = self.clean(body['team'])
-        verified = db.execute('SELECT 1 FROM claim_memberships WHERE team_id=?', (row['team_id'],)).fetchone() is not None
+        verified=not current['membersEditable']
         if verified:
-            confirmed=json.loads(row['members_json'])
+            confirmed=baseline['members']
             # Keep every approved identity; name-only edits accept the exact full list or ordered tail.
-            if value['captain'] != row['captain'] or value['school'] != row['school'] or body['team']['members'] not in (confirmed,confirmed[1:]):
+            if value['captain'] != baseline['captain'] or value['school'] != baseline['school'] or body['team']['members'] not in (confirmed,confirmed[1:]):
                 raise APIError(409, '本队成员已获组织方批准，成员变化请交由组织方处理')
             if value['targetSize']<len(confirmed):
                 raise APIError(400, '目标人数不能少于已批准的完整成员人数')
-            if value['targetSize'] != row['target_size']:
+            if value['targetSize'] != baseline['targetSize']:
                 raise APIError(409, '本队人数已由组织方确认，人数变化请交由组织方处理')
             value['members']=confirmed
-        self.check_duplicates(db, value, row['team_id'], check_members=not verified)
+        self.check_duplicates(db, value, team_id, check_members=not verified)
         # A registration edit must not overwrite an already submitted project title.
-        if db.execute('SELECT 1 FROM submissions WHERE team_id=? AND submitted_json IS NOT NULL', (row['team_id'],)).fetchone() and value['project'] != row['project']:
+        if not current['projectEditable'] and value['project']!=team['project']:
             raise APIError(409, '已正式提交的项目名称请在选手工作台更新')
-        self.s.admin_data.save_team(db, None, {'id': row['team_id'], 'name': value['name'], 'project': value['project']})
-        db.execute('''UPDATE team_registrations SET captain=?,school=?,phone=?,target_size=?,members_json=?,summary=?,
-            flags_json=?,revision=revision+1 WHERE team_id=?''', (value['captain'],value['school'],value['phone'],value['targetSize'],
-              json.dumps(value['members'],ensure_ascii=False),value['summary'],json.dumps(self.flags(value),ensure_ascii=False),row['team_id']))
+        self.s.admin_data.save_team(db, actor, {'id':team_id,'name':value['name'],'project':value['project']})
+        if not row:
+            db.execute('''INSERT INTO team_registrations(team_id,captain,school,phone,target_size,members_json,summary,secret_hash,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?)''',(team_id,value['captain'],value['school'],value['phone'],value['targetSize'],
+                json.dumps(value['members'],ensure_ascii=False),value['summary'],'disabled:'+secrets.token_hex(32),self.clock()))
+            db.execute('INSERT INTO team_profile_visibility(team_id,directory_visible) VALUES (?,0)',(team_id,))
+        else:
+            db.execute('''UPDATE team_registrations SET captain=?,school=?,phone=?,target_size=?,members_json=?,summary=?,
+                flags_json=?,revision=revision+1 WHERE team_id=?''',(value['captain'],value['school'],value['phone'],value['targetSize'],
+                json.dumps(value['members'],ensure_ascii=False),value['summary'],json.dumps(self.flags(value),ensure_ascii=False),team_id))
         if not verified:
             self.sync_people(db, value)
-        saved = self.row(db, row['team_id'])
-        self.s.audit(db, None, 'registration.save', row['team_id'], {'revision': saved['revision']})
-        return {'ok': True, 'team': self.private(saved)}
+        saved=self.profile(db,team_id)
+        self.s.audit(db,actor,'team.profile.save',team_id,{'revision':saved['revision'],'teamRevision':saved['teamRevision']})
+        return {'ok':True,**saved}
 
     def import_rows(self, db, actor, rows):
         if not isinstance(rows, list) or not 1 <= len(rows) <= 100:
@@ -247,9 +272,8 @@ class TeamRegistration:
                 skipped += 1
                 continue
             value = self.clean(item['team'], imported=True)
-            secret = secrets.token_urlsafe(32)
-            row = self.insert(db, value, secret, source, item['raw'])
-            access.append({'id': row['team_id'], 'number': row['number'], 'name': row['name'], 'captain': row['captain'], 'code': secret})
+            row = self.insert(db, value, None, source, item['raw'])
+            access.append({'id': row['team_id'], 'number': row['number'], 'name': row['name'], 'captain': row['captain']})
             added += 1
         self.s.audit(db, actor, 'registration.import', metadata={'added': added, 'skipped': skipped})
         return {'ok': True, 'added': added, 'skipped': skipped, 'access': access}
@@ -258,8 +282,10 @@ class TeamRegistration:
         admin = path.startswith('/api/admin/registration')
         if query:
             raise APIError(400, '此接口不接受查询参数')
-        if not admin and path not in PUBLIC_PATHS:
+        if not admin and path not in PUBLIC_PATHS|RETIRED_PATHS:
             raise APIError(404, '接口不存在')
+        if method=='POST' and path in RETIRED_PATHS:
+            raise APIError(410,'队伍管理码功能已停用。请使用原参赛码登录选手工作台；尚无参赛码请前往队伍申请入口','registration_code_retired')
         if method == 'POST' and not admin:
             self.s.rate_limit(ip, 'registration')
         with self.s.db() as db:
@@ -275,22 +301,9 @@ class TeamRegistration:
                     return self.listing(db, admin=True)
                 if method == 'POST' and path == '/api/admin/registration/import' and set(body) == {'rows'}:
                     return self.import_rows(db, actor, body['rows'])
-                if method == 'POST' and path == '/api/admin/registration/rotate' and set(body) == {'teamId', 'expectedRevision'}:
-                    row = self.row(db, body['teamId']) if isinstance(body['teamId'], str) else None
-                    if not row or type(body['expectedRevision']) is not int or row['revision'] != body['expectedRevision']:
-                        raise APIError(409, '资料已变化，请刷新后重发')
-                    self.s.team_lifecycle.require_available(db,row['team_id'])
-                    code = secrets.token_urlsafe(32)
-                    db.execute('UPDATE team_registrations SET secret_hash=?,revision=revision+1 WHERE team_id=?', (code_hash(code),row['team_id']))
-                    self.s.audit(db, actor, 'registration.rotate', row['team_id'])
-                    return {'ok': True, 'code': code}
+                if method == 'POST' and path == '/api/admin/registration/rotate':
+                    raise APIError(410,'队伍管理码已停用，不再重发；队伍资料使用原参赛码登录选手工作台管理','registration_code_retired')
             else:
                 if method == 'GET' and path == '/api/registration':
                     return self.listing(db)
-                if method == 'POST' and path == '/api/registration/create':
-                    return self.create(db, body)
-                if method == 'POST' and path == '/api/registration/open' and set(body) == {'code'}:
-                    return {'team': self.private(self.authorize(db, body['code']))}
-                if method == 'POST' and path == '/api/registration/save':
-                    return self.save(db, body)
             raise APIError(404, '接口不存在')

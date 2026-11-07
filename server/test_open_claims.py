@@ -1,4 +1,5 @@
 """Open applications: synthetic HTTP fixtures, no pre-imported eligibility list."""
+from test_registration_fixtures import registration_fixture_create, registration_fixture_open, registration_fixture_save
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 import json
@@ -153,7 +154,7 @@ class OpenClaimsTests(unittest.TestCase):
         value={'name':prefix+' Team','captain':prefix+' Captain','school':'School A','phone':'13900000001',
                'targetSize':3,'members':[prefix+' One'],'project':'Existing project','summary':'Retained summary',**changes}
         code=secrets.token_urlsafe(32)
-        status,result,_=self.public.post('/api/registration/create',{'code':code,'team':value})
+        status,result,_=registration_fixture_create(self,{'code':code,'team':value})
         self.assertEqual(status,200,result)
         return code,result['team'],value
 
@@ -182,9 +183,9 @@ class OpenClaimsTests(unittest.TestCase):
         self.assertEqual(json.loads(updated['members_json']),['Open Captain','Open One','Open Two'])
         self.assertGreater(updated['revision'],original['revision'])
         for field in ['phone','source_key','raw_json','secret_hash','summary','created_at']:self.assertEqual(updated[field],original[field])
-        saved=self.public.post('/api/registration/open',{'code':code})[1]['team']
+        saved=registration_fixture_open(self,{'code':code})[1]['team']
         self.assertEqual(saved['members'],['Open Captain','Open One','Open Two'])
-        self.assertEqual(self.public.post('/api/registration/save',{'code':code,'expectedRevision':saved['revision'],
+        self.assertEqual(registration_fixture_save(self,{'code':code,'expectedRevision':saved['revision'],
             'team':{**value,'name':'Reviewed name','members':['Open One','Different Person']}})[0],409)
         issue=self.bearer(claim,'redeem')[1];team_client=Client(self.server)
         self.assertEqual(team_client.post('/api/login',{'role':'team','code':issue['code']})[0],200)
@@ -193,7 +194,7 @@ class OpenClaimsTests(unittest.TestCase):
 
     def test_selected_registration_snapshot_rejects_changed_registration_and_team_fields(self):
         code,team,value=self.registration();claim=self.application();body=self.selected_approval(claim,team['id'])
-        saved=self.public.post('/api/registration/save',{'code':code,'expectedRevision':team['revision'],'team':{**value,'phone':'13900000002'}})
+        saved=registration_fixture_save(self,{'code':code,'expectedRevision':team['revision'],'team':{**value,'phone':'13900000002'}})
         self.assertEqual(saved[0],200,saved[1]);before=self.counts()
         self.assertEqual(self.admin_call('/approve',body)[0],409);self.assertEqual(self.counts(),before)
         body=self.selected_approval(claim,team['id'])
@@ -255,18 +256,18 @@ class OpenClaimsTests(unittest.TestCase):
                 body=self.selected_approval(claim,registered['id'],resolvedIdentity=True,note='Distinct people from different schools verified')
                 self.assertEqual(self.admin_call('/approve',body)[0],200)
                 stored=[captain,*members]
-                current=self.public.post('/api/registration/open',{'code':code})[1]['team']
+                current=registration_fixture_open(self,{'code':code})[1]['team']
                 self.assertEqual(current['members'],stored)
                 with self.service.db() as db:
                     before=[tuple(row) for row in db.execute('SELECT person_id,team_id,request_id FROM claim_memberships WHERE team_id=? ORDER BY person_id',(registered['id'],))]
                 for submitted in [members,stored]:  # Browser tail and compatible full-list clients.
-                    result=self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],
+                    result=registration_fixture_save(self,{'code':code,'expectedRevision':current['revision'],
                         'team':{**value,'members':submitted,'phone':'13900000002','project':'Editable project after identity review'}})
                     self.assertEqual(result[0],200,result[1]);current=result[1]['team']
                     self.assertEqual(current['members'],stored);self.assertEqual(current['phone'],'13900000002')
                     self.assertEqual(current['project'],'Editable project after identity review')
                 for changed in [members[:-1],['Replacement',members[1]],list(reversed(stored))]:
-                    result=self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],
+                    result=registration_fixture_save(self,{'code':code,'expectedRevision':current['revision'],
                         'team':{**value,'members':changed}})
                     self.assertEqual(result[0],409,result[1])
                 with self.service.db() as db:
@@ -278,10 +279,10 @@ class OpenClaimsTests(unittest.TestCase):
         code,registered,value=self.registration(targetSize=4)
         members=[{'name':name,'school':'School '+str(index)} for index,name in enumerate(['Alex','Alex','Bob'])]
         claim=self.application(members=members);self.assertEqual(self.admin_call('/approve',self.selected_approval(claim,registered['id']))[0],200)
-        current=self.public.post('/api/registration/open',{'code':code})[1]['team']
+        current=registration_fixture_open(self,{'code':code})[1]['team']
         for names,target,status in [(['Alex','Bob','Alex'],4,409),(['Alex','Alex','Bob'],3,400),(['Alex','Bob'],4,409)]:
-            result=self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],'team':{**value,'members':names,'targetSize':target}})
+            result=registration_fixture_save(self,{'code':code,'expectedRevision':current['revision'],'team':{**value,'members':names,'targetSize':target}})
             self.assertEqual(result[0],status,result[1])
-        result=self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],
+        result=registration_fixture_save(self,{'code':code,'expectedRevision':current['revision'],
             'team':{**value,'members':['Alex','Alex','Bob'],'phone':'13900000002'}})
         self.assertEqual(result[0],200,result[1]);self.assertEqual(result[1]['team']['members'],['Open Captain','Alex','Alex','Bob'])

@@ -53,9 +53,19 @@ rosters, repository records and usage, but releases current memberships and revo
 team credentials/sessions. A recycled name is available for new approval. Restore
 is atomic and rejects current name or verified-member conflicts; it cannot replace
 another team's members. Successful restore retains the previous eligibility status
-and leaves old access inactive. Operators must separately reissue submission codes,
-enable API access/create new keys, and rotate existing registration management codes
-when access is needed. Review and explicitly republish affected stage results.
+and leaves old access inactive. Operators must separately reissue submission codes
+and enable API access/create new keys when access is needed. Team profile management
+uses the contestant session; separate registration management codes are retired.
+Review and explicitly republish affected stage results.
+
+Unified team access adds the idempotent `team_profile_visibility` metadata table.
+New own-team profile rows are private; historical public registrations keep their
+existing directory visibility. Preserve this filter on subsequent saves, approvals
+and restoration. Legacy registration hashes remain stored for data preservation,
+but their create/open/save and administrator rotate routes return 410. A compatible
+rollback must retain both these retirement guards and the visibility filter: an
+older binary would re-enable old management codes and expose new private profiles.
+Do not reset contestant accounts, codes, sessions or the database for this update.
 
 **After the first real recycle, rollback must retain lifecycle-aware code.** An older
 binary cannot interpret tombstones or archived memberships and may permit ordinary
