@@ -243,3 +243,60 @@ test('admin directory member cell lists captain and teammates with escaping',()=
   assert.match(html,/&lt;b&gt;x&lt;\/b&gt;/);
   assert.match(context.cell([]),/暂无成员资料/);assert.match(context.cell(undefined),/暂无成员资料/);
 });
+
+function directoryData(name='PRIVATE MEMBER'){
+  return {config:{votingOpen:false,votingDeadline:null},teams:[{id:'T1',number:1,name:'Public team',revision:7,
+    members:[{name,school:'PRIVATE SCHOOL',role:'captain'}]}],judges:[],audience:[],trackOptions:[],recycleCount:0};
+}
+function directoryHarness(fetcher=async()=>ok(directoryData())){
+  const h=harness(fetcher),list=element();let table=element();
+  h.context.document.querySelector=selector=>selector==='.admin-team-table'?table:list;
+  h.context.document.querySelectorAll=()=>[];
+  for(const id of ['clear-team','admin-total-teams','admin-active-audience','new-code'])h.elements[id]=element();
+  for(const id of ['invite-form','audience-settings','settings-form','submission-settings'])h.elements[id]=form({role:'judge',name:''});
+  for(const key of ['number','project','track','status','statusReason','booth','roadshowOrder'])h.entry.elements[key]=Object.assign(element(),{value:''});
+  const query=h.entry.querySelector;h.entry.querySelector=selector=>selector==='.form-grid'?element():query(selector);
+  h.entry.reset=()=>{};
+  vm.runInContext('installSettingsForm=()=>{};installImportTools=(ctx,controls)=>{globalThis.directoryContext=ctx;globalThis.directoryControls=controls;};installRecordTools=()=>{};installAuditTools=()=>{};',h.context);
+  h.context.eventData=directoryData();
+  vm.runInContext('adminEventData=eventData;installAdminData(eventData,1);controller=currentAdminTeamLifecycle;',h.context);
+  const events={};h.context.window={addEventListener:(name,fn)=>events[name]=fn};
+  vm.runInContext(platform.slice(platform.indexOf("window.addEventListener('storage'"),platform.indexOf("window.addEventListener('pagehide'")),h.context);
+  return {...h,events,get table(){return table;},refresh:()=>vm.runInContext('directoryControls.refreshDirectory()',h.context),
+    remount(){table.isConnected=false;table=element();h.marker('LOGIN2');h.context.eventData=directoryData('CURRENT MEMBER');
+      vm.runInContext("session={role:'admin',loginId:'LOGIN2'};adminEventData=eventData;installAdminData(eventData,1);controller=currentAdminTeamLifecycle;",h.context);}};
+}
+
+for(const event of ['storage','focus','pageshow'])test(`directory ${event} revalidation clears private DOM and caches but preserves form inputs`,()=>{
+  const h=directoryHarness();assert.match(h.table.innerHTML,/PRIVATE MEMBER/);
+  h.entry.elements.name.value='UNSAVED TEAM EDIT';h.entry.input();h.marker('LOGIN2');
+  h.events[event](event==='pageshow'?{persisted:true}:{key:'synthetic-owner',newValue:'LOGIN2'});
+  assert.doesNotMatch(h.table.innerHTML,/PRIVATE MEMBER|PRIVATE SCHOOL/);
+  assert.match(h.table.textContent,/成员资料已隐藏/);
+  assert.equal(h.entry.elements.name.value,'UNSAVED TEAM EDIT');
+  assert.equal(vm.runInContext('dirtyAdminForms.has(document.getElementById("team-form"))',h.context),true);
+  assert.equal(vm.runInContext('Object.hasOwn(adminEventData.teams[0],"members")',h.context),false);
+  assert.equal(Object.hasOwn(h.context.directoryContext.data.teams[0],'members'),false);
+});
+
+for(const status of [401,403,428])test(`directory ${status} hides members and a late successful read cannot restore them`,async()=>{
+  const old=deferred();let reads=0;
+  const h=directoryHarness(()=>++reads===1?old.promise:Promise.resolve({ok:false,status,json:async()=>({error:'Synthetic denial'})}));
+  const pending=h.refresh();await assert.rejects(vm.runInContext("api('admin')",h.context),/Synthetic denial/);
+  const stale=directoryData('LATE PRIVATE MEMBER');old.resolve(ok(stale));await pending;
+  assert.doesNotMatch(h.table.innerHTML,/PRIVATE MEMBER|PRIVATE SCHOOL/);
+  assert.equal(Object.hasOwn(stale.teams[0],'members'),false);
+  assert.equal(Object.hasOwn(h.context.directoryContext.data.teams[0],'members'),false);
+  assert.equal(vm.runInContext('controller.valid()',h.context),false);
+});
+
+for(const status of [200,401,403,428])test(`old directory ${status} response cannot clear a newly mounted login`,async()=>{
+  const old=deferred(),h=directoryHarness(()=>old.promise),oldData=h.context.eventData;
+  const pending=h.refresh();h.remount();
+  old.resolve(status===200?ok(directoryData('OLD RESPONSE')):{ok:false,status,json:async()=>({error:'Old denial'})});await pending;
+  assert.match(h.table.innerHTML,/CURRENT MEMBER/);assert.doesNotMatch(h.table.innerHTML,/OLD RESPONSE/);
+  assert.equal(vm.runInContext('session.loginId',h.context),'LOGIN2');
+  assert.equal(vm.runInContext('controller.valid()',h.context),true);
+  assert.equal(vm.runInContext('adminEventData.teams[0].members[0].name',h.context),'CURRENT MEMBER');
+  assert.equal(Object.hasOwn(oldData.teams[0],'members'),false);
+});

@@ -194,6 +194,38 @@ class LeanGiteeTests(unittest.TestCase):
                     with self.service.db() as db:
                         db.execute("UPDATE repository_bindings SET state='reconcile'")
 
+    def test_known_enterprise_user_id_survives_grant_and_readback_failures(self):
+        self.membership_fixture(grant_requires_member=False)
+        row=self.application()
+        for active in (True,False):
+            for mismatch in ('grant','permission'):
+                with self.subTest(active=active,mismatch=mismatch):
+                    self.member=self.member_data(user={'id':789,'login':'Developer'},active=active)
+                    self.remote.gitee_member_response=(200,{'id':789,'login':'Developer'}) if mismatch=='permission' else None
+                    self.remote.calls.clear()
+                    row=self.admin_action(row,'approve' if row['state']=='requested' else 'reconcile')[1]['repository']
+                    self.assertEqual(row['state'],'reconcile' if active else 'invited')
+                    grants=[c for c in self.remote.calls if '/collaborators/' in c[1]]
+                    # The fake grants/permission readback report id 456. Do not
+                    # retry without the enterprise-confirmed id 789 constraint.
+                    self.assertEqual(sum(c[0]=='PUT' for c in grants),1)
+                    self.assertEqual(sum(c[0]=='GET' for c in grants),int(mismatch=='permission'))
+                    self.assertEqual(self.invites,0)
+
+    def test_invalid_enterprise_identity_never_falls_back_to_repository_grant(self):
+        self.membership_fixture(grant_requires_member=False)
+        row=self.application()
+        for member in [self.member_data(user={'id':456,'login':'other'}),
+                       self.member_data(enterprise={'path':'other-enterprise'}),
+                       self.member_data(role='unknown'),self.member_data(active=None),{}]:
+            with self.subTest(member=member):
+                self.member=member
+                self.remote.calls.clear()
+                row=self.admin_action(row,'approve' if row['state']=='requested' else 'reconcile')[1]['repository']
+                self.assertEqual(row['state'],'reconcile')
+                self.assertFalse(any('/collaborators/' in path for _,path,_ in self.remote.calls))
+                self.assertEqual(self.invites,0)
+
     def test_failed_invitation_still_tries_repository_grant_without_reinviting(self):
         self.membership_fixture(grant_requires_member=False)
         self.lose_invite=True

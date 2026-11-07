@@ -474,7 +474,7 @@ class Repositories:
         if p.name!='gitee':
             return p.invite(row,username)
         try:
-            outcome=self.enterprise_invite(p,row,username)
+            outcome,expected_user_id=self.enterprise_invite(p,row,username)
         except UpstreamError:
             # Enterprise member APIs may be unavailable to this token (scope/plan/seats).
             return self.direct_grant(p,row,username,None)
@@ -482,13 +482,17 @@ class Repositories:
             if error.code!='repository_membership_unknown':
                 raise
             return self.direct_grant(p,row,username,error)
-        return outcome if outcome=='ready' else self.direct_grant(p,row,username,outcome)
+        # Once the enterprise response identifies a user, every grant/readback must
+        # retain that numeric identity. Grant failures are outside the membership
+        # fallback above, so they cannot trigger a second, unconstrained grant.
+        return self.direct_grant(p,row,username,'invited' if outcome=='invited' else None,
+                                 expected_user_id=expected_user_id)
 
     @staticmethod
-    def direct_grant(p,row,username,fallback):
+    def direct_grant(p,row,username,fallback,expected_user_id=None):
         """Try a repository-level push grant; success is still verified by permission readback."""
         try:
-            return p.invite(row,username)
+            return p.invite(row,username,expected_user_id=expected_user_id)
         except UpstreamError:
             if fallback is None:
                 raise
@@ -497,6 +501,7 @@ class Repositories:
             return fallback
 
     def enterprise_invite(self,p,row,username):
+        """Return membership state and any verified numeric user ID, without granting repository access."""
         # Provisioning has already verified and persisted the enterprise repository.
         # Check this account directly before any repository permission mutation.
         path='/enterprises/'+quote(row['organization'],safe='')+'/members'
@@ -512,7 +517,7 @@ class Repositories:
                 # A sent invitation can remain invisible until acceptance. An unknown
                 # send must be checked manually; neither result authorizes a resend.
                 if prior['state']=='sent':
-                    return 'invited'
+                    return 'invited',None
                 raise APIError(409,'企业成员邀请结果待核对，请主办方人工检查邀请；平台不会自动重复邀请','repository_membership_unknown')
             # Commit intent BEFORE the remote POST, including a lost-response/crash case.
             with self.s.db() as db:
@@ -523,7 +528,7 @@ class Repositories:
                     prior=db.execute('SELECT state FROM repository_enterprise_invites WHERE organization=? AND username=?',
                                      (row['organization'].lower(),username.lower())).fetchone()
                     if prior['state']=='sent':
-                        return 'invited'
+                        return 'invited',None
                     raise APIError(409,'企业成员邀请结果待核对，请主办方人工检查邀请；平台不会自动重复邀请','repository_membership_unknown')
             try:
                 status,_=p.request('POST',path,{'username':username,'role':'member'})
@@ -534,7 +539,7 @@ class Repositories:
             with self.s.db() as db:
                 db.execute("UPDATE repository_enterprise_invites SET state='sent' WHERE organization=? AND username=?",
                            (row['organization'].lower(),username.lower()))
-            return 'invited'
+            return 'invited',None
         user=member.get('user') if isinstance(member,dict) else None
         enterprise=member.get('enterprise') if isinstance(member,dict) else None
         if (status!=200 or not isinstance(user,dict) or type(user.get('id')) is not int or user['id']<=0
@@ -543,12 +548,12 @@ class Repositories:
                 or type(member.get('active')) is not bool
                 or (isinstance(enterprise,dict) and 'path' in enterprise
                     and (not isinstance(enterprise['path'],str) or enterprise['path'].lower()!=row['organization'].lower()))):
-            raise APIError(409,'企业成员身份、角色或激活状态未能确认，请主办方人工核对；平台不会修改已有企业角色','repository_membership_unknown')
+            raise APIError(409,'企业成员身份、角色或激活状态未能确认，请主办方人工核对；平台不会修改已有企业角色','repository_membership_identity')
         if member['active'] is False:
-            return 'invited'
+            return 'invited',user['id']
         # Preserve existing member/outsourced/admin roles; the separately verified
         # effective repository permission must still be exactly push for this user id.
-        return p.invite(row,username,expected_user_id=user['id'])
+        return 'ready',user['id']
 
     def binding(self, db, team_id):
         row = self.get(db, team_id)
