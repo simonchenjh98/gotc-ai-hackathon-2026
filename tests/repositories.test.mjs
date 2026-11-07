@@ -24,6 +24,7 @@ function fixture(options={}){
     calls.push({path,body});
     if(path==='team')return context.teamResponse?await context.teamResponse():structuredClone(latest);
     if(path==='team/repository')return context.repositoryResponse();
+    if(path==='team/repository/refresh')return context.repositoryResponse();
     if(path==='team/repository/preview')return context.previewResponse?await context.previewResponse():{previewId,sha,branch:'main',codeUrl:boundRepository.codeUrl,archived:false};
     if(path==='submission'){
       if(context.submissionResponse)await context.submissionResponse(body);
@@ -293,4 +294,27 @@ test('rendered unchanged bound draft retains its saved full SHA while formal pre
   f.context.previewResponse=async()=>({previewId,sha:'c'.repeat(40),branch:'main',codeUrl:bound.codeUrl});
   await f.node('submission-form').onsubmit({preventDefault(){}});assert.match(f.node('submission-preview').innerHTML,/c{40}/);
   assert.equal(f.calls.filter(call=>call.path==='team/repository/preview').length,1);
+});
+
+test('bound repository panel guides joining, self refresh and one-click submit',()=>{
+  const {h}=fixture(),gitee={...repository,provider:'gitee',codeUrl:'https://gitee.com/gotc-ai-hackathon/x',canSubmit:true};
+  const joinProviders=[{provider:'gitee',organization:'gotc-ai-hackathon',enabled:true,autoApprove:true,joinUrl:'https://gitee.com/gotc-ai-hackathon/invite'}];
+  const pending=h.teamRepositoryMarkup({repository:gitee,repositoryProviders:joinProviders,window:{canEdit:true}});
+  assert.match(pending,/我已加入，刷新授权/);assert.match(pending,/加入赛事 Gitee 组织/);assert.match(pending,/id="repository-submit"/);
+  const closed=h.teamRepositoryMarkup({repository:{...gitee,state:'ready'},repositoryProviders:joinProviders,window:{canEdit:false}});
+  assert.match(closed,/id="repository-submit" disabled/);assert.match(closed,/尚未开放或已截止/);assert.match(closed,/刷新仓库状态/);
+  const requested=h.teamRepositoryMarkup({repository:{...gitee,state:'requested',codeUrl:null,canSubmit:false},repositoryProviders:joinProviders,window:{canEdit:true}});
+  assert.ok(!requested.includes('id="repository-submit"'));assert.match(requested,/刷新并关联仓库/);assert.match(requested,/手动填写/);
+  const application=h.teamRepositoryMarkup({repositoryProviders:joinProviders});
+  assert.match(application,/创建并关联本队仓库/);assert.match(application,/自动在赛事组织下创建/);
+  const unsafe=h.teamRepositoryMarkup({repositoryProviders:[{...joinProviders[0],joinUrl:'javascript:alert(1)'}]});
+  assert.ok(!unsafe.includes('javascript:'));
+});
+
+test('team refresh uses the self-service endpoint',async()=>{
+  const ready={...repository,provider:'gitee',state:'ready',codeUrl:'https://gitee.com/synthetic/ready',canSubmit:true};
+  const f=fixture({liveRepository:true,repository:{...ready,state:'invited'}});await f.context.render();
+  f.context.repositoryResponse=async()=>({repository:ready});
+  await f.node('refresh-team-repository').onclick({currentTarget:f.node('refresh-team-repository')});
+  const call=f.calls.find(c=>c.path==='team/repository/refresh');assert.ok(call);assert.equal(JSON.stringify(call.body),'{}');
 });

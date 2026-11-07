@@ -257,6 +257,19 @@ class TeamLifecycleTests(unittest.TestCase):
         self.assertEqual(self.admin.post('/api/admin/team-access',{'teamId':team_id,'action':'issue'})[0],200)
         self.assertEqual(self.recycle(team_id,stale)[1]['code'],'team_context_conflict')
 
+    def test_admin_directory_lists_member_names_but_delegated_sessions_cannot_read_it(self):
+        team_id,claim=self.approved('Synthetic Directory Roster')
+        detail=self.detail(team_id)
+        team=next(t for t in self.admin.get('/api/admin')[1]['teams'] if t['id']==team_id)
+        self.assertEqual([m['name'] for m in team['members']],[m['name'] for m in detail['roster']['members']])
+        self.assertEqual(team['members'][0]['role'],'captain')
+        self.assertTrue(all(set(m)=={'name','role','school'} for m in team['members']))
+        status,delegated,_=self.admin.request('POST','/api/admin/team-workbench',{'teamId':team_id},headers={'X-GOTC-Login':self.admin.login_id})
+        self.assertEqual(status,200,delegated)
+        response=self.admin.request('GET','/api/admin',headers={'X-GOTC-Login':delegated['loginId']})
+        self.assertEqual(response[0],403)
+        self.assertNotIn(team['members'][0]['name'],json.dumps(response[1]))
+
     def test_private_detail_denies_delegation_and_never_enriches_public_snapshots(self):
         team_id,_=self.approved('Synthetic Secret Roster')
         detail=self.detail(team_id)

@@ -290,9 +290,10 @@ class RepositoryTests(unittest.TestCase):
         row = result['repository']
         self.assertEqual(row['state'], 'reconcile')
         self.assertEqual(row['externalId'], '123')
-        self.assertNotEqual(row['message'], '仓库写权限已确认')
+        self.assertNotEqual(row['message'], '仓库写权限已确认，可以 push 代码并提交作品')
         self.open_submissions()
-        self.assertEqual(self.preview()[0], 409)
+        # The verified repository can still be submitted while access is reconciled.
+        self.assertEqual(self.preview()[0], 200)
         self.remote.gitee_member_response = None
         self.remote.gitee_permission = 'pull'
         row = self.admin_action(row, 'reconcile')[1]['repository']
@@ -317,7 +318,7 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn('不会自动修改', row['message'])
         self.assertEqual(row['externalId'], '123')
         self.open_submissions()
-        self.assertEqual(self.preview()[0], 409)
+        self.assertEqual(self.preview()[0], 200)
         grants = [c for c in self.remote.calls if '/collaborators/' in c[1] and c[0] == 'PUT']
         self.assertEqual(len(grants), 1)
         self.assertEqual(grants[0][2], {'permission': 'push'})

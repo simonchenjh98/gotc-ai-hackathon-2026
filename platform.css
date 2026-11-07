@@ -112,3 +112,5 @@
 .admin-restore-blocking h4,.admin-restore-advisory h4{margin:0}.admin-restore-blocking p,.admin-restore-advisory p{margin-bottom:0}
 #team-recycle-confirm[hidden],#team-recycle-bin[hidden],#team-restore-detail[hidden],#team-restore-result[hidden],#team-recycle-open[hidden],#team-detail-refresh[hidden]{display:none}
 @media(max-width:720px){.admin-lifecycle-panel{padding:16px}.admin-team-members .section-caption{align-items:flex-start;flex-direction:column;gap:12px}.admin-recycle-bin .form-actions{flex-wrap:wrap}.admin-recycle-bin .form-grid{grid-template-columns:1fr}}
+.repository-steps{margin:16px 0;padding-left:20px;font-size:13px;line-height:1.9}.repository-steps li{margin-bottom:6px}.repository-panel>.btn.small{margin:8px 8px 0 0}
+.admin-team-table td small{color:var(--muted)}

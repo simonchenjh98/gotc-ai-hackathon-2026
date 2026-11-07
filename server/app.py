@@ -793,6 +793,10 @@ class EventService:
                     for person in judges:person['credentialMode']=self.admin_data.credential_mode(db,person['id'],'judge')
                     for person in audience:person['credentialMode']=self.admin_data.credential_mode(db,person['id'],'audience')
                     teams=[team for team in self.teams(db, public=False) if not self.team_lifecycle.is_recycled(db,team['id'])]
+                    for team in teams:
+                        # Admin-only directory: show who is on each team without opening the editor.
+                        team['members']=[{'name':m['name'],'role':m['role'],'school':m.get('school')}
+                                         for m in self.team_lifecycle.member_view(db,team['id'])['members']]
                     stats = {"teamCount":len(teams), "submittedScores": db.execute("SELECT COUNT(*) FROM scores WHERE status='submitted'").fetchone()[0], "audienceVotes": db.execute("SELECT COUNT(*) FROM votes").fetchone()[0]}
                     submissions=[row for row in self.admin_submissions(db) if not self.team_lifecycle.is_recycled(db,row['teamId'])]
                     recycle_count=db.execute('SELECT COUNT(*) FROM team_recycle_events WHERE restored_at IS NULL').fetchone()[0]
