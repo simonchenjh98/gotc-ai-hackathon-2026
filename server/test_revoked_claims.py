@@ -1,4 +1,5 @@
 """Explicit administrator reissue tests with synthetic people and temporary databases."""
+from test_registration_fixtures import registration_fixture_open
 from concurrent.futures import ThreadPoolExecutor
 import json
 import unittest
@@ -84,7 +85,7 @@ class RevokedClaimsTests(unittest.TestCase):
             request=db.execute('SELECT * FROM claim_requests WHERE id=?',(claim['requestId'],)).fetchone()
             self.assertEqual(request['account_id'],access['id'])
             self.assertEqual(db.execute('SELECT COUNT(*) FROM team_api').fetchone()[0],0)
-        saved=self.public.post('/api/registration/open',{'code':management})[1]['team']
+        saved=registration_fixture_open(self,{'code':management})[1]['team']
         self.assertEqual(saved['targetSize'],5);self.assertEqual(len(saved['members']),5)
         serialized=json.dumps(self.admin_call('')[1])+' '.join(row[-1] for row in after['audit'])
         for secret in [management,access['code'],claim['secret'],claim['pin'],issued['code'],rotated[0]]:self.assertNotIn(secret,serialized)

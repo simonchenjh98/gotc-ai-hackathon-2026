@@ -619,10 +619,23 @@ class EventService:
             # Resolve write identities only after the lock: revocation may have committed while queued.
             if method=="POST":
                 db.execute("BEGIN IMMEDIATE")
-            elif method=="GET" and (self.finals.supports(path) or path in TEAM_LIFECYCLE_PATHS or path in {"/api/admin", "/api/team/score", "/api/board", "/api/judge", "/api/audience"}):
+            elif method=="GET" and (self.finals.supports(path) or path in TEAM_LIFECYCLE_PATHS or path in {"/api/admin", "/api/team/profile", "/api/team/score", "/api/board", "/api/judge", "/api/audience"}):
                 # Keep release settings, aggregates and editor revisions in one read snapshot.
                 db.execute("BEGIN")
             actor = self.account(db, cookie)
+            if path=='/api/team/profile':
+                self.require(actor,'team')
+                if operator_for(actor):raise APIError(403,'本队资料仅供参赛队伍登录管理；组织方请使用独立后台')
+                if not expected_login_id:raise APIError(428,'请刷新页面并核对登录队伍','login_required')
+                if expected_login_id!=self.login_id(cookie):raise APIError(401,'登录身份已变化，请重新登录')
+                if query:raise APIError(400,'本队资料由当前登录队伍确定，不接受查询参数')
+                team=self.bound_submission_team(db,actor)
+                if self.admin_data.team(db,team['id'])['status']!='active':raise APIError(409,'本队资料已暂停，请联系组织方','team_ineligible')
+                if method=='GET':
+                    if body:raise APIError(400,'读取本队资料不接受请求字段')
+                    return {**self.registration.profile(db,team['id']),'loginId':self.login_id(cookie)},None,None
+                if method=='POST':return {**self.registration.save_profile(db,actor,team['id'],body),'loginId':self.login_id(cookie)},None,None
+                raise APIError(405,'本队资料仅支持读取和保存')
             if path in TEAM_LIFECYCLE_PATHS:
                 return self.team_lifecycle.dispatch(db,actor,method,path,body,query or {},cookie,expected_login_id),None,None
             if path in ADMIN_TEAM_PATHS:

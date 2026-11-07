@@ -1,4 +1,5 @@
 """Online organizer review uses explicit intent, never an exchanged device PIN."""
+from test_registration_fixtures import registration_fixture_open, registration_fixture_save
 import json
 import unittest
 import test_claims
@@ -49,11 +50,11 @@ class OnlineClaimsTests(unittest.TestCase):
         self.assertEqual(client.post('/api/login',{'role':'team','code':receipt['code']})[0],200)
         with self.service.db() as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM claim_memberships WHERE team_id=?',(registered['id'],)).fetchone()[0],5)
-        current=self.public.post('/api/registration/open',{'code':code})[1]['team']
+        current=registration_fixture_open(self,{'code':code})[1]['team']
         self.assertEqual(current['targetSize'],5)
         self.assertEqual(current['members'],['Open Captain',*names])
         changed={**value,'project':'Five-person project'}
-        saved=self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],'team':changed})
+        saved=registration_fixture_save(self,{'code':code,'expectedRevision':current['revision'],'team':changed})
         self.assertEqual(saved[0],200,saved[1]);self.assertEqual(len(saved[1]['team']['members']),5)
         extra=[{'name':name,'school':'School A'} for name in [*names,'Open Five']]
         invalid=self.public.post('/api/claims/request',{'name':'Six Captain','school':'School A','teamName':'Six people','track':'','members':extra})
@@ -111,23 +112,23 @@ class OnlineClaimsTests(unittest.TestCase):
     def test_online_sync_uses_assigned_members_final_count_and_allows_metadata_despite_public_homonym(self):
         code,registered,value=self.registration(targetSize=5);claim=self.application()
         self.assertEqual(self.admin_call('/approve',self.selected_approval(claim,registered['id']))[0],200)
-        current=self.public.post('/api/registration/open',{'code':code})[1]['team']
+        current=registration_fixture_open(self,{'code':code})[1]['team']
         self.assertEqual(current['targetSize'],3);self.assertFalse(current['recruiting']);self.assertEqual(current['phone'],value['phone'])
         with self.service.db() as db:
             db.execute("INSERT INTO teams(id,number,name,project,track,updated_at) VALUES ('homonym',2,'Other team','','',1)")
             db.execute("INSERT INTO team_registrations(team_id,captain,school,phone,target_size,members_json,secret_hash,created_at) VALUES ('homonym','Other Captain','School A','',3,?,'homonym-secret',1)",
                 (json.dumps(['Other Captain','Open One']),))
         saved={**value,'targetSize':3,'members':current['members'][1:],'phone':'13900000002','project':'Metadata edit'}
-        result=self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],'team':saved})
+        result=registration_fixture_save(self,{'code':code,'expectedRevision':current['revision'],'team':saved})
         self.assertEqual(result[0],200,result[1]);self.assertEqual(result[1]['team']['members'],current['members'])
         current=result[1]['team']
-        self.assertEqual(self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],'team':{**saved,'targetSize':4}})[0],409)
-        self.assertEqual(self.public.post('/api/registration/save',{'code':code,'expectedRevision':current['revision'],'team':{**saved,'members':['Open One']}})[0],409)
+        self.assertEqual(registration_fixture_save(self,{'code':code,'expectedRevision':current['revision'],'team':{**saved,'targetSize':4}})[0],409)
+        self.assertEqual(registration_fixture_save(self,{'code':code,'expectedRevision':current['revision'],'team':{**saved,'members':['Open One']}})[0],409)
 
     def test_online_changed_captain_clears_stale_contact_and_keeps_private_audit(self):
         code,registered,value=self.registration();claim=self.application(name='Replacement Captain',school='Replacement School')
         body=self.selected_approval(claim,registered['id']);self.assertEqual(self.admin_call('/approve',body)[0],200)
-        current=self.public.post('/api/registration/open',{'code':code})[1]['team']
+        current=registration_fixture_open(self,{'code':code})[1]['team']
         self.assertEqual(current['captain'],'Replacement Captain');self.assertEqual(current['phone'],'')
         self.assertEqual(current['members'],['Replacement Captain','Open One','Open Two']);self.assertEqual(current['targetSize'],3)
         with self.service.db() as db:
@@ -135,4 +136,4 @@ class OnlineClaimsTests(unittest.TestCase):
             self.assertEqual(audit['previousContact'],{'captain':value['captain'],'school':value['school'],'phone':value['phone']})
         self.assertNotIn(value['phone'],json.dumps(self.public.get('/api/registration')[1]))
         before=current['revision'];self.assertEqual(self.admin_call('/approve',body)[0],200)
-        self.assertEqual(self.public.post('/api/registration/open',{'code':code})[1]['team']['revision'],before)
+        self.assertEqual(registration_fixture_open(self,{'code':code})[1]['team']['revision'],before)

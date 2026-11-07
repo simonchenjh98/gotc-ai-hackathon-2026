@@ -1,4 +1,5 @@
 """Recycle-aware current entry points; every fixture uses a synthetic temporary DB."""
+from test_registration_fixtures import registration_fixture_create
 import json
 import sqlite3
 import unittest
@@ -169,9 +170,9 @@ class TeamRecycleIntegrationTests(unittest.TestCase):
                 [('synthetic-'+str(i),i,'Synthetic Capacity '+str(i)) for i in range(1,201)])
         value={'name':'Synthetic New Registration','captain':'Synthetic Capacity Captain','school':'Synthetic Capacity School',
             'phone':'','targetSize':3,'members':['Synthetic Capacity One','Synthetic Capacity Two'],'project':'','summary':''}
-        self.assertEqual(self.public.post('/api/registration/create',{'team':value,'code':'c'*43})[0],409)
+        self.assertEqual(registration_fixture_create(self,{'team':value,'code':'c'*43})[0],409)
         self.recycle('synthetic-1')
-        status,result,_=self.public.post('/api/registration/create',{'team':value,'code':'c'*43})
+        status,result,_=registration_fixture_create(self,{'team':value,'code':'c'*43})
         self.assertEqual(status,200,result);self.assertEqual(result['team']['number'],201)
         with self.service.db() as db:
             db.executemany('INSERT INTO teams(id,number,name,project,track,updated_at) VALUES (?,?,?,\'\',\'\',1)',
@@ -182,7 +183,7 @@ class TeamRecycleIntegrationTests(unittest.TestCase):
                 original_status,original_status_reason,team_snapshot_json,roster_snapshot_json)
                 VALUES (?,1,?,'Synthetic capacity','active','','{}','{}')""",
                 [(row[0],actor) for row in db.execute('SELECT id FROM teams WHERE id<>?',('synthetic-1',))])
-        status,result,_=self.public.post('/api/registration/create',{'team':{**value,'name':'Synthetic Exhausted'},'code':'d'*43})
+        status,result,_=registration_fixture_create(self,{'team':{**value,'name':'Synthetic Exhausted'},'code':'d'*43})
         self.assertEqual(status,409,result);self.assertIn('1–999',result['error'])
 
     def test_reused_name_and_people_approve_distinct_team_restore_cannot_take_people(self):
@@ -226,22 +227,22 @@ class TeamRecycleIntegrationTests(unittest.TestCase):
         body={'name':'Synthetic Registration','captain':'Synthetic Captain','school':'Synthetic School',
             'phone':'','targetSize':3,'members':['Synthetic Captain','Synthetic One','Synthetic Two'],
             'project':'Synthetic Project','summary':'Synthetic summary'}
-        status,result,_=self.public.post('/api/registration/create',{'team':body,'code':'a'*43})
+        status,result,_=registration_fixture_create(self,{'team':body,'code':'a'*43})
         self.assertEqual(status,200,result);team_id=result['team']['id']
         self.recycle(team_id)
         row=self.service.registration.row
         with self.service.db() as db:revision=row(db,team_id)['revision']
         status,result,_=self.admin.request('POST','/api/admin/registration/rotate',{
             'teamId':team_id,'expectedRevision':revision},headers={'X-GOTC-Login':self.admin.login_id})
-        self.assertEqual(status,409,result);self.assertEqual(result.get('code'),'team_recycled')
-        status,result,_=self.public.post('/api/registration/create',{'team':body,'code':'b'*43})
+        self.assertEqual(status,410,result);self.assertEqual(result.get('code'),'registration_code_retired')
+        status,result,_=registration_fixture_create(self,{'team':body,'code':'b'*43})
         self.assertEqual(status,200,result);self.assertNotEqual(result['team']['id'],team_id)
         self.assertEqual(len(self.public.get('/api/registration')[1]['teams']),1)
 
     def test_registration_history_marks_recycle_only_for_admins(self):
         body={'name':'Synthetic History Registration','captain':'Synthetic History Captain','school':'Synthetic History School',
             'phone':'','targetSize':3,'members':['Synthetic History One','Synthetic History Two'],'project':'','summary':''}
-        status,result,_=self.public.post('/api/registration/create',{'team':body,'code':'h'*43})
+        status,result,_=registration_fixture_create(self,{'team':body,'code':'h'*43})
         self.assertEqual(status,200,result);team_id=result['team']['id']
         self.assertNotIn('recycled',result['team'])
         self.assertNotIn('recycled',self.public.get('/api/registration')[1]['teams'][0])

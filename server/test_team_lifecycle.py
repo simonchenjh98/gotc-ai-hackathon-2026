@@ -1,4 +1,5 @@
 """Lifecycle acceptance tests. All data and credentials are synthetic and temporary."""
+from test_registration_fixtures import registration_fixture_create, registration_fixture_open
 import json
 import secrets
 import unittest
@@ -52,7 +53,7 @@ class TeamLifecycleTests(unittest.TestCase):
             'name':detail['team']['name'],'reason':'Synthetic restore reason',**changes})
 
     def test_private_registration_and_empty_rosters(self):
-        status,registered,_=self.public.post('/api/registration/create',{'code':secrets.token_urlsafe(32),'team':{
+        status,registered,_=registration_fixture_create(self,{'code':secrets.token_urlsafe(32),'team':{
             'name':'Synthetic Registration','captain':'Synthetic Captain','school':'Synthetic School A',
             'phone':'','targetSize':3,'members':['Synthetic Captain','Synthetic Member','Synthetic Third'],
             'project':'','summary':''}})
@@ -310,22 +311,22 @@ class TeamLifecycleTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT status FROM team_details WHERE team_id=?',(team_id,)).fetchone()[0],'withdrawn')
             self.assertEqual(db.execute('SELECT snapshot_json FROM judging_roster').fetchone()[0],snapshot)
 
-    def test_old_registration_code_stays_invalid_and_stale_context_rejects_rotation(self):
+    def test_revoked_registration_code_stays_unusable_and_stale_context_rejects_profile_change(self):
         code=secrets.token_urlsafe(32)
-        status,registered,_=self.public.post('/api/registration/create',{'code':code,'team':{
+        status,registered,_=registration_fixture_create(self,{'code':code,'team':{
             'name':'Synthetic Registered Access','captain':'Synthetic Captain','school':'Synthetic School',
             'phone':'','targetSize':3,'members':['Synthetic Captain','Synthetic One','Synthetic Two'],'project':'','summary':''}})
         self.assertEqual(status,200,registered)
         team_id=registered['team']['id'];stale=self.detail(team_id)
         rotated=self.admin_request('POST','/api/admin/registration/rotate',{'teamId':team_id,'expectedRevision':registered['team']['revision']})
-        self.assertEqual(rotated[0],200,rotated[1])
+        self.assertEqual(rotated[0],410,rotated[1])
+        # Historical profile fixture changes still invalidate old deletion confirmations.
+        with self.service.db() as db:db.execute('UPDATE team_registrations SET phone=?,revision=revision+1 WHERE team_id=?',('13900000001',team_id))
         self.assertEqual(self.recycle(team_id,stale)[1]['code'],'team_context_conflict')
         self.assertEqual(self.recycle(team_id)[0],200)
-        for secret in [code,rotated[1]['code']]:
-            self.assertEqual(self.public.post('/api/registration/open',{'code':secret})[0],403)
+        self.assertEqual(self.public.post('/api/registration/open',{'code':code})[0],403)
         self.assertEqual(self.restore(team_id)[0],200)
-        for secret in [code,rotated[1]['code']]:
-            self.assertEqual(self.public.post('/api/registration/open',{'code':secret})[0],403)
+        self.assertEqual(self.public.post('/api/registration/open',{'code':code})[0],403)
 
     def test_gateway_final_recheck_rejects_recycled_and_restored_old_key(self):
         team_id=self.team(name='Synthetic Gateway')
@@ -346,7 +347,7 @@ class TeamLifecycleTests(unittest.TestCase):
     def test_verified_same_name_different_school_members_restore_with_same_captain_school(self):
         def register_and_approve(prefix,member_school):
             captain=prefix+' Captain';name=prefix+' Team'
-            status,registration,_=self.public.post('/api/registration/create',{'code':secrets.token_urlsafe(32),'team':{
+            status,registration,_=registration_fixture_create(self,{'code':secrets.token_urlsafe(32),'team':{
                 'name':name,'captain':captain,'school':'Synthetic Shared Captain School',
                 'phone':'','targetSize':3,'members':[captain],'project':'','summary':''}})
             self.assertEqual(status,200,registration)
@@ -379,7 +380,7 @@ class TeamLifecycleTests(unittest.TestCase):
     def test_registration_only_restore_preserves_existing_same_school_duplicate_policy(self):
         def register(prefix):
             captain=prefix+' Captain'
-            status,registration,_=self.public.post('/api/registration/create',{'code':secrets.token_urlsafe(32),'team':{
+            status,registration,_=registration_fixture_create(self,{'code':secrets.token_urlsafe(32),'team':{
                 'name':prefix+' Team','captain':captain,'school':'Synthetic Registration School',
                 'phone':'','targetSize':3,'members':[captain,'Synthetic Shared Member'],'project':'','summary':''}})
             self.assertEqual(status,200,registration)
