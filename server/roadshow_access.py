@@ -106,11 +106,13 @@ class RoadshowAccess:
     def public_view(self, db, state):
         rows = self.rows(db, state)
         configured = any(row['granted'] for row in rows)
-        available = any(self.claimable(row) for row in rows)
+        schedule = self.s.judge_login_schedule.view(db, 'roadshow')
+        available = schedule['loginAvailable'] and any(self.claimable(row) for row in rows)
         message = ('名单待配置，请等待主办方录入路演评委名单。' if not configured else
                    '请输入名单中的完整真实姓名作为邀请码，直接登录路演评分。' if available else
                    '姓名登录暂不可用，请联系组织方。')
-        return {'configured': configured, 'claimAvailable': available, 'nameLoginAvailable': available, 'message': message}
+        return {'configured': configured, 'claimAvailable': available, 'nameLoginAvailable': available,
+                'message': message if schedule['loginAvailable'] else schedule['message'], 'loginSchedule': schedule}
 
     def editable(self, db, state):
         numeric_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadshow_scores'").fetchone()
@@ -120,6 +122,7 @@ class RoadshowAccess:
     def admin_view(self, db, state):
         rows = self.rows(db, state)
         return {'configured': any(row['granted'] for row in rows),
+                'loginSchedule': self.s.judge_login_schedule.view(db, 'roadshow'),
                 'revision': db.execute('SELECT revision FROM roadshow_access_config WHERE id=1').fetchone()[0],
                 'runId': state['run_id'], 'editable': bool(self.editable(db, state)),
                 'names': [row['name'] for row in rows],
@@ -189,11 +192,13 @@ class RoadshowAccess:
         return row
 
     def login(self, db, state, body):
+        self.s.judge_login_schedule.require_open(db, 'roadshow')
         row = self.resolve_name(db, state, body)
         account = db.execute('SELECT * FROM accounts WHERE id=?', (row['judge_id'],)).fetchone()
         return self.s.issue_session(db, account)
 
     def claim(self, db, state, body):
+        self.s.judge_login_schedule.require_open(db, 'roadshow')
         row = self.resolve_name(db, state, body)
         code = self.code(row)
         if row['claimed_at'] is None:

@@ -57,6 +57,9 @@ LOCATIONS = BEGIN + '''    location = /gotc { return 308 /gotc/; }
         client_max_body_size 128k;
     }
     location ^~ /gotc/v1/ {
+        # Realtime model sessions (gateway_websocket) need the WebSocket upgrade.
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
         proxy_pass http://127.0.0.1:5274;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -129,7 +132,7 @@ def allowed(name):
     if any(re.search(r'(?:secret|credential|admin-access|production\.env)', p, re.I) for p in parts):
         return False
     suffix = Path(name).suffix.lower()
-    return (name in FILES or name in {'scripts/backup_event.py','downloads/gotc-gitee-submission-guide.pdf'} or
+    return (name in FILES or name in {'scripts/backup_event.py','downloads/gotc-gitee-submission-guide.pdf','server/gateway_catalog.json'} or
             (parts[0] == 'server' and suffix == '.py' and len(parts) == 2 and not parts[-1].startswith('test')) or
             (parts[0] == 'assets' and suffix in ASSETS) or
             (parts[0] == 'downloads' and suffix in {'.ics', '.txt'}))

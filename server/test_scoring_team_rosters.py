@@ -204,14 +204,11 @@ class ScoringTeamRosterTests(unittest.TestCase):
     def test_finals_judge_only_sees_explicit_shortlist_even_after_directory_grows(self):
         selected = self.team()
         outside = self.team(2, 'Not a finalist')
-        self.service.shared_login_codes['admin'] = finals_fixtures.FINALS_INVITATION
-        status, entry, _ = self.public.post('/api/finals/access', {'code': finals_fixtures.FINALS_INVITATION})
-        self.assertEqual(status, 200, entry)
         admin = self.request(self.admin, 'GET', '/api/admin/finals')[1]
         status, created, _ = self.request(self.admin, 'POST', '/api/admin/finals/judges', {
             'expectedRevision': admin['config']['revision']})
         self.assertEqual(status, 200, created)
-        headers = {'X-GOTC-Finals-Access': entry['accessToken'], 'X-GOTC-Finals-Judge': created['judges'][0]['id']}
+        headers = {'X-GOTC-Finals-Judge': created['judges'][0]['id']}
         self.assertEqual(self.public.request('GET', '/api/finals/judge', headers=headers)[1]['teams'], [])
         status, saved, _ = self.request(self.admin, 'POST', '/api/admin/finals/roster', {
             'expectedRevision': created['config']['revision'], 'teamIds': [selected],

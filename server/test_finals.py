@@ -6,31 +6,16 @@ import unittest
 from finals import DIMENSIONS, MAX_REVISION
 import test_api as fixtures
 
-FINALS_INVITATION = 'synthetic-finals-invitation-820416'
-
-
 class FinalsTests(unittest.TestCase):
+    setUp = fixtures.APITests.setUp
     tearDown = fixtures.APITests.tearDown
     team = fixtures.APITests.team
     invitation = fixtures.APITests.invitation
 
-    def setUp(self):
-        fixtures.APITests.setUp(self)
-        self.service.shared_login_codes['admin'] = FINALS_INVITATION
-        self.authorize(self.public)
-
-    def authorize(self, client, code=FINALS_INVITATION):
-        status, result, headers = client.post('/api/finals/access', {'code': code})
-        self.assertEqual(status, 200, result)
-        self.assertNotIn('Set-Cookie', headers)
-        client.finals_access_token = result['accessToken']
-        return result
-
     def request(self, client, method, path, body=None, marker=None, seat=None):
         if path.startswith('/api/finals/'):
             return client.request(method, path, body, headers={
-                'X-GOTC-Finals-Judge': getattr(client, 'finals_judge_id', '') if seat is None else seat,
-                'X-GOTC-Finals-Access': getattr(client, 'finals_access_token', '')})
+                'X-GOTC-Finals-Judge': getattr(client, 'finals_judge_id', '') if seat is None else seat})
         if marker is None:
             marker = client.get('/api/session')[1].get('loginId') or ''
         return client.request(method, path, body, headers={'X-GOTC-Login': marker})
@@ -54,7 +39,6 @@ class FinalsTests(unittest.TestCase):
         self.assertNotIn('credentials', created)
         for seat in self.seats:
             client = fixtures.Client(self.server)
-            self.authorize(client)
             client.finals_judge_id = seat['id']
             self.assertEqual(client.cookie, '')
             self.judges.append(client)
@@ -112,13 +96,12 @@ class FinalsTests(unittest.TestCase):
         self.assertEqual(self.public.get('/api/finals/board?x=1')[0], 400)
         self.configure()
         other, invitation = self.invitation(name='Unassigned')
-        self.authorize(other)
         self.assertEqual(self.request(other, 'GET', '/api/finals/judge')[0], 400)
         self.assertEqual(self.request(other, 'GET', '/api/finals/judge', seat=invitation['id'])[0], 403)
         self.assertEqual(self.request(self.judges[0], 'GET', '/api/admin/finals')[0], 401)
         self.assertEqual(self.request(self.judges[1], 'GET', '/api/finals/judge', seat='not-a-seat')[0], 403)
         self.assertEqual(self.request(self.judges[0], 'GET', '/api/finals/judge/')[0], 404)
-        self.assertEqual(self.judges[0].get('/api/finals/judge')[0], 401)
+        self.assertEqual(self.judges[0].get('/api/finals/judge')[0], 400)
         with self.service.db() as db:
             db.execute('UPDATE accounts SET active=0 WHERE id=?', (self.seats[0]['id'],))
         self.assertEqual(self.request(self.judges[0], 'GET', '/api/finals/judge')[0], 403)
@@ -291,13 +274,12 @@ class FinalsTests(unittest.TestCase):
         self.assertEqual(summary['awards'][0]['suggestedWinners'], self.teams)
         self.assertTrue(all(not award['suggestedWinners'] for award in summary['awards'][1:]))
         other, invitation = self.invitation(name='Ninth non-final judge')
-        self.authorize(other)
         other.finals_judge_id = invitation['id']
         self.assertEqual(self.ballot(other, choices)[0], 403)
         self.assertEqual(self.settings(False)[0], 200)
         self.assertEqual(self.ballot(self.judges[0], choices, revision=1)[0], 409)
 
-    def test_invited_entry_cookie_independent_scoring_and_no_other_permissions(self):
+    def test_public_entry_anonymous_scoring_and_header_never_grants_other_permissions(self):
         empty = self.request(self.public, 'GET', '/api/finals/entry')
         self.assertEqual(empty[0], 200)
         self.assertEqual(empty[1]['judges'], [])
@@ -323,7 +305,7 @@ class FinalsTests(unittest.TestCase):
         self.assertEqual(summary['teams'][0]['score'], 60)
         self.assertEqual(summary['teams'][0]['scoreCount'], 1)
         self.assertEqual(summary['submittedBallots'], 1)
-        headers = {'X-GOTC-Finals-Judge': first.finals_judge_id, 'X-GOTC-Finals-Access': first.finals_access_token}
+        headers = {'X-GOTC-Finals-Judge': first.finals_judge_id}
         for path in ('/api/admin', '/api/admin/finals', '/api/judge'):
             self.assertEqual(self.public.request('GET', path, headers=headers)[0], 401)
         self.assertEqual(self.public.request('POST', '/api/score', {

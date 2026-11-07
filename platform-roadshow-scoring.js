@@ -1,6 +1,13 @@
 'use strict';
 
 // Roadshow numeric scores are separate from finals and from legacy qualitative records.
+const roadshowProgressLevels=[[0,'无实质变化'],[2,'少量修改'],[4,'有可验证实质改进，但未贯通'],[6,'重要新增或改进可演示'],[8,'关键成果完整，可复验'],[10,'相对初始 Demo 有充分、完整的进展']];
+function roadshowProgressPending(record){return record?.status==='submitted' && (record.progressPending===true || !Number.isInteger(record.progressScore));}
+function roadshowScoreStatus(record){return roadshowProgressPending(record)?'已正式提交 · 待补进展评分，不计入均分':finalsStatus(record);}
+function roadshowWeightedPreview(scores,progressScore){const rawTenths=scores.reduce((sum,score)=>sum+Math.round(score*10),0);return {rawTotal:rawTenths/10,multiplier:(10+progressScore)/20,weightedTotal:Math.floor((rawTenths*(10+progressScore)+1)/2)/100};}
+function roadshowProgressMarkup(record){
+  return `<section class="roadshow-progress"><h3>两天作品进展</h3><p class="small-note">现场对照初始 Demo 与最终成果核验进展。无法核实可先保存草稿；不按代码行数或提交次数自动评分。</p><label class="field">进展评分（正式提交必填，0—10分）<select name="progressScore" required><option value="" ${record?.progressScore===null || record?.progressScore===undefined?'selected':''}>请选择进展评分</option>${Array.from({length:11},(_,value)=>`<option value="${value}" ${record?.progressScore===value?'selected':''}>${value}分 · 系数 ${((10+value)/20).toFixed(2)}</option>`).join('')}</select></label><details class="roadshow-progress-guide"><summary>查看进展评分参考档位</summary><ul>${roadshowProgressLevels.map(([score,label])=>`<li><strong>${score}分</strong>：${esc(label)}</li>`).join('')}</ul><p class="small-note">可选择相邻档位之间的整数分。进展系数 = 0.5 + 0.05 × 进展分；每份路演加权分 = 六维原始总分 × 进展系数。</p></details><label class="field">进展依据（选填，最多1000字）<textarea name="progressNote" maxlength="1000" rows="3" placeholder="可记录本次新增或改进，以及现场核验依据">${esc(record?.progressNote || '')}</textarea></label><p class="score-preview" data-roadshow-weighted>请填写六维分数并选择进展评分，查看加权分。</p></section>`;
+}
 function roadshowMinimum(data){return Number(data.summary?.minimumScores || data.config?.minimumScores || 3);}
 function roadshowTeamValid(team,minimum=3){return team.eligible!==false && team.valid!==false && Number(team.scoreCount || 0)>=minimum;}
 function roadshowWindowText(config,now=config.serverTime??Date.now()){
@@ -65,20 +72,32 @@ function roadshowScoreSummaryMarkup(data,publicView=false){
   const summary=data.summary,teams=summary.teams || [],minimum=roadshowMinimum(data),published=data.config?.published===true;
   const rows=[...teams].sort((a,b)=>Number(roadshowTeamValid(b,minimum))-Number(roadshowTeamValid(a,minimum))||(a.rank??9999)-(b.rank??9999)||a.number-b.number).map(team=>{
     const valid=roadshowTeamValid(team,minimum),eligible=team.eligible!==false;
-    return `<tr><td>${!eligible?'—':valid?esc(team.rank??'待定'):'评分不足'}</td><td><strong>${esc(finalsName(team))}</strong><small>${esc(team.project || '作品名称待完善')}${!eligible?' · 已不具备参赛资格':''}</small></td><td class="board-score">${!eligible || (publicView && !valid)?'—':finalsScore(team.score)}${!publicView && eligible && !valid?'<small>暂定均分 · 不参与排名</small>':''}</td><td>已收 ${Number(team.scoreCount || 0)} / 至少 ${minimum}<small>${Number(team.recusedCount || 0)} 人回避 · ${valid?'有效成绩':'评分不足'}</small></td></tr>`;
+    const hidden=!eligible || (publicView && !valid);
+    return `<tr><td>${!eligible?'—':valid?esc(team.rank??'待定'):'评分不足'}</td><td><strong>${esc(finalsName(team))}</strong><small>${esc(team.project || '作品名称待完善')}${!eligible?' · 已不具备参赛资格':''}</small></td><td class="board-score">${hidden?'—':finalsScore(team.score)}${!publicView && eligible && !valid?'<small>暂定加权均分 · 不参与排名</small>':''}</td><td>${hidden?'—':finalsScore(team.rawScore)}<small>同批有效评分</small></td><td>已收 ${Number(team.scoreCount || 0)} / 至少 ${minimum}<small>${Number(team.recusedCount || 0)} 人回避 · ${valid?'有效成绩':'评分不足'}${Number(team.pendingProgressCount || 0)>0?` · ${Number(team.pendingProgressCount)} 份待补进展`:''}</small></td></tr>`;
   }).join('');
-  return `<div class="info-banner ${published?'':'warning'}"><strong>${published?'已发布 · 路演最终成绩':'暂定路演成绩 · 尚未发布'}</strong><p>每队至少${minimum}位不同评委正式评分后成绩有效，平均分纳入所有已交正式评分。草稿、未交与回避不计入人数或分数；不足${minimum}份不排名。成绩排名不代表晋级名单。</p></div>${metrics([[teams.length,'路演队伍'],[Number(summary.activeJudges ?? summary.expectedJudges ?? 0),'本轮有效评委'],[teams.filter(team=>roadshowTeamValid(team,minimum)).length,'有效成绩队伍'],[published?'已发布':'暂定','当前结果']])}<section class="surface"><h2>路演成绩 · 六维100分</h2><div class="table-wrap"><table class="board-table finals-results"><thead><tr><th>排名</th><th>队伍 / 作品</th><th>平均分</th><th>正式评分人数</th></tr></thead><tbody>${rows || '<tr><td colspan="4">尚未配置路演队伍。</td></tr>'}</tbody></table></div></section>${!publicView && summary.blockers?.length?`<div class="info-banner warning"><strong>发布前还需处理</strong><ul>${summary.blockers.map(item=>`<li>${esc(item)}</li>`).join('')}</ul></div>`:''}`;
+  return `<div class="info-banner ${published?'':'warning'}"><strong>${published?'已发布 · 路演最终成绩':'暂定路演成绩 · 尚未发布'}</strong><p>路演按加权均分排名：每位评委的六维原始总分 × 进展系数，再对有效正式评分取平均。进展系数 = 0.5 + 0.05 × 两天进展分（0—10分）。每队至少${minimum}位不同评委完整正式评分后成绩有效；草稿、未交、回避与待补进展评分不计入人数或分数，不足${minimum}份不排名。成绩排名不代表晋级名单。</p></div>${metrics([[teams.length,'路演队伍'],[Number(summary.activeJudges ?? summary.expectedJudges ?? 0),'本轮有效评委'],[teams.filter(team=>roadshowTeamValid(team,minimum)).length,'有效成绩队伍'],[published?'已发布':'暂定','当前结果']])}<section class="surface"><h2>路演成绩 · 进展加权</h2><div class="table-wrap"><table class="board-table finals-results"><thead><tr><th>排名</th><th>队伍 / 作品</th><th>加权均分（排名依据）</th><th>六维原始均分</th><th>完整正式评分人数</th></tr></thead><tbody>${rows || '<tr><td colspan="5">尚未配置路演队伍。</td></tr>'}</tbody></table></div></section>${!publicView?roadshowScoreDetailsMarkup(data):''}${!publicView && summary.blockers?.length?`<div class="info-banner warning"><strong>发布前还需处理</strong><ul>${summary.blockers.map(item=>`<li>${esc(item)}</li>`).join('')}</ul></div>`:''}`;
+}
+
+function roadshowScoreDetailsMarkup(data){
+  const details=Array.isArray(data.scoreDetails)?data.scoreDetails:[];if(!details.length)return '';
+  const grouped=new Map();for(const record of details){if(!grouped.has(record.teamId))grouped.set(record.teamId,[]);grouped.get(record.teamId).push(record);}
+  return `<section class="surface roadshow-score-details"><h2>逐队评分明细 · 仅后台可见</h2><p class="small-note">核对各评委的六维原始总分、进展评分、系数与加权分。进展依据仅供组织方复核，不在公开看板展示。</p>${[...grouped].map(([teamId,records])=>`<details data-roadshow-details="${esc(teamId)}"><summary>${esc(finalsName({number:records[0].teamNumber,name:records[0].teamName}))} · ${records.length}份记录</summary><div class="table-wrap"><table class="board-table"><thead><tr><th>评委 / 状态</th><th>原始总分</th><th>进展分</th><th>系数</th><th>加权分</th><th>进展依据</th></tr></thead><tbody>${records.map(record=>`<tr><td>${esc(record.judgeName)}<small>${esc(roadshowScoreStatus(record))}${record.judgeActive===false?' · 评委已停用':''}${record.teamEligible===false?' · 队伍无参赛资格':''}<br>${record.validForAverage?'计入当前均分':'不计入当前均分'}</small></td><td>${finalsScore(record.rawTotal)}</td><td>${record.progressScore===null || record.progressScore===undefined?'—':Number(record.progressScore)}</td><td>${finalsScore(record.progressMultiplier)}</td><td>${finalsScore(record.weightedTotal)}</td><td class="roadshow-progress-note">${esc(record.progressNote || '—')}</td></tr>`).join('')}</tbody></table></div></details>`).join('')}</section>`;
 }
 
 function roadshowPatchScoreSummary(view,data,publicView=false){
   const host=view.container.querySelector('[data-roadshow-summary]'),markup=roadshowScoreSummaryMarkup(data,publicView);
-  if(host.roadshowMarkup!==markup){host.innerHTML=markup;host.roadshowMarkup=markup;}
+  if(host.roadshowMarkup!==markup){
+    const open=new Set([...(host.querySelectorAll?.('[data-roadshow-details]') || [])].filter(node=>node.open).map(node=>node.dataset.roadshowDetails));
+    const focused=document.activeElement?.matches?.('summary')?document.activeElement.closest?.('[data-roadshow-details]')?.dataset.roadshowDetails:null;
+    host.innerHTML=markup;host.roadshowMarkup=markup;
+    for(const node of host.querySelectorAll?.('[data-roadshow-details]') || []){node.open=open.has(node.dataset.roadshowDetails);if(node.dataset.roadshowDetails===focused)node.querySelector('summary')?.focus({preventScroll:true});}
+  }
   view.latest=data;
 }
 
 async function renderRoadshowBoard(version){
   const view=createFinalsView(version,null),data=await finalsRequest(view,'roadshow/board');if(!view.valid())return;
-  finalsShell(view,'ROADSHOW / 路演成绩','路演成绩看板','创意20 · 社会关怀15 · 技术呈现20 · 应用潜力20 · AI跨界探索15 · 开源贡献10','<p class="small-note" data-finals-sync role="status">每2秒同步</p><div data-roadshow-summary></div>');
+  finalsShell(view,'ROADSHOW / 路演成绩','路演成绩看板','六维100分 × 两天作品进展系数，以各评委加权分的平均分排名。','<p class="small-note" data-finals-sync role="status">每2秒同步</p><div data-roadshow-summary></div>');
   const update=latest=>roadshowPatchScoreSummary(view,latest,true);update(data);finalsStartPolling(view,'roadshow/board',update);
 }
 
@@ -93,7 +112,7 @@ async function renderRoadshowJudge(version){
   }
   if(!view.valid())return;
   view.data=data;view.config=data.config;view.scores=new Map((data.myScores || []).map(record=>[record.teamId,record]));
-  finalsShell(view,'ROADSHOW / 路演评委','路演评分 · 六维100分',`${esc(session.name || '评委')} · 路演成绩独立统计；专项奖提名在决赛进行。`,`<div class="finals-admin-tools"><button class="btn secondary small" type="button" data-roadshow-reload-score>重新读取评分</button><span class="small-note" data-finals-sync role="status">每2秒核对评分状态</span></div><p class="info-banner ${data.config.canEdit?'':'warning'}" data-roadshow-window>${esc(roadshowWindowText(data.config))}</p><p class="info-banner warning" data-roadshow-changed hidden></p><section class="surface"><label class="field">选择路演队伍<select data-roadshow-team>${data.teams.map(team=>`<option value="${esc(team.id)}" ${team.eligible===false?'disabled':''}>${esc(finalsName(team))} · ${esc(finalsStatus(view.scores.get(team.id)))}</option>`).join('')}</select></label><div data-roadshow-editor></div></section>`);
+  finalsShell(view,'ROADSHOW / 路演评委','路演评分 · 六维与作品进展',`${esc(session.name || '评委')} · 六维100分乘以两天进展系数；专项奖提名在决赛进行。`,`<div class="finals-admin-tools"><button class="btn secondary small" type="button" data-roadshow-reload-score>重新读取评分</button><span class="small-note" data-finals-sync role="status">每2秒核对评分状态</span></div><p class="info-banner ${data.config.canEdit?'':'warning'}" data-roadshow-window>${esc(roadshowWindowText(data.config))}</p><p class="info-banner warning" data-roadshow-changed hidden></p><section class="surface"><label class="field">选择路演队伍<select data-roadshow-team>${data.teams.map(team=>`<option value="${esc(team.id)}" ${team.eligible===false?'disabled':''}>${esc(finalsName(team))} · ${esc(roadshowScoreStatus(view.scores.get(team.id)))}</option>`).join('')}</select></label><div data-roadshow-editor></div></section>`);
   const select=view.container.querySelector('[data-roadshow-team]');view.selected=data.teams.find(team=>team.eligible!==false)?.id || '';select.value=view.selected;
   view.container.querySelector('[data-roadshow-reload-score]').onclick=()=>finalsConfirmReload(view);
   select.onchange=()=>{
@@ -107,29 +126,34 @@ async function renderRoadshowJudge(version){
     view.config.canEdit=canEdit;const notice=view.container.querySelector('[data-roadshow-window]');notice.textContent=text;notice.classList.toggle('warning',!canEdit);
     if(view.scoreForm){view.scoreForm.querySelector('fieldset').disabled=!scoringCanEditTeam(view,view.selected,true);view.scoreForm.finalsRefreshButtons();}
   }});view.cleanups.push(()=>countdown.stop());countdown.update(data.config);
-  finalsStartPolling(view,'roadshow/scoring',latest=>{if(syncScoringJudge(view,latest,true))countdown.update(latest.config);});
+  finalsStartPolling(view,'roadshow/scoring',latest=>{if(syncScoringJudge(view,latest,true)){countdown.update(latest.config);for(const option of select.options){const team=view.data.teams.find(item=>item.id===option.value);if(team)option.textContent=finalsName(team)+' · '+roadshowScoreStatus(view.scores.get(team.id))+(team.eligible===false?'（无参赛资格）':'');}}});
 }
 
 function roadshowRenderScore(view){
   const team=view.data.teams.find(item=>item.id===view.selected),host=view.container.querySelector('[data-roadshow-editor]');
   if(!team){view.scoreForm=null;host.innerHTML='<p>本轮路演队伍尚未配置，请等待组织方准备。</p>';return;}
   let record=view.scores.get(team.id);const dimensions=view.data.dimensions;
-  host.innerHTML=`<form data-roadshow-score-form><h2>${esc(finalsName(team))}</h2><p>${esc(team.project || '作品名称待完善')}</p><p class="small-note" data-finals-saved>${esc(finalsStatus(record))}</p><fieldset class="finals-fieldset" ${scoringCanEditTeam(view,team.id,true)?'':'disabled'}>${dimensions.map((dimension,index)=>`<label class="finals-dimension"><span><strong>${esc(dimension.name)}</strong><small>${esc(finalsGuidance[dimension.id] || '')}</small></span><span class="finals-number"><input name="score-${esc(dimension.id)}" type="number" min="0" max="${Number(dimension.max)}" step="0.1" inputmode="decimal" required aria-label="${esc(dimension.name)}，满分${Number(dimension.max)}分" value="${record?.scores?.[index]??''}"><small>/ ${Number(dimension.max)}</small></span></label>`).join('')}<p class="score-preview">当前合计 <strong data-finals-total>—<small> / 100</small></strong></p><label class="field">评语（选填）<textarea name="feedback" maxlength="2000" rows="4">${esc(record?.feedback || '')}</textarea></label><div class="form-actions"><button class="btn" type="submit" data-finals-save>正式提交评分</button><button class="btn secondary" type="button" data-finals-draft data-finals-save>保存草稿</button><button class="btn secondary" type="button" data-finals-recuse data-finals-save>回避此队</button></div></fieldset><p class="form-error" role="status"></p><div data-finals-recovery></div></form>`;
+  host.innerHTML=`<form data-roadshow-score-form><h2>${esc(finalsName(team))}</h2><p>${esc(team.project || '作品名称待完善')}</p><p class="small-note" data-finals-saved>${esc(roadshowScoreStatus(record))}</p><fieldset class="finals-fieldset" ${scoringCanEditTeam(view,team.id,true)?'':'disabled'}>${dimensions.map((dimension,index)=>`<label class="finals-dimension"><span><strong>${esc(dimension.name)}</strong><small>${esc(finalsGuidance[dimension.id] || '')}</small></span><span class="finals-number"><input name="score-${esc(dimension.id)}" type="number" min="0" max="${Number(dimension.max)}" step="0.1" inputmode="decimal" required aria-label="${esc(dimension.name)}，满分${Number(dimension.max)}分" value="${record?.scores?.[index]??''}"><small>/ ${Number(dimension.max)}</small></span></label>`).join('')}<p class="score-preview">六维原始总分 <strong data-finals-total>—<small> / 100</small></strong></p>${roadshowProgressMarkup(record)}<label class="field">评语（选填）<textarea name="feedback" maxlength="2000" rows="4">${esc(record?.feedback || '')}</textarea></label><div class="form-actions"><button class="btn" type="submit" data-finals-save>正式提交评分</button><button class="btn secondary" type="button" data-finals-draft data-finals-save>保存草稿</button><button class="btn secondary" type="button" data-finals-recuse data-finals-save>回避此队</button></div></fieldset><p class="form-error" role="status"></p><div data-finals-recovery></div></form>`;
   if(typeof reviewMaterialMarkup==='function')host.insertAdjacentHTML('beforeend',reviewMaterialMarkup(team.materialSnapshot));
   const form=host.querySelector('form');view.scoreForm=form;finalsTrack(view,form);
   const draft=form.querySelector('[data-finals-draft]'),recuse=form.querySelector('[data-finals-recuse]'),submit=form.querySelector('[type=submit]');
   form.finalsRefreshButtons=()=>{const disabled=!scoringCanEditTeam(view,team.id,true) || form.finalsBusy || form.finalsBlocked;submit.disabled=disabled;recuse.disabled=disabled;draft.disabled=disabled || record?.status==='submitted';};
   function values(){return dimensions.map(dimension=>{const input=form.elements['score-'+dimension.id],value=Number(input.value);if(!input.value.trim() || !Number.isFinite(value) || value<0 || value>dimension.max || Math.abs(value*10-Math.round(value*10))>1e-7)throw new Error(`${dimension.name}须在0至${dimension.max}分之间，最多一位小数。`);return value;});}
-  function preview(){try{form.querySelector('[data-finals-total]').innerHTML=values().reduce((sum,value)=>sum+value,0).toFixed(1)+'<small> / 100</small>';}catch{form.querySelector('[data-finals-total]').innerHTML='—<small> / 100</small>';}}
-  form.addEventListener('input',preview);preview();
+  function progress(required){const value=form.elements.progressScore.value;if(value==='' && !required)return null;if(!/^(?:[0-9]|10)$/.test(value))throw new Error('请选择0至10之间的整数进展评分；无法核实可先保存草稿。');return Number(value);}
+  function preview(){
+    const weighted=form.querySelector('[data-roadshow-weighted]');
+    try{const scores=values(),value=progress(false),raw=scores.reduce((sum,score)=>sum+Math.round(score*10),0)/10;form.querySelector('[data-finals-total]').innerHTML=raw.toFixed(1)+'<small> / 100</small>';if(value===null){weighted.textContent='请选择进展评分，查看加权分。';return;}const result=roadshowWeightedPreview(scores,value);weighted.textContent=`六维原始总分 ${result.rawTotal.toFixed(1)} × 进展系数 ${result.multiplier.toFixed(2)} = 加权分 ${result.weightedTotal.toFixed(2)}`;}
+    catch{form.querySelector('[data-finals-total]').innerHTML='—<small> / 100</small>';weighted.textContent='请填写六维分数并选择进展评分，查看加权分。';}
+  }
+  form.addEventListener('input',preview);form.addEventListener('change',preview);preview();
   async function save(status){
     if(!view.valid() || !scoringCanEditTeam(view,team.id,true))return;
-    let scores=null;try{if(status!=='recused')scores=values();}catch(error){finalsMessage(form,error.message);return;}
+    let scores=null,progressScore=null,progressNote='';try{if(status!=='recused'){scores=values();progressScore=progress(status==='submitted');progressNote=form.elements.progressNote.value.trim();if(progressNote.length>1000)throw new Error('进展依据最多1000字，也可以留空。');}}catch(error){finalsMessage(form,error.message);return;}
     if(status==='recused' && !confirm('确认回避此队？本评委对此队的分数将不计入路演平均分。'))return;
-    await finalsSave(view,form,'roadshow/score',{runId:view.config.runId,teamId:team.id,expectedRevision:record?.revision || 0,status,scores,feedback:form.elements.feedback.value.trim()},(result,unchanged)=>{
-      record=result.score;view.scores.set(team.id,record);form.querySelector('[data-finals-saved]').textContent=finalsStatus(record);
-      const option=[...view.container.querySelector('[data-roadshow-team]').options].find(item=>item.value===team.id);if(option)option.textContent=finalsName(team)+' · '+finalsStatus(record);
-      if(unchanged && record.status==='recused'){for(const dimension of dimensions)form.elements['score-'+dimension.id].value='';preview();}view.poller?.kick();
+    await finalsSave(view,form,'roadshow/score',{runId:view.config.runId,teamId:team.id,expectedRevision:record?.revision || 0,status,scores,feedback:form.elements.feedback.value.trim(),progressScore,progressNote},(result,unchanged)=>{
+      record=result.score;view.scores.set(team.id,record);form.querySelector('[data-finals-saved]').textContent=roadshowScoreStatus(record);
+      const option=[...view.container.querySelector('[data-roadshow-team]').options].find(item=>item.value===team.id);if(option)option.textContent=finalsName(team)+' · '+roadshowScoreStatus(record);
+      if(unchanged && record.status==='recused'){for(const dimension of dimensions)form.elements['score-'+dimension.id].value='';form.elements.progressScore.value='';form.elements.progressNote.value='';preview();}view.poller?.kick();
     });
   }
   form.onsubmit=event=>{event.preventDefault();return save('submitted');};draft.onclick=()=>save('draft');recuse.onclick=()=>save('recused');form.finalsRefreshButtons();
@@ -172,7 +196,7 @@ function installRoadshowTeams(view,onSaved){
 }
 
 async function mountRoadshowScoringAdmin(version,parent){
-  const view=createFinalsView(version,'admin');parent.insertAdjacentHTML('beforeend','<section class="roadshow-score-admin finals-root"><p data-finals-auth class="info-banner warning" role="alert" hidden></p>'+roadshowTeamRosterMarkup()+'<h2>路演实时成绩与发布</h2><p class="info-banner" data-roadshow-countdown></p><p class="small-note" data-finals-sync role="status">每2秒同步成绩</p><div data-roadshow-summary><p>正在读取路演成绩…</p></div><section class="surface"><h3>公开路演成绩</h3><p>90分钟到时或手动关闭后，只要至少1队获得3位不同评委正式评分，即可发布。未达3份的队伍显示评分不足，不公开均分、不参与排名；不要求所有评委交齐。</p><button class="btn" type="button" data-roadshow-publish disabled>发布路演成绩</button><button class="btn secondary" type="button" data-roadshow-refresh-score>重新读取成绩</button><p class="form-error" data-roadshow-publish-message role="status"></p><a href="#board-roadshow">打开公开路演成绩看板 →</a></section></section>');
+  const view=createFinalsView(version,'admin');parent.insertAdjacentHTML('beforeend','<section class="roadshow-score-admin finals-root"><p data-finals-auth class="info-banner warning" role="alert" hidden></p>'+roadshowTeamRosterMarkup()+'<h2>路演实时成绩与发布</h2><p class="info-banner" data-roadshow-countdown></p><p class="small-note" data-finals-sync role="status">每2秒同步成绩</p><div data-roadshow-summary><p>正在读取路演成绩…</p></div><section class="surface"><h3>公开路演成绩</h3><p>90分钟到时或手动关闭后，至少1队获得3位不同评委完整正式评分，且没有待补进展的正式评分，才可发布。未达3份的队伍显示评分不足，不公开均分、不参与排名；不要求所有评委交齐。可展开上方逐队评分明细，核对待补进展的记录。</p><button class="btn" type="button" data-roadshow-publish disabled>发布路演成绩</button><button class="btn secondary" type="button" data-roadshow-refresh-score>重新读取成绩</button><p class="form-error" data-roadshow-publish-message role="status"></p><a href="#board-roadshow">打开公开路演成绩看板 →</a></section></section>');
   view.container=parent.querySelector('.roadshow-score-admin');view.publishBusy=false;view.publishBlocked=false;
   const publish=view.container.querySelector('[data-roadshow-publish]'),message=view.container.querySelector('[data-roadshow-publish-message]');
   const countdown=makeRoadshowCountdown({alive:()=>view.valid(),apply:text=>{const node=view.container.querySelector('[data-roadshow-countdown]');if(node)node.textContent=text;}});view.cleanups.push(()=>countdown.stop());

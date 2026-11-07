@@ -33,6 +33,7 @@ from judging import JudgingService
 from finals import FinalsService
 from roadshow_access import RoadshowAccess
 from roadshow_scoring import RoadshowScoring
+from judge_login_schedule import JudgeLoginSchedule
 from admin_data import AdminDataService, TRACK_OPTIONS
 from admin_team_access import AdminTeamAccess, PATHS as ADMIN_TEAM_PATHS, operator_for
 from keys import KeyService, load_config
@@ -277,6 +278,7 @@ class EventService:
         self.finals=FinalsService(self,now_ms,text_field)
         self.roadshow_access=RoadshowAccess(self,now_ms,text_field,scrypt_hash)
         self.roadshow_scoring=RoadshowScoring(self,now_ms,text_field)
+        self.judge_login_schedule=JudgeLoginSchedule(self,lambda:now_ms())
         self.write_conflicts.backup_before_upgrade()
         self.admin_data.backup_before_upgrade()
         self.keys=KeyService(self, load_config(self.data_dir / "gateway.json"), text_field)
@@ -554,6 +556,8 @@ class EventService:
 
     def issue_session(self, db, account):
         """Issue a session only after the caller authenticates inside its write transaction."""
+        if account['role'] == 'judge' and self.roadshow_access.owns_account(db, account['id']):
+            self.judge_login_schedule.require_open(db, 'roadshow')
         token = secrets.token_urlsafe(32)
         db.execute("DELETE FROM sessions WHERE expires_at<=?", (now_ms(),))
         db.execute("INSERT INTO sessions VALUES (?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), account["id"], now_ms() + SESSION_SECONDS * 1000))
@@ -661,6 +665,8 @@ class EventService:
                     raise APIError(428, "缺少页面登录信息，请刷新页面并核对登录身份后重试", "login_required")
                 if expected_login_id != self.login_id(cookie):
                     raise APIError(401, "登录身份已变化，请重新登录后操作")
+            if path in {'/api/judging/roadshow', '/api/judging/roadshow/', '/api/judging/roadshow/review'}:
+                self.judge_login_schedule.require_open(db, 'roadshow')
             if path == "/api/team/score":
                 self.require(actor, "team")
                 if method != "GET":
@@ -1300,12 +1306,14 @@ def main():
     previous_term=signal.signal(signal.SIGTERM,interrupted)
     try:
         service.repository_backups.start()
+        service.keys.tasks.start()
         print(f"GOTC service ready on {host}:{server.server_port}{service.base_path}/ (access code is in private data directory)", flush=True)
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         service.repository_backups.stop()
+        service.keys.tasks.stop()
         server.server_close()
         signal.signal(signal.SIGTERM,previous_term)
 

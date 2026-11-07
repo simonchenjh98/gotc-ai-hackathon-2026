@@ -51,7 +51,9 @@ class RoadshowScoringTests(unittest.TestCase):
     def score(self, client=None, team=None, revision=0, status='submitted', values=None, **changes):
         body = {'runId': self.run_id, 'teamId': team or self.teams[0], 'expectedRevision': revision,
                 'status': status, 'scores': [20, 15, 20, 20, 15, 10] if values is None else values,
-                'feedback': 'PRIVATE_SCORE_FEEDBACK'}
+                'feedback': 'PRIVATE_SCORE_FEEDBACK',
+                # Multiplier (10+p)/20 is exactly 1 at p=10, so raw-score expectations hold.
+                'progressScore': None if status == 'recused' else 10}
         body.update(changes)
         return self.request(client or self.judges[0], 'POST', '/api/roadshow/score', body)
 
@@ -70,6 +72,25 @@ class RoadshowScoringTests(unittest.TestCase):
         status, data, _ = self.public.get('/api/roadshow/board')
         self.assertEqual(status, 200, data)
         return data
+
+    def test_progress_weighting_ranks_by_weighted_mean_and_requires_progress(self):
+        self.configure(team_count=2, judge_count=4)
+        # Raw total 100 for every score; multiplier is (10+p)/20 per judge.
+        for client, progress in zip(self.judges[:3], (0, 10, 5)):
+            self.assertEqual(self.score(client, self.teams[0], progressScore=progress)[0], 200)
+        for client in self.judges[:3]:
+            self.assertEqual(self.score(client, self.teams[1], progressScore=10)[0], 200)
+        missing = self.score(self.judges[3], self.teams[0], progressScore=None)
+        self.assertEqual((missing[0], missing[1].get('code')), (400, 'progress_required'))
+        for bad in (-1, 11, 2.5, '5'):
+            self.assertEqual(self.score(self.judges[3], self.teams[0], progressScore=bad)[1].get('code'), 'progress_invalid')
+        self.assertEqual(self.score(self.judges[3], self.teams[0], status='recused', progressScore=3)[0], 400)
+        rows = {row['id']: row for row in self.admin_view()['summary']['teams']}
+        first, second = rows[self.teams[0]], rows[self.teams[1]]
+        # (50 + 100 + 75) / 3 = 75.00 weighted; raw stays 100.
+        self.assertEqual((first['score'], first['rawScore'], first['scoreCount']), (75.0, 100.0, 3))
+        self.assertEqual((second['score'], second['rawScore']), (100.0, 100.0))
+        self.assertEqual((second['rank'], first['rank']), (1, 2))
 
     def test_empty_authentication_exact_routes_and_privacy(self):
         self.assertEqual([item['max'] for item in DIMENSIONS], [20, 15, 20, 20, 15, 10])
@@ -274,6 +295,8 @@ class RoadshowScoringTests(unittest.TestCase):
         self.assertEqual(self.publish()[0], 200)
         with self.service.db() as db:
             db.execute('UPDATE roadshow_scores SET revision=revision+1 WHERE run_id=?', (self.run_id,))
+            # Progress rows are bound to the score revision they were entered with.
+            db.execute('UPDATE roadshow_score_progress SET score_revision=score_revision+1 WHERE run_id=?', (self.run_id,))
         self.assertFalse(self.board()['config']['published'])
         self.assertEqual(self.publish()[0], 200)
         old_run = self.run_id

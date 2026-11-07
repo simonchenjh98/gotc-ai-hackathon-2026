@@ -30,6 +30,8 @@ from collections import defaultdict, deque
 from urllib.parse import parse_qs, urlsplit
 
 from errors import APIError
+from gateway_pricing import Catalog, PricingError, quote
+from gateway_uploads import UploadLimitedConnectionMixin, UploadQueueFull, UploadPostSendError, UploadDrainTimeout, LARGE_BODY_THRESHOLD
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS team_api (
@@ -116,7 +118,7 @@ RETRY_DELAYS = (0.3, 0.6, 1.2, 2.4)  # sub2api: 5 attempts, 300 ms doubling, 3 s
 TEAM_CONCURRENCY = 15
 DAY_MS = 86_400_000
 RESPONSE_LOG_CAP = 16 * 1024 * 1024  # bytes of a reply kept for the content viewer; requests are already capped by BODY_LIMIT
-SECRET_HEADERS = {"authorization", "x-api-key", "cookie", "proxy-authorization"}
+SECRET_HEADERS = {"authorization", "x-api-key", "cookie", "proxy-authorization", "sec-websocket-protocol"}
 
 
 def now_ms():
@@ -252,7 +254,7 @@ def upstream_http_error(path, status, message):
     return GatewayError("upstream_invalid", message or "上游请求失败", status=status, upstream_status=status, upstream_message=message)
 
 
-class _ShortConnect:
+class _ShortConnect(UploadLimitedConnectionMixin):
     """Connect and TLS handshake within CONNECT_TIMEOUT; reads then use the request's own timeout."""
 
     def connect(self):
@@ -275,12 +277,19 @@ class _HTTPSConnection(_ShortConnect, http.client.HTTPSConnection):
 
 class _HTTPHandler(urllib.request.HTTPHandler):
     def http_open(self, req):
-        return self.do_open(_HTTPConnection, req)
+        try:
+            return self.do_open(_HTTPConnection, req, upload_admitted=getattr(req, "_gotc_upload_admitted", None))
+        except UploadQueueFull:
+            raise GatewayError("rate_limit", "中转站大请求上传繁忙，请稍后重试（请求尚未发出，不计费）", retry_after=5) from None
 
 
 class _HTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, req):
-        return self.do_open(_HTTPSConnection, req, context=self._context)
+        try:
+            return self.do_open(_HTTPSConnection, req, context=self._context,
+                                upload_admitted=getattr(req, "_gotc_upload_admitted", None))
+        except UploadQueueFull:
+            raise GatewayError("rate_limit", "中转站大请求上传繁忙，请稍后重试（请求尚未发出，不计费）", retry_after=5) from None
 
 
 def make_opener(proxies=None):
@@ -550,7 +559,7 @@ def request_was_sent(error):
     or while sending the request in URLError; failures after the request was sent (waiting for or reading the reply)
     are raised unwrapped. HTTPError is a URLError but means the upstream answered.
     """
-    return isinstance(error, urllib.error.HTTPError) or not isinstance(error, urllib.error.URLError)
+    return getattr(getattr(error, "reason", error), "request_sent", False) or isinstance(error, urllib.error.HTTPError) or not isinstance(error, urllib.error.URLError)
 
 
 def reject_stored_file_references(body):
@@ -704,6 +713,35 @@ class KeyService:
         self.auth_failures, self.auth_blocked = defaultdict(deque), {}
         self.auth_failures_seen = deque(maxlen=100000)  # failed key attempts, for the admin overview
         self.opener = make_opener()  # honours HTTPS_PROXY for reaching upstreams
+        from gateway_media import MediaGateway
+        from gateway_tasks import AsyncTasks
+        self.catalog = Catalog()
+        self.tasks = AsyncTasks(self, pricing=self.task_price)
+        self.media = MediaGateway(self, self.catalog, self.tasks)
+
+    @staticmethod
+    def is_gitee(upstream):
+        return upstream.get("url", "").rstrip("/") == "https://ai.gitee.com/v1"
+
+    def currency(self):
+        kinds = {"CNY" if self.is_gitee(u) else "USD" for u in (self.config or {}).values()}
+        return next(iter(kinds)) if len(kinds) == 1 else "MIXED"
+
+    def task_price(self, task, payload, headers):
+        result = quote(task["pricing_snapshot"], request=task.get("request"), response=payload,
+                       headers=headers, started_at=task.get("requested_at"), trusted_quantities=task.get("quantities"))
+        return {**result, "billing": result, "usage": [0] * USAGE_FIELDS,
+                "billing_status": "pending" if result.get("pending") else "settled"}
+
+    def billing_summary(self, db, team_id=None, since=0, key_id=None):
+        clause, values = "", [since]
+        for column, value in (("team_id", team_id), ("key_id", key_id)):
+            if value:
+                clause += " AND " + column + "=?"
+                values.append(value)
+        rows = db.execute("SELECT currency,SUM(cost_micro)/1e6 AS cost,SUM(billing_status='pending') AS pending "
+                          "FROM api_usage WHERE at>=?" + clause + " GROUP BY currency", values)
+        return [dict(r) for r in rows]
 
     def digest(self, token):
         return hashlib.pbkdf2_hmac("sha256", token.encode(), self.pepper, KEY_HASH_ITERATIONS).hex()
@@ -716,7 +754,8 @@ class KeyService:
                  "error_owner": "TEXT NOT NULL DEFAULT ''", "upstream_status": "INTEGER", "error_message": "TEXT NOT NULL DEFAULT ''",
                  "cache_write_1h_tokens": "INTEGER NOT NULL DEFAULT 0", "requested_model": "TEXT NOT NULL DEFAULT ''",
                  "first_token_ms": "INTEGER", "client_ip": "TEXT NOT NULL DEFAULT ''", "upstream_request_id": "TEXT NOT NULL DEFAULT ''",
-                 "request_id": "TEXT NOT NULL DEFAULT ''"}
+                 "request_id": "TEXT NOT NULL DEFAULT ''", "currency": "TEXT NOT NULL DEFAULT 'legacy'",
+                 "billing_status": "TEXT NOT NULL DEFAULT 'settled'", "billing_details": "TEXT NOT NULL DEFAULT '{}'"}
         for column, kind in added.items():  # databases created before these columns existed
             if column not in columns:
                 db.execute(f"ALTER TABLE api_usage ADD COLUMN {column} {kind}")
@@ -726,6 +765,7 @@ class KeyService:
             db.execute("INSERT OR IGNORE INTO gateway_config VALUES (1,?,?)", (json.dumps(self.seed, ensure_ascii=False), now_ms()))
         row = db.execute("SELECT data FROM gateway_config WHERE id=1").fetchone()
         self.config = parse_config(json.loads(row["data"])) if row else None
+        self.tasks.initialize(db)
 
     def raw_config(self, db):
         row = db.execute("SELECT data FROM gateway_config WHERE id=1").fetchone()
@@ -814,10 +854,11 @@ class KeyService:
                       COALESCE(SUM(u.cost_micro),0) AS total, COUNT(u.id) AS requests
                       FROM api_keys k LEFT JOIN api_usage u ON u.key_id=k.id WHERE k.team_id=? AND k.active=1
                       GROUP BY k.id ORDER BY k.created_at""", (since, team_id))]
-            return {"enabled": True, "baseUrl": self.service.origin + self.service.base_path, "models": self.models(),
+            return {"enabled": True, "baseUrl": self.service.origin + self.service.base_path, "models": self.models(), "currency": self.currency(),
                     "maxKeys": settings["maxKeys"], "keys": keys, "logContent": settings["logContent"],
                     "announcement": settings["announcement"],
                     "usage": {"used24h": self.spend(db, team_id, since), "usedTotal": self.spend(db, team_id)},
+                    "billing": self.billing_summary(db, team_id),
                     "expiresAt": settings["expiresAt"]}
         if not enabled:
             raise APIError(409, "本队 API 访问权限尚未开通或已停用")
@@ -882,7 +923,8 @@ class KeyService:
                 overview_auth = {"authFailuresHour": sum(1 for t in self.auth_failures_seen if t > hour_ago),
                                  "blockedClients": sum(1 for t in self.auth_blocked.values() if t > time.monotonic())}
             overview.update(overview_auth)
-            return {"enabled": self.config is not None, "settings": settings, "models": self.models(), "overview": overview,
+            overview["billing"] = self.billing_summary(db, since=today)
+            return {"enabled": self.config is not None, "settings": settings, "models": self.models(), "overview": overview, "currency": self.currency(),
                     "upstreams": self.public_config(db), "storage": storage,
                     "changes": changes,
                     "teams": [{"teamId": r["team_id"], "active": bool(r["active"]), "keyCount": r["key_count"], "inflight": inflight.get(r["team_id"], 0), "waiting": waiting.get(r["team_id"], 0),
@@ -1071,7 +1113,8 @@ class KeyService:
                 "COALESCE(SUM(u.cost_micro),0)/1e6 AS cost")
         rows = lambda sql: [dict(r) for r in db.execute(sql, params)]
         return {
-            "days": days,
+            "days": days, "currency": self.currency(),
+            "billing": self.billing_summary(db, body.get("teamId"), beijing_midnight() - (days - 1) * DAY_MS, body.get("keyId")),
             "totals": rows(f"SELECT {sums}, SUM(u.status>=400 OR u.incomplete=1) AS errors, "
                            f"CAST(AVG(CASE WHEN u.status<400 AND u.incomplete=0 THEN u.duration_ms END) AS INTEGER) AS avgMs, "
                            f"CAST(AVG(u.first_token_ms) AS INTEGER) AS avgFirstTokenMs FROM api_usage u WHERE {clause}")[0],
@@ -1109,26 +1152,27 @@ class KeyService:
           u.model, u.path, u.stream, u.status, u.input_tokens AS input, u.output_tokens AS output, u.cache_write_tokens AS cacheWrite,
           u.cache_read_tokens AS cacheRead, u.cache_write_1h_tokens AS cacheWrite1h, u.cost_micro/1e6 AS cost,
           u.requested_model AS requestedModel, u.first_token_ms AS firstTokenMs, u.client_ip AS clientIp,
+          u.currency, u.billing_status AS billingStatus, u.billing_details AS billingDetails,
           u.upstream_request_id AS upstreamRequestId, u.request_id AS requestId,
           u.duration_ms AS durationMs, u.user_agent AS userAgent, u.incomplete, u.estimated, u.error_type AS errorType,
           u.error_phase AS errorPhase, u.error_owner AS errorOwner, u.upstream_status AS upstreamStatus, u.error_message AS errorMessage, EXISTS(SELECT 1 FROM api_logs l WHERE l.usage_id=u.id) AS hasContent,
           (SELECT l.request_bytes FROM api_logs l WHERE l.usage_id=u.id) AS requestBytes
           FROM api_usage u JOIN api_keys k ON k.id=u.key_id JOIN teams t ON t.id=u.team_id {clause} ORDER BY u.id DESC LIMIT 50""", params)]
-        return {"items": items, "more": len(items) == 50}
+        return {"items": items, "more": len(items) == 50, "currency": self.currency()}
 
     def export(self, db):
         """Usage CSV without request content; formula-like cells are neutralised."""
         out = io.StringIO(newline="")
         writer = csv.writer(out)
-        writer.writerow(["时间(UTC毫秒)", "队号", "队名", "密钥", "模型", "接口", "流式", "状态", "输入tokens", "输出tokens", "缓存写入tokens", "缓存读取tokens", "费用USD", "耗时ms", "User-Agent", "中断", "估算计费",
+        writer.writerow(["时间(UTC毫秒)", "队号", "队名", "密钥", "模型", "接口", "流式", "状态", "输入tokens", "输出tokens", "缓存写入tokens", "缓存读取tokens", "费用（见币种）", "耗时ms", "User-Agent", "中断", "估算计费",
                          "错误类型", "错误阶段", "责任方", "上游状态", "错误信息",
-                         "其中1小时缓存写入tokens", "请求模型", "首字耗时ms", "客户端IP", "上游请求ID"])
+                         "其中1小时缓存写入tokens", "请求模型", "首字耗时ms", "客户端IP", "上游请求ID", "币种", "计费状态", "计费依据"])
         for r in db.execute("""SELECT u.*, t.number, t.name AS team_name, k.name AS key_name FROM api_usage u
           JOIN teams t ON t.id=u.team_id JOIN api_keys k ON k.id=u.key_id ORDER BY u.id"""):
             writer.writerow([self.service.csv_safe(v) for v in (r["at"], r["number"], r["team_name"], r["key_name"], r["model"], r["path"],
                              r["stream"], r["status"], r["input_tokens"], r["output_tokens"], r["cache_write_tokens"], r["cache_read_tokens"], r["cost_micro"] / 1e6, r["duration_ms"], r["user_agent"], r["incomplete"], r["estimated"],
                              r["error_type"], r["error_phase"], r["error_owner"], r["upstream_status"], r["error_message"],
-                             r["cache_write_1h_tokens"], r["requested_model"], r["first_token_ms"], r["client_ip"], r["upstream_request_id"])])
+                             r["cache_write_1h_tokens"], r["requested_model"], r["first_token_ms"], r["client_ip"], r["upstream_request_id"], r["currency"], r["billing_status"], r["billing_details"])])
         return ("\ufeff" + out.getvalue()).encode("utf-8")
 
     def admit(self, team, rpm, slot=True):
@@ -1183,7 +1227,7 @@ class KeyService:
         call = {"key": None, "path": path, "model": "", "stream": False, "price": None, "usage": [0] * USAGE_FIELDS, "status": 0,
                 "request": b"", "response": [], "size": 0, "started": time.monotonic(), "log": False,
                 "request_bytes": 0, "reply_bytes": 0, "done": False, "forwarded": False,
-                "request_id": uuid.uuid4().hex, "reply_headers": {}, "secrets": self.error_secrets()}
+                "request_id": uuid.uuid4().hex, "reply_headers": {}, "secrets": self.error_secrets(), "requested_at": time.time()}
         try:
             query = parse_qs(urlsplit(handler.path).query)
             if "key" in query or "api_key" in query:
@@ -1285,6 +1329,8 @@ class KeyService:
         """Store the call once, before the final bytes are sent where possible, so history is never behind the client."""
         if not call["key"] or call.get("recorded"):
             return
+        if call.get("billing_finalize"):
+            call["billing_finalize"]()
         if not call["status"]:
             call["status"] = 500  # defensive: every stored call has a real outcome
         usage, price = list(call["usage"]), call["price"] or (0,) * USAGE_FIELDS
@@ -1292,7 +1338,9 @@ class KeyService:
         # failed after output started is a 502 for the record but its tokens were still produced.
         incomplete = call["forwarded"] and not call["done"]
         estimated = False
-        if call.get("charge_estimate"):
+        if call.get("metered_media"):
+            estimated = bool((call.get("billing") or {}).get("estimated"))
+        elif call.get("charge_estimate"):
             usage, incomplete, estimated = [call.get("input_estimate", call["request_bytes"] // 4), call.get("output_estimate", 0), 0, 0, 0], True, True
         elif call["forwarded"]:
             # sub2api bills only what it observed; a call with no usage would then be missing from cost statistics.
@@ -1302,7 +1350,20 @@ class KeyService:
                 usage[0], usage[1], estimated = est_in, est_out, True
             elif incomplete and usage[1] < est_out:
                 usage[1], estimated = est_out, True
-        cost = round(sum(t * p for t, p in zip(usage, price)))  # USD per 1M tokens == micro-USD per token
+        cost = round(sum(t * p for t, p in zip(usage, price)))
+        billing = call.get("billing")
+        if not billing and not call.get("metered_media") and call.get("pricing_snapshot") and (call["forwarded"] or call.get("charge_estimate")):
+            billing = quote(call["pricing_snapshot"], request=call.get("pricing_request"), usage=usage,
+                            headers=call.get("pricing_headers"), started_at=call["requested_at"])
+            billing["estimated"] = bool(billing.get("estimated") or estimated)
+        if not billing and call.get("metered_media"):
+            pending = bool(call["forwarded"] or call.get("charge_estimate"))
+            billing = {"cost_micro": None if pending else 0, "currency": "CNY", "pending": pending,
+                       "estimated": False, "details": {"reason": "Awaiting authoritative upstream usage" if pending else "Request not generated"}}
+        if billing:
+            cost = billing.get("cost_micro") or 0
+            estimated = bool(billing.get("estimated"))
+        currency = (billing or {}).get("currency", call.get("currency", "USD"))
         error = call.get("error") or {"type": "", "phase": "", "owner": "", "upstream_status": None, "upstream_message": "", "message": ""}
         at = now_ms()
         with self.service.db() as db:
@@ -1318,6 +1379,9 @@ class KeyService:
                                                      call.get("stream_first_ms") if call["stream"] else call.get("first_token_ms"),
                                                      client_ip(handler), call.get("upstream_request_id", "")[:100], call["request_id"])).lastrowid
             db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (at, call["key"]["id"]))
+            db.execute("UPDATE api_usage SET currency=?,billing_status=?,billing_details=? WHERE id=?",
+                       (currency, "pending" if (billing or {}).get("pending") else "settled",
+                        json.dumps((billing or {}).get("details", {}), ensure_ascii=False), usage_id))
             if call["log"] and time.monotonic() - self.last_prune > 600:  # amortised: at most every 10 minutes
                 self.last_prune = time.monotonic()
                 self.prune_logs(db, call.get("settings") or self.settings(db))
@@ -1441,13 +1505,33 @@ class KeyService:
     def serve(self, handler, path, call):
         # A live upstream edit applies to subsequent calls; this request keeps one coherent snapshot.
         config = self.config
+        if path.startswith("/v1/task/"):
+            key = self.authenticate(handler, call)
+            self.admit(key["team_id"], call["settings"]["teamRpm"])
+            try:
+                self.recheck_access(handler, call)
+                status, payload, headers = self.tasks.request(key, handler.command, path)
+            finally:
+                self.release(key["team_id"])
+            call["recorded"] = True  # task submission owns the single usage record
+            call["reply_headers"].update({k: v for k, v in headers.items() if k.lower() in {"retry-after"}})
+            return self.send(handler, call, status, "application/json", gateway_json(payload))
         if config is None:
             raise APIError(404, "接口不存在")
+        media_upstream = config.get("openai", {})
+        if self.is_gitee(media_upstream):
+            if path in {"/v1/audio/speech/ws", "/v1/audio/transcriptions/ws"}:
+                from gateway_websocket import serve_websocket
+                return serve_websocket(self, handler, path, call, media_upstream)
+            if self.media.supports(path):
+                return self.media.serve(handler, path, call, media_upstream)
         if (path == "/v1/models" or path.startswith("/v1/models/")) and handler.command == "GET":
             self.authenticate(handler)  # not metered or logged
             # Fields of both APIs, so OpenAI and Anthropic SDKs can each parse the list (sub2api answers per platform).
             data = [{"id": m, "object": "model", "owned_by": name, "created": 0, "type": "model", "display_name": m,
-                     "created_at": "2024-01-01T00:00:00Z"} for name, item in config.items() for m in item["models"]]
+                     "created_at": "2024-01-01T00:00:00Z",
+                     **({"capabilities": self.catalog.model_info(m)} if self.is_gitee(item) else {})}
+                    for name, item in config.items() for m in item["models"]]
             if path != "/v1/models":
                 item = next((d for d in data if d["id"] == path[len("/v1/models/"):]), None)
                 if item is None:
@@ -1487,6 +1571,13 @@ class KeyService:
             raise GatewayError("not_found", "模型不在本活动开放列表中，可用模型见 /v1/models")
         body["model"] = model
         call["price"] = upstream["models"][model]
+        call["currency"] = "CNY" if self.is_gitee(upstream) else "USD"
+        if self.is_gitee(upstream):
+            try:
+                call["pricing_snapshot"] = self.catalog.resolve(model, "/v1/chat/completions", body)
+            except PricingError:
+                raise GatewayError("not_found", "该模型不支持此对话接口，请使用模型目录中的对应接口") from None
+            call["pricing_request"] = body.copy()
         reject_stored_file_references(body)
         settings = call["settings"]
         if settings["blockedWords"]:
@@ -1560,7 +1651,11 @@ class KeyService:
 
     def open_with_retry(self, request):
         """Retry upstream overload and connection errors; safe because nothing has reached the client yet."""
-        for delay in (*RETRY_DELAYS, None):
+        large_upload = (urlsplit(request.full_url).hostname == "ai.gitee.com" and
+                        isinstance(request.data, (bytes, bytearray)) and len(request.data) >= LARGE_BODY_THRESHOLD)
+        # Replaying a large context up to five times worsens an already saturated exit link.
+        # Surface the provider's overload and Retry-After so the client can back off instead.
+        for delay in (*(RETRY_DELAYS if not large_upload else ()), None):
             try:
                 return self.opener.open(request, timeout=UPSTREAM_TIMEOUT)
             except urllib.error.HTTPError as error:
@@ -1579,6 +1674,12 @@ class KeyService:
                     raise
             time.sleep(delay)
 
+    def upload_ready(self, handler, call):
+        """Recheck access after the global upload queue, before sending any upstream bytes."""
+        self.recheck_access(handler, call)
+        if self.client_gone(handler):
+            raise GatewayError("client_closed", "客户端已断开，请求未发出，不计费")
+
     def count_tokens(self, handler, call, upstream):
         """Claude Code calls this before requests; passed through at zero cost, recorded without content."""
         body = self.read_body(handler)
@@ -1596,6 +1697,7 @@ class KeyService:
             headers["anthropic-beta"] = beta
         headers["User-Agent"] = (handler.headers.get("User-Agent") or "gotc-gateway/1.0")[:300]
         request = urllib.request.Request(upstream["url"] + "/messages/count_tokens", data=gateway_json(body), headers=headers, method="POST")
+        request._gotc_upload_admitted = lambda: self.upload_ready(handler, call)
         try:
             with self.open_with_retry(request) as response:
                 status, payload, content_type = response.status, response.read(1_000_000), response.headers.get("Content-Type", "application/json")
@@ -1625,7 +1727,7 @@ class KeyService:
     def upstream_failed(self, call, error):
         """Turn a network failure into the team's error response, estimating cost when the upstream may have run."""
         reason = getattr(error, "reason", error)
-        timed_out = isinstance(reason, (TimeoutError, socket.timeout))
+        timed_out = isinstance(reason, (TimeoutError, socket.timeout, UploadDrainTimeout))
         if not call["forwarded"] and not request_was_sent(error):
             # Failed while connecting, in the TLS handshake or while sending: the upstream never had the whole request,
             # so nothing can have been generated or billed. Decided by where the failure happened, not by its type.
@@ -1655,6 +1757,7 @@ class KeyService:
         # The client's own User-Agent (sub2api passes it); the urllib default is blocked by Cloudflare-fronted upstreams.
         headers["User-Agent"] = (handler.headers.get("User-Agent") or "gotc-gateway/1.0")[:300]
         request = urllib.request.Request(upstream["url"] + suffix, data=gateway_json(body), headers=headers, method="POST")
+        request._gotc_upload_admitted = lambda: self.upload_ready(handler, call)
         handler.connection.settimeout(UPSTREAM_TIMEOUT)
         try:
             response = self.open_with_retry(request)
@@ -1680,12 +1783,13 @@ class KeyService:
             handler.close_connection = True
             self.send(handler, call, 400, error.headers.get("Content-Type", "application/json"), payload)
             return
-        except (OSError, http.client.BadStatusLine, http.client.LineTooLong) as error:
+        except (OSError, http.client.BadStatusLine, http.client.LineTooLong, UploadPostSendError) as error:
             # Response parsing failed after sending. Other HTTPExceptions (e.g. InvalidURL) can occur before sending.
             self.upstream_failed(call, error)
         call["status"], call["forwarded"] = response.status, True
         call["upstream_request_id"] = response.headers.get("request-id") or response.headers.get("x-request-id") or ""
         call["reply_headers"] = passed_headers(response.headers)
+        call["pricing_headers"] = {k: v for k, v in response.headers.items() if k.lower() in {"inference-cost", "inference-currency", "inference-cost-currency"}}
         if not call.get("first_token_ms"):  # non-streaming: the whole reply arrives with the headers
             call["first_token_ms"] = int((time.monotonic() - call["started"]) * 1000)
         usage = call["usage"]

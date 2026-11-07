@@ -4,3 +4,7 @@
 .roadshow-claim [data-roadshow-refresh]{margin-top:12px}.roadshow-claim [data-roadshow-result]{margin-top:20px}
 .roadshow-claim [hidden]{display:none}.roadshow-access-admin{display:grid;gap:24px}
 .roadshow-access-admin textarea{min-height:180px;resize:vertical}.roadshow-access-admin .table-scroll{overflow-x:auto}
+.roadshow-progress{margin:24px 0;padding:20px;border:1px solid var(--line,#ced6e0);border-radius:12px;background:#f6f8fc}
+.roadshow-progress h3{margin-top:0}.roadshow-progress-guide{margin:16px 0}.roadshow-progress-guide summary,.roadshow-score-details summary{cursor:pointer;font-weight:700}
+.roadshow-progress-guide li{margin:8px 0}.roadshow-score-details details{padding:16px 0;border-bottom:1px solid var(--line,#ced6e0)}
+.roadshow-score-details .table-wrap{margin-top:12px}.roadshow-score-details td{vertical-align:top}.roadshow-progress-note{min-width:180px;max-width:380px;white-space:pre-wrap;overflow-wrap:anywhere}

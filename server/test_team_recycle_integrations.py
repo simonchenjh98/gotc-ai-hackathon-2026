@@ -333,7 +333,6 @@ class NumericFinalsRecycleTests(unittest.TestCase):
     lifecycle_get=TeamRecycleIntegrationTests.lifecycle_get
     recycle=TeamRecycleIntegrationTests.recycle
     restore=TeamRecycleIntegrationTests.restore
-    authorize=finals_helpers.FinalsTests.authorize
     request=finals_helpers.FinalsTests.request
     admin_view=finals_helpers.FinalsTests.admin_view
     settings=finals_helpers.FinalsTests.settings
