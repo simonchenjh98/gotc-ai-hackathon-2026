@@ -62,7 +62,8 @@ LOCATIONS = BEGIN + '''    location = /gotc { return 308 /gotc/; }
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_buffering off;
-        proxy_read_timeout 330s;
+        # Queue (30s), connection (20s), initial upstream read (1200s), plus error delivery margin.
+        proxy_read_timeout 1260s;
         proxy_send_timeout 330s;
         client_max_body_size 32m;
     }
