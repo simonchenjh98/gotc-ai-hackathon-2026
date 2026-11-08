@@ -90,7 +90,7 @@ class SubmissionRecordAPITests(unittest.TestCase):
 
     def test_manual_check_version_url_actor_validation_and_reset(self):
         team_id=self.team();client,_=self.access(team_id);self.open_submissions();self.submit(client);path='/api/admin/submissions/'+team_id+'/checks'
-        before=self.admin.get(path+'?version=1')[1];self.assertEqual(len(before['items']),4);self.assertTrue(all(row['revision']==0 and row['actor'] is None for row in before['items']))
+        before=self.admin.get(path+'?version=1')[1];self.assertEqual(len(before['items']),5);self.assertTrue(all(row['revision']==0 and row['actor'] is None for row in before['items']))
         body={'version':1,'field':'codeUrl','expectedRevision':0,'status':'accessible','note':'人工记录'};saved=self.admin.post(path,body)[1]['items'][0]
         self.assertEqual(saved['url'],self.materials()['codeUrl']);self.assertEqual(saved['revision'],1);self.assertEqual(saved['actor']['name'],'活动管理员');self.assertIsInstance(saved['checkedAt'],int)
         self.assertEqual(self.admin.post(path,body)[1]['code'],'check_revision_conflict')

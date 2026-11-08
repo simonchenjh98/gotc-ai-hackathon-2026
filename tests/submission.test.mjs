@@ -65,7 +65,7 @@ test('submission notice explains save-time checks and mutable external content',
   const html=h.windowMarkup({canEdit:true,submissionDeadline:null});
   assert.match(html,/实际保存前检查提交窗口和材料版本/);
   assert.match(html,/点击提交不代表已保存/);
-  assert.match(html,/只保存填写的内容和链接/);
+  assert.match(html,/保存填写的内容和链接/);
   assert.match(html,/不会抓取或检查外链内容/);
   assert.match(html,/文件之后仍可能变化/);
   assert.ok(!html.includes('服务器接收时'));
@@ -81,8 +81,25 @@ test('formal preflight aggregates missing fields while partial drafts remain all
   const missing=h.submissionProblems({},true);
   assert.ok(missing.some(e=>e.key==='codeVersion'));
   assert.ok(missing.some(e=>e.key==='confirmed'));
-  assert.ok(missing.some(e=>e.key==='demoInstructions'));
-  assert.ok(missing.length>=10);
+  assert.ok(missing.some(e=>e.key==='demoUrl'));
+  assert.ok(missing.length>=9);
+});
+test('online demo is required while video and supplementary ZIP remain optional',()=>{
+  const materials={projectName:'Synthetic',summary:'Summary',codeUrl:'https://github.com/team/project',codeVersion:'a'.repeat(40),readmeUrl:'https://example.test/readme',license:'MIT',slidesUrl:'https://example.test/slides',sourcesAndLimitations:'Synthetic only',confirmed:true,demoInstructions:'Run the local app'};
+  const errors=h.submissionProblems(materials,true);assert.equal(errors.length,1);assert.equal(errors[0].key,'demoUrl');
+  assert.equal(h.submissionProblems({...materials,demoUrl:'https://example.test/demo'},true).length,0);
+  assert.equal(h.submissionProblems({...materials,demoUrl:'https://example.test/demo',filesUrl:'file:///archive.zip'},true)[0].key,'filesUrl');
+});
+test('three submission sections offer upload or link and make the video optional',()=>{
+  const html=h.teamFormMarkup({team:{name:'Synthetic'},submission:{},window:{canEdit:true}});
+  for(const kind of ['slides','files','demo']){assert.match(html,new RegExp(`id="submission-${kind}"`));assert.match(html,new RegExp(`id="upload-${kind}-file"`));assert.match(html,new RegExp(`id="upload-${kind}-button"`));}
+  assert.match(html,/name="demoUrl"[^>]*required/);assert.ok(!/name="videoUrl"[^>]*required/.test(html));assert.ok(!/name="filesUrl"[^>]*required/.test(html));assert.match(html,/本地运行说明不能代替链接/);assert.match(html,/多文件网站请部署后/);
+});
+test('supplementary ZIP is clickable in formal material, receipts and copied submission records',()=>{
+  const filesUrl='https://example.test/gotc/materials/'+('a'.repeat(43))+'/Team%2BProject.zip',materials={projectName:'Project',filesUrl,confirmed:true};
+  assert.match(h.materialMarkup(materials),/代码及其他文件 ZIP/);assert.ok(h.materialMarkup(materials).includes(`href="${filesUrl}"`));
+  const data={team:{name:'Team',number:1},submission:{submitted:materials,submittedVersion:1,submittedAt:0},judgingMaterials:{}};
+  assert.ok(h.submissionRecordText(data).includes(filesUrl));assert.match(h.submissionRecordText(data),/本站上传文件另行保存/);
 });
 test('stage views and receipts distinguish current formal, frozen, empty and absent snapshots',()=>{
   const sha='a'.repeat(40),stage={runId:'run-one',inRoster:true,frozenAt:1000,materialSnapshot:{submissionVersion:1,materials:{summary:'FROZEN_ONLY',codeVersion:sha}}};
@@ -110,6 +127,6 @@ test('stage action patches only matching read-only adoption cards and keeps othe
 });
 
 test('GitHub dot-prefixed repositories pass the real formal preflight for full SHA and commit URLs',()=>{
-  const sha='a'.repeat(40),materials={projectName:'Synthetic',summary:'Synthetic',codeUrl:'https://github.com/github/.github',readmeUrl:'https://example.test/readme',license:'MIT',demoInstructions:'Local demo',slidesUrl:'https://example.test/slides',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
+  const sha='a'.repeat(40),materials={projectName:'Synthetic',summary:'Synthetic',codeUrl:'https://github.com/github/.github',readmeUrl:'https://example.test/readme',license:'MIT',demoUrl:'https://example.test/demo',demoInstructions:'Local demo',slidesUrl:'https://example.test/slides',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
   for(const codeVersion of [sha,'https://github.com/github/.github/commit/'+sha])assert.equal(h.submissionProblems({...materials,codeVersion},true).length,0,codeVersion);
 });

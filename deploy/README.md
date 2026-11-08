@@ -81,6 +81,29 @@ Gateway revocation takes effect at the existing final admission recheck after a
 queue wait. Requests already admitted may complete and remain billed/auditable;
 there is no network-instant cancellation or erasure of incurred usage.
 
+## Contestant material uploads
+
+The team workbench accepts PPT/PPTX/PDF (50 MiB), supporting ZIP archives
+(100 MiB), and standalone UTF-8 HTML (10 MiB). The dedicated
+`/gotc/api/team/uploads/` nginx location streams requests to the application;
+the generic API body limit stays unchanged. The service authenticates the team
+and rechecks the submission window, session and 500 MiB team quota before
+committing an upload. Archives are never extracted. HTML uses a response-level
+opaque-origin CSP sandbox, and all other material files are attachments.
+
+Completed files live in `data/material-uploads/`; `material_uploads` database
+rows retain their immutable IDs, hashes and filenames. Keep this directory with
+the database across releases. `scripts/backup_event.py backup|restore` copies
+the completed files referenced by the database snapshot, verifies their size
+and SHA-256, and refuses to replace a different existing destination file.
+Do not restore a database alone into a new data directory. The installer's
+in-place rollback snapshots continue to use the existing live data directory;
+use the backup script for a portable database-and-files backup.
+
+The uploaded file URL is preparation only: it becomes official when the team
+confirms a formal submission and receives its versioned receipt. Existing
+formal versions keep their original URLs when a replacement file is uploaded.
+
 ## Optional private source backup worker
 
 The sealed Gitee source worker additionally requires the system Git executable (production baseline: Git 2.43.0) and Python 3.12; no pip dependency is added. Configure `GOTC_REPO_GITEE_ENABLED=1`, the existing private Gitee organization/token settings, and `GOTC_REPO_GITEE_SEAL_ENABLED=1` for sealed previews. Set `GOTC_REPO_BACKUP_ENABLED=1` in the private service environment to start one worker from `main()` after HTTP server initialization. The GOTC event deployment uses GOTC_REPO_BACKUP_ENABLED=0 with Gitee sealing enabled: new versions have no archive job and existing private downloads remain available. Any other value than 1 leaves the worker stopped; constructing EventService in tests starts no threads. The Gitee token's mandatory user_info scope supports validating its login via `/user`; no additional scope is requested here. Optional: `GOTC_REPO_AUTO_APPROVE=1` creates a team's repository as soon as it applies (no admin approval click), and `GOTC_REPO_GITEE_JOIN_URL=https://gitee.com/...` shows participants a join-organization button.

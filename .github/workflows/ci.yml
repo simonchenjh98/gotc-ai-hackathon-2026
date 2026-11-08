@@ -41,7 +41,7 @@ jobs:
   backend:
     name: Backend checks (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    # The full 723-test API suite can take just over 10 minutes on Python 3.11.
+    # The full API suite can take just over 10 minutes on Python 3.11.
     timeout-minutes: 15
     strategy:
       fail-fast: false
