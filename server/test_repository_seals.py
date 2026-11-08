@@ -91,6 +91,23 @@ class SealedTests(unittest.TestCase):
         self.assertIn('repositorySeal', preview)
         return preview
 
+    def test_bound_team_can_submit_only_ppt_zip_without_preview_seal_or_backup(self):
+        self.remote.fail_all = True
+        before = len(self.remote.calls)
+        body = {'requestId': 'bound-file-only-00001', 'expectedVersion': 0, 'status': 'submitted',
+                'materials': {'slidesUrl': 'https://example.test/slides.pdf', 'filesUrl': 'https://example.test/work.zip', 'confirmed': False}}
+        with patch.object(self.repos, 'provider', side_effect=AssertionError('file-only submission must not resolve provider')):
+            status, result, _ = self.request(self.client, '/api/submission', body)
+        self.assertEqual(status, 200, result)
+        self.assertEqual(len(self.remote.calls), before)
+        self.assertEqual(result['receipt']['materials']['codeVersion'], '')
+        self.assertNotIn('repositoryMaterialsUrl', result['receipt']['materials'])
+        self.assertIsNone(result['repositorySeal']); self.assertIsNone(result['repositoryBackup'])
+        with self.service.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM repository_previews').fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM repository_backups').fetchone()[0], 0)
+        self.assertEqual(self.request(self.client, '/api/submission/history/1')[1]['materials'], result['receipt']['materials'])
+
     def test_reconcile_binding_can_seal_preview_and_submit(self):
         with self.service.db() as db:
             db.execute("UPDATE repository_bindings SET state='reconcile' WHERE team_id=?", (self.team_id,))

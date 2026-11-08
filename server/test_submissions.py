@@ -110,7 +110,7 @@ class SubmissionAPITests(unittest.TestCase):
     def materials(self, **changes):
         return {'projectName':'Synthetic Project','summary':'A synthetic prototype', 'codeUrl':'https://github.com/synthetic/repository',
                 'readmeUrl':'https://example.test/README','license':'MIT','licenseUrl':'', 'demoUrl':'https://example.test/demo',
-                'demoInstructions':'Run locally following the README','slidesUrl':'https://example.test/slides',
+                'demoInstructions':'Run locally following the README','slidesUrl':'https://example.test/slides','filesUrl':'https://example.test/project.zip',
                 'videoUrl':'https://example.test/video','sourcesAndLimitations':'No third-party assets. Synthetic demo only.',
                 'codeVersion':'a'*40,'confirmed':True,**changes}
 
@@ -252,7 +252,7 @@ class SubmissionAPITests(unittest.TestCase):
             self.assertEqual(client.post('/api/submission',{'expectedVersion':0,'status':invalid_type,'materials':{}})[0],400)
             self.assertEqual(self.admin.post('/api/admin/team-access',{'teamId':client.get('/api/team')[1]['team']['id'],'action':invalid_type})[0],400)
         self.assertEqual(client.get('/api/team')[1]['submission']['version'],0)
-        for changes in [{'confirmed':False},{'demoUrl':'','demoInstructions':''},{'demoUrl':''},{'slidesUrl':''},{'sourcesAndLimitations':''}]:
+        for changes in [{'slidesUrl':''},{'filesUrl':''}]:
             self.assertEqual(self.save(client,materials=self.materials(**changes))[0],400,changes)
         self.assertEqual(client.request('POST','/api/submission',{'expectedVersion':0,'status':'draft','materials':{}},origin='https://attacker.invalid')[0],403)
         large=self.materials(summary='中'*600,demoInstructions='中'*2000,sourcesAndLimitations='中'*2000,

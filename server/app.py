@@ -207,7 +207,7 @@ def repository_parts(value, commit=False):
         return None
 
 
-def normalize_code_version(repository, version):
+def normalize_code_version(repository, version, allow_empty=False):
     try:
         url=urlsplit(repository)
         valid=(url.scheme=='https' and valid_material_host(url.hostname) and url.username is None and url.password is None
@@ -219,6 +219,8 @@ def normalize_code_version(repository, version):
     repo=repository_parts(repository)
     if not valid or (url.hostname in COMMIT_LINK_HOSTS and not repo):
         raise APIError(400,'仓库请填写完整 HTTPS 仓库主页链接，不是本地路径或文件页面；GitHub、Gitee、GitCode、GitLab 请使用仓库根地址')
+    if allow_empty and not version:
+        return ''
     if re.fullmatch(r'(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})',version):
         return version.lower()
     commit=repository_parts(version,commit=True)
@@ -989,16 +991,11 @@ class EventService:
             raise APIError(400, "提交确认必须为布尔值")
         result["confirmed"]=confirmed
         if submitted:
-            required=("projectName", "summary", "codeUrl", "readmeUrl", "license", "slidesUrl", "sourcesAndLimitations")
-            if lean_gitee:
-                required=tuple(key for key in required if key not in {'readmeUrl','license','sourcesAndLimitations'})
+            required=("slidesUrl", "filesUrl")
             if any(not result[key] for key in required):
-                raise APIError(400, "正式提交请填写全部必填项目材料")
-            if not result["demoUrl"]:
-                raise APIError(400, "请上传HTML作品展示，或填写可以直接打开的HTTPS分享链接")
-            if not confirmed:
-                raise APIError(400, "正式提交前请完成材料自查确认")
-            result['codeVersion']=normalize_code_version(result['codeUrl'],result['codeVersion'])
+                raise APIError(400, "正式提交只需提供PPT和作品压缩包，请补齐这两项")
+            if result['codeUrl'] or result['codeVersion']:
+                result['codeVersion']=normalize_code_version(result['codeUrl'],result['codeVersion'],allow_empty=True)
         return result
 
     def save_submission(self, db, actor, team, body, accepted_at=None):
@@ -1025,7 +1022,7 @@ class EventService:
         if lean_gitee:
             for key in ('readmeUrl','license','licenseUrl','sourcesAndLimitations'):
                 materials[key]=''
-            if submitted:
+            if submitted and materials['codeVersion']:
                 materials['repositoryMaterialsUrl']=self.repositories.public(binding)['codeUrl']+'/tree/'+materials['codeVersion']
         current=now_ms()
         if not self.submission_window(db, current if accepted_at is None else accepted_at)["canEdit"]:
@@ -1043,7 +1040,7 @@ class EventService:
            version if submitted else previous["submittedVersion"], (previous["firstSubmittedAt"] or current) if submitted else previous["firstSubmittedAt"],
            current if submitted else previous["submittedAt"], current))
         if submitted:
-            db.execute("UPDATE teams SET project=?,updated_at=? WHERE id=?", (materials["projectName"], current, team["id"]))
+            db.execute("UPDATE teams SET project=?,updated_at=? WHERE id=?", (materials["projectName"] or team["project"], current, team["id"]))
             db.execute('UPDATE team_details SET revision=revision+1 WHERE team_id=?',(team['id'],))
             self.touch(db)
         self.audit(db, actor, "submission."+body["status"], team["id"], {"version": version})

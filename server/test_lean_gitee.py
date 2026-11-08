@@ -382,18 +382,18 @@ class LeanGiteeTests(unittest.TestCase):
             with self.assertRaises(APIError):self.service.check_materials({**old,field:'http://invalid'},False,lean_gitee=True)
         with self.assertRaises(APIError):self.service.check_materials(old,False,lean_gitee=False)
 
-    def test_unbound_and_github_still_require_duplicate_fields_and_client_cannot_forge_reference(self):
+    def test_unbound_and_github_optional_fields_and_client_cannot_forge_reference(self):
         materials={k:v for k,v in self.materials().items() if k not in {'readmeUrl','license','sourcesAndLimitations'}}
         self.open_submissions()
-        self.assertEqual(self.request(self.client,'/api/submission',{'expectedVersion':0,'status':'submitted','materials':materials})[0],400)
+        self.assertEqual(self.request(self.client,'/api/submission',{'expectedVersion':0,'status':'submitted','materials':materials})[0],200)
         self.assertEqual(self.service.check_materials(self.materials(),True)['license'],'MIT')
-        with self.assertRaises(APIError):self.service.check_materials(materials,True)
+        self.assertEqual(self.service.check_materials(materials,True)['license'],'')
         self.enable('github')
         self.remote.provider='github'
         github=self.apply('github',['Developer'])[1]['repository']
         self.admin_action(github)
         selected=self.preview()[1]
-        self.assertEqual(self.submit(selected,request_id='github-still-required-0001',materials=materials)[0],400)
+        self.assertEqual(self.submit(selected,version=1,request_id='github-optional-fields-0001',materials={**materials,'codeUrl':'','codeVersion':''})[0],200)
         forged={**self.materials(),'repositoryMaterialsUrl':'https://gitee.com/other/project/tree/'+'a'*40}
         with self.assertRaises(APIError):self.service.check_materials(forged,True,lean_gitee=True)
 

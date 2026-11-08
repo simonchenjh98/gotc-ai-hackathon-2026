@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 const source=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8').split("window.addEventListener('hashchange'")[0];
 const sha='a'.repeat(40);
-const materials={projectName:'Project',summary:'Summary',codeUrl:'https://github.com/team/project',codeVersion:'https://github.com/team/project/commit/'+sha,readmeUrl:'https://example.test/readme',license:'MIT',licenseUrl:'',demoUrl:'https://example.test/demo',demoInstructions:'Run locally',slidesUrl:'https://example.test/slides',filesUrl:'',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
+const materials={projectName:'Project',summary:'Summary',codeUrl:'https://github.com/team/project',codeVersion:'https://github.com/team/project/commit/'+sha,readmeUrl:'https://example.test/readme',license:'MIT',licenseUrl:'',demoUrl:'https://example.test/demo',demoInstructions:'Run locally',slidesUrl:'https://example.test/slides',filesUrl:'https://example.test/work.zip',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
 function fixture(mode='success'){
   const nodes=new Map(),calls=[];let lastReceipt,latest={team:{id:'T1',number:1,name:'Synthetic'},window:{canEdit:true,submissionDeadline:null},submission:{version:0,draft:null,submitted:null,submittedVersion:null,submittedAt:null},judgingMaterials:{}};
   function node(id){if(nodes.has(id))return nodes.get(id);const item={id,isConnected:true,disabled:false,readOnly:false,dataset:{},classList:{add(){},remove(){}},listeners:{},value:'',type:'text',focus(){this.focused=true;},scrollIntoView(){this.scrolled=true;},setAttribute(name,value){this[name]=value;},addEventListener(event,fn){this.listeners[event]=fn;},querySelector(){return null;},querySelectorAll(){return [];}};let html='';Object.defineProperty(item,'innerHTML',{configurable:true,get:()=>html,set(value){html=value;for(const match of value.matchAll(/id="([^"]+)"/g))node(match[1]);}});nodes.set(id,item);return item;}
@@ -22,6 +22,17 @@ test('real team controller preflights, previews, then sends canonical SHA and re
   f.fill();await f.preview();assert.match(f.node('submission-preview').innerHTML,new RegExp(sha));assert.equal(f.calls.filter(c=>c.body).length,0);
   await f.node('confirm-submission').onclick();
   assert.equal(f.calls.filter(c=>c.body).length,1);assert.equal(f.calls.filter(c=>c.body).at(-1).body.materials.codeVersion,sha);assert.match(f.root.innerHTML,/正式版 v1 已收到/);
+});
+
+test('PPT and ZIP alone preview and formally submit without title, demo, repository or declaration',async()=>{
+  const f=fixture();await f.context.render();f.node('material-slidesUrl').value='https://example.test/presentation.pdf';f.node('material-filesUrl').value='https://example.test/work.zip';
+  await f.node('submission-form').onsubmit({preventDefault(){}});assert.match(f.node('submission-preview').innerHTML,/确认本次正式材料/);assert.equal(f.calls.filter(c=>c.body).length,0);
+  await f.node('confirm-submission').onclick();const sent=f.calls.find(c=>c.path==='submission').body;
+  assert.equal(sent.status,'submitted');assert.equal(sent.materials.projectName,'');assert.equal(sent.materials.summary,'');assert.equal(sent.materials.demoUrl,'');assert.equal(sent.materials.confirmed,false);assert.ok(!Object.hasOwn(sent.materials,'codeVersion'));assert.ok(!Object.hasOwn(sent.materials,'repositoryMaterialsUrl'));assert.ok(!Object.hasOwn(sent,'repoPreviewId'));assert.equal(f.latest().submission.submittedVersion,1);assert.match(f.root.innerHTML,/正式版 v1 已收到/);
+});
+
+test('formal submission still requires each of PPT and ZIP before displaying confirmation',async()=>{
+  for(const missing of ['slidesUrl','filesUrl']){const f=fixture();await f.context.render();f.node('material-slidesUrl').value='https://example.test/presentation.pdf';f.node('material-filesUrl').value='https://example.test/work.zip';f.node('material-'+missing).value='';await f.node('submission-form').onsubmit({preventDefault(){}});assert.match(f.node('submission-errors').innerHTML,new RegExp('material-'+missing));assert.equal(f.node('submission-preview').innerHTML,'');assert.equal(f.calls.filter(c=>c.body).length,0);}
 });
 
 test('intro save accepts only title and summary without attachments or confirmation and remains a draft',async()=>{

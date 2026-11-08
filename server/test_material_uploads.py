@@ -91,7 +91,7 @@ class MaterialUploadTests(unittest.TestCase):
         result = self.uploaded(project='中' * 140)
         self.assertLessEqual(len(result['filename'].encode()), 145)
         self.assertLess(len(result['url'].encode()), 1024)
-        for headers in [{'X-GOTC-Project': '%ZZ'}, {'X-GOTC-Project': '%FF'}, {'X-GOTC-Project': '%0D%0Aevil'}, {'X-GOTC-Project': ''}, {'X-GOTC-Filename': 'x.html'}]:
+        for headers in [{'X-GOTC-Project': '%ZZ'}, {'X-GOTC-Project': '%FF'}, {'X-GOTC-Project': '%0D%0Aevil'}, {'X-GOTC-Filename': 'x.html'}]:
             self.assertIn(self.upload(headers=headers)[0], {400, 415})
         self.assertEqual(self.upload(project='中' * 141)[0], 400)
 
@@ -199,11 +199,44 @@ class MaterialUploadTests(unittest.TestCase):
         with patch('material_uploads.zipfile.ZipFile', side_effect=AssertionError('must reject before allocating central directory')):
             self.assertEqual(self.upload(kind='files', data=forged, filename='bad.zip')[0], 415)
 
-    def test_demo_link_is_required_but_video_and_files_are_optional(self):
-        missing = self.submit(self.materials(demoUrl='', videoUrl=''))
-        self.assertEqual(missing[0], 400)
-        self.assertIn('HTML', missing[1]['error'])
-        self.assertEqual(self.submit(self.materials(videoUrl=''), request_id='optional-video-0001')[0], 200)
+    def test_only_slides_and_zip_are_required_and_receipt_history_preserve_optional_blanks(self):
+        materials = {'slidesUrl': 'https://example.test/slides.pdf', 'filesUrl': 'https://example.test/work.zip', 'confirmed': False}
+        for number, field in enumerate(('slidesUrl', 'filesUrl')):
+            status, _, _ = self.submit({**materials, field: ''}, request_id='missing-required-' + str(number))
+            self.assertEqual(status, 400)
+        with self.service.db() as db:
+            original_project = db.execute('SELECT project FROM teams WHERE id=?', (self.team_id,)).fetchone()[0]
+        with patch.object(self.service.repositories, 'provider', side_effect=AssertionError('file-only must not contact a provider')):
+            status, result, _ = self.submit(materials)
+        self.assertEqual(status, 200, result)
+        saved = result['receipt']['materials']
+        for field in ('projectName', 'summary', 'codeUrl', 'codeVersion', 'demoUrl', 'license', 'sourcesAndLimitations'):
+            self.assertEqual(saved[field], '')
+        self.assertFalse(saved['confirmed'])
+        self.assertEqual(result['team']['project'], original_project)
+        self.assertIsNone(result['repositorySeal']); self.assertIsNone(result['repositoryBackup'])
+        self.assertEqual(self.client.get('/api/submission/history/1')[1]['materials'], saved)
+        self.assertEqual(self.submit(materials)[1]['receipt'], result['receipt'])
+
+    def test_uploaded_slides_zip_without_project_title_can_be_formally_submitted(self):
+        slides = self.uploaded(project='')
+        files = self.uploaded(kind='files', data=archive(), filename='code.zip', project='')
+        self.assertEqual(slides['filename'], '测试队伍+作品.pdf')
+        self.assertEqual(files['filename'], '测试队伍+作品.zip')
+        status, result, _ = self.submit({'slidesUrl': slides['url'], 'filesUrl': files['url']})
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result['receipt']['materials']['projectName'], '')
+        self.assertEqual(self.read(slides)[1], PDF)
+        # A blank optional title also accepts previously named uploads without renaming bytes.
+        named = self.uploaded(project='Named project')
+        self.assertEqual(self.submit({'slidesUrl': named['url'], 'filesUrl': files['url']}, 1, 'named-upload-blank-title')[0], 200)
+
+    def test_optional_filled_invalid_fields_still_reject_formal_submission(self):
+        base = {'slidesUrl': 'https://example.test/slides', 'filesUrl': 'https://example.test/work.zip'}
+        for number, change in enumerate([{'demoUrl': 'http://invalid'}, {'codeUrl': 'https://github.com/team/repo/blob/main/x'},
+                                        {'codeVersion': 'main'}, {'confirmed': 'yes'}, {'summary': 'x' * 601}]):
+            status, _, _ = self.submit({**base, **change}, request_id='optional-invalid-' + str(number))
+            self.assertEqual(status, 400)
 
     def test_team_rename_requires_new_file_but_preserves_existing_receipts_and_bytes(self):
         slides = self.uploaded()

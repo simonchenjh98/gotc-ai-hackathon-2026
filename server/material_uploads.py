@@ -36,7 +36,7 @@ SCHEMA = '''CREATE TABLE IF NOT EXISTS material_uploads (
  SELECT RAISE(ABORT,'uploaded materials are immutable'); END;'''
 
 
-def header_text(headers, name):
+def header_text(headers, name, allow_empty=False):
     values = headers.get_all(name, [])
     if len(values) != 1 or len(values[0]) > 2048 or re.search(r'%(?![0-9a-fA-F]{2})', values[0]):
         raise APIError(400, '请填写作品名称并选择上传文件', 'upload_metadata')
@@ -45,7 +45,7 @@ def header_text(headers, name):
         value.encode('utf-8')
     except UnicodeError:
         raise APIError(400, '上传名称编码不正确', 'upload_metadata') from None
-    if not value.strip() or any(unicodedata.category(c).startswith('C') for c in value):
+    if (not value.strip() and not allow_empty) or any(unicodedata.category(c).startswith('C') for c in value):
         raise APIError(400, '上传名称包含无效字符', 'upload_metadata')
     return value.strip()
 
@@ -117,7 +117,7 @@ class MaterialUploads:
     def upload(self, handler, kind, length):
         if length <= 0 or length > LIMITS[kind]:
             raise APIError(413, '文件超过大小限制或为空', 'upload_size')
-        project = header_text(handler.headers, 'X-GOTC-Project')
+        project = header_text(handler.headers, 'X-GOTC-Project', allow_empty=True) or '作品'
         original = header_text(handler.headers, 'X-GOTC-Filename')
         if len(project) > 140:
             raise APIError(400, '作品名称最多140字', 'upload_metadata')
@@ -247,8 +247,9 @@ class MaterialUploads:
                 raise APIError(403, '只能提交本队上传的文件', 'upload_owner')
             if {'slidesUrl': 'slides', 'filesUrl': 'files', 'demoUrl': 'demo'}.get(field) != row['kind']:
                 raise APIError(400, '上传文件与提交项不匹配，请选择对应文件', 'upload_kind')
-            expected_name = safe_part(team_name) + '+' + safe_part(materials['projectName']) + Path(row['filename']).suffix
-            if row['project_name'] != materials['projectName'] or row['filename'] != expected_name:
+            project_name = materials['projectName'] or row['project_name']
+            expected_name = safe_part(team_name) + '+' + safe_part(project_name) + Path(row['filename']).suffix
+            if row['project_name'] != project_name or row['filename'] != expected_name:
                 raise APIError(400, '队名或作品名称已变化，请按新名称重新上传文件', 'upload_project')
 
     def serve(self, handler, path):

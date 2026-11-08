@@ -330,7 +330,7 @@ class RepositoryTests(unittest.TestCase):
     def test_missing_preview_and_manual_code_override_are_denied(self):
         self.provision()
         self.open_submissions()
-        self.assertEqual(self.submit()[0], 400)
+        self.assertEqual(self.submit(materials=self.materials(codeUrl='',codeVersion='a'*40))[0], 400)
         preview = self.preview()[1]
         status, result, _ = self.submit(preview, materials=self.materials(codeUrl='https://github.com/other/team'))
         self.assertEqual(status, 400, result)

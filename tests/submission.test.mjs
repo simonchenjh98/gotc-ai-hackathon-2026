@@ -79,27 +79,24 @@ test('shared repository and full SHA normalization contract rejects ambiguous UR
 test('formal preflight aggregates missing fields while partial drafts remain allowed',()=>{
   assert.equal(h.submissionProblems({codeVersion:'a1b'},false).length,0);
   const missing=h.submissionProblems({},true);
-  assert.ok(missing.some(e=>e.key==='codeVersion'));
-  assert.ok(missing.some(e=>e.key==='confirmed'));
-  assert.ok(missing.some(e=>e.key==='demoUrl'));
-  assert.ok(missing.length>=9);
+  assert.deepEqual(Array.from(missing,e=>e.key),['slidesUrl','filesUrl']);
 });
-test('online demo is required while video and supplementary ZIP remain optional',()=>{
-  const materials={projectName:'Synthetic',summary:'Summary',codeUrl:'https://github.com/team/project',codeVersion:'a'.repeat(40),readmeUrl:'https://example.test/readme',license:'MIT',slidesUrl:'https://example.test/slides',sourcesAndLimitations:'Synthetic only',confirmed:true,demoInstructions:'Run the local app'};
-  const errors=h.submissionProblems(materials,true);assert.equal(errors.length,1);assert.equal(errors[0].key,'demoUrl');
-  assert.equal(h.submissionProblems({...materials,demoUrl:'https://example.test/demo'},true).length,0);
-  assert.equal(h.submissionProblems({...materials,demoUrl:'https://example.test/demo',filesUrl:'file:///archive.zip'},true)[0].key,'filesUrl');
+test('only PPT and ZIP are required; repository URL without SHA and all other empty fields are allowed',()=>{
+  const materials={slidesUrl:'https://example.test/slides',filesUrl:'https://example.test/work.zip'};
+  assert.equal(h.submissionProblems(materials,true).length,0);
+  assert.equal(h.submissionProblems({...materials,codeUrl:'https://github.com/team/project'},true).length,0);
+  assert.equal(h.submissionProblems({...materials,filesUrl:'file:///archive.zip'},true)[0].key,'filesUrl');
 });
 test('three submission sections offer upload or link and make the video optional',()=>{
   const html=h.teamFormMarkup({team:{name:'Synthetic'},submission:{},window:{canEdit:true}});
   assert.match(html,/<button type="button" id="save-project-intro"/);assert.match(html,/只填名称和介绍即可保存/);
   assert.ok(html.indexOf('name="summary"')<html.indexOf('id="save-project-intro"'));assert.ok(html.indexOf('id="save-project-intro"')<html.indexOf('name="sourcesAndLimitations"'));assert.ok(html.indexOf('id="save-project-intro"')<html.indexOf('id="submission-slides"'));
   for(const kind of ['slides','files','demo']){assert.match(html,new RegExp(`id="submission-${kind}"`));assert.match(html,new RegExp(`id="upload-${kind}-file"`));assert.match(html,new RegExp(`id="upload-${kind}-button"`));}
-  assert.match(html,/name="demoUrl"[^>]*required/);assert.ok(!/name="videoUrl"[^>]*required/.test(html));assert.ok(!/name="filesUrl"[^>]*required/.test(html));assert.match(html,/本地运行说明不能代替链接/);assert.match(html,/多文件网站请部署后/);
+  assert.ok(!/name="demoUrl"[^>]*required/.test(html));assert.ok(!/name="videoUrl"[^>]*required/.test(html));assert.match(html,/name="filesUrl"[^>]*required/);assert.ok(!/name="confirmed"[^>]*required/.test(html));assert.match(html,/不填写也可正式提交/);assert.match(html,/多文件网站请部署后/);
 });
 test('supplementary ZIP is clickable in formal material, receipts and copied submission records',()=>{
   const filesUrl='https://example.test/gotc/materials/'+('a'.repeat(43))+'/Team%2BProject.zip',materials={projectName:'Project',filesUrl,confirmed:true};
-  assert.match(h.materialMarkup(materials),/代码及其他文件 ZIP/);assert.ok(h.materialMarkup(materials).includes(`href="${filesUrl}"`));
+  assert.match(h.materialMarkup(materials),/作品压缩包 ZIP/);assert.ok(h.materialMarkup(materials).includes(`href="${filesUrl}"`));
   const data={team:{name:'Team',number:1},submission:{submitted:materials,submittedVersion:1,submittedAt:0},judgingMaterials:{}};
   assert.ok(h.submissionRecordText(data).includes(filesUrl));assert.match(h.submissionRecordText(data),/本站上传文件另行保存/);
 });
@@ -129,6 +126,6 @@ test('stage action patches only matching read-only adoption cards and keeps othe
 });
 
 test('GitHub dot-prefixed repositories pass the real formal preflight for full SHA and commit URLs',()=>{
-  const sha='a'.repeat(40),materials={projectName:'Synthetic',summary:'Synthetic',codeUrl:'https://github.com/github/.github',readmeUrl:'https://example.test/readme',license:'MIT',demoUrl:'https://example.test/demo',demoInstructions:'Local demo',slidesUrl:'https://example.test/slides',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
+  const sha='a'.repeat(40),materials={projectName:'Synthetic',summary:'Synthetic',codeUrl:'https://github.com/github/.github',readmeUrl:'https://example.test/readme',license:'MIT',demoUrl:'https://example.test/demo',demoInstructions:'Local demo',slidesUrl:'https://example.test/slides',filesUrl:'https://example.test/work.zip',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
   for(const codeVersion of [sha,'https://github.com/github/.github/commit/'+sha])assert.equal(h.submissionProblems({...materials,codeVersion},true).length,0,codeVersion);
 });

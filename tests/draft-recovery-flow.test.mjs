@@ -35,9 +35,15 @@ test('binary upload fills the matching URL and local recovery without submitting
   }
 });
 
+test('blank project uploads under the default title and equivalent blank edits do not invalidate it',async()=>{
+  const f=await uploadFixture();f.edit('projectName','');chooseUpload(f,'files','work.zip');f.hooks['team/uploads/files']=()=>f.response(uploaded('files','zip'));
+  assert.match(f.node('upload-files-name').textContent,/One\+作品.zip/);await f.node('upload-files-button').onclick();const call=f.calls.find(c=>c.path==='team/uploads/files');assert.equal(call.headers['X-GOTC-Project'],encodeURIComponent('作品'));assert.equal(f.node('material-filesUrl').value,uploaded('files','zip').url);assert.equal(f.node('material-projectName').value,'');
+  f.edit('projectName','  ');assert.ok(!f.node('upload-files-status').textContent.includes('作品名称已变化'));f.edit('projectName','新名称');assert.match(f.node('upload-files-status').textContent,/作品名称已变化/);
+});
+
 test('an upload is single-flight and blocks draft save, preview and an already-rendered confirmation',async()=>{
   const f=await uploadFixture(),gate=deferred();
-  for(const [key,value] of Object.entries({codeUrl:'https://github.com/team/project',codeVersion:'a'.repeat(40),readmeUrl:'https://example.test/readme',license:'MIT',demoUrl:'https://example.test/demo',slidesUrl:'https://example.test/slides',sourcesAndLimitations:'Synthetic only'}))f.edit(key,value);
+  for(const [key,value] of Object.entries({codeUrl:'https://github.com/team/project',codeVersion:'a'.repeat(40),readmeUrl:'https://example.test/readme',license:'MIT',demoUrl:'https://example.test/demo',slidesUrl:'https://example.test/slides',filesUrl:'https://example.test/work.zip',sourcesAndLimitations:'Synthetic only'}))f.edit(key,value);
   f.node('material-confirmed').checked=true;await f.node('submission-form').onsubmit({preventDefault(){}});const oldConfirm=f.node('confirm-submission').onclick;assert.equal(typeof oldConfirm,'function');
   chooseUpload(f,'slides','slides.pptx');chooseUpload(f,'files','files.zip');f.hooks['team/uploads/slides']=()=>gate.promise;
   const pending=f.node('upload-slides-button').onclick();assert.equal(f.node('save-project-intro').disabled,true);assert.equal(f.node('save-submission-draft').disabled,true);assert.equal(f.node('check-submission').disabled,true);assert.equal(f.node('submission-preview').innerHTML,'');
@@ -77,8 +83,8 @@ test('late upload success and denial cannot paint or lock a new team login',asyn
   }
 });
 
-test('missing title, mismatched file extension and oversized file fail before sending bytes',async()=>{
-  for(const [project,kind,name,size] of [['','slides','slides.pptx',12],['作品','demo','site.zip',12],['作品','files','files.zip',100*1024*1024+1],['作品','slides','empty.pdf',0]]){
+test('mismatched file extension and oversized file fail before sending bytes',async()=>{
+  for(const [project,kind,name,size] of [['作品','demo','site.zip',12],['作品','files','files.zip',100*1024*1024+1],['作品','slides','empty.pdf',0]]){
     const f=await uploadFixture();f.edit('projectName',project);chooseUpload(f,kind,name,size);await f.node(`upload-${kind}-button`).onclick();assert.equal(f.calls.filter(c=>c.path.startsWith('team/uploads/')).length,0);assert.ok(f.node(`upload-${kind}-status`).textContent);
   }
 });
