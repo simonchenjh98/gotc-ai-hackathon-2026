@@ -213,7 +213,7 @@ test('saving validity preserves another record reason entered during the POST',a
     invalidated:true,reason:'Reason submitted for first'});
 });
 
-function teamHarness(fetch,directoryOverrides={}){
+function teamHarness(fetch,directoryOverrides={},lifecycleOverride=null){
   const entry=form({id:'T1',number:'1',name:'Submitted name',project:'P',track:'AI for Science',
     expectedRevision:'7',status:'active',statusReason:'',booth:'A1',roadshowOrder:'2'});
   entry.elements.track=select('AI for Science');entry.elements.name.focus=()=>{};
@@ -240,11 +240,24 @@ function teamHarness(fetch,directoryOverrides={}){
     {id:'T2',number:2,name:'Stored B',track:'AI for Science',revision:10}],judges:[],audience:[],trackOptions:['AI for Science'],...directoryOverrides};
   elements['settings-form'].elements.scoringOpen={checked:true};elements['settings-form'].elements.resultsPublished={checked:true};elements['settings-form'].onsubmit=()=>{elements['settings-form'].originalHandlerCalled=true;};
   elements['audience-settings'].elements={votingOpen:{checked:false},votingDeadline:{value:''}};
-  const context=environment(elements,fetch,{eventData});
+  const context=environment(elements,fetch,{eventData,lifecycleOverride});
   context.document.querySelector=selector=>selector==='.admin-team-table'?table:list;
-  vm.runInContext('installImportTools=()=>{};installRecordTools=()=>{};installAuditTools=()=>{};installAdminData(eventData,1);trackAdminForm(document.getElementById("team-form"));',context);
+  vm.runInContext('installImportTools=()=>{};installRecordTools=()=>{};installAuditTools=()=>{};if(lifecycleOverride)installAdminTeamLifecycle=()=>lifecycleOverride;installAdminData(eventData,1);trackAdminForm(document.getElementById("team-form"));',context);
   return {context,entry,elements,eventData,buttons:()=>buttons,credentialButtons:()=>credentialButtons};
 }
+
+for(const action of ['switch team','clear team'])test(`an independent member draft requires confirmation before ${action}`,()=>{
+  let clears=0,prompts=0;
+  const lifecycle={valid:()=>true,canSave:()=>true,hasUnsaved:()=>true,select(){},clear(){clears++;},updateCount(){}};
+  const h=teamHarness(async()=>ok({}),{},lifecycle);
+  h.context.confirm=()=>{prompts++;return false;};
+  const original={id:h.entry.elements.id.value,name:h.entry.elements.name.value,revision:h.entry.elements.expectedRevision.value};
+  const invoke=()=>action==='switch team'?h.buttons().find(button=>button.dataset.editTeam==='T2').onclick():h.elements['clear-team'].onclick();
+  invoke();assert.equal(prompts,1);assert.equal(clears,0);
+  assert.deepEqual({id:h.entry.elements.id.value,name:h.entry.elements.name.value,revision:h.entry.elements.expectedRevision.value},original);
+  h.context.confirm=()=>true;invoke();
+  assert.equal(h.entry.elements.id.value,action==='switch team'?'T2':'');assert.equal(clears,action==='clear team'?1:0);
+});
 
 test('team editing adopts the POST revision, keeps new input and allows the next save',async()=>{
   const post=deferred(),requests=[];

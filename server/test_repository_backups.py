@@ -8,10 +8,123 @@ import unittest
 import json
 import io
 import time
+import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 from test_api import Client
 
 import test_repository_seals
+
+
+class BackupInitializationTests(unittest.TestCase):
+    """Controlled init must not need an exception to strict symlink checks."""
+    def setUp(self):
+        from repository_backups import RepositoryBackups
+        self.temp=tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.backups=RepositoryBackups(SimpleNamespace(data_dir=Path(self.temp.name)))
+        self.scratch=self.backups.directory(self.backups.root/'scratch')
+        self.repo=self.backups.directory(self.scratch/'repo')
+        self.ctx={'scratch':self.scratch,'deadline':time.monotonic()+30,'env':os.environ.copy()}
+
+    def test_git_init_probe_is_avoided_and_other_symlinks_remain_rejected(self):
+        from repository_backups import BackupFailure
+        probe=self.repo/'tABC123'
+        original_is_symlink=Path.is_symlink
+        started=[]
+        force_probe=False
+        class Child:
+            returncode=0
+            def __init__(child,*args,**kwargs):
+                child.polls=0
+                head=self.repo/'HEAD'
+                started.append(head.read_text() if head.exists() else None)
+                if not head.exists() or force_probe:probe.write_text('simulated Git symlink')
+            def poll(child):
+                child.polls+=1
+                return None if child.polls==1 else 0
+            def wait(child):
+                probe.unlink(missing_ok=True)
+                return 0
+        # Windows need not grant symlink privileges: model the exact filesystem
+        # observation while a real Git init's capability probe is in flight.
+        with patch('repository_backups.subprocess.Popen',side_effect=Child), \
+             patch('repository_backups.time.sleep'), \
+             patch.object(Path,'is_symlink',lambda path: (path==probe and probe.exists()) or original_is_symlink(path)):
+            with self.assertRaisesRegex(BackupFailure,'^unsafe_path$'):
+                self.backups._git(self.repo,['init','--template=','--bare','-q','.'],self.ctx)
+            self.backups.init_bare(self.repo,self.ctx)
+            self.assertEqual(started,[None,'ref: refs/heads/backup-init\n'])
+            # No filename/target exemption: the same observed symlink remains
+            # forbidden if a child creates it despite the seeded HEAD.
+            force_probe=True
+            with self.assertRaisesRegex(BackupFailure,'^unsafe_path$'):
+                self.backups._git(self.repo,['init','--template=','--bare','-q','.'],self.ctx)
+        self.assertIsNone(self.backups.process)
+
+    def test_seeded_head_cannot_overwrite_an_existing_file(self):
+        from repository_backups import BackupFailure
+        head=self.repo/'HEAD'
+        head.write_text('existing private file')
+        with patch.object(self.backups,'_git') as git:
+            with self.assertRaisesRegex(BackupFailure,'^unsafe_path$'):
+                self.backups.init_bare(self.repo,self.ctx)
+        git.assert_not_called()
+        self.assertEqual(head.read_text(),'existing private file')
+
+    def test_initialization_still_enforces_resource_limits_before_git(self):
+        from repository_backups import BackupFailure
+        (self.scratch/'existing-output').write_bytes(b'1234')
+        with patch.object(self.backups,'TASK_BYTES',1),patch.object(self.backups,'_git') as git:
+            with self.assertRaisesRegex(BackupFailure,'^task_limit$'):
+                self.backups.init_bare(self.repo,self.ctx)
+        git.assert_not_called()
+        self.assertFalse((self.repo/'HEAD').exists())
+
+    def test_stopping_or_expired_work_cannot_seed_a_head(self):
+        from repository_backups import BackupFailure
+        for error in ('worker_interrupted','git_timeout'):
+            with self.subTest(error=error),patch.object(self.backups,'_git') as git:
+                if error=='worker_interrupted':self.backups.stopping.set()
+                else:self.ctx['deadline']=time.monotonic()-1
+                with self.assertRaisesRegex(BackupFailure,'^'+error+'$'):
+                    self.backups.init_bare(self.repo,self.ctx)
+                git.assert_not_called()
+                self.assertFalse((self.repo/'HEAD').exists())
+                self.backups.stopping.clear()
+
+    def test_seeded_repository_supports_real_fetch_bundle_and_verification(self):
+        # Use real local Git with synthetic content; no credentials/network.
+        # The process resource wrapper has separate Linux integration coverage.
+        env={**os.environ,'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':os.devnull,
+             'GIT_TERMINAL_PROMPT':'0'}
+        def git(repo,*args):
+            result=subprocess.run(['git','-c','core.hooksPath=/dev/null','-C',str(repo),*args],
+                                  env=env,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            return result.stdout.strip()
+        def local_git(repo,args,ctx):return git(repo,*args)
+        source=self.backups.directory(self.scratch/'source')
+        git(source,'init','--template=','-q','.')
+        (source/'synthetic.txt').write_text('synthetic backup content')
+        git(source,'add','synthetic.txt')
+        git(source,'-c','user.name=Synthetic','-c','user.email=synthetic@example.invalid','commit','-qm','Synthetic')
+        sha=git(source,'rev-parse','HEAD')
+        with patch.object(self.backups,'_git',side_effect=local_git):
+            self.backups.init_bare(self.repo,self.ctx)
+            self.assertEqual(git(self.repo,'rev-parse','--is-bare-repository'),'true')
+            self.assertEqual(git(self.repo,'config','--get','core.repositoryformatversion'),'0')
+            git(self.repo,'-c','protocol.file.allow=always','fetch','--no-tags',str(source),'+HEAD:refs/heads/selected')
+            git(self.repo,'symbolic-ref','HEAD','refs/heads/selected')
+            self.assertEqual(git(self.repo,'rev-parse','HEAD'),sha)
+            bundle=self.scratch/'synthetic.bundle'
+            git(self.repo,'bundle','create',str(bundle),'refs/heads/selected','HEAD')
+            verify=self.backups.directory(self.scratch/'verify')
+            self.backups.init_bare(verify,self.ctx)
+            git(verify,'bundle','verify',str(bundle))
+            git(verify,'-c','protocol.file.allow=always','fetch',str(bundle),'+HEAD:refs/heads/selected')
+            self.assertEqual(git(verify,'show','refs/heads/selected:synthetic.txt'),'synthetic backup content')
+        self.backups.check(self.ctx)
 
 
 class BackupTests(unittest.TestCase):

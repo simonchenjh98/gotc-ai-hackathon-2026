@@ -103,6 +103,7 @@
 .admin-team-members{border-top:1px solid var(--line);margin-top:24px;padding-top:18px;min-width:0}
 .admin-team-members h3{margin:0}.admin-member-table caption{text-align:left;padding:12px 0;font-size:13px;font-weight:600}
 .admin-member-table td,.admin-recycle-bin td{overflow-wrap:anywhere;max-width:320px}
+.admin-member-editor .admin-lifecycle-panel{margin-top:12px;border-color:var(--line);background:transparent}.admin-member-editor input{width:100%;min-width:8em}.admin-member-editor td:last-child{white-space:nowrap}
 .admin-lifecycle-panel{margin-top:20px;padding:20px;border:1px solid #c78075;background:#fff9f7}
 .admin-lifecycle-panel h3{margin-top:0}.admin-lifecycle-panel textarea{max-width:100%}
 .admin-recycle-bin{scroll-margin-top:24px}.admin-recycle-bin .section-caption{flex-wrap:wrap;gap:12px}

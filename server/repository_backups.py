@@ -274,12 +274,25 @@ class RepositoryBackups:
                 yield from records
             if pending:raise BackupFailure('object_invalid')
 
+    def init_bare(self,repo,ctx):
+        self.check(ctx)
+        # This is a new private directory, never a checkout. Seed a real HEAD
+        # with exclusive creation so Git takes its reinitialization path: a new
+        # init otherwise briefly creates a symlink to probe filesystem support,
+        # racing our strict usage() scan. Keep every path/resource check intact.
+        try:
+            with (repo/'HEAD').open('x',encoding='ascii',newline='\n') as head:
+                head.write('ref: refs/heads/backup-init\n')
+        except FileExistsError:
+            raise BackupFailure('unsafe_path') from None
+        self._git(repo,['init','--template=','--bare','-q','.'],ctx)
+
     def build(self,source,scratch):
         if not all(re.fullmatch(r'[A-Za-z0-9_-]+',source[k]) for k in ('organization','slug')) or not re.fullmatch(r'gotc-archive-[0-9a-f]{32}-[0-9a-f]{40,64}',source['ref']) or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}',source['sha']):raise BackupFailure('source_identity')
         env={'PATH':'/usr/bin:/bin','HOME':str(scratch),'LANG':'C','LC_ALL':'C','GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':os.devnull,'GIT_TERMINAL_PROMPT':'0','GIT_ATTR_NOSYSTEM':'1','GIT_LFS_SKIP_SMUDGE':'1'}
         ctx={'scratch':scratch,'deadline':time.monotonic()+self.GIT_SECONDS,'env':env}
         repo=self.directory(scratch/'repo')
-        self._git(repo,['init','--template=','--bare','-q','.'],ctx)
+        self.init_bare(repo,ctx)
         try:provider=self.s.repositories.provider(source)
         except APIError:raise BackupFailure('provider_unavailable') from None
         if provider.name!='gitee' or provider.origin!='https://gitee.com/api/v5':raise BackupFailure('provider_unavailable')
@@ -295,7 +308,7 @@ class RepositoryBackups:
         self._git(repo,['symbolic-ref','HEAD','refs/heads/selected'],ctx)
         self._git(repo,['bundle','create',str(bundle),'refs/heads/selected','HEAD'],ctx)
         empty=self.directory(scratch/'verify')
-        self._git(empty,['init','--template=','--bare','-q','.'],ctx)
+        self.init_bare(empty,ctx)
         self._git(empty,['bundle','verify',str(bundle)],ctx)
         # Keep the complete path listing only in the private artifact. Stream one JSON
         # entry at a time; even a tree of long gitlink names never becomes a DB payload.

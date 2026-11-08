@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS team_recycle_memberships (
 '''
 TEAM_FIELDS=('id','number','name','project','track','status','statusReason','booth','roadshowOrder','revision')
 PATHS={'/api/admin/data/team','/api/admin/data/recycle-bin',
-       '/api/admin/data/team/recycle','/api/admin/data/team/restore'}
+       '/api/admin/data/team/recycle','/api/admin/data/team/restore','/api/admin/data/team/members'}
 
 
 class TeamLifecycle:
@@ -199,7 +199,8 @@ class TeamLifecycle:
         return {'team':{**team,'recycled':event is not None},'roster':self.member_view(db,team_id),
             'recycle':self.recycle_state(event),'recycleContext':None if event else self.recycle_context(db,team_id),
             'restoreConflicts':self.restore_conflicts(db,team_id,team['name']) if event else [],
-            'restoreAdvisories':self.restore_advisories(db,team_id) if event else []}
+            'restoreAdvisories':self.restore_advisories(db,team_id) if event else [],
+            **self.s.team_members.view(db,team_id)}
 
     def listing(self,db):
         return {'teams':[{'id':row['team_id'],'number':row['number'],'name':row['name'],
@@ -304,4 +305,5 @@ class TeamLifecycle:
         if method=='GET' and path=='/api/admin/data/recycle-bin':return self.listing(db)
         if method=='POST' and path=='/api/admin/data/team/recycle':return self.recycle(db,actor,body)
         if method=='POST' and path=='/api/admin/data/team/restore':return self.restore(db,actor,body)
+        if method=='POST' and path=='/api/admin/data/team/members':return self.s.team_members.edit(db,actor,body)
         raise APIError(405,'队伍操作方法不正确')

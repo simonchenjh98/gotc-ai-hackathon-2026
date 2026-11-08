@@ -39,6 +39,7 @@ from admin_team_access import AdminTeamAccess, PATHS as ADMIN_TEAM_PATHS, operat
 from keys import KeyService, load_config
 from gateway_cors import origin_allowed, preflight_allowed, response_headers as gateway_cors_headers
 from team_lifecycle import TeamLifecycle, PATHS as TEAM_LIFECYCLE_PATHS
+from team_members import TeamMembers
 from material_uploads import MaterialUploads
 
 DIMENSIONS = [
@@ -270,6 +271,7 @@ class EventService:
             is_team_recycled=lambda db,team_id:self.team_lifecycle.is_recycled(db,team_id))
         self.admin_data=AdminDataService(self)
         self.team_lifecycle=TeamLifecycle(self)
+        self.team_members=TeamMembers(self)
         self.admin_team_access=AdminTeamAccess(self,COOKIE_NAME)
         self.claims=Claims(self,now_ms,text_field,scrypt_hash)
         self.registration=TeamRegistration(self,now_ms,text_field)

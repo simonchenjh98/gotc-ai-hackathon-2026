@@ -178,7 +178,7 @@ function installAdminData(data,version){
     table.querySelectorAll('[data-edit-team]').forEach(button=>button.onclick=()=>{
       const form=formFrom('team-form');
       if(!lifecycle.valid()){formError(form,adminTeamLifecycleLoginNotice);return;}
-      if(dirtyAdminForms.has(form) && !confirm('表单有未保存的修改，确认载入另一支队伍？'))return;
+      if(lifecycle.hasUnsaved() && !confirm('队伍或成员有未保存的修改，确认载入另一支队伍？'))return;
       form.editSession=(form.editSession || 0)+1;
       const team=ctx.data.teams.find(item=>item.id===button.dataset.editTeam);
       const track=form.elements.track;
@@ -210,7 +210,7 @@ function installAdminData(data,version){
       toast('队伍信息已保存。');await refreshDirectory();
     });
   };
-  document.getElementById('clear-team').onclick=event=>{if(!event?.lifecycleComplete && dirtyAdminForms.has(teamForm) && !confirm('队伍表单有未保存的修改，确认清空？'))return;lifecycle.clear();teamForm.reset();teamForm.elements.id.value='';teamForm.elements.expectedRevision.value='';teamForm.editRevision=(teamForm.editRevision || 0)+1;teamForm.editSession=(teamForm.editSession || 0)+1;dirtyAdminForms.delete(teamForm);teamForm.querySelector('[type=submit]').textContent='新增队伍';};
+  document.getElementById('clear-team').onclick=event=>{if(!event?.lifecycleComplete && lifecycle.hasUnsaved() && !confirm('队伍或成员有未保存的修改，确认清空？'))return;lifecycle.clear();teamForm.reset();teamForm.elements.id.value='';teamForm.elements.expectedRevision.value='';teamForm.editRevision=(teamForm.editRevision || 0)+1;teamForm.editSession=(teamForm.editSession || 0)+1;dirtyAdminForms.delete(teamForm);teamForm.querySelector('[type=submit]').textContent='新增队伍';};
   renderDirectory();
 
   function renderCredentials(){
@@ -248,7 +248,7 @@ function adminTeamRosterMarkup(detail){
   const members=detail.roster?.members || [],archived=detail.recycle?'<p class="small-note">删除时记录 · 恢复冲突另列于下方。</p>':'';
   if(!members.length)return archived+'<p class="small-note">暂无成员资料</p>';
   const sources={approved_membership:'已审核成员记录',registration_captain:'队长原登记',registration_member:'原登记成员'};
-  return archived+`<div class="table-wrap"><table class="board-table admin-member-table"><caption>队员与学校（只读）</caption><thead><tr><th scope="col">姓名 / 角色</th><th scope="col">学校</th><th scope="col">资料来源</th></tr></thead><tbody>${members.map(member=>`<tr><td>${esc(member.name)}${member.role==='captain'?'<br><small>队长</small>':''}</td><td>${member.school?esc(member.school):'学校待补充（原登记未提供）'}${member.schoolState==='needs_review'?'<br><span class="status-chip closed">学校待核对</span>':''}</td><td>${esc(sources[member.source] || '已记录资料')}</td></tr>`).join('')}</tbody></table></div>`;
+  return archived+`<div class="table-wrap"><table class="board-table admin-member-table"><caption>当前队员与学校</caption><thead><tr><th scope="col">姓名 / 角色</th><th scope="col">学校</th><th scope="col">资料来源</th></tr></thead><tbody>${members.map(member=>`<tr><td>${esc(member.name)}${member.role==='captain'?'<br><small>队长</small>':''}</td><td>${member.school?esc(member.school):'学校待补充（原登记未提供）'}${member.schoolState==='needs_review'?'<br><span class="status-chip closed">学校待核对</span>':''}</td><td>${esc(sources[member.source] || '已记录资料')}</td></tr>`).join('')}</tbody></table></div>`;
 }
 function adminRestoredAccessMessage(result){
   const access=result.access || {},parts=['队伍已恢复。'];
@@ -259,13 +259,119 @@ function adminRestoredAccessMessage(result){
   parts.push(`恢复后的参赛状态：${status[result.team?.status] || result.team?.status || '请核对'}。`);
   return parts.join('');
 }
+function adminMemberEditorMarkup(){
+  return `<div class="admin-member-editor"><div class="form-actions"><button type="button" class="btn secondary small" id="team-member-edit" hidden>编辑成员</button></div><div id="team-member-editor" class="admin-lifecycle-panel" hidden><h3>编辑队员</h3><p class="small-note" id="team-member-mode"></p><div id="team-member-rows"></div><div class="form-actions"><button type="button" class="btn secondary small" id="team-member-add">添加队员</button></div><label class="field">修改原因<textarea id="team-member-reason" rows="2" maxlength="500" placeholder="例如：队长来信更正姓名；新增队员经组织方核实"></textarea></label><div class="form-actions"><button type="button" class="btn" id="team-member-save">保存成员</button><button type="button" class="btn secondary" id="team-member-cancel">取消</button></div><p class="form-error" id="team-member-error" role="alert"></p></div></div>`;
+}
+const ADMIN_MEMBER_LIMIT=5;
+function adminMemberDraft(detail){return (detail?.roster?.members || []).map(member=>({personId:member.personId ?? null,name:member.name || '',school:member.school || ''}));}
+function adminMemberRowsMarkup(draft,mode){
+  const registration=mode==='registration';
+  if(!draft.length)return '<p class="small-note">暂无成员，请点击“添加队员”。</p>';
+  return `<div class="table-wrap"><table class="board-table admin-member-table"><caption>第一位为队长</caption><thead><tr><th scope="col">角色</th><th scope="col">姓名</th><th scope="col">学校</th><th scope="col">操作</th></tr></thead><tbody>${draft.map((member,index)=>{
+    const schoolLocked=registration && index>0;
+    return `<tr><td>${index===0?'<strong>队长</strong>':'队员'}${member.personId?'':'<br><small>新增</small>'}</td><td><input aria-label="第 ${index+1} 位成员姓名" maxlength="100" value="${esc(member.name)}" data-member-field="name" data-member-index="${index}"></td><td><input aria-label="第 ${index+1} 位成员学校" maxlength="200" value="${esc(schoolLocked?'':member.school)}" data-member-field="school" data-member-index="${index}"${schoolLocked?' disabled placeholder="原登记只记录队长学校"':''}></td><td>${index>0?`<button type="button" class="btn secondary small" data-member-action="captain" data-member-index="${index}">设为队长</button> `:''}<button type="button" class="btn secondary small" data-member-action="remove" data-member-index="${index}"${draft.length<=1?' disabled':''}>移除</button></td></tr>`;
+  }).join('')}</tbody></table></div>`;
+}
+function adminMemberPayload(draft,mode){
+  const members=draft.map((member,index)=>({personId:member.personId,name:member.name.trim(),school:mode==='registration' && index>0?'':member.school.trim()}));
+  if(!members.length)return {error:'每队至少保留一名成员（队长）。'};
+  if(members.length>ADMIN_MEMBER_LIMIT)return {error:`每队最多 ${ADMIN_MEMBER_LIMIT} 名成员。`};
+  const blank=members.findIndex(member=>!member.name);
+  if(blank>=0)return {error:`请填写第 ${blank+1} 位成员的姓名，或移除这一行。`};
+  const noSchool=members.findIndex((member,index)=>!member.school && (mode!=='registration' || index===0));
+  if(noSchool>=0)return {error:noSchool===0?'请填写队长学校。':`请填写第 ${noSchool+1} 位成员的学校。`};
+  const keys=members.map(member=>mode==='registration'?member.name:member.name+'\u0000'+member.school);
+  if(new Set(keys).size!==keys.length)return {error:mode==='registration'?'成员名单中有重名。':'成员名单中有同名同校的重复行。'};
+  return {members};
+}
+function installAdminMemberEditor({request,valid,current,onSaved}){
+  const node=id=>document.getElementById('team-member-'+id),open=node('edit'),panel=node('editor'),rows=node('rows'),reason=node('reason'),error=node('error'),save=node('save');
+  // Existing lightweight DOM fixtures need not implement this optional UI surface.
+  if(!open || !panel || !rows)return {reset(){},pause(){},dirty:()=>false,state:()=>null};
+  let draft=[],mode=null,target=null,busy=false;
+  const render=()=>{rows.innerHTML=adminMemberRowsMarkup(draft,mode);node('add').disabled=draft.length>=ADMIN_MEMBER_LIMIT;};
+  const hide=()=>{
+    panel.hidden=true;target=null;draft=[];mode=null;
+    rows.innerHTML='';node('mode').textContent='';error.textContent='';reason.value='';
+    panel.editRevision=(panel.editRevision || 0)+1;
+    dirtyAdminForms.delete(panel);
+  };
+  const key=value=>value?[value.capture.id,value.capture.session].join(':'):null;
+  function reset(value){
+    open.hidden=!value || !current();open.disabled=save.disabled=busy;
+    if(!value){hide();return;}
+    // A refresh of the same team keeps unsaved rows; personIds are re-checked by the server.
+    if(target!==null && target===key(value) && value.value.rosterMode===mode)return;
+    hide();
+  }
+  function pause(capture){
+    if(target!==null && target!==key({capture}))hide();
+    open.disabled=save.disabled=true;
+  }
+  function changed(){
+    if(panel.hidden || !valid())return;
+    panel.editRevision=(panel.editRevision || 0)+1;
+    dirtyAdminForms.add(panel);error.textContent='';
+  }
+  function start(){
+    const value=current();if(!valid() || !value || busy)return;
+    if(target===key(value) && !panel.hidden)return;
+    target=key(value);mode=value.value.rosterMode;draft=adminMemberDraft(value.value);error.textContent='';reason.value='';
+    node('mode').textContent=mode==='registration'?'该队尚无已审核成员：按原登记保存，只记录队长学校。':'已审核队伍：每位成员须填写姓名和学校；修改已有成员会更正其身份记录，移除的成员可再加入其他队伍。';
+    render();panel.hidden=false;
+  }
+  open.onclick=start;
+  node('cancel').onclick=()=>{if(!busy)hide();};
+  node('add').onclick=()=>{if(busy || !valid() || draft.length>=ADMIN_MEMBER_LIMIT)return;draft.push({personId:null,name:'',school:''});changed();render();};
+  const stop=event=>event?.stopPropagation?.();
+  // Member inputs live inside the team form; keep them from marking the directory form dirty.
+  panel.addEventListener('input',stop);panel.addEventListener('change',stop);
+  reason.addEventListener('input',changed);
+  rows.addEventListener('input',event=>{
+    const field=event.target?.dataset?.memberField,index=Number(event.target?.dataset?.memberIndex);
+    if(!valid() || !['name','school'].includes(field) || !draft[index])return;
+    draft[index][field]=event.target.value;changed();stop(event);
+  });
+  rows.addEventListener('click',event=>{
+    const button=event.target?.closest?.('[data-member-action]') || event.target;
+    const action=button?.dataset?.memberAction,index=Number(button?.dataset?.memberIndex);
+    if(busy || !valid() || !draft[index])return;
+    if(action==='captain' && index>0){draft.unshift(...draft.splice(index,1));changed();render();}
+    if(action==='remove' && draft.length>1){draft.splice(index,1);changed();render();}
+  });
+  save.onclick=async()=>{
+    if(busy)return;
+    const value=current();
+    if(!valid() || !value || key(value)!==target){error.textContent='队伍或成员资料已变化，请点击“刷新成员明细”后重新编辑。';return;}
+    const prepared=adminMemberPayload(draft,mode);if(prepared.error){error.textContent=prepared.error;return;}
+    const why=reason.value.trim();if(!why){error.textContent='请填写修改原因，便于之后核对。';return;}
+    const epoch=panel.editRevision || 0;
+    busy=true;save.disabled=true;open.disabled=true;dirtyAdminForms.add(panel);error.textContent='正在保存…';
+    try{
+      await request('admin/data/team/members',{teamId:value.capture.id,rosterContext:value.value.rosterContext,reason:why,members:prepared.members});
+      if(!valid())return;
+      if(target===key(value)){
+        if((panel.editRevision || 0)===epoch)hide();
+        else error.textContent='提交时的成员已保存；保存期间的新输入已保留，尚未保存。';
+      }
+      toast('队伍成员已保存。');
+      await onSaved();
+    }catch(failure){
+      if(valid() && target===key(value))error.textContent=failure.message+(failure.status===409?' 当前输入已保留；请点击“刷新成员明细”后核对再保存。':'');
+    }finally{
+      busy=false;
+      if(valid())open.disabled=save.disabled=!current();
+    }
+  };
+  return {reset,pause,dirty:()=>dirtyAdminForms.has(panel),state:()=>({draft,mode,target,open:!panel.hidden})};
+}
 const adminTeamLifecycleLoginNotice='当前管理员登录已失效或切换。成员资料已隐藏，请刷新后重新核对登录身份。';
 function installAdminTeamLifecycle({form,alive,refreshDirectory,clearDirectoryMembers=()=>{},count=0,clearEditor}){
-  form.insertAdjacentHTML('beforeend',`<section class="admin-team-members" aria-label="队员与学校"><div class="section-caption"><h3>队员与学校</h3><button type="button" class="btn secondary small" id="team-detail-refresh" hidden>刷新成员明细</button></div><div id="team-member-detail" aria-live="polite"><p class="small-note">编辑已有队伍后查看成员资料。</p></div></section><div class="form-actions"><button type="button" class="btn danger small" id="team-recycle-open" hidden disabled>删除队伍</button><button type="button" class="btn secondary small" id="team-recycle-toggle">回收站（${Number(count) || 0}）</button></div><div id="team-recycle-confirm" class="admin-lifecycle-panel" hidden><h3>确认删除队伍</h3><p id="team-recycle-target"></p><p class="small-note">移入回收站后停止参赛并停用登录与 API；历史材料和成绩保留，同名队伍可重新申请。恢复时需检查队名和成员冲突，并重新发放访问凭据。</p><label class="field">删除原因<textarea id="team-recycle-reason" rows="3" maxlength="500"></textarea></label><div class="form-actions"><button type="button" class="btn danger" id="team-recycle-submit">确认移入回收站</button><button type="button" class="btn secondary" id="team-recycle-cancel">取消</button></div></div><p class="form-error" id="team-lifecycle-error" role="alert"></p>`);
+  form.insertAdjacentHTML('beforeend',`<section class="admin-team-members" aria-label="队员与学校"><div class="section-caption"><h3>队员与学校</h3><button type="button" class="btn secondary small" id="team-detail-refresh" hidden>刷新成员明细</button></div><div id="team-member-detail" aria-live="polite"><p class="small-note">编辑已有队伍后查看成员资料。</p></div>${adminMemberEditorMarkup()}</section><div class="form-actions"><button type="button" class="btn danger small" id="team-recycle-open" hidden disabled>删除队伍</button><button type="button" class="btn secondary small" id="team-recycle-toggle">回收站（${Number(count) || 0}）</button></div><div id="team-recycle-confirm" class="admin-lifecycle-panel" hidden><h3>确认删除队伍</h3><p id="team-recycle-target"></p><p class="small-note">移入回收站后停止参赛并停用登录与 API；历史材料和成绩保留，同名队伍可重新申请。恢复时需检查队名和成员冲突，并重新发放访问凭据。</p><label class="field">删除原因<textarea id="team-recycle-reason" rows="3" maxlength="500"></textarea></label><div class="form-actions"><button type="button" class="btn danger" id="team-recycle-submit">确认移入回收站</button><button type="button" class="btn secondary" id="team-recycle-cancel">取消</button></div></div><p class="form-error" id="team-lifecycle-error" role="alert"></p>`);
   form.insertAdjacentHTML('afterend',`<section class="surface admin-recycle-bin" id="team-recycle-bin" hidden><div class="section-caption"><h2>队伍回收站</h2><button type="button" class="btn secondary small" id="team-recycle-refresh">刷新回收站</button></div><p class="small-note">回收站中的队伍已停用参赛；历史材料与成绩仍保留。</p><div id="team-recycle-list" aria-live="polite"></div><section id="team-restore-detail" hidden><h3 id="team-restore-heading"></h3><div id="team-restore-members" aria-live="polite"></div><form id="team-restore-form"><div class="form-grid"><label class="field">恢复后的队名<input name="name" maxlength="80" required></label><label class="field">恢复原因<textarea name="reason" maxlength="500" rows="3" required></textarea></label></div><div id="team-restore-conflicts" aria-live="polite"></div><div id="team-restore-advisories" aria-live="polite"></div><button type="submit" class="btn" disabled>恢复队伍</button><p class="form-error" role="alert"></p></form><p id="team-restore-result" class="info-banner" hidden role="status"></p></section></section>`);
   const node=id=>document.getElementById('team-'+id),roster=node('member-detail');
   // Existing lightweight DOM fixtures need not implement this optional UI surface.
-  if(!roster)return {select(){},clear(){},updateCount(){},canSave:alive,valid:alive};
+  if(!roster)return {select(){},clear(){},updateCount(){},canSave:alive,valid:alive,hasUnsaved:()=>dirtyAdminForms.has(form)};
   document.getElementById('clear-team')?.insertAdjacentElement?.('afterend',node('recycle-open'));
   const owner=session,loginId=owner.loginId,marker=browserLoginOwner(),restoreForm=node('restore-form'),restoreButton=restoreForm.querySelector('[type=submit]');
   let detail=null,readSeq=0,listSeq=0,restoreSeq=0,restoreSession=0,restoringId=null,restored=false,confirmation=null,recycling=false,restoreBusy=null,restoreDetail=null,attempt=null,lastEditor=null,locked=false;
@@ -273,7 +379,7 @@ function installAdminTeamLifecycle({form,alive,refreshDirectory,clearDirectoryMe
     if(locked)return;
     locked=true;readSeq++;listSeq++;restoreSeq++;
     detail=null;restoreDetail=null;confirmation=null;restoringId=null;attempt=null;
-    clearDirectoryMembers();
+    clearDirectoryMembers();memberEditor?.reset(null);
     if(currentAdminTeamLifecycle!==controller || !form.isConnected || node('member-detail')!==roster)return;
     roster.textContent=adminTeamLifecycleLoginNotice;
     for(const id of ['recycle-target','recycle-list','restore-heading','restore-members','restore-conflicts','restore-advisories','restore-result'])node(id).textContent='';
@@ -302,28 +408,32 @@ function installAdminTeamLifecycle({form,alive,refreshDirectory,clearDirectoryMe
     }
   }
   const selected=()=>({id:form.elements.id.value,revision:Number(form.elements.expectedRevision.value),session:form.editSession || 0});
+  const memberEditor=installAdminMemberEditor({request,valid,
+    current:()=>detail && same(detail.capture) && !detail.value.recycle && /^[a-f0-9]{64}$/i.test(detail.value.rosterContext || '')?detail:null,
+    onSaved:async()=>{await select();await refreshDirectory();}});
   const same=capture=>valid() && form.isConnected && selected().id===capture.id && selected().revision===capture.revision && selected().session===capture.session;
+  const hasUnsaved=()=>dirtyAdminForms.has(form) || memberEditor.dirty();
   const ready=()=>detail && same(detail.capture) && !detail.value.recycle && /^[a-f0-9]{64}$/i.test(detail.value.recycleContext || '');
   const close=()=>{confirmation=null;node('recycle-confirm').hidden=true;};
-  function clear(){readSeq++;detail=null;close();node('recycle-open').hidden=true;node('recycle-open').disabled=true;node('detail-refresh').hidden=true;roster.innerHTML='<p class="small-note">编辑已有队伍后查看成员资料。</p>';node('lifecycle-error').textContent='';node('recycle-reason').value='';}
+  function clear(){readSeq++;detail=null;close();memberEditor.reset(null);node('recycle-open').hidden=true;node('recycle-open').disabled=true;node('detail-refresh').hidden=true;roster.innerHTML='<p class="small-note">编辑已有队伍后查看成员资料。</p>';node('lifecycle-error').textContent='';node('recycle-reason').value='';}
   async function select(){
     if(!valid())return;
-    const capture=selected(),seq=++readSeq;detail=null;close();
+    const capture=selected(),seq=++readSeq;detail=null;close();memberEditor.pause(capture);
     const editor=[capture.id,capture.session].join(':');if(editor!==lastEditor)node('recycle-reason').value='';lastEditor=editor;
     node('recycle-open').hidden=!capture.id;node('recycle-open').disabled=true;node('detail-refresh').hidden=!capture.id;node('lifecycle-error').textContent='';
-    if(!capture.id){roster.innerHTML='<p class="small-note">编辑已有队伍后查看成员资料。</p>';return;}
+    if(!capture.id){memberEditor.reset(null);roster.innerHTML='<p class="small-note">编辑已有队伍后查看成员资料。</p>';return;}
     roster.innerHTML='<p class="small-note">正在读取成员明细…</p>';
     try{
       const result=await request(adminQuery('admin/data/team',{teamId:capture.id}));
       if(seq!==readSeq || !same(capture))return;
       if(result.team?.id!==capture.id || result.team.revision!==capture.revision)throw new Error('队伍版本已变化，请重新选择队伍后核对。');
-      detail={capture,value:result};roster.innerHTML=adminTeamRosterMarkup(result);node('recycle-open').hidden=!!result.recycle;node('recycle-open').disabled=!ready();
-    }catch(error){if(seq===readSeq && same(capture)){roster.innerHTML='<p class="small-note">成员明细读取失败；请刷新后核对。</p>';node('lifecycle-error').textContent=error.message;}}
+      detail={capture,value:result};roster.innerHTML=adminTeamRosterMarkup(result);memberEditor.reset(detail);node('recycle-open').hidden=!!result.recycle;node('recycle-open').disabled=!ready();
+    }catch(error){if(seq===readSeq && same(capture)){memberEditor.pause(capture);roster.innerHTML='<p class="small-note">成员明细读取失败；请刷新后核对。</p>';node('lifecycle-error').textContent=error.message;}}
   }
   node('detail-refresh').onclick=()=>select();
   node('recycle-open').onclick=()=>{
     if(!valid() || !ready() || recycling)return;
-    if(dirtyAdminForms.has(form) && !confirm('队伍表单有未保存的输入。删除针对下方已读取的队伍记录；确认继续查看删除确认？'))return;
+    if(hasUnsaved() && !confirm('队伍或成员有未保存的输入。删除针对下方已读取的队伍记录；确认继续查看删除确认？'))return;
     if(!ready())return;
     confirmation={...detail.capture,context:detail.value.recycleContext,detail:detail.value};
     node('recycle-target').textContent=`${detail.value.team.number} 号 · ${detail.value.team.name}（版本 ${detail.value.team.revision}）`;
@@ -341,7 +451,7 @@ function installAdminTeamLifecycle({form,alive,refreshDirectory,clearDirectoryMe
       if(same(capture)){
         close();detail={capture,value:{...capture.detail,team:result.team,recycle:result.recycle,recycleContext:null}};
         if((form.editRevision || 0)===editRevision)clearEditor();
-        else{node('recycle-open').hidden=true;roster.innerHTML=adminTeamRosterMarkup(detail.value);node('lifecycle-error').textContent='队伍已移入回收站。之后的新输入已保留；请从回收站恢复队伍后重新核对。';}
+        else{node('recycle-open').hidden=true;memberEditor.reset(null);roster.innerHTML=adminTeamRosterMarkup(detail.value);node('lifecycle-error').textContent='队伍已移入回收站。之后的新输入已保留；请从回收站恢复队伍后重新核对。';}
       }
       await refreshDirectory();if(valid()){await loadList();if(valid())toast('队伍已移入回收站，参赛访问已停用。');}
     }catch(error){
@@ -418,7 +528,7 @@ function installAdminTeamLifecycle({form,alive,refreshDirectory,clearDirectoryMe
       }
     }finally{if(restoreBusy===capture)restoreBusy=null;if(valid()){if(restoreDetail)conflicts();else restoreButton.disabled=true;}}
   }).finally(()=>{if(!valid() || !restoreDetail || restored)restoreButton.disabled=true;else conflicts();});};
-  return {select,clear,updateCount,valid,canSave:()=>valid() && !detail?.value.recycle};
+  return {select,clear,updateCount,valid,hasUnsaved,canSave:()=>valid() && !detail?.value.recycle};
 }
 
 function adminImportMarkup(){return `<section class="surface" id="admin-import"><h2>批量导入</h2><p class="small-note">先预览，再确认。队伍按编号匹配；更新评委须填写 ID，留空会新建。预览不会写入名录或生成登录码。</p><form id="import-form"><div class="form-grid"><label class="field">导入类型<select name="kind"><option value="teams">队伍</option><option value="judges">评委</option></select></label><label class="field">上传 CSV（UTF-8）<input type="file" name="file" accept=".csv,text/csv"><small>最多 500 行、256 KiB，也可直接粘贴。</small></label></div><a class="btn secondary small" id="import-template" href="api/admin/data/template?kind=teams" download>下载队伍模板</a><label class="field">CSV 内容<textarea name="csv" rows="8" placeholder="粘贴包含表头的 CSV"></textarea></label><button class="btn small" type="submit">预览导入</button><p class="form-error" role="alert"></p></form><div id="import-preview" aria-live="polite"></div><div id="import-credentials" aria-live="polite"></div></section>`;}
