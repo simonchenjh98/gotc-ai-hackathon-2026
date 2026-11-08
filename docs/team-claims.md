@@ -1,16 +1,16 @@
-# 队伍申请与线上批准
+# 队伍申请与自动完成
 
-所有参赛者都可以在 `platform.html#claim` 填写队名、队长与 2–4 名组员的姓名和学校。赛道可选已公布的三条赛道，也可留为待定。空数据库无需导入名单、预建队伍或开放 API 额度即可接受申请。提交只保存待审核申请，不创建人员、队伍或登录账号。
+所有参赛者都可以在 `platform.html#claim` 填写队名、队长与 2–4 名组员的姓名和学校。赛道可选已公布的三条赛道，也可留为待定。空数据库无需导入名单、预建队伍或开放 API 额度即可接受申请。
 
-提交后，申请自动进入组织方后台。队长保留当前标签页的领取凭据，在本页查询状态即可，无需私信、交换核验码或到场。组织方在后台「队伍申请审核」读取申请，审核申报成员与相关私有身份参考，可修改队名或赛道，然后点击批准或拒绝。批准表示组织方基于申报信息作出的审核决定，不表示已核实本人到场。默认在同一写事务中分配 1–999 中最小的未使用队号，创建有效队伍、登记或复用人员、绑定成员并发放提交码领取权限。失败全部回滚。队长查询状态后点击领取；重复领取保持同一码。此流程不自动开通 API 网关权限或额度。
+完整申请提交后会在同一写事务中自动分配 1–999 中最小的未使用队号、创建有效队伍、登记或复用未归队人员、绑定成员并开放提交码领取权限，不再进入人工审核队列。队名已经存在、申报成员已归属其他队伍、同名身份需要人工区分、队号或名单容量不足等情况会直接返回冲突，并将本次申请整笔回滚，不留下新的待审申请。队长在原页点击领取；重复领取保持同一码。此流程不自动开通 API 网关权限或额度。
 
-如本队已有历史组队登记，组织方可以在「归队方式」主动选择已有队伍。此项可选，默认仍为新建，系统不会按队名自动绑定。候选只包含有效且未发提交码、未绑定领取申请、未绑定已批准成员的队伍。选择后展示登记队长、学校、成员、版本和项目；批准明确确认该登记属于本申请，并按审核通过的申报更新登记队长、学校与成员。原队伍 ID、队号、项目、来源及原始记录保留；原参赛码可统一本队资料与参赛功能，已有有效队伍管理码仍仅保留原登记资料修改能力。队长及学校不变时保留联系电话，变更时清空旧电话并将原联系信息保存到私有审计。人数同步为实际批准人数，已确认的成员与人数不能由参赛者自行改写。新建路径遇到规范化后相同的队名会拒绝，请主动选择已有队伍或填写可区分的队名。
+如本队已有历史组队登记，系统只在恰好存在一个有效、尚未发参赛码的同名队伍，且登记队长姓名、队长学校和完整成员姓名集合都与本次申报精确一致时自动绑定。绑定后保留原队伍 ID、队号、项目、来源及原始记录，并同步本次确认的成员；既有队伍管理码仍只保留原登记资料修改能力。任何不唯一或不完全匹配都直接提示冲突，不按相似名称猜测归队。
 
-私有参考记录仅用于去重，不决定报名资格。同名同校且未归队的记录会复用；已有队伍的同名同校记录会阻止重复归队。同名但不同学校且已归队时，组织方必须区分相关人员，勾选确认并填写说明。旧记录的待核实标记是参考，不要求新参赛者先导入或改写名单。原始记录与备注保留，参考管理和导入入口收在折叠区域内。
+私有参考记录仅用于去重，不决定报名资格。同名同校且未归队的记录会复用；已有队伍的同名同校记录会阻止重复归队。同名但不同学校且已归队时，为避免自动冒认，本次新申请也会直接提示冲突。旧记录和原始备注继续保留。
 
-申请待审核时，队长可以修改队名、赛道和组员。冲突或保存结果不明时，页面保留草稿，必须读取已保存内容、人工核对并明确确认后才可再次提交。已批准或领码的申请不可改写。旧版无组员的申请须由原领取页面补充；已有组员但没有队名或赛道的旧申请可由组织方补齐。旧请求或更新载荷未包含队伍信息时，不会删除既存队伍信息。
+已自动完成或已领码的申请不可改写。发布前遗留的 `pending` 回执仍可在原页面补充或修改；保存完整且无冲突的信息时会自动完成。旧版无组员的回执仍须先补充全体成员；旧请求或更新载荷未包含队伍信息时，不会删除既存队伍信息。
 
-管理员列表提供每份申请的 `reviewContext`，包含申请版本和相关同名参考记录的快照摘要。`POST /api/admin/claims/approve` 提交 `requestId`、`expectedRevision`、`reviewContext`、`teamName`、`track`、`verificationMethod: "online"`、`applicationReviewed: true`、`resolvedIdentity`、`note`。普通审核备注可为空，同名冲突仍须明确区分并填写说明。点击批准才会发送审核意图。批准事务重新验证上下文；相关记录有变化时要求刷新核对，无关人员的变化不会阻塞申请。选择已有队伍时另传 `teamId` 与列表中的 `teamContext`；事务内同时核对完整队伍和登记快照及资格，任何相关编辑、改名、发码或归队都要求重新读取核对。选择与其快照包含在幂等摘要内，相同批准载荷可安全重试，包括领码之后。旧版 `pin` + `inPersonVerified` 载荷仍按原流程校验，不能与线上审核字段混用；已有领取凭据不失效。审计区分 online 与 onsite，线上批准不记作到场核验。现有 `/api/admin/claims/review` 继续支持旧版名单映射客户端与拒绝操作。
+自动完成复用原 `approve_open` 的原子写入、版本校验、唯一约束、成员同步和账号签发，只增加内部 `automatic` 模式；公开客户端不能伪造该模式。审计写入 `verificationMethod: "automatic"`、`applicationReviewed: false` 和独立的 `claims.approve-auto-open` 事件。原 `/api/admin/claims/approve`、`/review` 仅作为历史回执、异常处理和停用身份重发的兼容接口保留，不再是正常新申请的必经步骤。
 
 公众只能通过自身 bearer 凭据读取本申请、申报信息和获批队伍，不能查询私有身份、身份匹配结果或管理员上下文。管理员列表不返回 PIN、领取凭据或提交码。现有身份、登录标记、同源写入、请求大小和速率限制继续适用。
 
@@ -40,20 +40,6 @@
 
 队长继续使用原领取凭据调用原 `/api/claims/status` 和 `/api/claims/redeem`，由正常领取流程得到新的可登录提交码。旧码保持失效；重复领取返回同一新码。上下文、身份或占用冲突返回 409，需重新读取核对；错误的审核字段返回 400。管理员列表和审计均不含领取凭据、PIN 或提交码。此入口不会更改自动审核开关、名单或规则，也不会开通 API 额度。
 
-## Trusted relay automatic approval
+## 历史可信名单兼容
 
-Automatic review defaults to disabled. Only the current authenticated administrator can import or enable a separate trusted snapshot. Public registration and ordinary `people` imports do not confer eligibility. The captain and every member (3–5 people total) must each have exactly one eligible, complete name+school match in the snapshot, using NFKC, case folding and whitespace normalization only. Duplicate pairs remain ambiguous, including when one duplicate is ineligible. No aliases or fuzzy matching are applied. Matching data does not prove physical identity.
-
-Use the protected `POST /api/admin/claims/roster` ingress with this alternate complete replacement contract (synthetic example):
-
-```json
-{"autoReview":{"expectedRevision":0,"sourceName":"Synthetic relay","sourceSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"id":"synthetic-1","name":"Example Captain","school":"Example School","eligible":true,"notes":""}]}}
-```
-
-`entries` accepts 0–500 unique IDs, each with exactly the five shown fields. Empty names/schools are retained but never qualify; duplicate normalized identity pairs are retained but never qualify. The source digest identifies the organizer's source file; it is not a computed digest of the JSON transport. Import is atomic, increments the configuration revision, and always disables automatic review. The existing `{people:[...]}` contract is unchanged. The HTTP import limit remains 2 MiB.
-
-`POST /api/admin/claims/auto-review` accepts exactly `{"expectedRevision":1,"enabled":true}`. Every change requires the current revision and increments it; enabling requires at least one complete unique eligible entry. `GET /api/admin/claims` returns a private `autoReview` summary with revision, enabled, sourceName, sourceSha256, count, eligibleCount and ambiguousCount. No public roster lookup or individual match hints exist.
-
-New applications, pending edits and valid pending bearer status/redemption checks may attempt automatic approval. Rejected, expired and processed receipts are unchanged. Approval uses the existing atomic team/membership/account pipeline and frozen declaration; ordinary conflicts roll back to pending manual review. Snapshot revision, source digest and matched source IDs are recorded in a distinct `claims.approve-auto` audit event. The ordinary bearer redemption and credential fingerprint checks still govern delivery. Automatic approval does not provision API access.
-
-An existing name collision is reusable only for one active, unissued eligible registered team with the exact normalized team name, captain name/school and full member-name multiset. Registration collects only the captain school; teammate schools are established by the trusted snapshot. A name spanning different schools in the trusted snapshot leaves existing-registration reuse manual because the registration cannot distinguish those identities. Reuse preserves the team ID, project and original records, and applies authoritative membership/contact/target-size synchronization. Existing valid registration credentials retain only their original profile-edit capability. Other collisions remain manual.
+原可信名单导入、开关和审计接口仍保留，用于旧版本回执与回退兼容；当全量自动完成策略开启时，它不再决定新申请是否通过。普通公开接口仍不会返回私有名单、匹配细节、PIN、领取凭据或提交码。领码继续由原 bearer 回执和账号指纹校验控制，自动完成申请不会自动开通 API 权限。

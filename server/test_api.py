@@ -81,7 +81,7 @@ class APITests(unittest.TestCase):
         (static / "secret.txt").write_text("never public", encoding="utf-8")
         (static / "assets").mkdir()
         (static / "assets" / "secret.json").write_text('{"secret":true}', encoding="utf-8")
-        self.service = EventService(data_dir=self.root / "private", origin="http://127.0.0.1", static_root=static)
+        self.service = EventService(data_dir=self.root / "private", origin="http://127.0.0.1", static_root=static, claims_auto_approve_all=False)
         self.server = EventHTTPServer(("127.0.0.1", 0), self.service)
         self.service.origin = "http://127.0.0.1:" + str(self.server.server_port)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

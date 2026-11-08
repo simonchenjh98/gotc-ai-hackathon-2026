@@ -68,7 +68,49 @@ class AutoReview:
         summary=self.summary(db);self.c.s.audit(db,actor,'claims.auto-review.configure',metadata=summary)
         return {'ok':True,'autoReview':summary}
 
-    def attempt(self,db,request_id):
+    def approve_all(self,db):
+        row=db.execute("SELECT value FROM settings WHERE key='claimsAutoApproveAll'").fetchone()
+        return True if row is None else json.loads(row['value']) is True
+
+    def registered_candidate(self,db,row,declaration):
+        people=[declaration['captain']]+declaration['members']
+        collisions=self.c.s.team_lifecycle.name_collisions(db,declaration['teamName'])
+        if len(collisions)!=1:return None
+        selected=self.c.eligible_team(db,collisions[0]['id'])
+        if not selected or not selected['registration']:return None
+        registration=selected['registration']
+        if (self.normalize(registration['captain'])!=self.normalize(row['name']) or
+            self.normalize(registration['school'])!=self.normalize(row['school']) or
+            Counter(self.normalize(n) for n in registration['members'])!=Counter(self.normalize(p['name']) for p in people)):
+            return None
+        return selected
+
+    def attempt(self,db,request_id,strict=False):
+        if not self.approve_all(db):return self.attempt_trusted(db,request_id)
+        c=self.c;row=db.execute('SELECT * FROM claim_requests WHERE id=?',(request_id,)).fetchone()
+        if not row or row['status']!='pending' or row['expires_at']<=c.clock():return False
+        declaration=c.declaration(db,request_id)
+        if not declaration or not declaration.get('teamName'):return False
+        selected=self.registered_candidate(db,row,declaration)
+        context,_=c.review_context(db,request_id,row['revision'],declaration)
+        body={'requestId':request_id,'expectedRevision':row['revision'],'reviewContext':context,
+              'teamName':declaration['teamName'],'track':declaration.get('track',''),'resolvedIdentity':False,'note':''}
+        if selected:body.update(teamId=selected['id'],teamContext=selected['teamContext'])
+        db.execute('SAVEPOINT automatic_open_approval')
+        try:
+            c.approve_open(db,None,body,automatic=True)
+            c.s.audit(db,None,'claims.approve-auto-open',request_id,{'policy':'complete-valid-application',
+                **({'selectedTeamId':selected['id']} if selected else {})})
+            return True
+        except APIError as error:
+            db.execute('ROLLBACK TO automatic_open_approval')
+            if strict and error.status in {400,409}:
+                raise APIError(409,error.message,'claim_conflict')
+            if error.status not in {400,409}:raise
+            return False
+        finally:db.execute('RELEASE automatic_open_approval')
+
+    def attempt_trusted(self,db,request_id):
         c=self.c;summary=self.summary(db)
         if not summary['enabled']:return
         row=db.execute('SELECT * FROM claim_requests WHERE id=?',(request_id,)).fetchone()
