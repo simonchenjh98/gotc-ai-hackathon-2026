@@ -23,6 +23,38 @@ test('real team controller preflights, previews, then sends canonical SHA and re
   await f.node('confirm-submission').onclick();
   assert.equal(f.calls.filter(c=>c.body).length,1);assert.equal(f.calls.filter(c=>c.body).at(-1).body.materials.codeVersion,sha);assert.match(f.root.innerHTML,/正式版 v1 已收到/);
 });
+
+test('intro save accepts only title and summary without attachments or confirmation and remains a draft',async()=>{
+  const f=fixture();await f.context.render();
+  f.node('material-projectName').value='  First idea  ';f.node('material-summary').value='  Initial description  ';
+  await f.node('save-project-intro').onclick();
+  const writes=f.calls.filter(call=>call.body);assert.equal(writes.length,1);assert.equal(writes[0].path,'submission');assert.equal(writes[0].body.status,'draft');
+  assert.equal(writes[0].body.materials.projectName,'First idea');assert.equal(writes[0].body.materials.summary,'Initial description');assert.equal(writes[0].body.materials.confirmed,false);
+  for(const field of ['slidesUrl','codeUrl','codeVersion','demoUrl','filesUrl'])assert.equal(writes[0].body.materials[field],'');
+  assert.equal(f.latest().submission.submitted,null);assert.equal(f.latest().submission.submittedVersion,null);assert.ok(!f.calls.some(call=>call.path.startsWith('submission/history') || call.path==='team/repository/preview'));
+  assert.match(f.node('save-project-intro-status').textContent,/作品名称和介绍已保存/);assert.ok(!f.root.innerHTML.includes('正式版 v1 已收到'));
+});
+
+test('intro save retains every current attachment and code field in the existing draft payload',async()=>{
+  const f=fixture();await f.context.render();f.fill();f.node('material-filesUrl').value='https://example.test/archive.zip';
+  await f.node('save-project-intro').onclick();
+  const sent=f.calls.find(call=>call.path==='submission').body;assert.equal(sent.status,'draft');
+  assert.deepEqual(JSON.parse(JSON.stringify(sent.materials)),{...materials,filesUrl:'https://example.test/archive.zip'});assert.equal(f.latest().submission.submitted,null);
+});
+
+test('intro button requires title and summary locally while the ordinary partial draft button still works',async()=>{
+  for(const missing of ['projectName','summary']){
+    const f=fixture();await f.context.render();f.node('material-projectName').value='Idea';f.node('material-summary').value='Description';f.node('material-'+missing).value='  ';
+    await f.node('save-project-intro').onclick();assert.equal(f.calls.filter(call=>call.body).length,0);assert.equal(f.node('material-'+missing).focused,true);assert.match(f.node('save-project-intro-status').textContent,/请先填写/);
+    await f.node('save-submission-draft').onclick();assert.equal(f.calls.filter(call=>call.body).length,1);
+  }
+});
+
+test('intro save does not claim success when the existing receipt path reports an uncertain result',async()=>{
+  const f=fixture('lost');await f.context.render();f.node('material-projectName').value='Idea';f.node('material-summary').value='Description';
+  await f.node('save-project-intro').onclick();assert.match(f.node('form-error').textContent,/结果待确认/);assert.ok(!f.node('save-project-intro-status').textContent.includes('已保存'));
+  await f.node('save-project-intro').onclick();assert.equal(f.calls.filter(call=>call.body).length,1);assert.equal(f.node('material-summary').value,'Description');
+});
 test('lost response preserves input, blocks repeat writes and reads latest only for comparison',async()=>{
   const f=fixture('lost');await f.context.render();f.fill();await f.preview();await f.node('confirm-submission').onclick();
   assert.match(f.node('form-error').textContent,/结果待确认/);assert.equal(f.node('material-summary').value,'Summary');assert.equal(f.node('material-summary').readOnly,true);
