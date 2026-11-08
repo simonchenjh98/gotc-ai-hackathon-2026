@@ -92,6 +92,8 @@ test('online demo is required while video and supplementary ZIP remain optional'
 });
 test('three submission sections offer upload or link and make the video optional',()=>{
   const html=h.teamFormMarkup({team:{name:'Synthetic'},submission:{},window:{canEdit:true}});
+  assert.match(html,/<button type="button" id="save-project-intro"/);assert.match(html,/只填名称和介绍即可保存/);
+  assert.ok(html.indexOf('name="summary"')<html.indexOf('id="save-project-intro"'));assert.ok(html.indexOf('id="save-project-intro"')<html.indexOf('name="sourcesAndLimitations"'));assert.ok(html.indexOf('id="save-project-intro"')<html.indexOf('id="submission-slides"'));
   for(const kind of ['slides','files','demo']){assert.match(html,new RegExp(`id="submission-${kind}"`));assert.match(html,new RegExp(`id="upload-${kind}-file"`));assert.match(html,new RegExp(`id="upload-${kind}-button"`));}
   assert.match(html,/name="demoUrl"[^>]*required/);assert.ok(!/name="videoUrl"[^>]*required/.test(html));assert.ok(!/name="filesUrl"[^>]*required/.test(html));assert.match(html,/本地运行说明不能代替链接/);assert.match(html,/多文件网站请部署后/);
 });

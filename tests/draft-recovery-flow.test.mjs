@@ -40,8 +40,8 @@ test('an upload is single-flight and blocks draft save, preview and an already-r
   for(const [key,value] of Object.entries({codeUrl:'https://github.com/team/project',codeVersion:'a'.repeat(40),readmeUrl:'https://example.test/readme',license:'MIT',demoUrl:'https://example.test/demo',slidesUrl:'https://example.test/slides',sourcesAndLimitations:'Synthetic only'}))f.edit(key,value);
   f.node('material-confirmed').checked=true;await f.node('submission-form').onsubmit({preventDefault(){}});const oldConfirm=f.node('confirm-submission').onclick;assert.equal(typeof oldConfirm,'function');
   chooseUpload(f,'slides','slides.pptx');chooseUpload(f,'files','files.zip');f.hooks['team/uploads/slides']=()=>gate.promise;
-  const pending=f.node('upload-slides-button').onclick();assert.equal(f.node('save-submission-draft').disabled,true);assert.equal(f.node('check-submission').disabled,true);assert.equal(f.node('submission-preview').innerHTML,'');
-  await f.node('upload-slides-button').onclick();await f.node('upload-files-button').onclick();await f.node('save-submission-draft').onclick();await f.node('submission-form').onsubmit({preventDefault(){}});await oldConfirm();
+  const pending=f.node('upload-slides-button').onclick();assert.equal(f.node('save-project-intro').disabled,true);assert.equal(f.node('save-submission-draft').disabled,true);assert.equal(f.node('check-submission').disabled,true);assert.equal(f.node('submission-preview').innerHTML,'');
+  await f.node('upload-slides-button').onclick();await f.node('upload-files-button').onclick();await f.node('save-project-intro').onclick();await f.node('save-submission-draft').onclick();await f.node('submission-form').onsubmit({preventDefault(){}});await oldConfirm();
   assert.equal(f.calls.filter(c=>c.path.startsWith('team/uploads/')).length,1);assert.equal(f.calls.filter(c=>c.path==='submission').length,0);
   gate.resolve(f.response(uploaded('slides','pptx')));await pending;assert.equal(f.node('save-submission-draft').disabled,false);assert.equal(f.node('check-submission').disabled,false);assert.equal(f.node('material-confirmed').checked,false);
 });
