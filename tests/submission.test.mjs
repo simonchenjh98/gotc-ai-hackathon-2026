@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 const source=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8').split("window.addEventListener('hashchange'")[0];
 const context=vm.createContext({document:{getElementById:()=>({})},location:{href:'https://example.test/gotc/platform.html#team'},URL,TextEncoder,Intl,Date,setTimeout,clearTimeout});
-vm.runInContext(source+'\nglobalThis.helpers={submissionState,safeMaterialUrl,materialMarkup,judgeSubmissionMarkup,teamFormMarkup,windowMarkup,beijingInput,parseBeijingInput,beijingTime,repositoryParts,normalizedCommit,submissionProblems,judgingMaterialsMarkup,submissionReceiptMarkup,submissionRecordText,patchSubmissionStageCards};',context);
+vm.runInContext(source+'\nglobalThis.helpers={submissionState,safeMaterialUrl,materialMarkup,judgeSubmissionMarkup,teamFormMarkup,windowMarkup,participantGuideMarkup,beijingInput,parseBeijingInput,beijingTime,repositoryParts,normalizedCommit,submissionProblems,judgingMaterialsMarkup,submissionReceiptMarkup,submissionRecordText,patchSubmissionStageCards};',context);
 const h=context.helpers;
 
 test('submission states distinguish empty, draft and changes after formal submission',()=>{
@@ -60,6 +60,15 @@ test('Beijing datetime conversion is independent of browser timezone and handles
   assert.throws(()=>h.parseBeijingInput('invalid'));
 });
 
+
+test('participant guide follows the configured Beijing deadline and handles no deadline',()=>{
+  const html=h.participantGuideMarkup({submissionDeadline:Date.parse('2026-11-08T14:00:00+08:00')});
+  assert.match(html,/14:00/);
+  assert.ok(!html.includes('13:00'));
+  assert.match(html,/北京时间/);
+  assert.match(h.participantGuideMarkup({submissionDeadline:null}),/未设置截止时间/);
+  assert.match(h.participantGuideMarkup(),/未设置截止时间/);
+});
 
 test('submission notice explains save-time checks and mutable external content',()=>{
   const html=h.windowMarkup({canEdit:true,submissionDeadline:null});
