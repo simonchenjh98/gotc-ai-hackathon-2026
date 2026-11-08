@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 const source=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8').split("window.addEventListener('hashchange'")[0];
 const sha='a'.repeat(40);
-const materials={projectName:'Project',summary:'Summary',codeUrl:'https://github.com/team/project',codeVersion:'https://github.com/team/project/commit/'+sha,readmeUrl:'https://example.test/readme',license:'MIT',licenseUrl:'',demoUrl:'https://example.test/demo',demoInstructions:'Run locally',slidesUrl:'https://example.test/slides',filesUrl:'',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
+const materials={projectName:'Project',summary:'Summary',codeUrl:'https://github.com/team/project',codeVersion:'https://github.com/team/project/commit/'+sha,readmeUrl:'https://example.test/readme',license:'MIT',licenseUrl:'',demoUrl:'https://example.test/demo',demoInstructions:'Run locally',slidesUrl:'https://example.test/slides',filesUrl:'https://example.test/work.zip',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
 function fixture(mode='success'){
   const nodes=new Map(),calls=[];let lastReceipt,latest={team:{id:'T1',number:1,name:'Synthetic'},window:{canEdit:true,submissionDeadline:null},submission:{version:0,draft:null,submitted:null,submittedVersion:null,submittedAt:null},judgingMaterials:{}};
   function node(id){if(nodes.has(id))return nodes.get(id);const item={id,isConnected:true,disabled:false,readOnly:false,dataset:{},classList:{add(){},remove(){}},listeners:{},value:'',type:'text',focus(){this.focused=true;},scrollIntoView(){this.scrolled=true;},setAttribute(name,value){this[name]=value;},addEventListener(event,fn){this.listeners[event]=fn;},querySelector(){return null;},querySelectorAll(){return [];}};let html='';Object.defineProperty(item,'innerHTML',{configurable:true,get:()=>html,set(value){html=value;for(const match of value.matchAll(/id="([^"]+)"/g))node(match[1]);}});nodes.set(id,item);return item;}
@@ -22,6 +22,49 @@ test('real team controller preflights, previews, then sends canonical SHA and re
   f.fill();await f.preview();assert.match(f.node('submission-preview').innerHTML,new RegExp(sha));assert.equal(f.calls.filter(c=>c.body).length,0);
   await f.node('confirm-submission').onclick();
   assert.equal(f.calls.filter(c=>c.body).length,1);assert.equal(f.calls.filter(c=>c.body).at(-1).body.materials.codeVersion,sha);assert.match(f.root.innerHTML,/正式版 v1 已收到/);
+});
+
+test('PPT and ZIP alone preview and formally submit without title, demo, repository or declaration',async()=>{
+  const f=fixture();await f.context.render();f.node('material-slidesUrl').value='https://example.test/presentation.pdf';f.node('material-filesUrl').value='https://example.test/work.zip';
+  await f.node('submission-form').onsubmit({preventDefault(){}});assert.match(f.node('submission-preview').innerHTML,/确认本次正式材料/);assert.equal(f.calls.filter(c=>c.body).length,0);
+  await f.node('confirm-submission').onclick();const sent=f.calls.find(c=>c.path==='submission').body;
+  assert.equal(sent.status,'submitted');assert.equal(sent.materials.projectName,'');assert.equal(sent.materials.summary,'');assert.equal(sent.materials.demoUrl,'');assert.equal(sent.materials.confirmed,false);assert.ok(!Object.hasOwn(sent.materials,'codeVersion'));assert.ok(!Object.hasOwn(sent.materials,'repositoryMaterialsUrl'));assert.ok(!Object.hasOwn(sent,'repoPreviewId'));assert.equal(f.latest().submission.submittedVersion,1);assert.match(f.root.innerHTML,/正式版 v1 已收到/);
+});
+
+test('formal submission still requires each of PPT and ZIP before displaying confirmation',async()=>{
+  for(const missing of ['slidesUrl','filesUrl']){const f=fixture();await f.context.render();f.node('material-slidesUrl').value='https://example.test/presentation.pdf';f.node('material-filesUrl').value='https://example.test/work.zip';f.node('material-'+missing).value='';await f.node('submission-form').onsubmit({preventDefault(){}});assert.match(f.node('submission-errors').innerHTML,new RegExp('material-'+missing));assert.equal(f.node('submission-preview').innerHTML,'');assert.equal(f.calls.filter(c=>c.body).length,0);}
+});
+
+test('intro save accepts only title and summary without attachments or confirmation and remains a draft',async()=>{
+  const f=fixture();await f.context.render();
+  f.node('material-projectName').value='  First idea  ';f.node('material-summary').value='  Initial description  ';
+  await f.node('save-project-intro').onclick();
+  const writes=f.calls.filter(call=>call.body);assert.equal(writes.length,1);assert.equal(writes[0].path,'submission');assert.equal(writes[0].body.status,'draft');
+  assert.equal(writes[0].body.materials.projectName,'First idea');assert.equal(writes[0].body.materials.summary,'Initial description');assert.equal(writes[0].body.materials.confirmed,false);
+  for(const field of ['slidesUrl','codeUrl','codeVersion','demoUrl','filesUrl'])assert.equal(writes[0].body.materials[field],'');
+  assert.equal(f.latest().submission.submitted,null);assert.equal(f.latest().submission.submittedVersion,null);assert.ok(!f.calls.some(call=>call.path.startsWith('submission/history') || call.path==='team/repository/preview'));
+  assert.match(f.node('save-project-intro-status').textContent,/作品名称和介绍已保存/);assert.ok(!f.root.innerHTML.includes('正式版 v1 已收到'));
+});
+
+test('intro save retains every current attachment and code field in the existing draft payload',async()=>{
+  const f=fixture();await f.context.render();f.fill();f.node('material-filesUrl').value='https://example.test/archive.zip';
+  await f.node('save-project-intro').onclick();
+  const sent=f.calls.find(call=>call.path==='submission').body;assert.equal(sent.status,'draft');
+  assert.deepEqual(JSON.parse(JSON.stringify(sent.materials)),{...materials,filesUrl:'https://example.test/archive.zip'});assert.equal(f.latest().submission.submitted,null);
+});
+
+test('intro button requires title and summary locally while the ordinary partial draft button still works',async()=>{
+  for(const missing of ['projectName','summary']){
+    const f=fixture();await f.context.render();f.node('material-projectName').value='Idea';f.node('material-summary').value='Description';f.node('material-'+missing).value='  ';
+    await f.node('save-project-intro').onclick();assert.equal(f.calls.filter(call=>call.body).length,0);assert.equal(f.node('material-'+missing).focused,true);assert.match(f.node('save-project-intro-status').textContent,/请先填写/);
+    await f.node('save-submission-draft').onclick();assert.equal(f.calls.filter(call=>call.body).length,1);
+  }
+});
+
+test('intro save does not claim success when the existing receipt path reports an uncertain result',async()=>{
+  const f=fixture('lost');await f.context.render();f.node('material-projectName').value='Idea';f.node('material-summary').value='Description';
+  await f.node('save-project-intro').onclick();assert.match(f.node('form-error').textContent,/结果待确认/);assert.ok(!f.node('save-project-intro-status').textContent.includes('已保存'));
+  await f.node('save-project-intro').onclick();assert.equal(f.calls.filter(call=>call.body).length,1);assert.equal(f.node('material-summary').value,'Description');
 });
 test('lost response preserves input, blocks repeat writes and reads latest only for comparison',async()=>{
   const f=fixture('lost');await f.context.render();f.fill();await f.preview();await f.node('confirm-submission').onclick();

@@ -7,7 +7,7 @@ const source=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8').s
 const sha='a'.repeat(40),previewId='b'.repeat(48);
 const repository={teamId:'T1',provider:'github',organization:'GOTC-AI-HACKATHON',slug:'gotc-2026-team-1-123',branch:'main',codeUrl:'https://github.com/GOTC-AI-HACKATHON/gotc-2026-team-1-123',state:'invited',revision:3,usernames:['Developer'],protection:'unverified',message:'等待接受邀请',archived:false};
 const providers=[{provider:'github',organization:'GOTC-AI-HACKATHON',enabled:true,message:'已配置'},{provider:'gitee',organization:'gotc-ai-hackathon',enabled:false,message:'尚未启用'}];
-const materials={projectName:'Synthetic',summary:'Summary',codeUrl:'',codeVersion:'',readmeUrl:'https://example.test/readme',license:'MIT',licenseUrl:'',demoUrl:'https://example.test/demo',demoInstructions:'Run locally',slidesUrl:'https://example.test/slides',filesUrl:'',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
+const materials={projectName:'Synthetic',summary:'Summary',codeUrl:'',codeVersion:'',readmeUrl:'https://example.test/readme',license:'MIT',licenseUrl:'',demoUrl:'https://example.test/demo',demoInstructions:'Run locally',slidesUrl:'https://example.test/slides',filesUrl:'https://example.test/work.zip',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
 function fixture(options={}){
   const boundRepository=options.repository || repository;
   const nodes=new Map(),calls=[];
@@ -34,11 +34,11 @@ function fixture(options={}){
     }
     throw new Error(path);
   };
-  context.recoveryStates=[];
+  context.recoveryStates=[];context.optInRepository=options.includeRepositoryVersion!==false;
   vm.runInContext(source+`\napi=transport;session={role:'team',loginId:'synthetic-login'};routeVersion=1;route='team';
     installTeamRecovery=()=>({isAuthorized:()=>true,hasAuthorization:()=>true,sessionOwner:session,teamId:'T1',input(){},pending(){},acknowledge(){},result(sent,state){globalThis.recoveryStates.push(state);}});
     if(!liveRepository)installTeamRepository=()=>{};installSubmissionHistory=()=>{};loadTeamKeys=()=>{};
-    globalThis.h={teamFormMarkup,teamRepositoryMarkup,repositoryAdminMarkup,repositoryStatusMarkup,materialMarkup,requestReceiptMarkup,renderTeam};globalThis.render=()=>renderTeam(1);`,context);
+    globalThis.h={teamFormMarkup,teamRepositoryMarkup,repositoryAdminMarkup,repositoryStatusMarkup,materialMarkup,requestReceiptMarkup,renderTeam};globalThis.render=async()=>{await renderTeam(1);if(globalThis.optInRepository!==false){document.getElementById('include-repository-version').checked=true;document.getElementById('submission-form').listeners.change();}};`,context);
   return {context,calls,node,root,h:context.h};
 }
 
@@ -50,7 +50,7 @@ test('bound form hides required manual code fields while unbound teams retain th
     assert.ok(!bound.includes(`for="material-${key}"`));
   }
   assert.ok(!bound.includes('OLD'));
-  assert.match(h.teamFormMarkup(data),/name="codeUrl"[^>]*required/);
+  assert.ok(!/name="codeUrl"[^>]*required/.test(h.teamFormMarkup(data)));
   assert.match(h.teamFormMarkup(data),/for="material-codeVersion"/);
 });
 
@@ -83,6 +83,21 @@ test('bound team controller obtains full server SHA and sends preview id only af
   const body=f.calls.find(c=>c.path==='submission').body;
   assert.equal(body.repoPreviewId,previewId);assert.equal(body.materials.codeVersion,sha);assert.equal(body.materials.codeUrl,repository.codeUrl);
   assert.match(f.root.innerHTML,/正式版 v1 已收到/);
+});
+
+test('bound Gitee file-only submission defaults to no repository preview and discards a stale hidden SHA',async()=>{
+  const bound={...repository,provider:'gitee',codeUrl:'https://gitee.com/team/project'},f=fixture({repository:bound,includeRepositoryVersion:false});await f.context.render();
+  const form=f.node('submission-form');for(const input of Object.values(form.elements)){input.value='';input.checked=false;}form.elements.codeVersion.value=sha;form.elements.slidesUrl.value='https://example.test/ppt.pdf';form.elements.filesUrl.value='https://example.test/work.zip';
+  assert.equal(f.node('include-repository-version').checked,false);assert.ok(!/id="include-repository-version"[^>]*checked/.test(f.root.innerHTML));
+  f.context.previewResponse=async()=>{throw new Error('This optional service must not run');};
+  await form.onsubmit({preventDefault(){}});assert.match(f.node('submission-preview').innerHTML,/本次未选填仓库代码版本/);assert.equal(f.calls.filter(c=>c.path==='team/repository/preview').length,0);
+  await f.node('confirm-submission').onclick();const sent=f.calls.find(c=>c.path==='submission').body;assert.equal(sent.status,'submitted');assert.equal(sent.materials.codeUrl,bound.codeUrl);assert.ok(!Object.hasOwn(sent.materials,'codeVersion'));assert.ok(!Object.hasOwn(sent.materials,'repositoryMaterialsUrl'));assert.ok(!Object.hasOwn(sent,'repoPreviewId'));assert.equal(sent.materials.confirmed,false);assert.match(f.root.innerHTML,/正式版 v1 已收到/);
+});
+
+test('turning off optional repository version invalidates the preview and returns to file-only submission',async()=>{
+  const f=fixture();await f.context.render();await f.node('submission-form').onsubmit({preventDefault(){}});assert.match(f.node('submission-preview').innerHTML,new RegExp(sha));
+  f.node('include-repository-version').checked=false;f.node('submission-form').listeners.change();assert.equal(f.node('submission-preview').innerHTML,'');
+  await f.node('submission-form').onsubmit({preventDefault(){}});assert.equal(f.calls.filter(c=>c.path==='team/repository/preview').length,1);await f.node('confirm-submission').onclick();assert.ok(!Object.hasOwn(f.calls.find(c=>c.path==='submission').body.materials,'codeVersion'));
 });
 
 test('sealed preview confirms its fixed SHA and keeps later pushes outside this confirmation',async()=>{

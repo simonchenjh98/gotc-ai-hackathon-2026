@@ -146,7 +146,7 @@ class ExactParentReleaseTests(unittest.TestCase):
         materials = {'projectName': 'NEW_FORMAL_PROJECT', 'summary': 'New synthetic material',
             'codeUrl': 'https://github.com/synthetic/repository', 'codeVersion': 'a'*40, 'readmeUrl': 'https://example.invalid/readme',
             'license': 'MIT', 'demoInstructions': 'Synthetic local demo', 'demoUrl': 'https://example.invalid/demo',
-            'slidesUrl': 'https://example.invalid/slides', 'videoUrl': 'https://example.invalid/video',
+            'slidesUrl': 'https://example.invalid/slides', 'filesUrl': 'https://example.invalid/project.zip', 'videoUrl': 'https://example.invalid/video',
             'sourcesAndLimitations': 'Synthetic only', 'confirmed': True}
         service.dispatch('POST', '/api/submission', {'expectedVersion': 0, 'status': 'submitted', 'materials': materials},
                          app.COOKIE_NAME + '=' + token, '127.0.0.1')

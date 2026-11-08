@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 const source=fs.readFileSync(new URL('../platform.js',import.meta.url),'utf8').split("window.addEventListener('hashchange'")[0];
 const context=vm.createContext({document:{getElementById:()=>({})},location:{href:'https://example.test/gotc/platform.html#team'},URL,TextEncoder,Intl,Date,setTimeout,clearTimeout});
-vm.runInContext(source+'\nglobalThis.helpers={submissionState,safeMaterialUrl,materialMarkup,judgeSubmissionMarkup,teamFormMarkup,windowMarkup,beijingInput,parseBeijingInput,beijingTime,repositoryParts,normalizedCommit,submissionProblems,judgingMaterialsMarkup,submissionReceiptMarkup,submissionRecordText,patchSubmissionStageCards};',context);
+vm.runInContext(source+'\nglobalThis.helpers={submissionState,safeMaterialUrl,safeDemoUrl,materialMarkup,materialChecksMarkup,updateSubmissionEntry,judgeSubmissionMarkup,teamFormMarkup,windowMarkup,participantGuideMarkup,beijingInput,parseBeijingInput,beijingTime,repositoryParts,normalizedCommit,submissionProblems,judgingMaterialsMarkup,submissionReceiptMarkup,submissionRecordText,patchSubmissionStageCards};',context);
 const h=context.helpers;
 
 test('submission states distinguish empty, draft and changes after formal submission',()=>{
@@ -25,6 +25,42 @@ test('material links allow complete HTTPS and independently reject executable or
   assert.match(html,/&lt;img/);
   assert.match(html,/target="_blank" rel="noopener noreferrer"/);
   assert.match(html,/x=&quot;&amp;y=1/);
+});
+
+test('demo links accept HTTP and longer shares while retaining safe schemes and byte bounds',()=>{
+  const prefix='http://example.test/share?token=',boundary=prefix+'x'.repeat(8192-prefix.length);
+  assert.equal(h.safeDemoUrl(boundary),boundary);
+  assert.equal(h.safeDemoUrl(boundary+'x'),'');
+  const unicode='https://example.test/share?q='+'中'.repeat(1000);
+  assert.equal(h.safeDemoUrl(unicode),unicode);
+  assert.equal(h.safeMaterialUrl(unicode),'');
+  assert.equal(h.safeDemoUrl('http://example.test/?q='+'中'.repeat(3000)),'');
+  for(const value of ['javascript:alert(1)','data:text/html,<script>alert(1)</script>','//example.test','/relative','http://u:p@example.test','http://@example.test','http://example.test/a b','http://example.test/a\\b','http://example.test/%0dheader','http://example.test/a\nb','http://example.test:0'])assert.equal(h.safeDemoUrl(value),'',value);
+  for(const code of [0,10,31,127])assert.equal(h.safeDemoUrl('http://example.test/a'+String.fromCharCode(code)+'b'),'');
+  assert.equal(h.safeDemoUrl('http:example.test'),'');
+  assert.equal(h.safeMaterialUrl('http://example.test'),'');
+});
+
+test('only the demo URL receives HTTP and expanded-length validation for drafts and formal submission',()=>{
+  const minimal={slidesUrl:'https://example.test/slides.pdf',filesUrl:'https://example.test/work.zip'},demo='http://example.test/share?token='+'x'.repeat(2000);
+  for(const formal of [false,true]){
+    assert.equal(h.submissionProblems({...minimal,demoUrl:demo},formal).length,0);
+    for(const key of ['slidesUrl','filesUrl','videoUrl','readmeUrl','licenseUrl','codeUrl'])assert.ok(h.submissionProblems({...minimal,[key]:'http://example.test/file'},formal).some(error=>error.key===key),key);
+    assert.ok(h.submissionProblems({...minimal,demoUrl:'http://example.test/'+'中'.repeat(3000)},formal).some(error=>error.key==='demoUrl' && error.message.includes('长度')));
+  }
+});
+
+test('HTTP demo links stay clickable in saved materials and manual checks and visible in entry status',()=>{
+  const demo='http://example.test/share?a=1&b=2';
+  assert.match(h.materialMarkup({demoUrl:demo}),/href="http:\/\/example\.test\/share\?a=1&amp;b=2"/);
+  assert.match(h.materialChecksMarkup({version:1,latestVersion:1,items:[{field:'demoUrl',url:demo}]}),/href="http:\/\/example\.test\/share\?a=1&amp;b=2"/);
+  assert.ok(!h.materialMarkup({videoUrl:demo}).includes('href="http:'));
+  const original=context.document.getElementById,nodes=new Map();
+  context.document.getElementById=id=>{if(!nodes.has(id))nodes.set(id,{});return nodes.get(id);};
+  try{h.updateSubmissionEntry({}, {elements:{demoUrl:{value:demo}}});assert.equal(nodes.get('submission-demo-state').textContent,'已填写展示链接（选填）');}finally{context.document.getElementById=original;}
+  const form=h.teamFormMarkup({team:{},submission:{},window:{canEdit:true}});
+  assert.match(form,/name="demoUrl"[^>]*maxlength="8192"/);
+  assert.match(form,/支持完整的 HTTP 或 HTTPS 展示链接/);
 });
 
 test('judge material block only renders its formal projection and preserves the unsubmitted scoring state',()=>{
@@ -61,6 +97,15 @@ test('Beijing datetime conversion is independent of browser timezone and handles
 });
 
 
+test('participant guide follows the configured Beijing deadline and handles no deadline',()=>{
+  const html=h.participantGuideMarkup({submissionDeadline:Date.parse('2026-11-08T14:00:00+08:00')});
+  assert.match(html,/14:00/);
+  assert.ok(!html.includes('13:00'));
+  assert.match(html,/北京时间/);
+  assert.match(h.participantGuideMarkup({submissionDeadline:null}),/未设置截止时间/);
+  assert.match(h.participantGuideMarkup(),/未设置截止时间/);
+});
+
 test('submission notice explains save-time checks and mutable external content',()=>{
   const html=h.windowMarkup({canEdit:true,submissionDeadline:null});
   assert.match(html,/实际保存前检查提交窗口和材料版本/);
@@ -79,25 +124,24 @@ test('shared repository and full SHA normalization contract rejects ambiguous UR
 test('formal preflight aggregates missing fields while partial drafts remain allowed',()=>{
   assert.equal(h.submissionProblems({codeVersion:'a1b'},false).length,0);
   const missing=h.submissionProblems({},true);
-  assert.ok(missing.some(e=>e.key==='codeVersion'));
-  assert.ok(missing.some(e=>e.key==='confirmed'));
-  assert.ok(missing.some(e=>e.key==='demoUrl'));
-  assert.ok(missing.length>=9);
+  assert.deepEqual(Array.from(missing,e=>e.key),['slidesUrl','filesUrl']);
 });
-test('online demo is required while video and supplementary ZIP remain optional',()=>{
-  const materials={projectName:'Synthetic',summary:'Summary',codeUrl:'https://github.com/team/project',codeVersion:'a'.repeat(40),readmeUrl:'https://example.test/readme',license:'MIT',slidesUrl:'https://example.test/slides',sourcesAndLimitations:'Synthetic only',confirmed:true,demoInstructions:'Run the local app'};
-  const errors=h.submissionProblems(materials,true);assert.equal(errors.length,1);assert.equal(errors[0].key,'demoUrl');
-  assert.equal(h.submissionProblems({...materials,demoUrl:'https://example.test/demo'},true).length,0);
-  assert.equal(h.submissionProblems({...materials,demoUrl:'https://example.test/demo',filesUrl:'file:///archive.zip'},true)[0].key,'filesUrl');
+test('only PPT and ZIP are required; repository URL without SHA and all other empty fields are allowed',()=>{
+  const materials={slidesUrl:'https://example.test/slides',filesUrl:'https://example.test/work.zip'};
+  assert.equal(h.submissionProblems(materials,true).length,0);
+  assert.equal(h.submissionProblems({...materials,codeUrl:'https://github.com/team/project'},true).length,0);
+  assert.equal(h.submissionProblems({...materials,filesUrl:'file:///archive.zip'},true)[0].key,'filesUrl');
 });
 test('three submission sections offer upload or link and make the video optional',()=>{
   const html=h.teamFormMarkup({team:{name:'Synthetic'},submission:{},window:{canEdit:true}});
+  assert.match(html,/<button type="button" id="save-project-intro"/);assert.match(html,/只填名称和介绍即可保存/);
+  assert.ok(html.indexOf('name="summary"')<html.indexOf('id="save-project-intro"'));assert.ok(html.indexOf('id="save-project-intro"')<html.indexOf('name="sourcesAndLimitations"'));assert.ok(html.indexOf('id="save-project-intro"')<html.indexOf('id="submission-slides"'));
   for(const kind of ['slides','files','demo']){assert.match(html,new RegExp(`id="submission-${kind}"`));assert.match(html,new RegExp(`id="upload-${kind}-file"`));assert.match(html,new RegExp(`id="upload-${kind}-button"`));}
-  assert.match(html,/name="demoUrl"[^>]*required/);assert.ok(!/name="videoUrl"[^>]*required/.test(html));assert.ok(!/name="filesUrl"[^>]*required/.test(html));assert.match(html,/本地运行说明不能代替链接/);assert.match(html,/多文件网站请部署后/);
+  assert.ok(!/name="demoUrl"[^>]*required/.test(html));assert.ok(!/name="videoUrl"[^>]*required/.test(html));assert.match(html,/name="filesUrl"[^>]*required/);assert.ok(!/name="confirmed"[^>]*required/.test(html));assert.match(html,/不填写也可正式提交/);assert.match(html,/多文件网站请部署后/);
 });
 test('supplementary ZIP is clickable in formal material, receipts and copied submission records',()=>{
   const filesUrl='https://example.test/gotc/materials/'+('a'.repeat(43))+'/Team%2BProject.zip',materials={projectName:'Project',filesUrl,confirmed:true};
-  assert.match(h.materialMarkup(materials),/代码及其他文件 ZIP/);assert.ok(h.materialMarkup(materials).includes(`href="${filesUrl}"`));
+  assert.match(h.materialMarkup(materials),/作品压缩包 ZIP/);assert.ok(h.materialMarkup(materials).includes(`href="${filesUrl}"`));
   const data={team:{name:'Team',number:1},submission:{submitted:materials,submittedVersion:1,submittedAt:0},judgingMaterials:{}};
   assert.ok(h.submissionRecordText(data).includes(filesUrl));assert.match(h.submissionRecordText(data),/本站上传文件另行保存/);
 });
@@ -127,6 +171,6 @@ test('stage action patches only matching read-only adoption cards and keeps othe
 });
 
 test('GitHub dot-prefixed repositories pass the real formal preflight for full SHA and commit URLs',()=>{
-  const sha='a'.repeat(40),materials={projectName:'Synthetic',summary:'Synthetic',codeUrl:'https://github.com/github/.github',readmeUrl:'https://example.test/readme',license:'MIT',demoUrl:'https://example.test/demo',demoInstructions:'Local demo',slidesUrl:'https://example.test/slides',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
+  const sha='a'.repeat(40),materials={projectName:'Synthetic',summary:'Synthetic',codeUrl:'https://github.com/github/.github',readmeUrl:'https://example.test/readme',license:'MIT',demoUrl:'https://example.test/demo',demoInstructions:'Local demo',slidesUrl:'https://example.test/slides',filesUrl:'https://example.test/work.zip',videoUrl:'https://example.test/video',sourcesAndLimitations:'Synthetic only',confirmed:true};
   for(const codeVersion of [sha,'https://github.com/github/.github/commit/'+sha])assert.equal(h.submissionProblems({...materials,codeVersion},true).length,0,codeVersion);
 });
