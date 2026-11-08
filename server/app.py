@@ -239,7 +239,9 @@ def csv_safe(value):
 
 
 class EventService:
-    def __init__(self, data_dir=None, base_path=None, origin=None, static_root=None):
+    def __init__(self, data_dir=None, base_path=None, origin=None, static_root=None, claims_auto_approve_all=True):
+        if type(claims_auto_approve_all) is not bool:
+            raise ValueError("claims_auto_approve_all must be boolean")
         self.root = Path(static_root or Path(__file__).resolve().parent.parent).resolve()
         self.data_dir = Path(data_dir or os.environ.get("GOTC_DATA_DIR", str(Path(__file__).parent / "data"))).resolve()
         self.base_path = (base_path if base_path is not None else os.environ.get("GOTC_BASE_PATH", "/gotc")).rstrip("/")
@@ -298,7 +300,7 @@ class EventService:
             self.registration.initialize(db)
             self.keys.initialize(db)
             self.repositories.initialize(db)
-            for key, value in {"scoringOpen": False, "resultsPublished": True, "minJudges": 5, "submissionsOpen": False, "submissionDeadline": None, "updatedAt": now_ms()}.items():
+            for key, value in {"scoringOpen": False, "resultsPublished": True, "minJudges": 5, "submissionsOpen": False, "submissionDeadline": None, "claimsAutoApproveAll": claims_auto_approve_all, "updatedAt": now_ms()}.items():
                 db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, json.dumps(value)))
             # Preserve an upgraded event's current audience window once; later changes are independent.
             db.execute("INSERT OR IGNORE INTO settings SELECT 'votingOpen',value FROM settings WHERE key='scoringOpen'")
@@ -386,7 +388,8 @@ class EventService:
             db.close()
 
     def config(self, db):
-        result = {r["key"]: json.loads(r["value"]) for r in db.execute("SELECT * FROM settings") if not r["key"].startswith("keys.")}
+        result = {r["key"]: json.loads(r["value"]) for r in db.execute("SELECT * FROM settings")
+                  if not r["key"].startswith("keys.") and r["key"]!='claimsAutoApproveAll'}
         result.update(dimensions=DIMENSIONS, voteLimit=VOTE_LIMIT, audienceIncludedInScore=False, maxScore=100)
         return result
 

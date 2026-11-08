@@ -145,7 +145,7 @@ function installAdminData(data,version){
     <button type="button" data-admin-jump="audience-settings">观众投票</button>
     <button type="button" data-admin-jump="judging-admin">评审窗口与名单</button>
     <button type="button" data-admin-jump="team-form">队伍名录</button>
-    <button type="button" data-admin-jump="claims-admin">队伍申请审核</button>
+    <button type="button" data-admin-jump="claims-admin">队伍申请记录</button>
     <button type="button" data-admin-jump="admin-import">CSV 导入</button>
     <button type="button" data-admin-jump="invite-form">身份与凭据</button>
     <button type="button" data-admin-jump="submission-settings">作品提交</button>

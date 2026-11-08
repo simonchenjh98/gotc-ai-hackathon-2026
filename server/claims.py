@@ -143,8 +143,9 @@ class Claims:
         request_id=secrets.token_hex(16);secret=secrets.token_urlsafe(32);pin=f'{secrets.randbelow(1000000):06d}';expires=now+24*3600*1000
         db.execute('''INSERT INTO claim_requests(id,secret_hash,pin_hash,name,school,normalized_name,normalized_school,created_at,expires_at)
             VALUES (?,?,?,?,?,?,?,?,?)''',(request_id,digest('receipt',secret),digest('pin:'+request_id,pin),name,school,normalize(name),normalize(school),now,expires))
-        if declaration:self.save_declaration(db,request_id,1,declaration)
-        result=self.bearer(db,{'requestId':request_id,'secret':secret})
+        if declaration:
+            self.save_declaration(db,request_id,1,declaration)
+        result=self.bearer(db,{'requestId':request_id,'secret':secret},strict=bool(declaration))
         return {**result,'requestId':request_id,'secret':secret,'pin':pin}
 
     def team_metadata(self,body):
@@ -196,14 +197,15 @@ class Claims:
         self.save_declaration(db,row['id'],row['revision']+1,declaration)
         db.execute('UPDATE claim_requests SET revision=revision+1 WHERE id=?',(row['id'],))
         self.s.audit(db,None,'claims.update',row['id'],{'requestRevision':row['revision']+1})
-        return self.bearer(db,{'requestId':body['requestId'],'secret':body['secret']})
+        return self.bearer(db,{'requestId':body['requestId'],'secret':body['secret']},strict=True)
 
-    def bearer(self,db,body,redeem=False):
+    def bearer(self,db,body,redeem=False,strict=False):
         if set(body)!={'requestId','secret'}:return dict(INVALID)
         row=self.receipt_row(db,body)
         if not row:return dict(INVALID)
         if row['status']=='pending':
-            self.auto.attempt(db,row['id'])
+            if strict:self.auto.attempt(db,row['id'],strict=True)
+            else:self.auto.attempt(db,row['id'])
             row=self.receipt_row(db,body)
             if row is None:
                 # Approval can cross the expiry boundary while deriving credentials.
@@ -284,20 +286,26 @@ class Claims:
             db.commit()  # Preserve failed attempts; called before any approval effects.
             raise APIError(400,'核验码不正确，请核对申请人的设备')
 
-    def approve_open(self,db,actor,body):
+    def approve_open(self,db,actor,body,*,automatic=False):
         fields={'requestId','expectedRevision','reviewContext','teamName','track','resolvedIdentity','note'}
         online_fields=fields|{'verificationMethod','applicationReviewed'}
         onsite_fields=fields|{'pin','inPersonVerified'}
         reissue='reissueRevoked' in body
         online=set(body) in (online_fields,online_fields|{'teamId','teamContext'},online_fields|{'teamId','teamContext','reissueRevoked'})
-        if not online and set(body) not in (onsite_fields,onsite_fields|{'teamId','teamContext'}):raise APIError(400,'开放申请审核字段不正确')
+        automatic_fields=(fields,fields|{'teamId','teamContext'})
+        onsite=set(body) in (onsite_fields,onsite_fields|{'teamId','teamContext'})
+        if automatic:
+            if actor is not None or set(body) not in automatic_fields or reissue:raise APIError(400,'自动完成申请字段不正确')
+        elif not online and not onsite:raise APIError(400,'开放申请审核字段不正确')
         if reissue:
             if body['reissueRevoked'] is not True:raise APIError(400,'请明确确认停用提交身份重新发码')
             self.s.require(actor,'admin')
         if 'teamId' in body and (not isinstance(body['teamId'],str) or not body['teamId'] or not isinstance(body['teamContext'],str) or not re.fullmatch(r'[a-f0-9]{64}',body['teamContext'])):raise APIError(400,'请选择队伍并提交当前队伍核验上下文')
         if not isinstance(body['requestId'],str) or type(body['expectedRevision']) is not int or not isinstance(body['reviewContext'],str) or not re.fullmatch(r'[a-f0-9]{64}',body['reviewContext']):raise APIError(400,'需要申请修订号及核验上下文')
         if type(body['resolvedIdentity']) is not bool:raise APIError(400,'身份区分确认字段不正确')
-        if online:
+        if automatic:
+            pass
+        elif online:
             if body['verificationMethod']!='online' or body['applicationReviewed'] is not True:raise APIError(400,'请明确审核申请并批准')
         else:
             if body['inPersonVerified'] is not True:raise APIError(400,'请当面核实本人和全部组员')
@@ -306,7 +314,8 @@ class Claims:
         if reissue and not note:raise APIError(400,'停用身份重新发码须填写审核备注')
         row=db.execute('SELECT * FROM claim_requests WHERE id=?',(body['requestId'],)).fetchone()
         if not row:raise APIError(404,'申请不存在')
-        canonical={**body,**metadata,'note':note,**({} if online else {'pin':digest('pin:'+row['id'],body['pin'])})}
+        canonical={**body,**metadata,'note':note,**({} if automatic or online else {'pin':digest('pin:'+row['id'],body['pin'])})}
+        if automatic:canonical['approvalMode']='automatic'
         approval=digest('open-approval-v1',json.dumps(canonical,ensure_ascii=False,sort_keys=True))
         # Compare applied intent before context, which necessarily changes after membership assignment.
         if row['status'] in {'approved','issued'} and row['approval_digest']==approval:
@@ -325,7 +334,7 @@ class Claims:
             raise APIError(409,'停用身份重新发码须保留原队名和赛道，请刷新核对')
         if self.s.team_lifecycle.name_collisions(db,metadata['teamName'],selected['id'] if selected else None):
             raise APIError(409,'这个队名已存在，请明确选择已有队伍进行核验，或填写可区分的队名')
-        if not online:self.verify_pin(db,actor,row,body['pin'])
+        if onsite:self.verify_pin(db,actor,row,body['pin'])
         people=[declaration['captain']]+declaration['members'];matches=[]
         for person in people:
             identity=(normalize(person['name']),normalize(person['school']))
@@ -362,7 +371,8 @@ class Claims:
         except sqlite3.IntegrityError:raise APIError(409,'成员或队伍已经分配，请重新读取并核对')
         self.s.audit(db,actor,'claims.approve-open',row['id'],{'teamId':team['id'],'memberIds':member_ids,'declaration':reviewed,
             'requestRevision':body['expectedRevision'],'reviewContext':body['reviewContext'],'resolvedIdentity':body['resolvedIdentity'],'note':note,
-            **({'verificationMethod':'online','applicationReviewed':True} if online else {'verificationMethod':'onsite','inPersonVerified':True}),
+            **({'verificationMethod':'automatic','applicationReviewed':False} if automatic else
+               ({'verificationMethod':'online','applicationReviewed':True} if online else {'verificationMethod':'onsite','inPersonVerified':True})),
             **({'reissueRevoked':True,'accountId':account['id']} if reissue else {}),
             **({'selectedTeamId':body['teamId'],'teamContext':body['teamContext']} if selected else {})})
         return {'ok':True,'status':'approved','revision':row['revision']+1}

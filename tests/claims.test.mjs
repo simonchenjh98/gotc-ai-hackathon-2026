@@ -58,7 +58,10 @@ test('public markup escapes server strings and renders only receipt, status and 
   const html=context.claimStateMarkup({receipt,error:'<img src=x onerror=alert(1)>',status:'issued',team:{number:1,name:'<script>evil()</script>'},code:'<secret>',busy:false});
   assert.ok(!html.includes('<img'));assert.ok(!html.includes('<script>'));assert.ok(html.includes('&lt;secret&gt;'));assert.ok(!html.includes(receipt.secret));assert.ok(!html.includes(receipt.pin));
   const pending=context.claimStateMarkup({receipt,error:'',status:'pending',team:null,code:null,busy:false});assert.ok(!pending.includes('id="claim-redeem"'));
-  assert.ok(context.claimStateMarkup({receipt,error:'',status:'approved',team:{number:1,name:'Fixture'},code:null,busy:false}).includes('id="claim-redeem"'));
+  const approved=context.claimStateMarkup({receipt,error:'',status:'approved',team:{number:1,name:'Fixture'},code:null,busy:false});
+  assert.ok(approved.includes('id="claim-redeem"'));assert.match(approved,/claim-redeem-primary/);assert.ok(!approved.includes('id="claim-status"'));
+  const rejected=context.claimStateMarkup({receipt,error:'',status:'rejected',team:null,code:null,busy:false});assert.match(rejected,/未完成/);assert.doesNotMatch(rejected,/立即领取/);
+  assert.match(context.claimStateMarkup({receipt:null,error:'',status:'new',team:null,code:null,busy:false,draft:{name:'',school:'',teamName:'',track:'',members:context.emptyClaimMembers()}}),/提交并自动完成申请/);
 });
 
 test('admin guard rejects changed route, identity, role, stale browser owner and detached panel',()=>{
@@ -358,9 +361,9 @@ test('optional existing team selection displays registration and binds its displ
   form.elements.teamId.value='';form.elements.teamId.onchange();assert.match(nodes['claim-existing-summary'].innerHTML,/默认批准后创建新队伍/);
 });
 
-test('online application and review require no device PIN, physical visit, or external message',()=>{
+test('automatic application and historical review compatibility require no public PIN or external message',()=>{
   const pending=context.claimStateMarkup({...declaredResponse,receipt,draft:{...declaredCaptain,members:declaredMembers},busy:false,error:''});
-  assert.match(pending,/等待审核/);assert.match(pending,/已提交至组织方后台/);
+  assert.match(pending,/正在自动完成申请/);assert.match(pending,/较早的申请/);assert.doesNotMatch(pending,/等待工作人员审核|查询审核状态/);
   assert.ok(!pending.includes(receipt.pin));assert.ok(!pending.includes('id="claim-redeem"'));
   const review=context.claimsReviewMarkup({id:'online',name:declaredCaptain.name,school:declaredCaptain.school,status:'pending',revision:1,declaration:declaredResponse.declaration},{teams:[],people:[]});
   for(const html of [pending,review]){
