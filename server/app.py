@@ -973,18 +973,21 @@ class EventService:
         if len(result['codeVersion'].encode('utf-8'))>1024:
             raise APIError(400,'代码版本最多1024字节')
         for key in urls:
-            value=text_field(materials.get(key, ""), key, 1024)
+            limit=8192 if key=='demoUrl' else 1024
+            schemes=('http','https') if key=='demoUrl' else ('https',)
+            value=text_field(materials.get(key, ""), key, limit)
             if value:
                 try:
                     parsed=urlsplit(value)
-                    valid=(parsed.scheme=="https" and valid_material_host(parsed.hostname) and parsed.username is None and parsed.password is None
-                           and parsed.port!=0 and len(value.encode("utf-8"))<=1024
+                    valid=(parsed.scheme in schemes and valid_material_host(parsed.hostname) and parsed.username is None and parsed.password is None
+                           and parsed.port!=0 and len(value.encode("utf-8"))<=limit
                            and not any(c.isspace() or ord(c)<32 or ord(c)==127 or c=="\\" for c in value)
                            and not re.search(r"%(?:0[0-9a-f]|1[0-9a-f]|7f)", value, re.I))
                 except ValueError:
                     valid=False
                 if not valid:
-                    raise APIError(400, key+"必须是无凭据、无空白的完整 HTTPS 链接（最多1024字节）")
+                    protocol='HTTP 或 HTTPS' if key=='demoUrl' else 'HTTPS'
+                    raise APIError(400, f"{key}必须是无凭据、无空白的完整 {protocol} 链接（最多{limit}字节）")
             result[key]=value
         confirmed=materials.get("confirmed", False)
         if type(confirmed) is not bool:

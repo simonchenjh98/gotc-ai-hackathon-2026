@@ -228,13 +228,18 @@ class MaterialUploads:
 
     def validate_materials(self, db, team_id, materials):
         own = urlsplit(self.s.origin)
+        own_key = origin_key(own)
         prefix = self.s.base_path + '/materials/'
         team_name = db.execute('SELECT name FROM teams WHERE id=?', (team_id,)).fetchone()['name']
         for field, value in materials.items():
             if not field.endswith('Url') or not value:
                 continue
             parsed = urlsplit(value)
-            if origin_key(parsed) != origin_key(own):
+            parsed_key = origin_key(parsed)
+            # HTTP can redirect to this deployment's HTTPS upload URLs. Keep those
+            # aliases in canonical-reference/ownership checks, regardless of port.
+            http_alias = parsed.scheme == 'http' and own.scheme == 'https' and parsed_key[0] == own_key[0]
+            if parsed_key != own_key and not http_alias:
                 continue
             path = posixpath.normpath(unquote(parsed.path))
             if not path.startswith(prefix):

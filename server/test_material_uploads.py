@@ -218,6 +218,63 @@ class MaterialUploadTests(unittest.TestCase):
         self.assertEqual(self.client.get('/api/submission/history/1')[1]['materials'], saved)
         self.assertEqual(self.submit(materials)[1]['receipt'], result['receipt'])
 
+    def test_http_demo_and_long_share_urls_survive_draft_formal_receipt_and_history(self):
+        base = {'slidesUrl': 'https://example.test/slides.pdf', 'filesUrl': 'https://example.test/work.zip'}
+        prefix = 'https://share.example.test/view?token='
+        urls = ['http://203.0.113.12:5173/demo/index.html?share=1#preview',
+                prefix + 'a' * (8192 - len(prefix)),
+                'https://share.example.test/view?title=' + '中' * 1500]
+        version = 0
+        for number, url in enumerate(urls):
+            with self.subTest(url_number=number):
+                materials = {**base, 'demoUrl': url}
+                for status in ('draft', 'submitted'):
+                    code, result, _ = self.submit(materials, version, f'demo-url-{number}-{status}', status)
+                    self.assertEqual(code, 200, result)
+                    version += 1
+                    saved = result['submission']['draft' if status == 'draft' else 'submitted']
+                    self.assertEqual(saved['demoUrl'], url)
+                    if status == 'submitted':
+                        self.assertEqual(result['receipt']['status'], 'succeeded')
+                        self.assertEqual(result['receipt']['materials']['demoUrl'], url)
+                        self.assertEqual(self.client.get('/api/submission/history/' + str(version))[1]['materials']['demoUrl'], url)
+
+    def test_demo_url_expansion_keeps_scheme_content_byte_and_other_url_checks(self):
+        base = {'slidesUrl': 'https://example.test/slides.pdf', 'filesUrl': 'https://example.test/work.zip'}
+        invalid_demos = ['javascript:alert(1)', 'data:text/html,hello', '//example.test/demo',
+                         'http://u:p@example.test/demo', 'https://example.test/a b',
+                         'http://example.test/a\\b', 'http://example.test/%0aheader',
+                         'http://example.test:0/demo', 'http://example.test:bad/demo',
+                         'https://example.test/' + 'a' * 8192,
+                         'https://example.test/' + '中' * 2730]
+        changes = [{'demoUrl': url} for url in invalid_demos]
+        changes += [{field: 'http://example.test/file'} for field in ('slidesUrl', 'filesUrl', 'codeUrl')]
+        changes += [{field: 'https://example.test/' + 'a' * 1024} for field in ('slidesUrl', 'filesUrl', 'codeUrl')]
+        for number, change in enumerate(changes):
+            for status in ('draft', 'submitted'):
+                with self.subTest(change=number, status=status):
+                    code, _, _ = self.submit({**base, **change}, request_id=f'invalid-demo-{number}-{status}', status=status)
+                    self.assertEqual(code, 400)
+        self.assertEqual(self.client.get('/api/team')[1]['submission']['version'], 0)
+
+    def test_http_aliases_of_internal_demo_uploads_cannot_bypass_canonical_or_owner_checks(self):
+        other, _ = self.access(self.team(2, 'Other'))
+        demo = self.uploaded(kind='demo', data=HTML, filename='index.html')
+        base = {'slidesUrl': 'https://example.test/slides.pdf', 'filesUrl': 'https://example.test/work.zip'}
+        aliases = [demo['url'].replace('https://', 'http://'),
+                   demo['url'].replace('https://event.example.test/', 'http://EVENT.example.test.:80/'),
+                   demo['url'].replace('https://event.example.test/', 'http://event.example.test:8080/'),
+                   demo['url'].replace('https://', 'http://').replace('/gotc/materials/', '/gotc/%2e%2e/gotc/materials/')]
+        for number, url in enumerate(aliases):
+            for client_number, client in enumerate((self.client, other)):
+                for status in ('draft', 'submitted'):
+                    code, result, _ = self.submit({**base, 'demoUrl': url}, request_id=f'http-alias-{number}-{client_number}-{status}', status=status, client=client)
+                    self.assertEqual((code, result.get('code')), (400, 'upload_reference'))
+        # Canonical HTTPS still enforces ownership; a valid upload from this team works.
+        code, result, _ = self.submit({**base, 'demoUrl': demo['url']}, client=other)
+        self.assertEqual((code, result.get('code')), (403, 'upload_owner'))
+        self.assertEqual(self.submit({**base, 'demoUrl': demo['url']})[0], 200)
+
     def test_uploaded_slides_zip_without_project_title_can_be_formally_submitted(self):
         slides = self.uploaded(project='')
         files = self.uploaded(kind='files', data=archive(), filename='code.zip', project='')
@@ -233,7 +290,7 @@ class MaterialUploadTests(unittest.TestCase):
 
     def test_optional_filled_invalid_fields_still_reject_formal_submission(self):
         base = {'slidesUrl': 'https://example.test/slides', 'filesUrl': 'https://example.test/work.zip'}
-        for number, change in enumerate([{'demoUrl': 'http://invalid'}, {'codeUrl': 'https://github.com/team/repo/blob/main/x'},
+        for number, change in enumerate([{'demoUrl': 'javascript:alert(1)'}, {'codeUrl': 'https://github.com/team/repo/blob/main/x'},
                                         {'codeVersion': 'main'}, {'confirmed': 'yes'}, {'summary': 'x' * 601}]):
             status, _, _ = self.submit({**base, **change}, request_id='optional-invalid-' + str(number))
             self.assertEqual(status, 400)
