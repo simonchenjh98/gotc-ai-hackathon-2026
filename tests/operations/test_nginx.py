@@ -109,7 +109,7 @@ class LiveNginxTests(unittest.TestCase):
             (root / "logs").mkdir()
             key, cert = root / "server.key", root / "server.crt"
             subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                            "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+                            "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
                             "-keyout", str(key), "-out", str(cert)], check=True, capture_output=True, timeout=20)
             with closing(socket.socket()) as probe:
                 probe.bind(("127.0.0.1", 0))
@@ -133,7 +133,7 @@ class LiveNginxTests(unittest.TestCase):
             commands = ["nginx", "-p", str(root), "-c", str(config)]
             check = subprocess.run([*commands, "-t"], text=True, capture_output=True, timeout=10)
             self.assertEqual(check.returncode, 0, check.stderr)
-            context = ssl.create_default_context(cafile=str(cert))
+            context = self.loopback_context(cert)
             with subprocess.Popen(commands, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) as process:
                 try:
                     deadline = time.monotonic() + 6
@@ -152,6 +152,7 @@ class LiveNginxTests(unittest.TestCase):
                     with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
                         with context.wrap_socket(sock, server_hostname="localhost") as tls:
                             self.assertEqual(tls.selected_alpn_protocol(), "h2")
+                            self.assertIn(tls.version(), ("TLSv1.2", "TLSv1.3"))
                     yield self.getter(port, cert), current, filename, js
                 finally:
                     process.terminate()
@@ -160,8 +161,7 @@ class LiveNginxTests(unittest.TestCase):
     @staticmethod
     def loopback_context(cert):
         context = ssl.create_default_context(cafile=str(cert))
-        # Connect by IPv4 to the private listener; the fixture's certificate names localhost.
-        context.check_hostname = False
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         return context
 
     def getter(self, port, cert):
