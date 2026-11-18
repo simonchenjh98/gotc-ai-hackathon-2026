@@ -180,6 +180,15 @@ def smoke(browser, service):
         page.locator("#claim-status").click()
         passed.append("contestant claim submission and receipt lookup")
 
+    with visit() as page:
+        page.goto(base + "platform.html#judge-roadshow")
+        form = page.locator("[data-roadshow-name-login]")
+        form.locator("[name=judgeName]").fill("Fixture Roadshow Judge")
+        form.locator("[data-roadshow-login-button]").click()
+        page.locator("[data-roadshow-score-form]").wait_for()
+        direct_entry(page, "[data-roadshow-score-form]")
+        passed.append("roadshow roster name login and direct score-page refresh")
+
     with visit("judge") as page:
         page.locator("#score-form").wait_for()
         go(page, "judge-exhibition", "#review-form")
@@ -229,6 +238,8 @@ def smoke(browser, service):
         form.locator("button").click()
         page.locator("#switch-team-workbench").wait_for()
         page.locator("#submission-form").wait_for(state="attached")
+        go(page, "team-score", "#refresh-team-score")
+        direct_entry(page, "#refresh-team-score")
         page.locator("#switch-team-workbench").click()
         page.locator("#admin-team-workbench").wait_for()
         go(page, "admin", "#settings-form")

@@ -55,6 +55,6 @@ make benchmark
 python3 -m ops.deploy.deploy --package /tmp/gotc-release.tar.gz
 ```
 
-[架构与开发说明](docs/architecture.md) · [活动平台现状审计](docs/audits/2026-11-18-platform.md) · [部署说明](ops/deploy/README.md) · [后端运维说明](backend/README.md)
+[架构与开发说明](docs/architecture.md) · [活动平台现状审计](docs/audits/2026-11-18-platform.md) · [重构验收与性能测量](docs/audits/2026-11-18-rebuild-verification.md) · [部署说明](ops/deploy/README.md) · [后端运维说明](backend/README.md)
 
 代码使用 MIT 许可证。活动主视觉、名称与标识的权利归各自权利人。

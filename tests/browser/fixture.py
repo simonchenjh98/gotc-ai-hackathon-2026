@@ -42,6 +42,9 @@ def participants(service):
         path = "admin/judging/" + stage
         revision = api(path)["stage"]["revision"]
         api(path + "/roster", {"expectedRevision": revision, "teamIds": [team_id], "judgeIds": [judge["id"]]})
+    roadshow = api("admin/roadshow-access")
+    api("admin/roadshow-access", {"expectedRevision": roadshow["revision"], "runId": roadshow["runId"],
+                                  "names": ["Fixture Roadshow Judge"]})
     revision = api("admin")["config"]["writeRevisions"]["voting"]
     api("admin/settings", {"votingOpen": True, "expectedRevisions": {"voting": revision}})
     finals_code = f"{secrets.randbelow(10**12):012d}"
