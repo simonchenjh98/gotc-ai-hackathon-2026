@@ -14,7 +14,7 @@ Open <http://127.0.0.1:5274/gotc/>. The development launcher serves the platform
 
 Production runs separate Starlette apps on Uvicorn Unix sockets behind an HTTPS Nginx entry point. HTTPX connects to external providers. Private gateway content capture is opt-in for new events. [Architecture](docs/architecture.md) · [Organizer account migration](docs/organizer-accounts.md)
 
-The [hardening report](docs/audits/2026-11-18-hardening.md) maps the rebuild brief to the implementation, synthetic benchmarks and remaining rollout checks.
+The release-blocker audit covers single-code team access, actual file uploads, gateway capacity, credential and data migrations, and Linux release rehearsals. The earlier hardening report records the architecture baseline. [Release-blocker audit](docs/audits/2026-11-18-release-blockers.md) · [Architecture baseline](docs/audits/2026-11-18-hardening.md)
 
 ## Project layout
 

@@ -21,6 +21,8 @@ At the checkpoint, selecting a file on the local preview returned HTTP 200, but 
 
 ## Reproduce locally
 
+The integrated macOS run used Python 3.12 with local Nginx on PATH. `make check` and `make test` passed, including 603 frontend, 875 backend, and 29 operations tests. Chromium 151.0.7922.34 passed all 11 journey groups against the fingerprinted site, including the updated organizer cutover and native file-picker upload journey. The local preview has submissions open only in its isolated synthetic database.
+
 ```sh
 make check
 make test
@@ -32,6 +34,10 @@ python tests/performance/login_capacity.py
 
 Use the project virtual environment for Python commands and install the pinned Playwright test dependency for the browser journey. The linked evidence files give the exact benchmark arguments, seeds, interpreter versions, OS and sampling methods. Browser checks and process rehearsals use loopback or temporary Unix sockets.
 
+## Ubuntu rehearsal
+
+On GitHub-hosted Ubuntu 26.04, Nginx 1.28.3 and OpenSSL 3.5.5 passed all five edge tests with zero skips. Both generated systemd units started. A process running with the configured proxy group reached each socket. The platform reported a 256 MiB memory ceiling and the gateway 384 MiB. Both reported a file descriptor limit of 1,024. All 36 Git tests passed under the platform service identity and hardening settings. The first attempt failed when the runner rejected a direct sudo user/group combination. Commit `dff93a5` runs that readiness probe as a transient systemd service with the intended identity. [Linux Nginx job](https://github.com/lucasnotfound59/gotc-ai-hackathon-2026/actions/runs/44266366153/job/134671779725) · [Linux systemd and Git job](https://github.com/lucasnotfound59/gotc-ai-hackathon-2026/actions/runs/44266366153/job/134671779751)
+
 ## Rollout boundary
 
-The replay uses generated timings and the 80-stream rehearsal uses small responses. The large-payload test covers a different synthetic workload. A passing combination of these tests does not establish Linux cgroup memory, page-cache or network occupancy on the shared target host. Confirm disk headroom before taking a release backup or selecting a migration mode. Secure deletion in the database does not erase previous snapshots. Production retention decisions, off-host backup and restore, host access policy, deployment identities, the domain and TLS setup remain with the organizer.
+The replay uses generated timings and the 80-stream rehearsal uses small responses. The large-payload test covers a different synthetic workload. Their measurements leave Linux cgroup memory, page-cache and network occupancy on the shared target host unverified. Confirm disk headroom before taking a release backup or setting `GOTC_LEGACY_GATEWAY_CONTENT=migrate|discard`. An operator must choose exactly one value. Secure deletion in the database leaves previous snapshots subject to their own retention policy. Production retention decisions, off-host backup and restore, host access policy, deployment identities, the domain and TLS setup remain with the organizer.

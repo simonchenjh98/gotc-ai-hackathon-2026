@@ -65,4 +65,15 @@ The local Docker socket was absent. The fork's Actions API reported `{"allowed_a
 | Nginx config and HTTPS asset contract | Installs Nginx, reports Nginx/OpenSSL versions and runs all five edge tests in verbose mode. |
 | Isolated services and Git under systemd | Installs the locked interpreter environment from wheels, starts both generated service units with disposable identities and an empty data directory, verifies /readyz through each Unix socket as the proxy group, reports systemd resource limits and runs the real Git backup suite under the platform service identity and sandbox. |
 
+At `d298339`, the host runner denied a direct `sudo -u nobody -g gotc-proxy` identity switch after systemd accepted the generated units and their start command. Socket readiness and Git were still untested in that run. The rehearsal now starts its readiness client in a transient systemd unit with the same unprivileged identity, explicit proxy group and checkout working directory. [Initial Linux job](https://github.com/lucasnotfound59/gotc-ai-hackathon-2026/actions/runs/44265050696/job/134667383340)
+
+Both dedicated Linux jobs passed for `dff93a5b2c4ec464cc3b0ed1b8d4a945afbba728` on GitHub-hosted Ubuntu 26.04. Nginx 1.28.3 with OpenSSL 3.5.5 exercised TLS/HTTP2 negotiation, both Unix upstreams, static headers, release switching and shared-host routing. Its verbose test log recorded `Ran 5 tests in 0.402s` and `OK`, with zero skips. [Linux Nginx job](https://github.com/lucasnotfound59/gotc-ai-hackathon-2026/actions/runs/44266366153/job/134671779725)
+
+The systemd job ran CPython 3.12.16 and Git 2.56.1. The proxy group reached both readiness endpoints. Each asserted `status=ready`. The host reported the following effective limits. Under the platform identity and service restrictions, the Git suite recorded `Ran 36 tests in 25.394s`, `OK` and `Finished with result: success`. [Linux systemd and Git job](https://github.com/lucasnotfound59/gotc-ai-hackathon-2026/actions/runs/44266366153/job/134671779751)
+
+| Service | ActiveState | MemoryMax (bytes) | TasksMax | LimitNOFILE |
+| --- | --- | ---: | ---: | ---: |
+| gotc-platform | active | 268435456 | 80 | 1024 |
+| gotc-gateway | active | 402653184 | 48 | 1024 |
+
 The protected-main signing and Pages workflows exclude this rehearsal branch. For the exact Linux run and deployment acceptance status, see the [release blocker audit](2026-11-18-release-blockers.md). The hosted runner exercises systemd and Git on a clean machine. Shared-host occupancy, cgroup memory pressure and operator-owned provisioning still require a production-like rehearsal. The documented socket budget and the synthetic process measurements apply to the default service configuration. [Service capacity](../../ops/deploy/README.md) · [Proxy capacity](../../ops/deploy/nginx.md) · [80-stream results](2026-11-18-gateway-capacity.md)
