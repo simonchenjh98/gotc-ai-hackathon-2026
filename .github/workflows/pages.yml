@@ -23,15 +23,23 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Validate source and event APIs
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.x'
+      - name: Validate application before publishing
         run: |
-          node --check app.js
-          node --check platform.js
-          node --check platform-admin.js
-          node --test tests/*.test.mjs
-          python -B scripts/check_site.py
-          python -B -m unittest discover -s server -p 'test_*.py'
-          python -B -m unittest discover -s deploy -p 'test_*.py'
+          python -B tools/check_layout.py
+          python -B tools/check_site.py
+          node --test tests/frontend/*.test.mjs
+          python -B -m unittest discover -s tests/backend
+          python -B -m unittest discover -s tests/operations
+      - name: Validate Pages staging
+        run: |
+          python -m ops.deploy.pages _site
+          python tools/check_site.py --pages-root _site
 
   deploy:
     needs: validate
@@ -55,11 +63,7 @@ jobs:
           persist-credentials: false
       - uses: actions/configure-pages@v5
       - name: Stage public files
-        run: |
-          mkdir _site
-          cp index.html styles.css app.js site-header.js site-header.css favicon.svg team-registration.js team-registration.css _site/
-          cp -r assets downloads _site/
-          touch _site/.nojekyll
+        run: python -m ops.deploy.pages _site
       - uses: actions/upload-pages-artifact@v4
         with:
           path: _site

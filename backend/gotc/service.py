@@ -1,0 +1,318 @@
+"""Event application composition, session identity and shared event configuration."""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import threading
+import time
+from collections import defaultdict, deque
+from http.cookies import CookieError, SimpleCookie
+from urllib.parse import urlsplit
+
+from . import api, bootstrap, database
+from .admin_data import AdminDataService
+from .constants import COOKIE_NAME, DIMENSIONS, LOGIN_KDF_CONCURRENCY, SESSION_SECONDS, VOTE_LIMIT
+from .errors import APIError
+from .gateway.keys import KeyService, load_config
+from .judging.finals import FinalsService
+from .judging.judge_login_schedule import JudgeLoginSchedule
+from .judging.judging import JudgingService
+from .judging.roadshow_access import RoadshowAccess
+from .judging.roadshow_scoring import RoadshowScoring
+from .judging.standings import Standings
+from .submissions.material_uploads import MaterialUploads
+from .submissions.repositories import Repositories
+from .submissions.repository_backups import RepositoryBackups
+from .submissions.submission_records import SubmissionRecords
+from .submissions.workflow import SubmissionWorkflow
+from .teams.admin_team_access import AdminTeamAccess, operator_for
+from .teams.claims import Claims
+from .teams.team_lifecycle import TeamLifecycle
+from .teams.team_registration import TeamRegistration
+from .validation import csv_safe, text_field
+from .write_conflicts import WriteConflicts
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def scrypt_hash(code, salt):
+    return hashlib.scrypt(code.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
+
+
+class EventService:
+    def __init__(self, data_dir=None, base_path=None, origin=None, static_root=None, *, clock=None):
+        project_root = Path(__file__).resolve().parents[2]
+        self.root = Path(static_root or project_root / "frontend").resolve()
+        self.data_dir = bootstrap.data_directory(data_dir, project_root)
+        self.clock = clock if clock is not None else lambda: now_ms()
+        self.standings = Standings(self)
+        self.submissions = SubmissionWorkflow(self)
+        self.base_path = (base_path if base_path is not None else os.environ.get("GOTC_BASE_PATH", "/gotc")).rstrip("/")
+        if self.base_path and not re.fullmatch(r"/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*", self.base_path):
+            raise ValueError("GOTC_BASE_PATH must be a plain absolute URL path")
+        self.origin = (origin or os.environ.get("GOTC_PUBLIC_ORIGIN", "https://8.141.114.201")).rstrip("/")
+        parsed = urlsplit(self.origin)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.path or parsed.query or parsed.fragment or parsed.username or parsed.password:
+            raise ValueError("GOTC_PUBLIC_ORIGIN must be an exact http(s) origin without a path")
+        self.secure = parsed.scheme == "https"
+        self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.data_dir, 0o700)
+        self.shared_login_codes = bootstrap.shared_login_codes(self.data_dir)
+        self.db_path = self.data_dir / "event.sqlite3"
+        database_existed=self.db_path.exists()
+        self.rate_lock = threading.Lock()
+        self.login_attempts = defaultdict(deque)
+        self.login_kdf_slots = threading.BoundedSemaphore(LOGIN_KDF_CONCURRENCY)
+        self.judging=JudgingService(clock=self.clock,text=text_field,audit=self.audit,touch=self.touch,
+            history=lambda *args,**kwargs:self.admin_data.record_review_change(*args,**kwargs),
+            enrich_team=lambda db,team:self.admin_data.enrich_team(db,team),
+            is_team_recycled=lambda db,team_id:self.team_lifecycle.is_recycled(db,team_id))
+        self.admin_data=AdminDataService(self)
+        self.team_lifecycle=TeamLifecycle(self)
+        self.admin_team_access=AdminTeamAccess(self,COOKIE_NAME)
+        self.claims=Claims(self,self.clock,text_field,scrypt_hash)
+        self.registration=TeamRegistration(self,self.clock,text_field)
+        self.submission_records=SubmissionRecords(self)
+        self.material_uploads=MaterialUploads(self)
+        self.repositories=Repositories(self)
+        self.repository_backups=RepositoryBackups(self)
+        self.write_conflicts=WriteConflicts(self)
+        self.finals=FinalsService(self,self.clock,text_field)
+        self.roadshow_access=RoadshowAccess(self,self.clock,text_field,scrypt_hash)
+        self.roadshow_scoring=RoadshowScoring(self,self.clock,text_field)
+        self.judge_login_schedule=JudgeLoginSchedule(self,self.clock)
+        self.write_conflicts.backup_before_upgrade()
+        self.admin_data.backup_before_upgrade()
+        self.keys=KeyService(self, load_config(self.data_dir / "gateway.json"), text_field)
+        self.csv_safe=csv_safe
+        bootstrap.initialize_state(self, database_existed=database_existed, hash_code=scrypt_hash)
+
+    def db(self):
+        return database.connection(self.db_path)
+
+    def teams(self, db, public=True):
+        return self.standings.teams(db, public)
+
+    def check_materials(self, materials, submitted, lean_gitee=False):
+        return self.submissions.check_materials(materials, submitted, lean_gitee)
+
+    def save_submission(self, db, actor, team, body, accepted_at=None):
+        return self.submissions.save_submission(db, actor, team, body, accepted_at)
+
+    def dispatch_submission(self, body, cookie, expected_login_id=None, server_received_at=None):
+        return self.submissions.dispatch_submission(body, cookie, expected_login_id, server_received_at)
+
+    def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None,
+                 server_received_at=None, finals_judge_id=None, finals_access_token=None):
+        return api.dispatch(self, method, path, body, cookie, ip, query, expected_login_id,
+                            server_received_at, finals_judge_id, finals_access_token)
+
+    def config(self, db):
+        result = {r["key"]: json.loads(r["value"]) for r in db.execute("SELECT * FROM settings") if not r["key"].startswith("keys.")}
+        result.update(dimensions=DIMENSIONS, voteLimit=VOTE_LIMIT, audienceIncludedInScore=False, maxScore=100)
+        return result
+
+    def voting_window(self, db):
+        config=self.config(db);current=self.clock()
+        return {'open':config['votingOpen'],'deadline':config['votingDeadline'],
+                'canEdit':config['votingOpen'] and (config['votingDeadline'] is None or current<config['votingDeadline']),'serverTime':current}
+
+    def credential_action(self, db, actor, body):
+        if set(body)!={'role','id','action'} or not isinstance(body['role'],str) or body['role'] not in {'judge','audience'} \
+                or not isinstance(body['action'],str) or body['action'] not in {'rotate','revoke'} or not isinstance(body['id'],str):
+            raise APIError(400,'凭据操作目标不正确')
+        target=db.execute('SELECT * FROM accounts WHERE id=? AND role=?',(body['id'],body['role'])).fetchone()
+        if not target:raise APIError(404,'身份不存在')
+        before={'active':bool(target['active']),'credentialMode':self.admin_data.credential_mode(db,target['id'],target['role'])}
+        result={'ok':True,'id':target['id'],'active':body['action']=='rotate'}
+        if body['action']=='rotate':
+            code=target['id']+'.'+secrets.token_urlsafe(32);salt=secrets.token_bytes(16)
+            db.execute('UPDATE accounts SET salt=?,code_hash=?,active=1 WHERE id=?',(salt,scrypt_hash(code,salt),target['id']))
+            db.execute('INSERT INTO credential_overrides VALUES (?,?) ON CONFLICT(account_id) DO UPDATE SET rotated_at=excluded.rotated_at',(target['id'],self.clock()))
+            result['code']=code
+        else:db.execute('UPDATE accounts SET active=0 WHERE id=?',(target['id'],))
+        db.execute('DELETE FROM sessions WHERE account_id=?',(target['id'],))
+        result['credentialMode']=self.admin_data.credential_mode(db,target['id'],target['role'])
+        self.audit(db,actor,'credential.'+body['action'],target['id'],{'role':target['role'],'before':before,'after':{key:result[key] for key in ('active','credentialMode')}})
+        return result
+
+    def touch(self, db):
+        db.execute("UPDATE settings SET value=? WHERE key='updatedAt'", (json.dumps(self.clock()),))
+
+    def audit(self, db, actor, action, target="", metadata=None):
+        operator = operator_for(actor)
+        if operator:
+            metadata = {**(metadata or {}), 'operator': operator}
+        db.execute("INSERT INTO audit(at,actor_id,role,action,target,metadata) VALUES (?,?,?,?,?,?)",
+                   (self.clock(), actor["id"] if actor else None, 'admin' if operator else actor["role"] if actor else None,
+                    action, target, json.dumps(metadata or {}, ensure_ascii=False)))
+
+    def create_account(self, db, role, name):
+        account_id = {"admin": "GA", "judge": "GJ", "audience": "GV", "team": "GT"}[role] + secrets.token_hex(8)
+        code = self.shared_login_codes.get(role) or account_id + "." + secrets.token_urlsafe(32)
+        salt = secrets.token_bytes(16)
+        db.execute("INSERT INTO accounts(id,role,name,salt,code_hash,created_at) VALUES (?,?,?,?,?,?)",
+                   (account_id, role, name, salt, scrypt_hash(code, salt), self.clock()))
+        return {"id": account_id, "role": role, "name": name}, code
+
+    def rate_limit(self, ip, role):
+        current = time.monotonic()
+        with self.rate_lock:
+            # Nginx's trusted X-Real-IP is used only for loopback peers.
+            for key in [("ip", ip, role), ("global", role)]:
+                bucket = self.login_attempts[key]
+                while bucket and bucket[0] < current - 60:
+                    bucket.popleft()
+                limit = 20 if key[0] == "ip" else 400
+                if len(bucket) >= limit:
+                    raise APIError(429, "登录尝试过于频繁，请一分钟后重试")
+            for key in [("ip", ip, role), ("global", role)]:
+                self.login_attempts[key].append(current)
+            if len(self.login_attempts) > 5000:
+                self.login_attempts = defaultdict(deque, {k: v for k, v in self.login_attempts.items() if v and v[-1] >= current - 60})
+
+    @staticmethod
+    def login_id(cookie):
+        """Public, non-bearer identity; it cannot be used in place of the HttpOnly token."""
+        try:
+            token = SimpleCookie(cookie or "")[COOKIE_NAME].value
+            if re.fullmatch(r"[A-Za-z0-9_-]{40,100}", token):
+                return hashlib.sha256(b"gotc-public-login-id\0" + token.encode()).hexdigest()
+        except (KeyError, ValueError, CookieError):
+            pass
+        return None
+
+    def account(self, db, cookie):
+        try:
+            cookies = SimpleCookie()
+            cookies.load(cookie or "")
+            token = cookies[COOKIE_NAME].value
+            if not re.fullmatch(r"[A-Za-z0-9_-]{40,100}", token):
+                return None
+        except (KeyError, ValueError, CookieError):
+            return None
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        # Read identity and delegation in one SQLite snapshot. A concurrent return
+        # must never make an old delegated cookie appear to be an unrestricted admin.
+        row = db.execute('''SELECT a.*,c.team_id AS delegated_team_id,t.name AS delegated_team_name
+            FROM sessions s JOIN accounts a ON a.id=s.account_id
+            LEFT JOIN admin_team_sessions c ON c.token_hash=s.token_hash
+            LEFT JOIN teams t ON t.id=c.team_id
+            WHERE s.token_hash=? AND s.expires_at>? AND a.active=1''', (token_hash, self.clock())).fetchone()
+        if row is None:
+            return None
+        actor = dict(row)
+        team_id, team_name = actor.pop('delegated_team_id'), actor.pop('delegated_team_name')
+        context = {'team_id':team_id,'name':team_name} if team_id else None
+        return self.admin_team_access.effective_account(actor,context)
+
+    def require(self, actor, role):
+        if actor is None:
+            raise APIError(401, "请先登录")
+        if actor["role"] != role:
+            raise APIError(403, "当前身份无权访问")
+
+    def issue_session(self, db, account):
+        """Issue a session only after the caller authenticates inside its write transaction."""
+        if account['role'] == 'judge' and self.roadshow_access.owns_account(db, account['id']):
+            self.judge_login_schedule.require_open(db, 'roadshow')
+        token = secrets.token_urlsafe(32)
+        db.execute("DELETE FROM sessions WHERE expires_at<=?", (self.clock(),))
+        db.execute("INSERT INTO sessions VALUES (?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), account["id"], self.clock() + SESSION_SECONDS * 1000))
+        self.audit(db, account, "login")
+        return {"ok": True, **self.admin_team_access.session_view(account, f"{COOKIE_NAME}={token}")}, token, "set"
+
+    def login(self, body, ip):
+        """Verify outside the writer lock, then recheck the proof before issuing a session."""
+        role = body.get("role")
+        if not isinstance(role, str) or role not in {"admin", "judge", "audience", "team"}:
+            raise APIError(400, "登录身份不正确")
+        self.rate_limit(ip, role)
+        code = text_field(body.get("code"), "邀请码", 160, True)
+        admin_code = self.shared_login_codes.get('admin')
+        if role == 'team' and admin_code and hmac.compare_digest(code.encode(), admin_code.encode()):
+            role = 'admin'
+        selector = body.get("accountId")
+        if selector is not None and (not isinstance(selector, str) or len(selector) > 80):
+            raise APIError(400, "登录身份不正确")
+        with self.db() as db:
+            shared_code = self.shared_login_codes.get(role)
+            if selector is None and shared_code and hmac.compare_digest(code.encode(), shared_code.encode()):
+                candidates = db.execute("SELECT id,name FROM accounts WHERE role=? AND active=1 AND id NOT IN (SELECT account_id FROM credential_overrides) ORDER BY created_at,id", (role,)).fetchall()
+                if len(candidates) > 1:
+                    return {"selectAccount": True, "accounts": [{"id": a["id"], "name": a["name"]} for a in candidates]}, None, None
+                if candidates:
+                    selector = candidates[0]["id"]
+            selector = selector or code.split(".", 1)[0]
+            account = db.execute("SELECT * FROM accounts WHERE id=? AND role=? AND active=1", (selector, role)).fetchone()
+        salt = account["salt"] if account else b"gotc-dummy-salt!"
+        # Waiting for a password-check slot must not reserve a SQLite write transaction.
+        with self.login_kdf_slots:
+            hashed = scrypt_hash(code, salt)
+        if not account or not hmac.compare_digest(hashed, account["code_hash"]):
+            raise APIError(401, "邀请码无效或已停用")
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT * FROM accounts WHERE id=? AND role=? AND active=1", (account["id"], role)).fetchone()
+            if not current or not hmac.compare_digest(current["salt"], account["salt"]) or not hmac.compare_digest(current["code_hash"], account["code_hash"]):
+                raise APIError(401, "邀请码无效或已停用")
+            return self.issue_session(db, current)
+
+    def bound_submission_team(self,db,actor):
+        self.require(actor,'team')
+        operator=operator_for(actor)
+        if operator:
+            team=db.execute('SELECT * FROM teams WHERE id=?',(operator['teamId'],)).fetchone()
+            if db.execute("SELECT 1 FROM team_details WHERE team_id=? AND status!='active'",(operator['teamId'],)).fetchone():
+                raise APIError(409,'该队伍已退出或被取消资格，不能继续代管','team_ineligible')
+        else:
+            team=db.execute('SELECT t.* FROM teams t JOIN team_accounts b ON b.team_id=t.id WHERE b.account_id=?',(actor['id'],)).fetchone()
+        if not team:raise APIError(403,'本账号未绑定队伍，请联系组织方')
+        self.team_lifecycle.require_available(db,team['id'])
+        return team
+
+    def team_access(self, db, actor, body):
+        if set(body)!={"teamId", "action"} or (not isinstance(body.get("action"), str) or body["action"] not in {"issue", "rotate", "revoke"}):
+            raise APIError(400, "提交码操作不正确")
+        team_id=self.team_exists(db, body["teamId"])
+        action=body["action"]
+        if action!='revoke':self.team_lifecycle.require_available(db,team_id)
+        account=db.execute("SELECT a.* FROM accounts a JOIN team_accounts t ON t.account_id=a.id WHERE t.team_id=?", (team_id,)).fetchone()
+        before={'id':account['id'],'active':bool(account['active'])} if account else None
+        if action=="issue":
+            if account:
+                raise APIError(409, "该队已有提交身份，请重发提交码")
+            name=db.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()[0]
+            account,code=self.create_account(db, "team", name)
+            db.execute("INSERT INTO team_accounts VALUES (?,?)", (account["id"], team_id))
+        else:
+            if not account:
+                raise APIError(404, "该队尚未创建提交身份")
+            db.execute("DELETE FROM sessions WHERE account_id=?", (account["id"],))
+            if action=="rotate":
+                code=account["id"]+"."+secrets.token_urlsafe(32)
+                salt=secrets.token_bytes(16)
+                db.execute("UPDATE accounts SET salt=?,code_hash=?,active=1 WHERE id=?", (salt, scrypt_hash(code, salt), account["id"]))
+            else:
+                db.execute("UPDATE accounts SET active=0 WHERE id=?", (account["id"],))
+        self.audit(db, actor, "team-access."+action, team_id,{'before':before,'after':{'id':account['id'],'active':action!='revoke'}})
+        result={"ok": True, "teamId": team_id, "id": account["id"], "active": action!="revoke"}
+        if action!="revoke":
+            result["code"]=code
+        return result
+
+    def team_exists(self, db, team_id, *, require_active=False):
+        if not isinstance(team_id, str) or len(team_id) > 80:
+            raise APIError(400, "队伍编号不正确")
+        if not db.execute("SELECT 1 FROM teams WHERE id=?", (team_id,)).fetchone():
+            raise APIError(404, "队伍不存在")
+        if require_active and db.execute("SELECT 1 FROM team_details WHERE team_id=? AND status!='active'", (team_id,)).fetchone():
+            raise APIError(409, "该队伍已退出或被取消资格，不能继续评分或投票", "team_ineligible")
+        return team_id

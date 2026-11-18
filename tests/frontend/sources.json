@@ -1,0 +1,99 @@
+{
+  "index.html": [
+    "frontend/index.html"
+  ],
+  "platform.html": [
+    "frontend/platform.html"
+  ],
+  "teams.html": [
+    "frontend/teams.html"
+  ],
+  "favicon.svg": [
+    "frontend/favicon.svg"
+  ],
+  "styles.css": [
+    "frontend/static/site/styles.css"
+  ],
+  "app.js": [
+    "frontend/static/site/app.js"
+  ],
+  "site-header.js": [
+    "frontend/static/site/header.js"
+  ],
+  "site-header.css": [
+    "frontend/static/site/header.css"
+  ],
+  "team-registration.css": [
+    "frontend/static/registration/registration.css"
+  ],
+  "platform.css": [
+    "frontend/static/platform/platform.css",
+    "frontend/static/platform/workspaces.css",
+    "frontend/static/platform/admin/dashboard.css"
+  ],
+  "platform-finals.css": [
+    "frontend/static/platform/finals/finals.css"
+  ],
+  "platform-roadshow-access.css": [
+    "frontend/static/platform/roadshow/access.css"
+  ],
+  "platform-api-admin.css": [
+    "frontend/static/platform/admin/api.css"
+  ],
+  "platform-draft-recovery.js": [
+    "frontend/static/platform/team/draft-store.js"
+  ],
+  "platform-admin.js": [
+    "frontend/static/platform/admin/directory.js"
+  ],
+  "platform-api-admin.js": [
+    "frontend/static/platform/admin/api.js"
+  ],
+  "platform-roadshow-scoring.js": [
+    "frontend/static/platform/roadshow/scoring.js"
+  ],
+  "team-registration.js": [
+    "frontend/static/registration/directory.js",
+    "frontend/static/registration/admin.js",
+    "frontend/static/registration/profile.js"
+  ],
+  "platform-claims.js": [
+    "frontend/static/platform/claims/receipt.js",
+    "frontend/static/platform/claims/form.js",
+    "frontend/static/platform/claims/application.js",
+    "frontend/static/platform/claims/review.js"
+  ],
+  "platform-finals.js": [
+    "frontend/static/platform/finals/shared.js",
+    "frontend/static/platform/finals/judges.js",
+    "frontend/static/platform/finals/organizer.js",
+    "frontend/static/platform/finals/dashboard.js"
+  ],
+  "platform-roadshow-access.js": [
+    "frontend/static/platform/roadshow/login.js",
+    "frontend/static/platform/roadshow/roster.js"
+  ],
+  "platform.js": [
+    "frontend/static/platform/shell.js",
+    "frontend/static/platform/team/delegation.js",
+    "frontend/static/platform/judging/rules.js",
+    "frontend/static/platform/judging/boards.js",
+    "frontend/static/platform/judging/judges.js",
+    "frontend/static/platform/judging/audience.js",
+    "frontend/static/platform/admin/settings.js",
+    "frontend/static/platform/admin/event.js",
+    "frontend/static/platform/submissions/materials.js",
+    "frontend/static/platform/admin/submissions.js",
+    "frontend/static/platform/team/repository.js",
+    "frontend/static/platform/submissions/uploads.js",
+    "frontend/static/platform/team/submission.js",
+    "frontend/static/platform/team/recovery.js",
+    "frontend/static/platform/submissions/history.js",
+    "frontend/static/platform/team/score.js",
+    "frontend/static/platform/gateway/usage.js",
+    "frontend/static/platform/gateway/keys.js",
+    "frontend/static/platform/gateway/logs.js",
+    "frontend/static/platform/routes.js",
+    "frontend/static/platform/navigation.js"
+  ]
+}
