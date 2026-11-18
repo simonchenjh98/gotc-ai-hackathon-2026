@@ -30,7 +30,8 @@ def main():
             sudo('systemctl', 'start', *SERVICES)
             for service in SERVICES:
                 # Probe as the proxy group to cover traversal and socket permissions.
-                sudo('-u', 'nobody', '-g', 'gotc-proxy', str(project / '.venv/bin/python'),
+                sudo('systemd-run', '--wait', '--collect', '--pipe', '--uid=nobody', '--gid=gotc-proxy',
+                     '--working-directory=' + str(project), str(project / '.venv/bin/python'),
                      '-Bc', 'from ops.deploy.install import wait_for_health; import sys; '
                      'wait_for_health("http://localhost/readyz", sys.argv[1])',
                      f'/run/{service}/http.sock')
