@@ -6,6 +6,7 @@ from pathlib import Path
 import secrets
 import sqlite3
 
+from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
 
 MAX_REVISION=9007199254740991
@@ -88,7 +89,7 @@ class WriteConflicts:
     def admin_config(self,db):
         return {**self.s.config(db),'writeRevisions':self.settings_revisions(db)}
 
-    def check_settings(self,db,body):
+    def check_settings(self,db,body: inputs.EventSettings):
         allowed=set().union(*SETTINGS_GROUPS.values())
         fields=set(body)-{'expectedRevisions'}
         if not fields or not fields.issubset(allowed):raise APIError(400,'设置字段不正确')

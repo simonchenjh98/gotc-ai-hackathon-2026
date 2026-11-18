@@ -1,14 +1,23 @@
 """SQLite usage ledger, billing reports and bounded request content logs."""
 
 import csv
+from contextlib import contextmanager
 import io
 import json
+import logging
+import re
+import sqlite3
+import threading
+import tempfile
 import time
 import zlib
 
+from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
+from .content_store import ContentStore
 from .config import settings
 from .gateway_pricing import quote
+from .protocol_errors import safe_header
 from .requests import client_ip
 from .usage import USAGE_FIELDS
 
@@ -48,7 +57,10 @@ CREATE TABLE IF NOT EXISTS api_logs (
 
 DAY_MS = 86_400_000
 RESPONSE_LOG_CAP = 16 * 1024 * 1024  # bytes of a reply kept for the content viewer; requests are already capped by BODY_LIMIT
-SECRET_HEADERS = {"authorization", "x-api-key", "cookie", "proxy-authorization", "sec-websocket-protocol"}
+CAPTURE_BLOCK = 64 * 1024
+CONTENT_HEADERS = {"content-type", "content-length", "accept", "user-agent", "x-trace"}
+PRUNE_INTERVAL = 60.0
+LOGGER = logging.getLogger("gotc.maintenance")
 
 
 def initialize_schema(db):
@@ -78,6 +90,57 @@ def unpack(blob):
     return zlib.decompress(blob).decode("utf-8", "replace")
 
 
+def compress_capture(blocks):
+    """Consume retained blocks in order without materializing another copy of the full reply."""
+    compressor = zlib.compressobj(6)
+    result = io.BytesIO()
+    blocks.reverse()
+    while blocks:
+        block = memoryview(blocks.pop())
+        for offset in range(0, len(block), CAPTURE_BLOCK):
+            result.write(compressor.compress(block[offset:offset + CAPTURE_BLOCK]))
+    result.write(compressor.flush())
+    return result.getvalue()
+
+
+@contextmanager
+def compressed_request(call):
+    """Keep validated spooled requests on disk throughout compression and SQLite insertion."""
+    source = call.pop("request_file", None)
+    if source is None:
+        size = len(call["request"])
+        encoded = zlib.compress(call["request"], 6)
+        call["request"] = b""
+        yield encoded, size
+        return
+    with source, tempfile.TemporaryFile() as encoded:
+        source.seek(0)
+        compressor = zlib.compressobj(6)
+        size = 0
+        while block := source.read(CAPTURE_BLOCK):
+            size += len(block)
+            encoded.write(compressor.compress(block))
+        encoded.write(compressor.flush())
+        if size != call["request_bytes"]:
+            raise OSError("Incomplete spooled request capture")
+        source.close()
+        yield encoded, size
+
+
+def _error_summary(error):
+    # Providers may echo the user prompt in an error. Long-lived billing metadata holds
+    # classifications and known local diagnostics; the private context viewer owns bodies.
+    if not error["type"]:
+        return ""
+    detail = error.get("detail", "")
+    if error.get("kind") == "forbidden" and detail.startswith("命中屏蔽词："):
+        return detail[:160]
+    diagnostic = error.get("upstream_message", "")
+    if re.fullmatch(r"SSE event buffer exceeded [0-9]{1,10} bytes", diagnostic):
+        return diagnostic
+    return error.get("code") or error["type"]
+
+
 def task_price(task, payload, headers):
     result = quote(task["pricing_snapshot"], request=task.get("request"), response=payload,
                    headers=headers, started_at=task.get("requested_at"), trusted_quantities=task.get("quantities"))
@@ -91,7 +154,34 @@ class UsageLedger:
     def __init__(self, service, currency):
         self.service = service
         self.currency = currency
-        self.last_prune = 0.0
+        self.content = ContentStore(service.data_dir)
+        self._stop = threading.Event()
+        self._worker = None
+
+    def start(self):
+        if self._worker and self._worker.is_alive():
+            return
+        self._stop.clear()
+        self._worker = threading.Thread(target=self._maintain, name="gateway-content-retention", daemon=True)
+        self._worker.start()
+
+    def stop(self):
+        if self._worker:
+            self._stop.set()
+            self._worker.join()
+            self._worker = None
+
+    def _maintain(self):
+        while not self._stop.is_set():
+            try:
+                with self.service.db() as db:
+                    policy = settings(db)
+                with self.content.connection() as content:
+                    self.content.prune(content, policy, now_ms())
+            except (sqlite3.Error, OSError):
+                LOGGER.error('{"event":"content_retention_failed"}')
+            self._stop.wait(PRUNE_INTERVAL)
+
 
     def billing_summary(self, db, team_id=None, since=0, key_id=None):
         clause, values = "", [since]
@@ -126,8 +216,8 @@ class UsageLedger:
             params.append(body["keyId"])
         return where, params
 
-    def stats(self, db, body):
-        where, params = self.scope(db, body, {"teamId", "keyId", "days", "granularity"})
+    def stats(self, db, body: inputs.StatsQuery):
+        where, params = self.scope(db, body, inputs.StatsQuery.__optional_keys__)
         granularity = body.get("granularity", "day")
         if granularity not in ("day", "hour"):
             raise APIError(400, "统计粒度只能是 day 或 hour")
@@ -162,8 +252,8 @@ class UsageLedger:
             "daily": rows(f"SELECT {bucket} AS day, {sums} FROM api_usage u WHERE {clause} GROUP BY day ORDER BY day"),
         }
 
-    def logs(self, db, body):
-        where, params = self.scope(db, body, {"teamId", "keyId", "beforeId", "errorsOnly", "model", "requestId"})
+    def logs(self, db, body: inputs.LogQuery):
+        where, params = self.scope(db, body, inputs.LogQuery.__optional_keys__)
         for field, column in (("model", "u.model"), ("requestId", "u.request_id")):
             value = body.get(field)
             if value not in (None, ""):
@@ -186,9 +276,9 @@ class UsageLedger:
           u.currency, u.billing_status AS billingStatus, u.billing_details AS billingDetails,
           u.upstream_request_id AS upstreamRequestId, u.request_id AS requestId,
           u.duration_ms AS durationMs, u.user_agent AS userAgent, u.incomplete, u.estimated, u.error_type AS errorType,
-          u.error_phase AS errorPhase, u.error_owner AS errorOwner, u.upstream_status AS upstreamStatus, u.error_message AS errorMessage, EXISTS(SELECT 1 FROM api_logs l WHERE l.usage_id=u.id) AS hasContent,
-          (SELECT l.request_bytes FROM api_logs l WHERE l.usage_id=u.id) AS requestBytes
+          u.error_phase AS errorPhase, u.error_owner AS errorOwner, u.upstream_status AS upstreamStatus, u.error_message AS errorMessage
           FROM api_usage u JOIN api_keys k ON k.id=u.key_id JOIN teams t ON t.id=u.team_id {clause} ORDER BY u.id DESC LIMIT 50""", params)]
+        self.content.annotate(items)
         return {"items": items, "more": len(items) == 50, "currency": self.currency()}
 
     def export(self, db):
@@ -207,27 +297,18 @@ class UsageLedger:
         return ("\ufeff" + out.getvalue()).encode("utf-8")
 
     def prune_logs(self, db, settings, everything=False):
-        """Delete stored request content past the retention period, then oldest first above the size cap.
-        Call metadata (tokens, cost, status) is retained for usage statistics."""
         if everything:
-            return db.execute("DELETE FROM api_logs").rowcount
-        cutoff = now_ms() - settings["logRetentionHours"] * 3600_000
-        deleted = db.execute("DELETE FROM api_logs WHERE usage_id IN (SELECT id FROM api_usage WHERE at<?)", (cutoff,)).rowcount
-        cap = settings["logMaxMB"] * 1048576
-        total = db.execute("SELECT COALESCE(SUM(length(request)+length(response)),0) FROM api_logs").fetchone()[0]
-        while total > cap:
-            rows = db.execute("SELECT usage_id, length(request)+length(response) AS size FROM api_logs ORDER BY usage_id LIMIT 500").fetchall()
-            if not rows:
-                break
-            ids = []
-            for r in rows:
-                ids.append(r["usage_id"])
-                total -= r["size"]
-                if total <= cap:
-                    break
-            db.execute(f"DELETE FROM api_logs WHERE usage_id IN ({','.join('?' * len(ids))})", ids)
-            deleted += len(ids)
-        return deleted
+            # Clearing invalidates optional content still being compressed after its
+            # metadata commit. Serialize with the event settings transaction.
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('keys.contentEpoch',json_quote(lower(hex(randomblob(16)))))")
+            return self.content.clear()
+        with self.content.connection() as content:
+            return self.content.prune(content, settings, now_ms())
+
+    @staticmethod
+    def _content_epoch(db):
+        row = db.execute("SELECT value FROM settings WHERE key='keys.contentEpoch'").fetchone()
+        return row[0] if row else ""
 
     def record(self, handler, call):
         """Store the call once, before the final bytes are sent where possible, so history is never behind the client."""
@@ -274,6 +355,13 @@ class UsageLedger:
         currency = (billing or {}).get("currency", call.get("currency", "USD"))
         error = call.get("error") or {"type": "", "phase": "", "owner": "", "upstream_status": None, "upstream_message": "", "message": ""}
         at = now_ms()
+        generation = None
+        if call["log"]:
+            try:
+                with self.content.connection() as content:
+                    generation = self.content.generation(content)
+            except (sqlite3.Error, OSError):
+                LOGGER.error('{"event":"optional_content_unavailable"}')
         with self.service.db() as db:
             usage_id = db.execute("""INSERT INTO api_usage(key_id,team_id,at,model,input_tokens,output_tokens,cache_write_tokens,cache_read_tokens,
               cost_micro,status,path,stream,duration_ms,user_agent,incomplete,estimated,error_type,error_phase,error_owner,
@@ -283,21 +371,36 @@ class UsageLedger:
                                                      call["status"], call["path"], int(call["stream"]), int((time.monotonic() - call["started"]) * 1000),
                                                      (handler.headers.get("User-Agent") or "")[:300], int(incomplete), int(estimated),
                                                      error["type"], error["phase"], error["owner"], error["upstream_status"],
-                                                     (error.get("detail") or error["upstream_message"] or error["message"])[:500], usage[4], call.get("requested_model", "")[:100],
+                                                     _error_summary(error), usage[4], call.get("requested_model", "")[:100],
                                                      call.get("stream_first_ms") if call["stream"] else call.get("first_token_ms"),
                                                      client_ip(handler), call.get("upstream_request_id", "")[:100], call["request_id"])).lastrowid
             db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (at, call["key"]["id"]))
             db.execute("UPDATE api_usage SET currency=?,billing_status=?,billing_details=? WHERE id=?",
                        (currency, "pending" if (billing or {}).get("pending") else "settled",
                         json.dumps((billing or {}).get("details", {}), ensure_ascii=False), usage_id))
-            if call["log"] and time.monotonic() - self.last_prune > 600:  # amortised: at most every 10 minutes
-                self.last_prune = time.monotonic()
-                self.prune_logs(db, call.get("settings") or settings(db))
-            if call["log"]:
-                headers = {k: v[:500] for k, v in handler.headers.items() if k.lower() not in SECRET_HEADERS}
-                response = b"".join(call["response"])[:RESPONSE_LOG_CAP]
-                # Full context, compressed: agent requests resend the whole conversation and compress ~5-10x.
-                db.execute("INSERT INTO api_logs VALUES (?,?,?,?,?,?)", (usage_id, json.dumps(headers, ensure_ascii=False),
-                           zlib.compress(call["request"], 6), zlib.compress(response, 6), len(call["request"]), call["size"]))
-        # Only suppress the finalization retry after the entire transaction has committed.
+            content_epoch = self._content_epoch(db) if call["log"] else None
+        # Optional content storage never owns the billing commit or replays a usage row.
         call["recorded"] = True
+        if generation is None:
+            capture = call.pop("request_file", None)
+            if capture is not None:
+                capture.close()
+            return
+        secrets = self.service.keys.error_secrets(call)
+        headers = {k: safe_header(v, secrets, limit=500) for k, v in handler.headers.items() if k.lower() in CONTENT_HEADERS}
+        try:
+            with compressed_request(call) as (request, request_size):
+                response = compress_capture(call["response"])
+                # Serialize with content clear and pruning in the sidecar, then read the
+                # committed event policy. Optional payload I/O never takes the event write lock.
+                with self.service.db() as db, self.content.connection() as content:
+                    content.execute("BEGIN IMMEDIATE")
+                    policy = settings(db)
+                    if (not policy["logContent"] or self._content_epoch(db) != content_epoch
+                            or self.content.generation(content) != generation):
+                        return
+                    self.content.insert(content, usage_id, call["request_id"], at, json.dumps(headers, ensure_ascii=False),
+                                        request, response, request_size, call["size"])
+                    self.content.prune(content, policy, now_ms())
+        except (sqlite3.Error, OSError):
+            LOGGER.error('{"event":"optional_content_write_failed"}')

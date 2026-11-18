@@ -82,6 +82,8 @@ class RepositoryBackups:
         if not db.execute("SELECT 1 FROM repository_backup_migrations WHERE name='summary_v1'").fetchone():
             self.compact_prior_manifests(db)
             db.execute("INSERT OR IGNORE INTO repository_backup_migrations VALUES ('summary_v1')")
+
+    def recover_interrupted(self, db):
         db.execute("UPDATE repository_backups SET status=CASE WHEN attempts>=? THEN 'failed' ELSE 'queued' END,error='worker_interrupted' WHERE status='running'",(self.MAX_ATTEMPTS,))
 
     def compact_prior_manifests(self,db):
@@ -106,7 +108,7 @@ class RepositoryBackups:
 
     def enqueue(self,db,team_id,version,request_id):
         seal=self.s.repositories.seals.source_for_version(db,team_id,version)
-        if seal and os.environ.get('GOTC_REPO_BACKUP_ENABLED')=='1':
+        if seal and self.s.credentials.repository_settings().get('GOTC_REPO_BACKUP_ENABLED')=='1':
             db.execute("INSERT OR IGNORE INTO repository_backups(team_id,version,request_id,status,sha) VALUES (?,?,?,'queued',?)",(team_id,version,request_id,seal['sha']))
         return self.for_version(db,team_id,version)
 
@@ -436,8 +438,10 @@ class RepositoryBackups:
         finally:self.lock.release()
 
     def start(self):
-        if os.environ.get('GOTC_REPO_BACKUP_ENABLED')!='1' or self.thread and self.thread.is_alive():return
+        if self.s.credentials.repository_settings().get('GOTC_REPO_BACKUP_ENABLED')!='1' or self.thread and self.thread.is_alive():return
         self.stopping.clear()
+        with self.s.db() as db:
+            self.recover_interrupted(db)
         # Recover uncommitted private publications and interrupted scratch only at startup.
         self.directory(self.root/'scratch');self.directory(self.root/'artifacts')
         with self.s.db() as db:known={r[0] for r in db.execute('SELECT DISTINCT artifact_id FROM repository_backups WHERE artifact_id IS NOT NULL')}

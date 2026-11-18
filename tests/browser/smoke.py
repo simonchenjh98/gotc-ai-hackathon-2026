@@ -2,7 +2,9 @@
 import argparse
 from contextlib import contextmanager
 import json
+import logging
 from pathlib import Path
+import re
 from statistics import median
 import sys
 from tempfile import TemporaryDirectory
@@ -26,7 +28,14 @@ def local_event(source):
         static = source
 
     with TemporaryDirectory(prefix="gotc-browser-") as data:
-        service = EventService(data_dir=data, static_root=static, origin="http://127.0.0.1")
+        if (source / "tools/build_frontend.py").is_file():
+            from ops.deploy.install import FILES
+            from tools.build_frontend import build_frontend
+            compiled = Path(data) / "public"
+            inputs = [name.removeprefix("frontend/") for name in FILES if name.startswith("frontend/")]
+            build_frontend(static, compiled, inputs)
+            static = compiled
+        service = EventService(data_dir=Path(data)/"private", static_root=static, origin="http://127.0.0.1")
         with EventHTTPServer(("127.0.0.1", 0), service) as server:
             service.origin = f"http://127.0.0.1:{server.server_port}"
             worker = Thread(target=server.serve_forever, daemon=True)
@@ -89,6 +98,7 @@ def benchmark(browser, service, runs):
                 .map(r => [new URL(r.name).pathname, r.decodedBodySize])
                 .sort()""")
             assert resources and all(size > 0 for _, size in resources), resources
+            assert all("/route-assets." not in path for path, _ in resources), "Signed-out team loaded the route manifest"
             if scripts is not None:
                 assert resources == scripts, "Script set changed between cold loads"
             scripts = resources
@@ -106,6 +116,7 @@ def smoke(browser, service):
     ids = participants(service)
     base = service.origin + service.base_path + "/"
     passed = []
+    organizer = None
 
     @contextmanager
     def visit(role=None, **options):
@@ -114,7 +125,11 @@ def smoke(browser, service):
             if role:
                 page.goto(base + "platform.html#" + role)
                 form = page.locator("#login-form")
-                form.locator("input[name=code]").fill(ids[role])
+                if role == "admin":
+                    from pyotp import TOTP
+                    form.locator("input[name=username]").fill(organizer["username"])
+                    form.locator("input[name=totp]").fill(TOTP(organizer["seed"]).now())
+                form.locator("input[name=code]").fill(organizer["code"] if role == "admin" else ids[role])
                 with page.expect_response(lambda r: urlsplit(r.url).path.endswith("/api/login")) as login:
                     form.locator("button[type=submit]").click()
                 assert login.value.status == 200, f"{role} login failed"
@@ -142,6 +157,9 @@ def smoke(browser, service):
         checklist = page.locator("input[data-check]").first
         checklist.check()
         assert "1 / 6" in page.locator("#check-count").inner_text()
+        for img in page.locator("main img[loading=lazy]").all():
+            img.scroll_into_view_if_needed()
+            img.evaluate("node => node.decode()")
         page.locator('a[href$="teams.html"]').filter(has_text="单独").click()
         page.locator("#registration-main").wait_for()
         page.get_by_role("heading", name="Browser Fixture Team").wait_for()
@@ -219,6 +237,20 @@ def smoke(browser, service):
         go(page, "team", "#jump-team-project-intro")
         passed.append("team submission workbench, AI panel, team profile and private score refresh")
 
+    # Exercise the pre-enrollment portal first, then activate the named account
+    # in the same disposable event and sign in with a real current TOTP.
+    with visit() as page:
+        page.goto(base + "platform.html#team")
+        team_login = page.locator("#login-form")
+        team_login.locator('a[href="#admin"]').click()
+        form = page.locator("#login-form")
+        form.locator("[name=legacyAdmin]").check()
+        form.locator("[name=code]").fill(ids["admin"])
+        form.locator("button[type=submit]").click()
+        page.locator("#settings-form").wait_for()
+        passed.append("contestant entry links to organizer portal; pre-enrollment organizer signs in explicitly")
+    from fixture import activate_organizer
+    organizer = activate_organizer(service)
     with visit("admin") as page:
         page.locator("#settings-form").wait_for()
         go(page, "admin-roadshow", "[data-roadshow-roster]")
@@ -250,17 +282,21 @@ def smoke(browser, service):
         page.goto(base + "platform.html#team")
         page.locator("#login-form").wait_for()
         delayed = []
-        page.route("**/claims/application.js", lambda route: delayed.append(route))
-        with page.expect_request("**/claims/application.js"):
+        claim_asset = re.compile(r"/claims/application(?:[.-][a-f0-9]{8,64})?\.js(?:\?.*)?$")
+        page.route(claim_asset, lambda route: delayed.append(route))
+        with page.expect_request(claim_asset):
             page.evaluate("location.hash = 'claim'")
         go(page, "judge", "#login-form")
         assert len(delayed) == 1, "Claim module request did not start"
-        with page.expect_event("requestfinished", predicate=lambda r: r.url.endswith("/claims/application.js")):
+        with page.expect_event("requestfinished", predicate=lambda r: bool(claim_asset.search(r.url))):
             delayed[0].continue_()
         page.evaluate("() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done)))")
         assert page.locator("#login-form h2").inner_text() == "专业评委登录"
         assert page.locator("#claim-request-form").count() == 0
         go(page, "claim", "#claim-request-form")
+        entries = page.evaluate(r"""() => [...document.scripts].filter(s => /route-assets\./.test(s.src))
+            .map(s => ({ integr: s.integrity, loads: performance.getEntriesByName(s.src).length }))""")
+        assert len(entries) == 1 and entries[0]["loads"] == 1 and entries[0]["integr"].startswith("sha384-")
         passed.append("delayed claim module cannot replace newer judge login; returning to claim succeeds")
     return passed
 
@@ -274,6 +310,8 @@ def main():
     mode.add_argument("--benchmark-only", action="store_true")
     mode.add_argument("--smoke-only", action="store_true")
     args = parser.parse_args()
+    # The JSON report is machine-readable. Production access logging has its own tests.
+    logging.getLogger("gotc.requests").disabled = True
     if args.runs < 1:
         parser.error("--runs must be at least 1")
     with local_event(args.source.resolve()) as service, sync_playwright() as pw:

@@ -5,19 +5,19 @@ The operation marker permits recovery of a lost create response without adopting
 """
 import hashlib
 import json
-import os
 import re
 import secrets
-import socket
 import threading
 import time
 from collections import deque
 from contextlib import contextmanager
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
-from urllib.request import Request, build_opener, HTTPRedirectHandler
+from urllib.parse import quote
 
+import httpx
+
+from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
+
 
 PREVIEW_MS = 5 * 60 * 1000
 SCHEMA = '''
@@ -34,11 +34,6 @@ CREATE TABLE IF NOT EXISTS repository_previews (
  id TEXT PRIMARY KEY, team_id TEXT NOT NULL REFERENCES teams(id), session_hash TEXT NOT NULL,
  binding_revision INTEGER NOT NULL, sha TEXT NOT NULL, expires_at INTEGER NOT NULL);
 '''
-
-
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
 
 
 class UpstreamError(APIError):
@@ -97,8 +92,23 @@ class Provider:
     def __init__(self, name, organization, token, branch, enabled):
         self.name, self.organization, self.token, self.branch = name, organization, token, branch
         self.enabled = enabled
+        self._http = None
+        self._client_lock = threading.Lock()
         self.origin = 'https://api.github.com' if name == 'github' else 'https://gitee.com/api/v5'
         self.web = 'https://github.com' if name == 'github' else 'https://gitee.com'
+
+    @property
+    def http(self):
+        with self._client_lock:
+            if self._http is None:
+                self._http = httpx.Client(timeout=8.0, follow_redirects=False)
+            return self._http
+
+    def close(self):
+        with self._client_lock:
+            if self._http is not None:
+                self._http.close()
+                self._http = None
 
     def request(self, method, path, body=None):
         if not self.enabled:
@@ -106,27 +116,27 @@ class Provider:
         if not path.startswith('/') or path.startswith('//') or '?' in path or '#' in path:
             raise ValueError('Provider paths must be fixed relative API paths')
         headers = {'Accept': 'application/vnd.github+json' if self.name == 'github' else 'application/json',
+                   'Accept-Encoding': 'identity',
                    'User-Agent': 'GOTC-Repository-Service', 'Content-Type': 'application/json'}
         url = self.origin + path
+        headers['Authorization'] = 'Bearer ' + self.token
         if self.name == 'github':
-            headers.update({'Authorization': 'Bearer ' + self.token, 'X-GitHub-Api-Version': '2022-11-28'})
-        elif method == 'GET':
-            url += '?' + urlencode({'access_token': self.token})
-        else:
-            body = {**(body or {}), 'access_token': self.token}
+            headers['X-GitHub-Api-Version'] = '2022-11-28'
         data = json.dumps(body).encode() if body is not None else None
         try:
-            with build_opener(NoRedirect()).open(Request(url, data=data, headers=headers, method=method), timeout=8) as response:
-                raw = response.read(2 * 1024 * 1024 + 1)
-                if len(raw) > 2 * 1024 * 1024:
-                    raise UpstreamError()
-                return response.status, json.loads(raw) if raw else {}
-        except HTTPError as error:
-            status=error.code
-            error.close()
-            raise UpstreamError(status) from None
-        except (URLError, TimeoutError, socket.timeout, ValueError, OSError):
-            raise UpstreamError() from None
+            with self.http.stream(method, url, headers=headers, content=data) as response:
+                if not 200 <= response.status_code < 300:
+                    raise UpstreamError(response.status_code)
+                raw = bytearray()
+                for chunk in response.iter_raw(65536):
+                    if len(raw) + len(chunk) > 2 * 1024 * 1024:
+                        raise UpstreamError()
+                    raw.extend(chunk)
+                return response.status_code, json.loads(raw) if raw else {}
+        except (httpx.HTTPError, ValueError, OSError):
+            # The transport exception can retain the original authenticated request.
+            pass
+        raise UpstreamError()
 
     def path(self, row):
         return '/repos/' + quote(row['organization'], safe='') + '/' + quote(row['slug'], safe='')
@@ -216,18 +226,24 @@ class Repositories:
         self.seals = RepositorySeals(self)
         self.operations = ProviderOperations()
         self.providers = {}
+        settings = service.credentials.repository_settings()
         for name, default in [('github', 'GOTC-AI-HACKATHON'), ('gitee', 'gotc-ai-hackathon')]:
             prefix = 'GOTC_REPO_' + name.upper()
-            org = os.environ.get(prefix + '_ORG', default)
-            branch = os.environ.get(prefix + '_BRANCH', 'main')
+            org = settings.get(prefix + '_ORG', default)
+            branch = settings.get(prefix + '_BRANCH', 'main')
             valid = bool(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,99}', org) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,99}', branch))
-            token = os.environ.get(prefix + '_TOKEN', '')
-            enabled = valid and bool(token) and (name != 'gitee' or os.environ.get(prefix + '_ENABLED') == '1')
+            token = settings.get(prefix + '_TOKEN', '')
+            enabled = valid and bool(token) and (name != 'gitee' or settings.get(prefix + '_ENABLED') == '1')
             self.providers[name] = Provider(name, org, token, branch, enabled)
         # Opt-in: provision immediately when a team applies, without waiting for an admin click.
-        self.auto_approve = os.environ.get('GOTC_REPO_AUTO_APPROVE') == '1'
-        join = os.environ.get('GOTC_REPO_GITEE_JOIN_URL', '')
+        self.auto_approve = settings.get('GOTC_REPO_AUTO_APPROVE') == '1'
+        join = settings.get('GOTC_REPO_GITEE_JOIN_URL', '')
         self.join_urls = {'gitee': join if re.fullmatch(r'https://gitee\.com/[A-Za-z0-9._~:/?#\[\]@!$&\'()*+,;=%-]{1,400}', join) else ''}
+
+    def close(self):
+        for provider in self.providers.values():
+            if isinstance(provider, Provider):
+                provider.close()
 
     def initialize(self, db):
         db.executescript(SCHEMA)
@@ -318,7 +334,7 @@ class Repositories:
                 db.execute('BEGIN IMMEDIATE')
                 actor = self.identity(cookie, expected_login_id, role, db)
                 team = self.s.bound_submission_team(db, actor)
-                if set(body) != {'provider', 'usernames'} or not isinstance(body['provider'], str) or body['provider'] not in self.providers:
+                if not inputs.accepts_fields(body, inputs.RepositoryApplication) or not isinstance(body['provider'], str) or body['provider'] not in self.providers:
                     raise APIError(400, '仓库申请字段不正确')
                 p = self.providers[body['provider']]
                 if not p.enabled:
@@ -348,7 +364,7 @@ class Repositories:
         raise APIError(404, '仓库路径不存在')
 
     def provision(self, reconcile, body, cookie, login_id):
-        if set(body) != {'teamId', 'expectedRevision', 'usernamesVerified'} or body['usernamesVerified'] is not True or type(body['expectedRevision']) is not int:
+        if not inputs.accepts_fields(body, inputs.RepositoryApproval) or body['usernamesVerified'] is not True or type(body['expectedRevision']) is not int:
             raise APIError(400, '管理员须明确确认已核对全部用户名归属，并提供当前修订号')
         # Inspect identity/provider without a writer lock, then acquire the shared permit.
         # _provision rechecks the revision and identity atomically before changing state.

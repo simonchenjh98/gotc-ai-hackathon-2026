@@ -248,6 +248,7 @@ class ClaimsTests(unittest.TestCase):
         team=self.team()
         with self.service.db() as db:
             for table in ['claim_memberships','claim_requests','claim_people']:db.execute('DROP TABLE '+table)
+            db.execute("PRAGMA user_version=0")  # Reproduce an unnumbered predecessor.
         old=self.service
         for _ in range(2):self.service=EventService(old.data_dir,base_path=old.base_path,origin=old.origin,static_root=old.root)
         self.server.service=self.service

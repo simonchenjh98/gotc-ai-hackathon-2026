@@ -1,361 +1,263 @@
-"""Bounded RFC 6455 bridge for the two documented Gitee speech routes."""
+"""ASGI speech sessions with Gitee's realtime synthesis and transcription services."""
 from __future__ import annotations
 
-import base64
-import hashlib
-import http.client
+import asyncio
 import json
-import os
-import socket
 import ssl
-import struct
-import threading
 import unicodedata
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
+from starlette.responses import JSONResponse
+from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
+from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed, WebSocketException
+
+from backend.gotc.errors import APIError
 from . import usage
+from .asgi_context import GatewayContext
 from .config import resolve
 from .gateway_media import MediaGateway
 from .gateway_pricing import PricingError, quote
-from .protocol_errors import GatewayError, redact_error_payload
+from .protocol_errors import ClientGone, GatewayError, error_body, redact_error_payload
 from .requests import gateway_json, reject_stored_file_references, request_text, validate_json_depth
 
-GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
-FRAME_LIMIT = 1024 * 1024
+MESSAGE_LIMIT = 1024 * 1024
 SESSION_LIMIT = 64 * 1024 * 1024
 SESSION_SECONDS = 300
 IDLE_SECONDS = 60
+SPEECH_PATHS = frozenset(('/v1/audio/speech/ws', '/v1/audio/transcriptions/ws'))
+PROVIDER_TLS = ssl.create_default_context()
+PROVIDER_TLS.minimum_version = ssl.TLSVersion.TLSv1_2
 
 
-class ProtocolError(ValueError):
-    pass
+class ProviderConnect(connect):
+    def process_redirect(self, exc):
+        # A credential is scoped to the configured provider endpoint, including its path.
+        return exc
 
 
-def exact(stream, count):
-    chunks = bytearray()
-    while len(chunks) < count:
-        part = stream.read(count - len(chunks))
-        if not part:
-            raise EOFError('WebSocket peer closed')
-        chunks.extend(part)
-    return bytes(chunks)
-
-
-def read_frame(stream, masked):
-    a, b = exact(stream, 2)
-    final, opcode, has_mask, length = bool(a & 128), a & 15, bool(b & 128), b & 127
-    if a & 112 or has_mask != masked or opcode not in (0, 1, 2, 8, 9, 10):
-        raise ProtocolError('Invalid WebSocket frame')
-    if length == 126:
-        length = struct.unpack('!H', exact(stream, 2))[0]
-        if length < 126:
-            raise ProtocolError('Noncanonical frame length')
-    elif length == 127:
-        length = struct.unpack('!Q', exact(stream, 8))[0]
-        if length < 65536 or length >> 63:
-            raise ProtocolError('Invalid frame length')
-    if length > FRAME_LIMIT or (opcode >= 8 and (not final or length > 125)):
-        raise ProtocolError('WebSocket frame too large')
-    mask = exact(stream, 4) if has_mask else b''
-    data = exact(stream, length)
-    if mask:
-        data = bytes(c ^ mask[i % 4] for i, c in enumerate(data))
-    if opcode == 8 and len(data) == 1:
-        raise ProtocolError('Invalid close frame')
-    if opcode == 8 and data:
-        code = struct.unpack('!H', data[:2])[0]
-        if code not in {1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014} and not 3000 <= code <= 4999:
-            raise ProtocolError('Invalid WebSocket close code')
-        try:
-            data[2:].decode('utf-8', errors='strict')
-        except UnicodeError:
-            raise ProtocolError('Invalid WebSocket close reason') from None
-    return final, opcode, data
-
-
-def frame(opcode, payload, masked=False):
-    n = len(payload)
-    prefix = bytes([128 | opcode, (128 if masked else 0) | (n if n < 126 else 126 if n < 65536 else 127)])
-    if n >= 126:
-        prefix += struct.pack('!H' if n < 65536 else '!Q', n)
-    if masked:
-        mask = os.urandom(4)
-        return prefix + mask + bytes(c ^ mask[i % 4] for i, c in enumerate(payload))
-    return prefix + payload
-
-
-def messages(stream, masked):
-    """Reassemble a bounded message while preserving control frames."""
-    pending, kind, total = bytearray(), None, 0
-    while True:
-        final, opcode, payload = read_frame(stream, masked)
-        total += len(payload)
-        if total > SESSION_LIMIT:
-            raise ProtocolError('WebSocket session byte limit exceeded')
-        if opcode >= 8:
-            yield opcode, payload
-            if opcode == 8:
-                return
-            continue
-        if opcode:
-            if kind is not None:
-                raise ProtocolError('Interleaved fragmented messages')
-            kind = opcode
-        elif kind is None:
-            raise ProtocolError('Unexpected continuation')
-        pending.extend(payload)
-        if len(pending) > FRAME_LIMIT:
-            raise ProtocolError('WebSocket message too large')
-        if final:
-            payload = bytes(pending)
-            if kind == 1:
-                payload.decode('utf-8', errors='strict')
-            yield kind, payload
-            pending, kind = bytearray(), None
-
-
-def validate_handshake(handler):
-    for name in ('Upgrade', 'Connection', 'Sec-WebSocket-Version', 'Sec-WebSocket-Key',
-                 'Content-Length', 'Authorization', 'x-api-key', 'Sec-WebSocket-Protocol'):
-        if len(handler.headers.get_all(name, [])) > 1:
-            raise ProtocolError('Duplicate WebSocket handshake field')
-    if handler.command != 'GET' or handler.headers.get('Upgrade', '').lower() != 'websocket':
-        raise ProtocolError('WebSocket Upgrade required')
-    if 'upgrade' not in {v.strip().lower() for v in handler.headers.get('Connection', '').split(',')}:
-        raise ProtocolError('Connection Upgrade required')
-    if handler.headers.get('Sec-WebSocket-Version') != '13':
-        raise ProtocolError('WebSocket version 13 required')
-    if handler.headers.get('Transfer-Encoding') or handler.headers.get('Content-Length', '0') != '0':
-        raise ProtocolError('WebSocket handshake must not contain a body')
-    nonce = handler.headers.get('Sec-WebSocket-Key', '')
-    try:
-        if len(base64.b64decode(nonce, validate=True)) != 16:
-            raise ValueError()
-    except ValueError:
-        raise ProtocolError('Invalid WebSocket key') from None
-    return nonce
-
-
-def open_upstream(upstream, path, model, protocols):
-    """No redirects, cookie forwarding or caller-selected host/query parameters."""
+def provider_connection(upstream, path, model, protocols):
     parts = urlsplit(upstream['url'])
-    sock = socket.create_connection((parts.hostname, parts.port or (443 if parts.scheme == 'https' else 80)), timeout=10)
-    try:
-        if parts.scheme == 'https':
-            context = ssl.create_default_context()
-            # Upstream model providers all support TLS 1.2+; never negotiate TLS 1.0/1.1.
-            context.minimum_version = ssl.TLSVersion.TLSv1_2
-            sock = context.wrap_socket(sock, server_hostname=parts.hostname)
-        sock.settimeout(IDLE_SECONDS)
-        nonce = base64.b64encode(os.urandom(16)).decode()
-        target = parts.path.rstrip('/') + path.removeprefix('/v1') + '?' + urlencode({'model': model})
-        lines = [f'GET {target} HTTP/1.1', f'Host: {parts.netloc}', 'Upgrade: websocket', 'Connection: Upgrade',
-                 'Sec-WebSocket-Version: 13', f'Sec-WebSocket-Key: {nonce}',
-                 'Authorization: Bearer ' + upstream['key'], 'User-Agent: gotc-gateway/1.0']
-        if protocols:
-            lines.append('Sec-WebSocket-Protocol: ' + ', '.join(protocols))
-        sock.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode('ascii'))
-        response = http.client.HTTPResponse(sock)
-        response.begin()
-        expected = base64.b64encode(hashlib.sha1((nonce + GUID).encode()).digest()).decode()
-        if response.status != 101 or response.headers.get('Sec-WebSocket-Accept') != expected:
-            raise ProtocolError('Upstream rejected WebSocket handshake')
-        if response.headers.get('Upgrade', '').lower() != 'websocket' or response.headers.get('Sec-WebSocket-Extensions') \
-                or 'upgrade' not in {v.strip().lower() for v in response.headers.get('Connection', '').split(',')}:
-            raise ProtocolError('Unsupported upstream WebSocket negotiation')
-        if any(len(response.headers.get_all(name, [])) > 1 for name in
-               ('Upgrade', 'Sec-WebSocket-Accept', 'Sec-WebSocket-Protocol')):
-            raise ProtocolError('Duplicate upstream WebSocket negotiation field')
-        selected = response.headers.get('Sec-WebSocket-Protocol')
-        if selected and selected not in protocols:
-            raise ProtocolError('Unexpected upstream WebSocket subprotocol')
-        return sock, response, selected
-    except Exception:
-        sock.close()
-        raise
+    secure = parts.scheme == 'https'
+    provider_path = parts.path.rstrip('/') + path.removeprefix('/v1')
+    uri = urlunsplit(('wss' if secure else 'ws', parts.netloc, provider_path, urlencode({'model': model}), ''))
+    return ProviderConnect(uri, ssl=PROVIDER_TLS if secure else None, subprotocols=protocols or None, proxy=None, compression=None,
+                           additional_headers={'Authorization': 'Bearer ' + upstream['key']},
+                           user_agent_header='gotc-gateway/1.0', max_size=MESSAGE_LIMIT, max_queue=4,
+                           open_timeout=10, close_timeout=2, ping_interval=None)
 
 
-def serve_websocket(gateway, handler, path, call, upstream):
-    call.update(metered_media=True, stream=True, currency='CNY')
-    try:
-        nonce = validate_handshake(handler)
-        query = parse_qs(urlsplit(handler.path).query, keep_blank_values=True, max_num_fields=8)
-        if set(query) != {'model'} or len(query['model']) != 1:
-            raise ProtocolError('Exactly one model query parameter is required')
-        protocols = [p.strip() for p in handler.headers.get('Sec-WebSocket-Protocol', '').split(',') if p.strip()]
-        tokens = [p.removeprefix('openai-insecure-api-key.') for p in protocols if p.startswith('openai-insecure-api-key.')]
-        if len(tokens) > 1:
-            raise ProtocolError('Ambiguous WebSocket authentication')
-        if tokens:
-            if handler.headers.get('Authorization') or handler.headers.get('x-api-key'):
-                raise ProtocolError('Use one authentication mechanism')
-            handler.headers['Authorization'] = 'Bearer ' + tokens[0]
-            call['secrets'] += tuple(tokens)
-        protocols = [p for p in protocols if p in {'realtime', 'openai-beta.realtime-v1'}]
-        # The browser's credential subprotocol is authentication, never content-log metadata.
-        if handler.headers.get('Sec-WebSocket-Protocol') is not None:
-            del handler.headers['Sec-WebSocket-Protocol']
-        if protocols:
-            handler.headers['Sec-WebSocket-Protocol'] = ', '.join(protocols)
-        key = gateway.authenticate(handler, call)
-        model = resolve(upstream, query['model'][0])
-        if model is None:
-            raise GatewayError('not_found', '模型不在本活动开放列表中')
-        snapshot = gateway.catalog.resolve(model, path, {})
-    except (ProtocolError, PricingError, ValueError) as error:
-        raise GatewayError('invalid', str(error)) from None
-    call.update(model=model, requested_model=query['model'][0], pricing_snapshot=snapshot, pricing_request={'model': model})
-    call['secrets'] += (upstream['key'],)
-    gateway.admit(key['team_id'], call['settings']['teamRpm'])
-    remote, response, timer, worker = None, None, None, None
-    stopped = threading.Event()
-    problems, provider_data = [], {}
-    request_characters = 0
-    write_lock = threading.Lock()
+def browser_credentials(websocket, ctx):
+    headers = ctx.handler.headers
+    for name in ('Authorization', 'x-api-key', 'Sec-WebSocket-Protocol', 'Content-Length'):
+        if len(headers.get_all(name, [])) > 1:
+            raise GatewayError('invalid', 'Duplicate WebSocket request field')
+    if headers.get('Transfer-Encoding') is not None or headers.get('Content-Length', '0') != '0':
+        raise GatewayError('invalid', 'WebSocket handshake must not contain a body')
+    offered = websocket.scope.get('subprotocols', [])
+    tokens = [p.removeprefix('openai-insecure-api-key.') for p in offered if p.startswith('openai-insecure-api-key.')]
+    if len(tokens) > 1 or (tokens and (headers.get('Authorization') or headers.get('x-api-key'))):
+        raise GatewayError('invalid', 'Use one authentication mechanism')
+    if tokens:
+        headers['Authorization'] = 'Bearer ' + tokens[0]
+        ctx.call['secrets'] += tuple(tokens)
+    # Only approved offers can reach the provider or the metering record.
+    protocols = [p for p in offered if p in {'realtime', 'openai-beta.realtime-v1'}]
+    if 'Sec-WebSocket-Protocol' in headers:
+        del headers['Sec-WebSocket-Protocol']
+    if protocols:
+        headers['Sec-WebSocket-Protocol'] = ', '.join(protocols)
+    return protocols
 
-    def shutdown_remote():
-        stopped.set()
-        if remote:
+
+def validate_model(data, model):
+    if isinstance(data, dict):
+        if 'model' in data and data['model'] != model:
+            raise ValueError('Changing model within a WebSocket session is not supported')
+        for value in data.values():
+            validate_model(value, model)
+    elif isinstance(data, list):
+        for value in data:
+            validate_model(value, model)
+
+
+def request_characters(message, call):
+    data = json.loads(message)
+    if not isinstance(data, dict):
+        raise ValueError('Speech events must be JSON objects')
+    validate_json_depth(data)
+    gateway_json(data)
+    reject_stored_file_references(data)
+    MediaGateway._check_shared_state(data)
+    validate_model(data, call['model'])
+    text = request_text(data)
+    for word in call['settings']['blockedWords']:
+        if word.strip() and ' '.join(unicodedata.normalize('NFKC', word).split()).lower() in text:
+            raise ValueError('Request contains a blocked word')
+    value = data.get('text', data.get('input', ''))
+    return len(value) if isinstance(value, str) else 0
+
+
+def checked_size(message, bytes_so_far):
+    size = len(message.encode('utf-8')) if isinstance(message, str) else len(message)
+    if size > MESSAGE_LIMIT or size + bytes_so_far > SESSION_LIMIT:
+        raise ValueError('WebSocket data limit exceeded')
+    return size
+
+
+async def relay(websocket, remote, gateway, ctx, evidence, first_event):
+    call = ctx.call
+
+    async def from_client():
+        pending_first = first_event
+        while True:
+            async with asyncio.timeout(IDLE_SECONDS):
+                event = await (asyncio.shield(pending_first) if pending_first is not None else websocket.receive())
+            pending_first = None
+            if event['type'] == 'websocket.disconnect':
+                raise ClientGone
+            message = event.get('text') if event.get('text') is not None else event['bytes']
+            size = checked_size(message, call['request_bytes'])
+            await ctx.sync(gateway.recheck_access, ctx.handler, call)
+            characters = request_characters(message, call) if isinstance(message, str) else 0
+            await remote.send(message)
+            call['request_bytes'] += size
+            call['pricing_quantities']['characters'] += characters
+
+    async def from_provider():
+        received_bytes = 0
+        while True:
             try:
-                remote.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-
-    def check_model(value):
-        if isinstance(value, dict):
-            if 'model' in value and value['model'] != model:
-                raise ProtocolError('Changing model within a WebSocket session is not supported')
-            for item in value.values():
-                check_model(item)
-        elif isinstance(value, list):
-            for item in value:
-                check_model(item)
-
-    def client_loop():
-        nonlocal request_characters
-        try:
-            for opcode, payload in messages(handler.rfile, True):
-                if stopped.is_set():
-                    break
-                characters = 0
-                if opcode in (1, 2):
-                    # Audio bytes are billable too: revocation must stop binary-only clients.
-                    gateway.recheck_access(handler, call)
-                if opcode == 1:
-                    data = json.loads(payload)
-                    if not isinstance(data, dict):
-                        raise ProtocolError('Speech events must be JSON objects')
-                    validate_json_depth(data)
-                    gateway_json(data)
-                    reject_stored_file_references(data)
-                    MediaGateway._check_shared_state(data)
-                    check_model(data)
-                    text = request_text(data)
-                    for word in call['settings']['blockedWords']:
-                        if word.strip() and ' '.join(unicodedata.normalize('NFKC', word).split()).lower() in text:
-                            raise ProtocolError('Request contains a blocked word')
-                    value = data.get('text', data.get('input', ''))
-                    if isinstance(value, str):
-                        characters = len(value)
-                if stopped.is_set():
-                    break
-                with write_lock:
-                    remote.sendall(frame(opcode, payload, True))
-                request_characters += characters
-                call['request_bytes'] += len(payload)
-                if opcode == 8:
-                    return
-        except (EOFError, OSError):
-            shutdown_remote()
-        except Exception as error:
-            problems.append(type(error).__name__)
-            shutdown_remote()
-
-    try:
-        gateway.recheck_access(handler, call)
-        try:
-            remote, response, protocol = open_upstream(upstream, path, model, protocols)
-        except (OSError, http.client.HTTPException, ProtocolError):
-            raise GatewayError('upstream', '上游实时语音连接失败，请稍后重试') from None
-        accept = base64.b64encode(hashlib.sha1((nonce + GUID).encode()).digest()).decode()
-        lines = ['HTTP/1.1 101 Switching Protocols', 'Upgrade: websocket', 'Connection: Upgrade',
-                 'Sec-WebSocket-Accept: ' + accept, 'X-Client-Request-ID: ' + call['request_id']]
-        if protocol:
-            lines.append('Sec-WebSocket-Protocol: ' + protocol)
-        handler.wfile.write(('\r\n'.join(lines) + '\r\n\r\n').encode('ascii'))
-        handler.wfile.flush()
-        call.update(headers_sent=True, forwarded=True, status=101)
-        handler.close_connection = True
-        handler.connection.settimeout(IDLE_SECONDS)
-        timer = threading.Timer(SESSION_SECONDS, shutdown_remote)
-        timer.daemon = True
-        timer.start()
-        worker = threading.Thread(target=client_loop, daemon=True, name='gotc-speech-client')
-        worker.start()
-        for opcode, payload in messages(response.fp, False):
-            if opcode == 1:
-                try:
-                    event = json.loads(payload)
-                except ValueError:
-                    raise ProtocolError('Invalid upstream speech event') from None
-                if isinstance(event, dict):
-                    if event.get('error') or 'error' in str(event.get('type', '')).lower():
-                        payload = redact_error_payload(payload, gateway.error_secrets(call))
-                        problems.append('upstream_error')
+                async with asyncio.timeout(IDLE_SECONDS):
+                    message = await remote.recv()
+            except ConnectionClosed as closed:
+                if closed.rcvd is None:
+                    raise GatewayError('upstream', '上游实时语音连接中断') from None
+                code = closed.rcvd.code
+                reason = redact_error_payload(closed.rcvd.reason.encode('utf-8'), gateway.error_secrets(call))
+                await websocket.close(code=1000 if code == 1005 else code, reason=reason[:123].decode('utf-8', 'ignore'))
+                call['done'] = code in (1000, 1001, 1005) and not evidence.get('error')
+                call['status'] = 101 if call['done'] else 502
+                return
+            size = checked_size(message, received_bytes)
+            received_bytes += size
+            if isinstance(message, bytes):
+                await websocket.send_bytes(message)
+            else:
+                data = json.loads(message)
+                if isinstance(data, dict):
+                    if data.get('error') or 'error' in str(data.get('type', '')).lower():
+                        evidence['error'] = True
+                        message = redact_error_payload(message.encode('utf-8'), gateway.error_secrets(call)).decode('utf-8')
                     else:
-                        usage.read_usage('openai', event, call['usage'])
-                        if isinstance(event.get('usage'), dict):
-                            provider_data['usage'] = event['usage']
-            elif opcode == 8:
-                code = struct.unpack('!H', payload[:2])[0] if payload else 1000
-                if code not in (1000, 1001):
-                    problems.append('upstream_closed_with_error')
-                if payload:
-                    reason = redact_error_payload(payload[2:], gateway.error_secrets(call))
-                    reason = reason[:123].decode('utf-8', 'ignore').encode('utf-8')
-                    payload = payload[:2] + reason
-            handler.wfile.write(frame(opcode, payload))
-            handler.wfile.flush()
-            call['reply_bytes'] += len(payload)
-            if opcode == 8:
-                call['done'] = not problems
-                break
-    except (OSError, EOFError, ProtocolError, ValueError):
-        problems.append('connection_interrupted')
+                        usage.read_usage('openai', data, call['usage'])
+                        if isinstance(data.get('usage'), dict):
+                            evidence['usage'] = data['usage']
+                await websocket.send_text(message)
+                size = len(message.encode('utf-8'))
+            call['reply_bytes'] += size
+
+    incoming = asyncio.create_task(from_client())
+    outgoing = asyncio.create_task(from_provider())
+    try:
+        async with asyncio.timeout(SESSION_SECONDS):
+            done, _ = await asyncio.wait((incoming, outgoing), return_when=asyncio.FIRST_COMPLETED)
+            # A provider's terminal event may coincide with the caller closing its end.
+            if outgoing in done:
+                outgoing.result()
+            else:
+                incoming.result()
     finally:
-        shutdown_remote()
-        if timer:
-            timer.cancel()
-        if remote:
-            remote.close()
-        if response:
-            response.close()
-        if worker and worker.is_alive():
+        for task in (incoming, outgoing):
+            task.cancel()
+        await asyncio.gather(incoming, outgoing, return_exceptions=True)
+
+
+def settle(call, evidence, headers):
+    if not call['done']:
+        evidence['error'] = True
+    try:
+        call['billing'] = quote(call['pricing_snapshot'], request=call['pricing_request'], response=evidence,
+                                headers=headers, started_at=call['requested_at'], trusted_quantities=call['pricing_quantities'])
+    except PricingError:
+        call['billing'] = {'cost_micro': None, 'currency': 'CNY', 'estimated': False, 'pending': True,
+                           'details': {'reason': 'invalid_provider_billing_evidence'}}
+
+
+async def speech_session(websocket, ctx, path, first_event):
+    gateway = ctx.gateway
+    call = ctx.call
+    call.update(metered_media=True, stream=True, currency='CNY', pricing_quantities={'characters': 0})
+    evidence, billing_headers = {}, {}
+    try:
+        upstream = (ctx.config or {}).get('openai', {})
+        if path not in SPEECH_PATHS or not gateway.is_gitee(upstream):
+            raise GatewayError('not_found', '接口不存在')
+        query = websocket.query_params
+        if set(query) != {'model'} or len(query.getlist('model')) != 1:
+            raise GatewayError('invalid', 'Exactly one model query parameter is required')
+        protocols = browser_credentials(websocket, ctx)
+        async with ctx.admitted():
+            model = resolve(upstream, query['model'])
+            if model is None:
+                raise GatewayError('not_found', '模型不在本活动开放列表中')
             try:
-                # End both directions after the last flushed frame. On Windows,
-                # SHUT_RD alone can leave the reader blocked while the peer waits
-                # for our EOF, delaying handler cleanup until its idle timeout.
-                handler.connection.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            worker.join(timeout=1)
-        try:
-            if call['forwarded']:
-                call['pricing_quantities'] = {'characters': request_characters}
-                if problems or not call['done']:
-                    # Preserve the outcome for pricing, without retaining provider
-                    # error text. Only an explicit upstream final cost can settle
-                    # a failed/incomplete session; sent text is not proof of work.
-                    provider_data['error'] = True
+                snapshot = gateway.catalog.resolve(model, path, {})
+            except PricingError:
+                raise GatewayError('invalid', '实时语音模型定价不可用') from None
+            call.update(model=model, requested_model=query['model'], pricing_snapshot=snapshot, pricing_request={'model': model})
+            call['secrets'] += (upstream['key'],)
+            try:
+                remote = await provider_connection(upstream, path, model, protocols)
+            except (OSError, WebSocketException, ValueError):
+                raise GatewayError('upstream', '上游实时语音连接失败，请稍后重试') from None
+            try:
+                billing_headers = dict(remote.response.headers.raw_items())
+                await websocket.accept(subprotocol=remote.subprotocol, headers=[
+                    (b'x-client-request-id', call['request_id'].encode('ascii')), (b'cache-control', b'no-store'),
+                ])
+                call.update(headers_sent=True, forwarded=True, status=101)
+                await relay(websocket, remote, gateway, ctx, evidence, first_event)
+            finally:
+                await remote.close()
+    except asyncio.CancelledError:
+        call['status'] = 499
+        raise
+    except (ClientGone, WebSocketDisconnect):
+        call['status'] = 499
+    except (APIError, WebSocketException, OSError, ValueError, RecursionError) as exc:
+        if call['forwarded']:
+            call['status'] = 502
+            if websocket.application_state is WebSocketState.CONNECTED:
                 try:
-                    call['billing'] = quote(snapshot, request=call['pricing_request'], response=provider_data,
-                                            headers=dict(response.headers) if response else {}, started_at=call['requested_at'],
-                                            trusted_quantities=call['pricing_quantities'])
-                except PricingError:
-                    call['billing'] = {'cost_micro': None, 'currency': 'CNY', 'estimated': False, 'pending': True,
-                                       'details': {'reason': 'invalid_provider_billing_evidence'}}
-                if problems and not call['done']:
-                    call['status'] = 502
-                gateway.safe_record(handler, call)
-        finally:
-            gateway.release(key['team_id'])
+                    await websocket.close(code=1011)
+                except WebSocketDisconnect:
+                    pass
+        else:
+            error = exc if isinstance(exc, APIError) else GatewayError('upstream', '上游实时语音连接失败，请稍后重试')
+            info = gateway.note_error(call, error)
+            headers = {'X-Client-Request-ID': call['request_id'], 'Cache-Control': 'no-store'}
+            if info.get('retry_after'):
+                headers['Retry-After'] = str(info['retry_after'])
+            await websocket.send_denial_response(JSONResponse(error_body(path, info), status_code=error.status, headers=headers))
+    finally:
+        if call['forwarded']:
+            settle(call, evidence, billing_headers)
+        await ctx.record()
+
+
+async def serve_websocket(websocket: WebSocket, ctx: GatewayContext, path: str) -> None:
+    # Watch for a caller leaving even while admission or the provider handshake is pending.
+    # The same read supplies the first application message after acceptance.
+    await websocket.receive()  # ASGI websocket.connect
+    first = asyncio.create_task(websocket.receive())
+    session = asyncio.create_task(speech_session(websocket, ctx, path, first))
+    try:
+        done, _ = await asyncio.wait((first, session), return_when=asyncio.FIRST_COMPLETED)
+        if session not in done and first.result()['type'] == 'websocket.disconnect' and not ctx.call['forwarded']:
+            return
+        await session
+    finally:
+        first.cancel()
+        session.cancel()
+        await asyncio.gather(first, session, return_exceptions=True)

@@ -1,15 +1,18 @@
 """Resolve public frontend files and implement conditional GET and HEAD."""
 from __future__ import annotations
 
-import os
+import json
 from pathlib import Path
-import shutil
-import stat
+import re
+
+from starlette.responses import FileResponse, Response
+from starlette.staticfiles import StaticFiles
 
 from ..errors import APIError
 
 
 ENTRY_TYPES = {
+    "asset-manifest.json": "application/json",
     "index.html": "text/html; charset=utf-8",
     "teams.html": "text/html; charset=utf-8",
     "platform.html": "text/html; charset=utf-8",
@@ -47,18 +50,25 @@ def public_file(root: Path, path: str) -> tuple[Path, str]:
     return resolved, content_type
 
 
-def serve_public_file(handler, root: Path, path: str) -> None:
+def immutable_assets(root: Path) -> set[str]:
+    manifest = root / "asset-manifest.json"
+    if not manifest.is_file():
+        return set()
+    entries = json.loads(manifest.read_text(encoding="utf-8"))["assets"]
+    return {entry["path"] for entry in entries.values()
+            if re.fullmatch(r"static/(?:[\w.-]+/)*[\w.-]+\.[0-9a-f]{16}\.(?:css|js)", entry["path"])}
+
+
+def public_response(root: Path, path: str, request_headers, immutable: set[str]) -> Response:
     source, content_type = public_file(root, path)
-    with source.open("rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode):
-            raise APIError(404, "页面不存在")
-        tag = f'"{info.st_ino:x}-{info.st_mtime_ns:x}-{info.st_ctime_ns:x}-{info.st_size:x}"'
-        headers = {"ETag": "W/" + tag}
-        validators = handler.headers.get("If-None-Match", "").split(",")
-        if any(value.strip().removeprefix("W/") in {tag, "*"} for value in validators):
-            handler.headers_out(304, content_type, None, extra=headers, cache_control="public, no-cache")
-            return
-        handler.headers_out(200, content_type, info.st_size, extra=headers, cache_control="public, no-cache")
-        if handler.command != "HEAD":
-            shutil.copyfileobj(stream, handler.wfile, length=64 * 1024)
+    info = source.stat()
+    tag = f'"{info.st_ino:x}-{info.st_mtime_ns:x}-{info.st_ctime_ns:x}-{info.st_size:x}"'
+    cache = "public, max-age=31536000, immutable" if path.lstrip("/") in immutable else "public, no-cache"
+    headers = {"ETag": tag, "Cache-Control": cache}
+    response = FileResponse(source, media_type=content_type, stat_result=info, headers=headers)
+    # Starlette compares the opaque tag against weak and strong request validators.
+    unchanged = StaticFiles().is_not_modified(response.headers, request_headers)
+    response.headers["ETag"] = "W/" + tag
+    if unchanged:
+        return Response(status_code=304, headers={"ETag": response.headers["ETag"], "Cache-Control": cache})
+    return response

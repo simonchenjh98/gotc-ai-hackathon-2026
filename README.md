@@ -1,45 +1,37 @@
-# GOTC 2026 开源 AI 黑客松
+# GOTC 2026 Open Source AI Hackathon
 
-“百格成城”活动官网与赛事平台。公开站提供赛程、参赛说明与组队名录。活动平台提供队伍申请、作品提交、评审、投票、决赛和组织方后台。选手可在本队工作台使用已开通的 AI 服务。[活动首页](https://etownyouthai.com/) · [选手工作台](https://8.141.114.201/gotc/platform.html#team)
+The public site publishes the schedule, team directory and contestant guidance. The event platform handles team registration, submissions, judging, voting, finals, organizer operations and team AI access. The participant interface is in Chinese. [Public event site](https://etownyouthai.com/)
 
-## 本地启动
+## Local development
 
-需要 Python 3.11 或更高版本。后端使用 Python 标准库和 SQLite。浏览器直接加载前端文件。运行前端测试需要 Node.js 22 或更高版本。
+Use Python 3.11 or later and Node.js 22 or later. From the repository root, run:
 
 ```sh
 make dev
 ```
 
-打开 <http://127.0.0.1:5274/gotc/>。首次启动会在私有数据目录生成数据库和管理码。新环境默认使用 `${XDG_DATA_HOME:-$HOME/.local/share}/gotc/`。可通过 `GOTC_DATA_DIR` 指定已有活动的数据目录。升级时如检测到旧目录，先按提示核对原数据库，再指定目录启动。正式环境由 Nginx 转发到回环地址的单实例 Python 服务。
+Open <http://127.0.0.1:5274/gotc/>. The development launcher serves the platform and gateway together on loopback. The first run creates a private SQLite database and an organizer bootstrap credential. Local state defaults to `${XDG_DATA_HOME:-$HOME/.local/share}/gotc`. Set `GOTC_DATA_DIR` explicitly to reuse an event. If startup detects an older data directory, verify the path before proceeding.
 
-也可直接从仓库根目录启动，默认数据目录与 `make dev` 相同。
+Production runs separate Starlette apps on Uvicorn Unix sockets behind an HTTPS Nginx entry point. HTTPX connects to external providers. Private gateway content capture is opt-in for new events. [Architecture](docs/architecture.md) · [Organizer account migration](docs/organizer-accounts.md)
 
-```sh
-GOTC_PUBLIC_ORIGIN=http://127.0.0.1:5274 \
-python3 -B -m backend.gotc
-```
+The [hardening report](docs/audits/2026-11-18-hardening.md) maps the rebuild brief to the implementation, synthetic benchmarks and remaining rollout checks.
 
-## 维护入口
+## Project layout
 
-| 目录 | 内容 |
+| Directory | Responsibility |
 | --- | --- |
-| `frontend/` | 官网、队伍名录和工作台的 HTML 入口，公共下载及浏览器资源 |
-| `frontend/static/` | 页面共用样式、导航与按工作流加载的浏览器代码 |
-| `backend/gotc/` | HTTP 接入、数据库、身份、队伍、提交、评审与 AI 网关 |
-| `ops/` | 备份、发布打包、安装与 Pages 静态站发布工具 |
-| `tests/` | 前后端回归、浏览器验收、发布包测试与性能测量 |
-| `tools/` | 本地和 CI 共用的站点与架构检查 |
-| `docs/` | 当前维护说明、审计与带日期的历史设计记录 |
+| `frontend/` | Public pages, team directory, downloadable materials and browser workspaces |
+| `backend/gotc/` | Platform and gateway APIs, data migrations, event workflows and model accounting |
+| `ops/` | Artifact building, offline installation, Nginx integration and backup operations |
+| `tests/` | Frontend, backend, browser and release tests, plus synthetic performance measurements |
+| `tools/` | Checks and asset generation shared by development and CI |
+| `docs/` | Engineering guides, audits and dated design records |
 
-## 赛事行为
+## Event contracts
 
-- 队长可申请队伍、查看审核进度、领取参赛码。已生效的旧登记码保留原登记资料权限。
-- 正式提交需要演示文稿和项目 ZIP。草稿、正式版本、冲突处理和回执分别保存。已绑定 Gitee 的队伍可以预览并封存提交版本。
-- 选手只能查看本队可见成绩。专业评分、展示记录、路演和决赛各自管理窗口、名单与结果。全队专业成绩接口要求组织方身份。
-- 路演成绩确认后按规则同步决赛名单。组织方单独确认的名单优先生效。决赛使用七个评委席位，评分、提名、奖项确认和结果发布是独立操作。
-- 网关按队伍管理访问、用量与账目。实际可用模型和外部服务取决于活动主办方的私有配置。
+A formal submission requires the presentation and project ZIP. Teams can recover drafts and retrieve a submission receipt. Teams see their own available scores. Organizers control the all-team professional standings. Roadshow publication normally supplies the finals roster, with an explicitly confirmed roster taking precedence. Finals use seven judge seats. Team API credentials and provider credentials have distinct scopes.
 
-## 验证和发布
+## Verification and packaging
 
 ```sh
 make check
@@ -47,14 +39,15 @@ make test
 make benchmark
 ```
 
-`make test` 包括前端、服务端和发布工具回归。浏览器验收需要本地 Chromium 和 Playwright。性能测试使用临时数据库，可重复对照旧部署源码。
+`make test` covers browser-side logic, backend behavior and release packaging. The separate browser suite exercises real Chromium and synthetic event accounts. [Browser test instructions](tests/browser/README.md)
 
-只打包且不连接服务器，可在已提交的检出目录运行下方命令。
+To produce a local release archive from a clean checkout, set the approved public origin as described in the deployment guide, then run:
 
 ```sh
+make wheels
 python3 -m ops.deploy.deploy --package /tmp/gotc-release.tar.gz
 ```
 
-[架构与开发说明](docs/architecture.md) · [活动平台现状审计](docs/audits/2026-11-18-platform.md) · [重构验收与性能测量](docs/audits/2026-11-18-rebuild-verification.md) · [部署说明](ops/deploy/README.md) · [后端运维说明](backend/README.md)
+The runtime lock pins dependency versions and wheel hashes. Production installation uses the wheels included in the release. [Runtime lock](backend/requirements.txt) · [Deployment guide](ops/deploy/README.md) · [Backend guide](backend/README.md)
 
-代码使用 MIT 许可证。活动主视觉、名称与标识的权利归各自权利人。
+Code is licensed under the MIT License. Rights to event artwork, names and marks belong to their respective owners.

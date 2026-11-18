@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from backend.gotc import service as service_module
 from backend.gotc import write_conflicts
-from test_submission_records_release import snapshot
+from test_submission_records_release import snapshot, unrelated_numbered_migrations
 
 
 TABLES={'score_write_revisions','settings_write_revisions','write_conflicts_meta'}
@@ -27,7 +27,7 @@ class WriteConflictsReleaseTests(unittest.TestCase):
 
     def legacy(self):
         # The preceding main already migrated admin data and immutable submissions.
-        with patch.object(write_conflicts.WriteConflicts,'initialize',return_value=None):service=self.service()
+        with patch('backend.gotc.migrations.apply', unrelated_numbered_migrations), patch.object(write_conflicts.WriteConflicts,'initialize',return_value=None):service=self.service()
         with service.db() as db:
             account,_=service.create_account(db,'judge','Synthetic existing judge')
             db.execute("INSERT INTO teams VALUES ('Tlegacy',1,'Existing team','Existing project','AI for Science',100)")
@@ -80,7 +80,15 @@ class WriteConflictsReleaseTests(unittest.TestCase):
 
     def test_backup_failure_stops_before_schema_changes(self):
         old,before=self.legacy()
-        with patch('backend.gotc.write_conflicts.os.open',side_effect=OSError('synthetic backup failure')):
+        import os
+        real_open = os.open
+
+        def fail_backup(path, *args, **kwargs):
+            if Path(path).name.startswith('before-write-conflicts-'):
+                raise OSError('synthetic backup failure')
+            return real_open(path, *args, **kwargs)
+
+        with patch('backend.gotc.write_conflicts.os.open', side_effect=fail_backup):
             with self.assertRaises(OSError):self.service()
         self.assertEqual(snapshot(old.db_path),before)
 

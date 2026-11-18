@@ -19,10 +19,13 @@ class BackupTests(unittest.TestCase):
     for _name in ('team','invitation','access','open_submissions','materials','request','apply','admin_action','preview','formal_submit','sealed_preview'):
         locals()[_name]=getattr(test_repository_seals.SealedTests,_name)
     def setUp(self):
-        env=patch.dict(os.environ,{'GOTC_REPO_BACKUP_ENABLED':'1'})
+        # Start the real HTTP app with polling disabled. These tests drive each
+        # queued job with run_once() or explicitly exercise worker.start().
+        env=patch.dict(os.environ,{'GOTC_REPO_BACKUP_ENABLED':'0'})
         env.start()
         self.addCleanup(env.stop)
         test_repository_seals.SealedTests.setUp(self)
+        os.environ['GOTC_REPO_BACKUP_ENABLED']='1'
         self.source=Path(self.service.data_dir).parent/'synthetic-source'
         self.source.mkdir()
         self.git('init','-q',str(self.source))
@@ -146,7 +149,7 @@ class BackupTests(unittest.TestCase):
             self.backups.enqueue(db,self.team_id,1,receipt['requestId'])
             self.assertEqual(db.execute('SELECT COUNT(*) FROM repository_backups').fetchone()[0],1)
             db.execute("UPDATE repository_backups SET status='running',attempts=1")
-        with self.service.db() as db:self.backups.initialize(db)
+        with self.service.db() as db:self.backups.recover_interrupted(db)
         self.assertEqual(self.record()['status'],'queued')
         self.backups.run_once()
         result=self.formal_submit(self.selected)[1]
@@ -324,7 +327,7 @@ class BackupTests(unittest.TestCase):
         self.enqueue_selected(self.sha_a)
         with self.service.db() as db:
             db.execute("UPDATE repository_backups SET status='running',attempts=3")
-        with self.service.db() as db:self.backups.initialize(db)
+        with self.service.db() as db:self.backups.recover_interrupted(db)
         self.assertEqual(self.record()['status'],'failed')
         self.assertFalse(self.backups.run_once())
 
@@ -375,21 +378,17 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(list((self.backups.root/'scratch').iterdir()),[])
         self.assertIsNone(self.backups.process)
 
-    def test_main_handles_sigterm_and_stops_worker(self):
-        import signal
+    def test_development_cli_releases_listener_and_database_after_interrupt(self):
         from unittest.mock import Mock
         from backend.gotc import cli
-        service=Mock(base_path='/gotc')
-        server=Mock(server_port=1234)
-        def terminated():raise KeyboardInterrupt()
-        server.serve_forever.side_effect=terminated
-        with patch.object(cli,'EventService',return_value=service),patch.object(cli,'EventHTTPServer',return_value=server),patch.object(cli,'print'),patch('signal.signal') as install:
-            cli.main()
-        self.assertEqual(install.call_args_list[0].args[0],signal.SIGTERM)
-        with self.assertRaises(KeyboardInterrupt):install.call_args_list[0].args[1](signal.SIGTERM,None)
-        service.repository_backups.start.assert_called_once()
-        service.repository_backups.stop.assert_called_once()
+        service = Mock(base_path='/gotc')
+        server = Mock(server_port=1234)
+        server.serve_forever.side_effect = KeyboardInterrupt()
+        with patch.object(cli, 'EventService', return_value=service), patch.object(
+                cli, 'EventHTTPServer', return_value=server), patch('builtins.print'):
+            cli.main([])
         server.server_close.assert_called_once()
+        service.connections.close.assert_called_once()
 
     def test_ready_replay_and_draft_metadata_do_not_read_artifacts_under_writer(self):
         import sqlite3

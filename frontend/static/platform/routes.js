@@ -69,12 +69,15 @@ function routeTarget(page, login) {
   return {files: [], render: () => renderWrongRole(target.role)};
 }
 
+// A packaged page pins its lazy manifest by URL and integrity. Source pages resolve directly.
+const builtRouteManifest = null;
 const platformAssetRequests = new Map();
-function loadPlatformAsset(path) {
+function loadPlatformAsset(path, built) {
   if (platformAssetRequests.has(path)) return platformAssetRequests.get(path);
   const style = path.endsWith('.css');
   const element = document.createElement(style ? 'link' : 'script');
-  const url = new URL('static/platform/' + path, base).href;
+  const url = new URL(built ? built.path : 'static/platform/' + path, base).href;
+  if (built) element.integrity = built.integrity;
   if (style) {
     element.rel = 'stylesheet';
     element.href = url;
@@ -86,13 +89,28 @@ function loadPlatformAsset(path) {
     element.onerror = () => {
       platformAssetRequests.delete(path);
       element.remove();
-      reject(new Error('页面资源未能载入，请检查网络后重新连接。'));
+      const error = new Error(built ? '页面资源未能载入。请刷新页面，读取当前活动平台版本。' : '页面资源未能载入，请检查网络后重新连接。');
+      error.refreshDocument = Boolean(built);
+      reject(error);
     };
   });
   platformAssetRequests.set(path, pending);
   document.head.append(element);
   return pending;
 }
-function loadPlatformAssets(paths) {
-  return Promise.all(paths.map(loadPlatformAsset));
+async function loadPlatformAssets(paths, current = () => true) {
+  if (!paths.length) return;
+  if (builtRouteManifest) {
+    await loadPlatformAsset('route-assets.js', builtRouteManifest);
+    if (!current()) return;
+  }
+  await Promise.all(paths.map(path => {
+    const built = builtRouteManifest && platformReleaseAssets[path];
+    if (builtRouteManifest && !built) {
+      const error = new Error('页面资源清单不完整，请刷新页面。');
+      error.refreshDocument = true;
+      throw error;
+    }
+    return loadPlatformAsset(path, built);
+  }));
 }

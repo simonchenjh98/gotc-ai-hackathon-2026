@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public SHA-256 provenance of the bundled OpenAPI catalog"
+condition = "AND"
+paths = ['''(?:^|/)backend/gotc/gateway/gateway_catalog\.json$''']
+regexTarget = "line"
+regexes = ['''^ *"openapi\.yaml": +"b150d17ab38792f469fdcdb094ba450561377691262cb00d3cddbd0a16fdcbb5",? *$''']

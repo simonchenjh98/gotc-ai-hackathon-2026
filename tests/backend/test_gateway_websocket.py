@@ -1,314 +1,319 @@
-"""RFC6455 frame boundaries and a real socket bridge with private upstream credentials."""
-import base64
-from email.message import Message
-import hashlib
-import http.client
-import io
-import json
-import socket
-import socketserver
-import struct
-import threading
-import time
+"""Speech sessions through a real Uvicorn Unix socket and a local synthetic provider."""
+import asyncio
+from http import HTTPStatus
+from pathlib import Path
+import ssl
+import tempfile
 import types
 import unittest
 from unittest import mock
 
+import uvicorn
+from websockets.asyncio.client import unix_connect
+from websockets.asyncio.server import serve
+from websockets.exceptions import ConnectionClosed, InvalidStatus
+
 from backend.gotc.errors import APIError
-from backend.gotc.gateway.gateway_websocket import GUID, ProtocolError, frame, messages, read_frame, validate_handshake, open_upstream, serve_websocket
-from test_gateway_media import Gateway
+from backend.gotc.gateway import gateway_websocket as speech
+from backend.gotc.gateway.asgi import create_gateway_app
+from backend.gotc.gateway.gateway_pricing import Catalog, PricingError
+from backend.gotc.gateway.protocol_errors import error_info
 
 
-def handshake_headers(auth=True):
-    headers = Message()
-    for k, v in {"Upgrade": "websocket", "Connection": "keep-alive, Upgrade", "Sec-WebSocket-Version": "13",
-                 "Sec-WebSocket-Key": base64.b64encode(b"0123456789abcdef").decode()}.items():
-        headers[k] = v
-    if auth:
-        headers["Authorization"] = "Bearer client-key"
-    return headers
+class SpeechGateway:
+    def __init__(self):
+        self.records = []
+        self.refreshed = 0
+        self.admitted = self.released = 0
+
+    def refresh_config(self):
+        self.refreshed += 1
+        return self.config
+
+    def authenticate(self, handler, call):
+        if handler.headers.get('Authorization') != 'Bearer client-key':
+            raise APIError(401, 'invalid key')
+        call.update(key={'id': 'key', 'team_id': 'team'}, settings={'teamRpm': 60, 'blockedWords': []})
+        return call['key']
+
+    async def admit_async(self, team, rpm, count_tokens=False):
+        self.admitted += 1
+
+    def release(self, team, count_tokens=False):
+        self.released += 1
+
+    def recheck_access(self, handler, call):
+        self.authenticate(handler, call)
+
+    def safe_record(self, handler, call):
+        if call['key'] and not call.get('recorded'):
+            self.records.append(dict(call))
+            call['recorded'] = True
+
+    def error_secrets(self, call=None):
+        return tuple((call or {}).get('secrets', ()))
+
+    def note_error(self, call, error):
+        call['status'] = error.status
+        return error_info(error)
 
 
-class FrameTests(unittest.TestCase):
-    def test_roundtrip_short_extended_and_masked_frames(self):
-        for size in (0, 1, 125, 126, 65535, 65536):
-            for masked in (False, True):
-                with self.subTest(size=size, masked=masked):
-                    payload = b"x" * size
-                    self.assertEqual(read_frame(io.BytesIO(frame(2, payload, masked)), masked), (True, 2, payload))
-
-    def test_wrong_mask_reserved_opcode_and_noncanonical_lengths(self):
-        invalid = [b"\x82\x80\0\0\0\0", b"\xc2\0", b"\x83\0", b"\x82\x7e\0\x01x",
-                   b"\x82\x7f" + struct.pack("!Q", 2**63), b"\x09\x00"]
-        for raw in invalid:
-            with self.subTest(raw=raw), self.assertRaises(ProtocolError):
-                read_frame(io.BytesIO(raw), False)
-
-    def test_control_and_fragmented_messages(self):
-        first = bytes([1, 2]) + b"he"
-        continuation = bytes([128, 3]) + b"llo"
-        stream = first + frame(9, b"ping") + continuation + frame(8, struct.pack("!H", 1000))
-        self.assertEqual(list(messages(io.BytesIO(stream), False)), [(9, b"ping"), (1, b"hello"), (8, b"\x03\xe8")])
-
-    def test_orphan_continuation_and_interleaved_fragments(self):
-        for raw in (b"\x80\x01x", b"\x01\x01x\x81\x01y"):
-            with self.assertRaises(ProtocolError):
-                list(messages(io.BytesIO(raw), False))
-
-    def test_invalid_close_codes_and_utf8_rejected(self):
-        for data in (b"x", struct.pack("!H", 1005), struct.pack("!H", 1000) + b"\xff"):
-            with self.assertRaises(ProtocolError):
-                read_frame(io.BytesIO(frame(8, data)), False)
-
-    def test_duplicate_handshake_fields_and_nonempty_body_rejected(self):
-        h = types.SimpleNamespace(command="GET", headers=handshake_headers())
-        validate_handshake(h)
-        for name, value in (("Sec-WebSocket-Key", "another"), ("Content-Length", "1")):
-            original = handshake_headers()
-            original[name] = value
-            with self.assertRaises(ProtocolError):
-                validate_handshake(types.SimpleNamespace(command="GET", headers=original))
-
-
-class Provider(socketserver.StreamRequestHandler):
-    mode = "echo"
-    calls = []
-    frames = []
-
-    def handle(self):
-        self.connection.settimeout(3)
-        line = self.rfile.readline().decode().rstrip()
-        headers = http.client.parse_headers(self.rfile)
-        type(self).calls.append((line, dict(headers)))
-        if self.mode == "reject":
-            self.wfile.write(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
-            return
-        accept = base64.b64encode(hashlib.sha1((headers['Sec-WebSocket-Key'] + GUID).encode()).digest()).decode()
-        response = ("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n")
-        if self.mode == "bad-protocol":
-            response += "Sec-WebSocket-Protocol: surprise\r\n"
-        if not self.mode.startswith("billing-") or self.mode == "billing-error-zero":
-            response += "Inference-Cost: " + ("0" if self.mode == "billing-error-zero" else "0.123") + "\r\nInference-Currency: CNY\r\n"
-        response += "\r\n"
-        if self.mode in ("immediate", "error-close"):
-            content = frame(1, b'{"usage":{"prompt_tokens":10,"completion_tokens":2}}')
-            reason = b"private-upstream-key" if self.mode == "error-close" else b"done"
-            close_code = 1008 if self.mode == "error-close" else 1000
-            # Early frame bytes share the handshake packet; HTTPResponse's buffered fp must retain them.
-            self.wfile.write(response.encode() + content + frame(2, b"audio\0bytes") + frame(8, struct.pack("!H", close_code) + reason))
-            return
-        self.wfile.write(response.encode())
-        self.wfile.flush()
-        try:
-            for opcode, payload in messages(self.rfile, True):
-                type(self).frames.append((opcode, payload))
-                if opcode in (1, 2):
-                    if self.mode.startswith("billing-"):
-                        if self.mode == "billing-disconnect":
-                            return
-                        event = b'{"error":{"message":"synthetic failure"}}' if self.mode in ("billing-error", "billing-error-zero") else b'{}'
-                        code = 1008 if self.mode == "billing-error-close" else 1000
-                        self.wfile.write(frame(1, event) + frame(8, struct.pack("!H", code)))
-                        self.wfile.flush()
-                        return
-                    self.wfile.write(frame(1, b'{"usage":{"prompt_tokens":5,"completion_tokens":3}}') +
-                                     frame(8, struct.pack("!H", 1000)))
-                    self.wfile.flush()
-                    return
-        except (EOFError, OSError, ProtocolError):
-            return
-
-
-class ProviderServer(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-
-class Catalog:
-    def resolve(self, model, path, body):
-        return {"model": model, "path": path}
-
-
-class BridgeTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.server = ProviderServer(("127.0.0.1", 0), Provider)
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.server.shutdown()
-        cls.server.server_close()
-        cls.thread.join()
-
-    def setUp(self):
-        Provider.mode, Provider.calls, Provider.frames = "echo", [], []
-        self.upstream = {"url": "http://127.0.0.1:" + str(self.server.server_address[1]) + "/v1",
-                         "key": "private-upstream-key", "models": {"valid": [0, 0]}, "aliases": {}}
-        self.gateway = Gateway()
+class BridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.mode = 'echo'
+        self.provider_requests = []
+        self.provider_opening = asyncio.Event()
+        self.resume_provider = asyncio.Event()
+        self.provider_messages = []
+        self.gateway = SpeechGateway()
+        self.gateway.service = types.SimpleNamespace(origin='https://event.test', base_path='/gotc', keys=self.gateway)
         self.gateway.catalog = Catalog()
-        self.quotes = []
-        def quote(*args, **kwargs):
-            self.quotes.append(kwargs)
-            return {"cost_micro": 123000, "currency": "CNY", "pending": False, "estimated": False, "details": {}}
-        self.patch = mock.patch("backend.gotc.gateway.gateway_websocket.quote", quote)
-        self.patch.start()
-        self.addCleanup(self.patch.stop)
+        self.gateway.is_gitee = lambda _: True
+        self.provider = await serve(self.provider_session, '127.0.0.1', 0, compression=None,
+                                    subprotocols=['realtime'], select_subprotocol=self.subprotocol,
+                                    process_request=self.process_request, process_response=self.process_response)
+        self.addAsyncCleanup(self.stop_provider)
+        port = self.provider.sockets[0].getsockname()[1]
+        self.gateway.config = {'openai': {'url': f'http://127.0.0.1:{port}/v1', 'key': 'private-upstream-key',
+                                          'models': {'TeleTTS-Mandarin': [0, 0], 'TeleASR-MultiDialect': [0, 0]}, 'aliases': {}}}
+        self.finished = asyncio.Event()
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.socket_path = str(Path(self.directory.name, 'gateway.sock'))
+        self.app = create_gateway_app(self.gateway.service, trusted_proxy_socket=self.socket_path)
+        config = uvicorn.Config(self.observe_gateway, interface='asgi3', uds=self.socket_path, ws='websockets-sansio', ws_max_size=speech.MESSAGE_LIMIT,
+                                ws_per_message_deflate=False, lifespan='off', access_log=False, log_level='critical')
+        self.server = uvicorn.Server(config)
+        self.server_task = asyncio.create_task(self.server.serve())
+        self.addAsyncCleanup(self.stop_gateway)
+        async with asyncio.timeout(3):
+            while not self.server.started:
+                if self.server_task.done():
+                    self.server_task.result()
+                await asyncio.sleep(0.01)
 
-    def bridge(self, outgoing=None, browser_auth=False):
-        server_side, client = socket.socketpair()
-        server_side.settimeout(2)
-        # Allow the bridge's bounded worker shutdown to finish before the test
-        # reader times out on abrupt upstream disconnects.
-        client.settimeout(5)
-        headers = handshake_headers(not browser_auth)
-        if browser_auth:
-            headers["Sec-WebSocket-Protocol"] = "realtime, openai-insecure-api-key.client-key"
-        self.handler = types.SimpleNamespace(command="GET", headers=headers, path="/v1/audio/speech/ws?model=valid",
-                                              rfile=server_side.makefile("rb"), wfile=server_side.makefile("wb"),
-                                              connection=server_side, close_connection=False)
-        self.call = {"path": "/v1/audio/speech/ws", "requested_at": time.time(), "key": None,
-                     "started": time.monotonic(), "model": "", "stream": False, "price": None, "usage": [0] * 5,
-                     "status": 0, "request": b"", "response": [], "size": 0, "log": False,
-                     "request_bytes": 0, "reply_bytes": 0, "done": False, "forwarded": False,
-                     "request_id": "local-request-1", "reply_headers": {}, "secrets": ()}
-        errors = []
-        def run():
-            try:
-                serve_websocket(self.gateway, self.handler, "/v1/audio/speech/ws", self.call, self.upstream)
-            except Exception as error:
-                errors.append(error)
-            finally:
-                self.handler.wfile.close()
-                self.handler.rfile.close()
-                server_side.close()
-        thread = threading.Thread(target=run, daemon=True)
-        thread.start()
-        reply = http.client.HTTPResponse(client)
-        result = []
+    async def stop_provider(self):
+        self.provider.close()
+        await self.provider.wait_closed()
+
+    async def stop_gateway(self):
+        self.server.should_exit = True
+        await self.server_task
+
+    def subprotocol(self, connection, offered):
+        return 'realtime' if 'realtime' in offered else None
+
+    async def process_request(self, connection, request):
+        self.provider_requests.append(request)
+        if self.mode == 'hold-handshake':
+            self.provider_opening.set()
+            await self.resume_provider.wait()
+        if self.mode == 'reject':
+            return connection.respond(HTTPStatus.UNAUTHORIZED, 'provider rejected')
+        if self.mode == 'redirect':
+            response = connection.respond(HTTPStatus.FOUND, 'redirect')
+            response.headers['Location'] = '/other-endpoint'
+            return response
+
+    def process_response(self, connection, request, response):
+        if self.mode == 'duplicate-negotiation':
+            response.headers['Upgrade'] = 'websocket'
+        if self.mode == 'zero':
+            response.headers['Inference-Cost'] = '0'
+        elif self.mode == 'immediate':
+            response.headers['Inference-Cost'] = '0.123'
+        return response
+
+    async def provider_session(self, remote):
+        if self.mode == 'immediate':
+            await remote.send('{"usage":{"prompt_tokens":10,"completion_tokens":2}}')
+            await remote.send(b'audio\x00bytes')
+            await remote.close(1000, 'done')
+            return
+        if self.mode == 'error-close':
+            await remote.close(1014, 'private-upstream-key')
+            return
+        if self.mode == 'hold':
+            await remote.wait_closed()
+            return
         try:
-            reply.begin()
-            self.assertEqual(reply.status, 101)
-            if outgoing is not None:
-                client.sendall(outgoing)
-            try:
-                result = list(messages(reply.fp, False))
-            except EOFError:
-                pass
-        finally:
-            try:
-                client.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass  # macOS reports ENOTCONN once the bridge has closed its end.
-            reply.close()
-            client.close()
-            thread.join(timeout=2)
-        self.assertFalse(thread.is_alive(), "bridge or worker did not stop")
-        self.assertEqual(errors, [])
-        return result
+            message = await remote.recv()
+        except ConnectionClosed:
+            return
+        self.provider_messages.append(message)
+        if self.mode in ('error', 'zero'):
+            await remote.send('{"error":{"message":"private-upstream-key"}}')
+        elif self.mode == 'provider-close':
+            await remote.close(1008, 'denied')
+        else:
+            await remote.send('{"usage":{"prompt_tokens":5,"completion_tokens":3}}')
+        await remote.close()
 
-    def test_early_upstream_frames_survive_http_handshake_buffer(self):
-        Provider.mode = "immediate"
-        result = self.bridge()
-        self.assertEqual([op for op, _ in result], [1, 2, 8])
-        self.assertEqual(result[1][1], b"audio\0bytes")
-        self.assertEqual(self.call["usage"][:2], [10, 2])
-        self.assertEqual(self.call["billing"]["cost_micro"], 123000)
+    async def observe_gateway(self, scope, receive, send):
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.finished.set()
+
+    def connect(self, *, browser=False, headers=(), query='model=TeleTTS-Mandarin', path='/v1/audio/speech/ws'):
+        protocols = ['realtime', 'openai-insecure-api-key.client-key'] if browser else []
+        fields = list(headers) if browser else [('Authorization', 'Bearer client-key'), *headers]
+        uri = f'ws://localhost/gotc{path}?{query}'
+        return unix_connect(self.socket_path, uri=uri, subprotocols=protocols or None, additional_headers=fields,
+                            compression=None, open_timeout=3, close_timeout=1)
+
+    async def bridge(self, outgoing=None, **kwargs):
+        self.finished.clear()
+        replies = []
+        async with self.connect(**kwargs) as client:
+            self.assertEqual(client.response.headers['x-client-request-id'], client.response.headers['x-request-id'])
+            self.assertEqual(client.subprotocol, 'realtime' if kwargs.get('browser') else None)
+            if outgoing is not None:
+                await client.send(outgoing)
+            async with asyncio.timeout(3):
+                try:
+                    while True:
+                        replies.append(await client.recv())
+                except ConnectionClosed as closed:
+                    self.close_code, self.close_reason = client.close_code, client.close_reason
+                    self.assertIsNotNone(closed.rcvd)
+        await asyncio.wait_for(self.finished.wait(), timeout=3)
+        self.call = self.gateway.records[-1]
         self.assertEqual(self.gateway.admitted, self.gateway.released)
+        return replies
+
+    async def test_early_provider_messages_and_cost(self):
+        self.mode = 'immediate'
+        replies = await self.bridge()
+        self.assertEqual(replies, ['{"usage":{"prompt_tokens":10,"completion_tokens":2}}', b'audio\x00bytes'])
+        self.assertEqual(self.call['billing']['cost_micro'], 123000)
+        self.assertEqual(self.call['usage'][:2], [10, 2])
+        self.assertTrue(self.call['done'])
         self.assertEqual(len(self.gateway.records), 1)
 
-    def test_failed_speech_without_final_fee_is_pending_but_explicit_zero_settles(self):
-        from backend.gotc.gateway.gateway_pricing import Catalog as PriceCatalog
-        self.patch.stop()  # Exercise actual pricing, rather than the fixed-fee stub.
-        catalog = PriceCatalog()
-        self.gateway.catalog = types.SimpleNamespace(resolve=lambda model, path, body:
-            catalog.resolve("TeleTTS-Mandarin", path, body))
-        for mode in ("billing-error", "billing-error-close", "billing-disconnect", "billing-error-zero", "billing-success"):
+    async def test_browser_credential_is_only_used_for_gateway_authentication(self):
+        text = '{"input":"你好"}'
+        await self.bridge([text[:5], text[5:]], browser=True, headers=[('Cookie', 'participant=session')])
+        request = self.provider_requests[0]
+        self.assertEqual(request.path, '/v1/audio/speech/ws?model=TeleTTS-Mandarin')
+        self.assertEqual(request.headers['Authorization'], 'Bearer private-upstream-key')
+        self.assertEqual(request.headers['Sec-WebSocket-Protocol'], 'realtime')
+        self.assertNotIn('Cookie', request.headers)
+        self.assertNotIn('client-key', repr(list(request.headers.raw_items())))
+        self.assertEqual(self.provider_messages, [text])
+        self.assertEqual(self.call['request_bytes'], len(text.encode()))
+        self.assertEqual(self.call['pricing_quantities'], {'characters': 2})
+
+    async def test_transcription_forwards_binary_and_requires_provider_duration_for_pricing(self):
+        await self.bridge(b'audio-bytes', path='/v1/audio/transcriptions/ws', query='model=TeleASR-MultiDialect')
+        self.assertEqual(self.provider_messages, [b'audio-bytes'])
+        self.assertEqual(self.provider_requests[0].path, '/v1/audio/transcriptions/ws?model=TeleASR-MultiDialect')
+        self.assertTrue(self.call['done'])
+        self.assertTrue(self.call['billing']['pending'])
+
+    async def test_failed_and_successful_billing(self):
+        for mode in ('error', 'provider-close', 'zero', 'echo'):
             with self.subTest(mode=mode):
-                Provider.mode = mode
-                self.bridge(frame(1, b'{"input":"hello world!"}', True))
-                result = self.call["billing"]
-                failed_without_cost = mode not in ("billing-success", "billing-error-zero")
-                self.assertEqual(result["pending"], failed_without_cost)
-                if failed_without_cost:
-                    self.assertIsNone(result["cost_micro"])
-                    self.assertFalse(result["estimated"])
-                elif mode == "billing-error-zero":
-                    self.assertEqual(result["cost_micro"], 0)
-                    self.assertFalse(result["estimated"])
+                self.mode = mode
+                replies = await self.bridge('{"input":"hello world!"}')
+                self.assertNotIn('private-upstream-key', repr(replies))
+                fee = self.call['billing']
+                if mode in ('error', 'provider-close'):
+                    self.assertTrue(fee['pending'])
+                    self.assertIsNone(fee['cost_micro'])
                 else:
-                    self.assertEqual(result["cost_micro"], 2880)
-                    self.assertTrue(result["estimated"])
-                self.assertEqual(self.gateway.admitted, self.gateway.released)
+                    self.assertEqual(fee['cost_micro'], 0 if mode == 'zero' else 2880)
+                    self.assertEqual(fee['estimated'], mode == 'echo')
 
-    def test_client_messages_masked_and_credentials_only_in_upstream_authorization(self):
-        self.bridge(frame(1, b'{"model":"valid","input":"hello"}', True), browser_auth=True)
-        first, headers = Provider.calls[0]
-        self.assertEqual(first, "GET /v1/audio/speech/ws?model=valid HTTP/1.1")
-        self.assertEqual(headers["Authorization"], "Bearer private-upstream-key")
-        self.assertNotIn("client-key", json.dumps(headers))
-        self.assertEqual(self.handler.headers["Sec-WebSocket-Protocol"], "realtime")
-        self.assertEqual(Provider.frames[0][1], b'{"model":"valid","input":"hello"}')
-        self.assertEqual(self.quotes[0]["trusted_quantities"]["characters"], 5)
-        self.assertNotIn("input", self.quotes[0]["request"])
+    async def test_registered_1014_close_reason_is_redacted(self):
+        self.mode = 'error-close'
+        await self.bridge()
+        self.assertEqual(self.close_code, 1014)
+        self.assertNotIn('private-upstream-key', self.close_reason)
+        self.assertEqual(self.call['status'], 502)
+        self.assertFalse(self.call['done'])
 
-    def test_session_cannot_switch_model_or_reference_foreign_file(self):
-        for payload in (b'{"model":"expensive"}', b'{"file_id":"foreign"}'):
-            with self.subTest(payload=payload):
-                self.bridge(frame(1, payload, True))
-                self.assertEqual(Provider.frames, [])
-                self.assertEqual(self.call["status"], 502)
+    async def test_client_abort_and_session_deadline_release_admission(self):
+        self.mode = 'hold'
+        async with self.connect() as client:
+            pong = await client.ping(b'client-ping')
+            await asyncio.wait_for(pong, timeout=1)
+        await asyncio.wait_for(self.finished.wait(), timeout=2)
+        self.assertEqual(self.gateway.records[-1]['status'], 499)
+        self.assertTrue(self.gateway.records[-1]['billing']['pending'])
+        with mock.patch.object(speech, 'SESSION_SECONDS', 0.1):
+            await self.bridge()
+        self.assertFalse(self.call['done'])
+        self.assertEqual(self.call['status'], 502)
 
-    def test_binary_frame_rechecks_revoked_key(self):
+    async def test_caller_disappearing_during_provider_handshake_releases_capacity(self):
+        self.mode = 'hold-handshake'
+        connecting = asyncio.ensure_future(self.connect())
+        try:
+            await asyncio.wait_for(self.provider_opening.wait(), timeout=2)
+            connecting.cancel()
+            await asyncio.gather(connecting, return_exceptions=True)
+            await asyncio.wait_for(self.finished.wait(), timeout=1)
+            self.assertEqual(self.gateway.admitted, self.gateway.released)
+            self.assertEqual(self.gateway.records[-1]['status'], 499)
+            self.assertFalse(self.gateway.records[-1]['forwarded'])
+        finally:
+            self.resume_provider.set()
+
+    async def test_text_policy_revocation_and_byte_limits(self):
+        for message in ('{"model":"other"}', '{"file_id":"foreign"}', b'abc'):
+            with self.subTest(message=message), mock.patch.object(speech, 'SESSION_LIMIT', 2 if isinstance(message, bytes) else 65536):
+                await self.bridge(message)
+                self.assertEqual(self.provider_messages, [])
+                self.assertFalse(self.call['done'])
+        original = self.gateway.recheck_access
         count = 0
-        def check(handler, call):
+        def revoke(handler, call):
             nonlocal count
             count += 1
-            if count > 1:
-                raise APIError(401, "revoked")
-        self.gateway.recheck_access = check
-        self.bridge(frame(2, b"audio data", True))
+            if count == 2:
+                raise APIError(401, 'revoked')
+            original(handler, call)
+        self.gateway.recheck_access = revoke
+        await self.bridge(b'audio')
         self.assertEqual(count, 2)
-        self.assertEqual(Provider.frames, [])
+        self.assertEqual(self.provider_messages, [])
 
-    def test_provider_close_error_reason_redacted(self):
-        Provider.mode = "error-close"
-        result = self.bridge()
-        self.assertNotIn(b"private-upstream-key", result[-1][1])
-        self.assertFalse(self.call["done"])
-        self.assertEqual(self.call["status"], 502)
+    async def test_failed_negotiation_is_http_502_without_redirects(self):
+        for i, mode in enumerate(('reject', 'redirect', 'duplicate-negotiation'), start=1):
+            with self.subTest(mode=mode):
+                self.mode = mode
+                self.finished.clear()
+                with self.assertRaises(InvalidStatus) as failed:
+                    await self.connect()
+                self.assertEqual(failed.exception.response.status_code, 502)
+                await asyncio.wait_for(self.finished.wait(), timeout=2)
+                self.assertEqual(len(self.provider_requests), i)
+                self.assertFalse(self.gateway.records[-1]['forwarded'])
+                self.assertEqual(self.gateway.admitted, self.gateway.released)
 
-    def test_invalid_billing_evidence_never_leaks_a_team_concurrency_slot(self):
-        from backend.gotc.gateway.gateway_pricing import PricingError
-        Provider.mode = "immediate"
-        with mock.patch("backend.gotc.gateway.gateway_websocket.quote", side_effect=PricingError("invalid provider cost")):
-            self.bridge()
-        self.assertEqual(self.gateway.admitted, self.gateway.released)
-        self.assertTrue(self.call["billing"]["pending"])
-        self.assertEqual(len(self.gateway.records), 1)
+    async def test_denied_origin_and_ambiguous_query_never_open_provider(self):
+        for kwargs, status in (({'headers': [('Origin', 'https://other.test')]}, 403),
+                               ({'query': 'model=a&model=b'}, 400),
+                               ({'browser': True, 'headers': [('x-api-key', 'other-team')]}, 400)):
+            with self.subTest(status=status), self.assertRaises(InvalidStatus) as failed:
+                await self.connect(**kwargs)
+            self.assertEqual(failed.exception.response.status_code, status)
+        self.assertEqual(self.provider_requests, [])
+        self.assertEqual(self.gateway.refreshed, 2)  # Origin refusal precedes the DB configuration lookup.
 
-    def test_rejected_or_invalid_upstream_handshake_has_no_101(self):
-        for mode in ("reject", "bad-protocol"):
-            Provider.mode = mode
-            with self.subTest(mode=mode), self.assertRaises(ProtocolError):
-                open_upstream(self.upstream, "/v1/audio/speech/ws", "valid", [])
+    async def test_invalid_billing_evidence_releases_team_slot(self):
+        self.mode = 'immediate'
+        with mock.patch.object(speech, 'quote', side_effect=PricingError('invalid fee')):
+            await self.bridge()
+        self.assertTrue(self.call['billing']['pending'])
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-class UpstreamTlsTests(unittest.TestCase):
-    def test_https_upstream_refuses_tls_below_1_2(self):
-        import ssl
-        from unittest import mock
-        from backend.gotc.gateway import gateway_websocket
-        raw, context = mock.MagicMock(), mock.MagicMock()
-        context.wrap_socket.side_effect = OSError('stop after TLS setup')
-        with mock.patch.object(gateway_websocket.socket, 'create_connection', return_value=raw), \
-                mock.patch.object(gateway_websocket.ssl, 'create_default_context', return_value=context):
-            with self.assertRaises(OSError):
-                gateway_websocket.open_upstream({'url': 'https://upstream.example/v1', 'key': 'synthetic'}, '/v1/realtime', 'm', [])
-        self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
-        context.wrap_socket.assert_called_once_with(raw, server_hostname='upstream.example')
+    def test_tls_policy_and_private_headers(self):
+        with mock.patch.object(speech, 'ProviderConnect') as connector:
+            speech.provider_connection({'url': 'https://provider.test/v1', 'key': 'synthetic'},
+                                       '/v1/audio/transcriptions/ws', 'model', [])
+        args, kwargs = connector.call_args
+        self.assertEqual(args, ('wss://provider.test/v1/audio/transcriptions/ws?model=model',))
+        self.assertGreaterEqual(kwargs['ssl'].minimum_version, ssl.TLSVersion.TLSv1_2)
+        self.assertEqual(kwargs['additional_headers'], {'Authorization': 'Bearer synthetic'})
+        self.assertIsNone(kwargs['proxy'])

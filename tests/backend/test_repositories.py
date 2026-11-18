@@ -4,10 +4,12 @@ import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 import unittest
 from contextlib import closing, contextmanager
 from unittest.mock import patch
-from urllib.error import HTTPError, URLError
+import httpx
 
 from backend.gotc.errors import APIError
 from backend.gotc.submissions.repositories import Provider, ProviderOperations, UpstreamError
@@ -622,6 +624,46 @@ class ProviderOperationTests(unittest.TestCase):
 
 
 class ProviderTransportTests(unittest.TestCase):
+    def test_repository_http_uses_one_hop_and_keeps_query_credentials_out_of_logs(self):
+        paths = []
+
+        class Fixture(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                path = urlsplit(self.path).path
+                paths.append((path, urlsplit(self.path).query, self.headers.get("Authorization")))
+                if path == '/move':
+                    self.send_response(307)
+                    self.send_header('Location', '/other')
+                    data = b''
+                else:
+                    self.send_response(200)
+                    data = b'{"name":"fixture"}'
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        with ThreadingHTTPServer(('127.0.0.1', 0), Fixture) as fixture:
+            worker = threading.Thread(target=fixture.serve_forever, daemon=True)
+            worker.start()
+            try:
+                provider = Provider('gitee', 'org', 'synthetic-repository-token', 'main', True)
+                provider.origin = f'http://127.0.0.1:{fixture.server_port}'
+                self.addCleanup(provider.close)
+                with self.assertLogs('httpx', 'INFO') as logs:
+                    self.assertEqual(provider.request('GET', '/repo'), (200, {'name': 'fixture'}))
+                    with self.assertRaises(UpstreamError) as rejected:
+                        provider.request('GET', '/move')
+                self.assertEqual(rejected.exception.upstream_status, 307)
+                self.assertEqual(paths, [('/repo', '', 'Bearer ' + provider.token),
+                                         ('/move', '', 'Bearer ' + provider.token)])
+                self.assertNotIn(provider.token, '\n'.join(logs.output))
+            finally:
+                fixture.shutdown()
+                worker.join()
+
     def test_gitee_enterprise_create_uses_integer_external_open_and_never_falls_back(self):
         provider = Provider('gitee', 'gotc-ai-hackathon', 'never-used', 'main', True)
         row = {'organization': 'gotc-ai-hackathon', 'slug': 'generated-team-repo', 'operation_id': 'operation-marker'}
@@ -643,17 +685,18 @@ class ProviderTransportTests(unittest.TestCase):
     def test_fixed_hosts_push_permission_no_redirect_and_redacted_errors(self):
         for name, origin in [('github', 'https://api.github.com/'), ('gitee', 'https://gitee.com/api/v5/')]:
             provider = Provider(name, 'org', 'synthetic-secret', 'main', True)
-            class Opener:
-                def open(self, request, timeout):
-                    self.request, self.timeout = request, timeout
-                    raise URLError('synthetic-secret echoed upstream')
-            opener = Opener()
-            with patch('backend.gotc.submissions.repositories.build_opener', return_value=opener):
+            self.addCleanup(provider.close)
+            failure = httpx.ConnectError(f"{provider.token} echoed by the synthetic upstream")
+            with patch.object(provider.http, 'stream', side_effect=failure) as request:
                 with self.assertRaises(UpstreamError) as error:
                     provider.request('GET', '/repos/org/repo')
-            self.assertTrue(opener.request.full_url.startswith(origin))
-            self.assertEqual(opener.timeout, 8)
+            method, url = request.call_args.args
+            self.assertEqual(method, 'GET')
+            self.assertTrue(url.startswith(origin))
+            self.assertNotIn(provider.token, url)
+            self.assertEqual(request.call_args.kwargs['headers']['Authorization'], 'Bearer ' + provider.token)
             self.assertNotIn('synthetic-secret', error.exception.message)
+            self.assertIsNone(error.exception.__context__)
             with self.assertRaises(ValueError):
                 provider.request('GET', '//attacker.test/token')
 

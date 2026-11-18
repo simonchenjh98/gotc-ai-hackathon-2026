@@ -16,6 +16,23 @@ The event has two delivery targets. GitHub Pages hosts the public information si
 | Operations | `ops/deploy/`, `ops/backup_event.py` | Build a release archive, stage Pages, or back up the configured data directory |
 | Verification | `tests/frontend/`, `tests/backend/`, `tests/browser/`, `tests/operations/`, `tests/performance/` | Controller checks, HTTP contracts, real browser journeys, package rehearsal and repeatable timings |
 
+## Network protocols and process boundaries
+
+Nginx terminates public HTTPS and negotiates HTTP/2. It serves the built static site, sends event API requests to the platform Unix socket, and sends `/gotc/v1/` to the gateway Unix socket. Each systemd service runs one Uvicorn worker. The development launcher hosts both ASGI apps on loopback. The production launcher requires a private socket path and a configured HTTPS origin.
+
+| Boundary | Library responsibility | Application responsibility |
+| --- | --- | --- |
+| Incoming HTTP | Uvicorn handles parsing, framing, keep-alive and flow control. Starlette declares routes and supplies request bodies and responses. | Check the route’s byte limit, identity and revisions. Trust forwarded client addresses only on the configured Unix listener. [Uvicorn settings](https://uvicorn.dev/settings/) · [Starlette routing](https://starlette.dev/routing/) |
+| Outbound HTTP | HTTPX manages TLS, connection pools, async request uploads and streamed responses. | Select a configured provider, supply server-owned credentials, enforce admission limits and record the outcome. Repository requests use a bounded synchronous HTTPX client. [HTTPX streaming](https://www.python-httpx.org/async/#streaming-responses) |
+| Speech | The ASGI WebSocket interface handles the caller connection. The websockets client opens the provider connection. | Check the team, model, permitted subprotocols, message size, session deadline and speech usage. [Starlette WebSockets](https://starlette.dev/websockets/) · [websockets asyncio client](https://websockets.readthedocs.io/en/stable/reference/asyncio/client.html) |
+| Streamed events and forms | httpx-sse decodes event fields. python-multipart parses multipart parts incrementally. | Retain original bytes for forwarding. Bound each event and its initial prelude, redact errors, meter completed and partial responses, and spool uploads under the material limits. [WHATWG event streams](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream) · [Python Multipart API](https://multipart.fastapiexpert.com/api/) |
+
+A team’s chat request enters at `/gotc/v1/chat/completions`. The gateway verifies the key and requested model, admits the call, and rechecks access after waiting. The relay opens the provider request with the organizer’s credential. It forwards server-sent events and accounts for usage even when a caller leaves after inference begins.
+
+New events default to metadata-only gateway logging. Gateway maintenance expires retained content when traffic is idle. Both services expose `/livez`, `/readyz` and `/metrics` to local operational clients. Public Nginx routes exclude those endpoints. [Runtime dependency lock](../backend/requirements.txt)
+
+The organizer dashboard reads event history from SQLite. For live inflight and queued calls it asks the gateway for a bounded snapshot over its private Unix socket after the authenticated database read completes. If the gateway is unavailable, the dashboard labels those counters unavailable. A combined development instance can obtain them from the same process.
+
 ## Following a submission
 
 1. The shared browser shell resolves `#team` against the current identity. The route lists the scripts and styles for that workspace. A navigation generation identifies the currently active view, so a delayed load cannot mount the page the user has left.

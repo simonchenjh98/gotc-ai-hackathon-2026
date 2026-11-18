@@ -11,6 +11,7 @@ Usage and the terminal settlement marker are committed in one transaction.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -20,14 +21,11 @@ import secrets
 import sqlite3
 import threading
 import time
-import urllib.error
-import urllib.request
-from urllib.parse import quote
 
 from backend.gotc.errors import APIError
-from . import transport
 from .config import check_url
-from .protocol_errors import redact_error_payload
+from .memory import BULK_BYTES
+from .protocol_errors import redact_error_payload, safe_header
 
 
 STATES = frozenset({"waiting", "in_progress", "success", "failure", "cancelled"})
@@ -108,6 +106,10 @@ def _redact(value, credential):
     return json.loads(redact_error_payload(_dump(value).encode(), (credential,)))
 
 
+class LargeTaskSnapshot(Exception):
+    """Retry this read under the gateway memory lease."""
+
+
 class AsyncTasks:
     """The gateway authenticates each public request before calling ``request``.
 
@@ -120,8 +122,9 @@ class AsyncTasks:
         self.gateway = gateway
         self.service = gateway.service
         self.pricing = pricing
-        self.transport = transport or self._transport
+        self.transport = transport
         self._locks = [threading.RLock() for _ in range(64)]
+        self._async_locks = [asyncio.Lock() for _ in range(64)]
         self._stop = threading.Event()
         self._worker = None
 
@@ -136,7 +139,13 @@ class AsyncTasks:
         return bool(TASK_ROUTE.fullmatch(path))
 
     def _lock(self, task_id):
-        return self._locks[int(hashlib.sha256(task_id.encode()).hexdigest()[:8], 16) % len(self._locks)]
+        return self._locks[self._lock_index(task_id)]
+
+    def async_lock(self, task_id):
+        return self._async_locks[self._lock_index(task_id)]
+
+    def _lock_index(self, task_id):
+        return int(hashlib.sha256(task_id.encode()).hexdigest()[:8], 16) % len(self._locks)
 
     def _task(self, row):
         task = dict(row)
@@ -147,16 +156,34 @@ class AsyncTasks:
         task["requested_at"] = task["created_at"] / 1000
         return task
 
-    def _get(self, task_id):
+    @staticmethod
+    def _check_snapshot_size(db, task_id, key=None):
+        # Keep the size check and subsequent row read on the same SQLite snapshot.
+        if not db.in_transaction:
+            db.execute("BEGIN")
+        sql = "SELECT length(CAST(payload AS BLOB)) FROM api_async_tasks WHERE id=?"
+        params = (task_id,)
+        if key is not None:
+            sql += " AND key_id=? AND team_id=?"
+            params += (key["id"], key["team_id"])
+        row = db.execute(sql, params).fetchone()
+        if row and row[0] >= BULK_BYTES:
+            raise LargeTaskSnapshot()
+
+    def _get(self, task_id, *, small_only=False):
         with self.service.db() as db:
+            if small_only:
+                self._check_snapshot_size(db, task_id)
             row = db.execute("SELECT * FROM api_async_tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
             raise APIError(404, "任务不存在")
         return self._task(row)
 
-    def _owned(self, key, task_id):
+    def _owned(self, key, task_id, *, small_only=False):
         """Exact key ownership: another key in the same team also cannot read it."""
         with self.service.db() as db:
+            if small_only:
+                self._check_snapshot_size(db, task_id, key)
             row = db.execute("""SELECT t.* FROM api_async_tasks t
               JOIN api_keys k ON k.id=t.key_id AND k.team_id=t.team_id AND k.active=1
               JOIN team_api a ON a.team_id=t.team_id AND a.active=1
@@ -193,6 +220,13 @@ class AsyncTasks:
         A repeated call with the same request_id is safe after a local database
         failure. It must never be implemented by resubmitting inference upstream.
         """
+        task = self.store_submission(call, upstream, payload, request=request, headers=headers)
+        if task["state"] in TERMINAL and not task["settled"]:
+            task = self._refresh(task) if task["state"] == "success" else self._settle(task)
+        return self._public(task)
+
+    def store_submission(self, call, upstream, payload, *, request=None, headers=None):
+        """Commit one accepted submission before any task poll or client response."""
         for attempt in range(3):
             try:
                 return self._register(call, upstream, payload, request=request, headers=headers)
@@ -203,7 +237,7 @@ class AsyncTasks:
 
     def _register(self, call, upstream, payload, *, request=None, headers=None):
         if not isinstance(payload, dict) or not isinstance(payload.get("task_id"), str) or \
-                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", payload["task_id"]) or payload.get("status") not in STATES:
+                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", payload["task_id"]) or not isinstance(payload.get("status"), str) or payload["status"] not in STATES:
             raise APIError(502, "上游未返回有效的异步任务")
         try:
             upstream_url = check_url(upstream["url"])
@@ -225,10 +259,10 @@ class AsyncTasks:
         if "error" in payload:
             payload = dict(payload, error=_redact(payload["error"], credential))
         encoded = _dump(payload)
-        response_headers = _dump(self._billing_headers(headers or {}), SNAPSHOT_LIMIT)
+        response_headers = _dump(self._billing_headers(headers or {}, credential), SNAPSHOT_LIMIT)
         with self.service.db() as db:
             db.execute("BEGIN IMMEDIATE")
-            existing = db.execute("SELECT * FROM api_async_tasks WHERE (key_id=? AND request_id=?) OR (remote_scope=? AND remote_id=?)",
+            existing = db.execute("SELECT id,key_id,team_id,remote_scope,remote_id FROM api_async_tasks WHERE (key_id=? AND request_id=?) OR (remote_scope=? AND remote_id=?)",
                                   (key["id"], request_id, scope, payload["task_id"])).fetchall()
             if existing:
                 row = existing[0]
@@ -257,14 +291,11 @@ class AsyncTasks:
                 db.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (at, key["id"]))
         # Publish the local identity only after both inserts have committed.
         call["recorded"], call["task_id"] = True, task_id
-        task = self._get(task_id)
-        if task["state"] in TERMINAL and not task["settled"]:
-            task = self._refresh(task) if task["state"] == "success" else self._settle(task)
-        return self._public(task)
+        return self._get(task_id)
 
     @staticmethod
-    def _billing_headers(headers):
-        return {str(k).lower(): str(v)[:256] for k, v in headers.items()
+    def _billing_headers(headers, credential):
+        return {str(k).lower(): safe_header(str(v), (credential,), limit=256) for k, v in headers.items()
                 if str(k).lower() in {"inference-cost", "inference-currency", "inference-cost-currency", "x-request-id", "request-id"}}
 
     def _quote(self, task):
@@ -314,64 +345,33 @@ class AsyncTasks:
                             "" if settled else task["upstream_key"], _now(), task["id"]))
         return self._get(task["id"])
 
-    def _transport(self, snapshot, method, suffix):
-        request = urllib.request.Request(snapshot["upstream_url"] + suffix,
-                  data=b"{}" if method == "POST" else None, method=method,
-                  headers={"Authorization": "Bearer " + snapshot["upstream_key"], "Accept": "application/json",
-                           "Content-Type": "application/json"})
-        # A dedicated no-redirect opener cannot forward the stored key to a URL
-        # returned in task.urls, Location, output or a caller's query string.
-        try:
-            with transport.make_opener().open(request, timeout=30) as response:
-                status = response.status
-                raw = response.read(RESPONSE_LIMIT + 1)
-                headers = self._billing_headers(response.headers)
-                if len(raw) > RESPONSE_LIMIT:
-                    raise APIError(502, "异步任务返回内容过大")
-                try:
-                    payload = json.loads(raw)
-                except (ValueError, UnicodeError, RecursionError):
-                    raise APIError(502, "异步任务返回格式不正确") from None
-                return status, payload, headers
-        except urllib.error.HTTPError as error:
-            error.close()
-            raise APIError(502, "上游异步任务查询失败") from None
-        except (OSError, urllib.error.URLError):
-            raise APIError(502, "上游异步任务暂时不可达") from None
+    def _run_provider(self, operation, *args):
+        """Synchronous domain callers share the ASGI provider operations and settlement rules."""
+        async def inline(fn, *values):
+            return fn(*values)
 
-    def _fetch(self, task, method="GET", action=""):
-        if not task["upstream_key"]:
-            raise APIError(502, "异步任务已结束，无法继续访问上游")
-        suffix = "/task/" + quote(task["remote_id"], safe="") + action
-        status, payload, headers = self.transport(task, method, suffix)
-        if status < 200 or status >= 300:
-            raise APIError(502, "上游异步任务查询失败")
-        return payload, self._billing_headers(headers)
+        async def run():
+            opener = None if self.transport is not None else self.gateway.opener
+            try:
+                provider = None if opener is None else opener.async_provider()
+                return await operation(self, provider, inline, *args)
+            finally:
+                if opener is not None:
+                    await opener.close()
+        return asyncio.run(run())
+
+    @staticmethod
+    def needs_result(task, payload, headers):
+        if not isinstance(payload, dict) or payload.get("task_id") != task["remote_id"] or not isinstance(payload.get("status"), str) or payload["status"] not in STATES:
+            raise APIError(502, "上游异步任务身份或状态不正确")
+        return payload["status"] == "success" and ("output" not in payload or
+                (payload.get("price") is None and "inference-cost" not in headers))
 
     def _refresh(self, task):
-        if task["settled"]:
-            return task
-        try:
-            payload, headers = self._fetch(task)
-        except APIError:
-            if task["state"] in TERMINAL:
-                return self._settle(task)  # cached result survives a provider outage
-            raise
-        if not isinstance(payload, dict) or payload.get("task_id") != task["remote_id"] or payload.get("status") not in STATES:
-            raise APIError(502, "上游异步任务身份或状态不正确")
-        if payload["status"] == "success" and ("output" not in payload or
-                (payload.get("price") is None and "inference-cost" not in headers)):
-            # The documented result route supplies Inference-Cost even when the
-            # task record has no price. Fetch it only after checking task identity.
-            try:
-                output, result_headers = self._fetch(task, "GET", "/get")
-                if not isinstance(output, dict):
-                    raise APIError(502, "上游异步任务结果格式不正确")
-                payload = dict(payload, output=output)
-                headers = {**headers, **result_headers}
-            except APIError:
-                if "output" not in payload:
-                    raise
+        from .async_tasks import _refresh
+        return self._run_provider(_refresh, task)
+
+    def save_refresh(self, task, payload, headers):
         # Scrub errors before caching and before removing the completed credential.
         if "error" in payload:
             payload = dict(payload, error=_redact(payload["error"], task["upstream_key"]))
@@ -383,28 +383,37 @@ class AsyncTasks:
                        (encoded, _dump(headers), payload["status"], _now(), _now() + POLL_INTERVAL * 1000, task["id"], payload["status"]))
         return self._settle(self._get(task["id"]))
 
-    def request(self, key, method, path):
+    @staticmethod
+    def route(method, path):
         match = TASK_ROUTE.fullmatch(path)
         if not match:
             raise APIError(404, "任务接口不存在")
         task_id, action = match.group(1), match.group("action") or ""
         if method != ("POST" if action == "/cancel" else "GET"):
             raise APIError(405, "任务接口请求方法不正确")
+        return task_id, action
+
+    def request(self, key, method, path):
+        task_id, action = self.route(method, path)
         with self._lock(task_id):
             task = self._owned(key, task_id)
             if action == "/cancel" and task["state"] not in TERMINAL:
-                self._fetch(task, "POST", "/cancel")  # no automatic mutation retry
+                from .async_tasks import _fetch
+                self._run_provider(_fetch, task, "POST", "/cancel")
             task = self._refresh(task)
             task = self._owned(key, task_id)
-            if action == "/status":
-                payload = task["state"]
-            elif action == "/get":
-                if task["state"] != "success":
-                    raise APIError(409, "任务尚无可用结果")
-                payload = copy.deepcopy(task["payload"].get("output", {}))
-            else:
-                payload = self._public(task)
-            return 200, payload, dict(task["response_headers"])
+            return self.reply(task, action)
+
+    def reply(self, task, action):
+        if action == "/status":
+            payload = task["state"]
+        elif action == "/get":
+            if task["state"] != "success":
+                raise APIError(409, "任务尚无可用结果")
+            payload = copy.deepcopy(task["payload"].get("output", {}))
+        else:
+            payload = self._public(task)
+        return 200, payload, dict(task["response_headers"])
 
     def recover_once(self, limit=20):
         """Reconcile submitted jobs even after a restart or key revocation.
@@ -413,28 +422,35 @@ class AsyncTasks:
         Network, pricing and database errors leave the job recoverable. A lost
         submit response is deliberately not retried by this module.
         """
-        limit = max(1, min(int(limit), 100))
-        with self.service.db() as db:
-            rows = db.execute("SELECT id FROM api_async_tasks WHERE settled=0 AND next_poll_at<=? ORDER BY next_poll_at LIMIT ?",
-                              (_now(), limit)).fetchall()
+        task_ids = self.due_ids(limit)
         result = {"checked": 0, "settled": 0, "failed": 0}
-        for row in rows:
-            with self._lock(row["id"]):
+        for task_id in task_ids:
+            with self._lock(task_id):
                 result["checked"] += 1
                 try:
-                    task = self._refresh(self._get(row["id"]))
+                    task = self._refresh(self._get(task_id))
                     result["settled"] += int(bool(task["settled"]))
                 except Exception:
                     # Never persist provider errors/credentials or expose them to
                     # background logs. The pending usage row remains incomplete.
                     result["failed"] += 1
                     try:
-                        with self.service.db() as db:
-                            db.execute("UPDATE api_async_tasks SET attempts=attempts+1,last_error=?,next_poll_at=? WHERE id=? AND settled=0",
-                                       ("reconciliation_pending", _now() + 30000, row["id"]))
+                        self.defer(task_id)
                     except Exception:
                         pass
         return result
+
+    def due_ids(self, limit=20):
+        limit = max(1, min(int(limit), 100))
+        with self.service.db() as db:
+            rows = db.execute("SELECT id FROM api_async_tasks WHERE settled=0 AND next_poll_at<=? ORDER BY next_poll_at LIMIT ?",
+                              (_now(), limit)).fetchall()
+        return [row["id"] for row in rows]
+
+    def defer(self, task_id):
+        with self.service.db() as db:
+            db.execute("UPDATE api_async_tasks SET attempts=attempts+1,last_error=?,next_poll_at=? WHERE id=? AND settled=0",
+                       ("reconciliation_pending", _now() + 30000, task_id))
 
     def start(self):
         """Start one bounded daemon; initialization/migrations must finish first."""

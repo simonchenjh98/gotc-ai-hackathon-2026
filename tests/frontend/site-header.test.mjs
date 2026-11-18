@@ -4,7 +4,7 @@ import {readSource} from './source.mjs';
 import vm from 'node:vm';
 
 const source=readSource('site-header.js');
-function fixture(href,page){
+function fixture(href,page,platformBase='./'){
   const listeners={},location={href,hash:new URL(href).hash},links=[];
   function node(){
     const classes=new Set(),attributes=new Map();
@@ -13,7 +13,7 @@ function fixture(href,page){
       addEventListener(name,fn){this.listeners[name]=fn;},focus(){this.focused=true;}};
   }
   const menu=node(),nav=node(),more=node(),summary=node(),header=node();more.querySelector=()=>summary;
-  header.dataset={page,platformBase:'https://8.141.114.201/gotc/'};
+  header.dataset={page,platformBase};
   Object.defineProperty(header,'innerHTML',{set(html){
     for(const match of html.matchAll(/<a href="([^"]+)" data-header-page="([^"]+)"(?: data-route="([^"]+)")?>([^<]+)<\/a>/g)){
       const link=node();link.href=match[1];link.textContent=match[4];link.dataset={headerPage:match[2],route:match[3]};links.push(link);
@@ -37,11 +37,11 @@ test('all local pages share destinations and stay inside the gotc mount',()=>{
 });
 
 test('the static homepage keeps event links local and platform links on the live service',()=>{
-  const f=fixture('https://example.github.io/gotc-ai-hackathon-2026/index.html','home');
+  const f=fixture('https://example.github.io/gotc-ai-hackathon-2026/index.html','home','https://event.example/gotc/');
   assert.equal(f.links.find(a=>a.dataset.headerPage==='home').href,'#');
   assert.equal(f.links.find(a=>a.dataset.headerPage==='schedule').href,'#schedule');
-  assert.equal(f.links.find(a=>a.dataset.headerPage==='teams').href,'https://8.141.114.201/gotc/teams.html');
-  assert.equal(f.links.find(a=>a.dataset.headerPage==='team').href,'https://8.141.114.201/gotc/platform.html#team');
+  assert.equal(f.links.find(a=>a.dataset.headerPage==='teams').href,'https://event.example/gotc/teams.html');
+  assert.equal(f.links.find(a=>a.dataset.headerPage==='team').href,'https://event.example/gotc/platform.html#team');
 });
 
 test('homepage section navigation keeps the same document including root paths and query strings',()=>{

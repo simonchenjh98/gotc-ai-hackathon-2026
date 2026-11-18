@@ -38,10 +38,15 @@ function installSubmissionUploads(data,form,{isCurrent,canUpload,onChange,onBusy
       const project=form.elements.projectName.value.trim() || '作品',file=input.files?.[0],problem=submissionUploadProblem(kind,file,project);
       if(problem){status.textContent=problem;(project?input:form.elements.projectName).focus();return;}
       const previous=field.value,controller=new AbortController(),timer=setTimeout(()=>controller.abort(),330000);
-      pending=true;controls(true);status.textContent='正在上传，请保持此页打开。文件上传完成后仍需保存草稿或正式提交。';resultBox.innerHTML='';
+      pending=true;controls(true);status.textContent='正在上传，请保持此页打开。文件上传完成后仍需保存草稿或正式提交。';resultBox.replaceChildren();
       try{
         const result=await uploadSubmissionFile(kind,file,project,owner,controller.signal);if(!live())return;
-        resultBox.innerHTML=`<a href="${esc(result.url)}" target="_blank" rel="noopener noreferrer">${kind==='demo'?'打开作品':'查看 / 下载'}：${esc(result.filename)} ↗</a>`;
+        const link = document.createElement('a');
+        link.href = result.url; // uploadSubmissionFile validated the same-origin material path.
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.textContent = (kind === 'demo' ? '打开作品' : '查看 / 下载') + '：' + result.filename + ' ↗';
+        resultBox.replaceChildren(link);
         if((form.elements.projectName.value.trim() || '作品')!==project || field.value!==previous){status.textContent='文件已上传，但上传期间作品名或链接已修改，未替换当前输入。请核对上方文件；作品名变化时需重新上传。';return;}
         field.value=result.url;form.elements.confirmed.checked=false;uploads.set(kind,{url:result.url,project});onChange();status.textContent='文件已上传，链接已填入当前草稿；尚未保存草稿或正式提交。';
       }catch(error){if(live()){status.textContent=error.name==='AbortError'?'上传等待超时；原链接和其他输入已保留，请重试。':error.message;if([401,403].includes(error.status))onUnauthorized();}}

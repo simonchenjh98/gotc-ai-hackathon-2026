@@ -37,7 +37,7 @@ SCHEMA = '''CREATE TABLE IF NOT EXISTS material_uploads (
 
 
 def header_text(headers, name, allow_empty=False):
-    values = headers.get_all(name, [])
+    values = headers.getlist(name)
     if len(values) != 1 or len(values[0]) > 2048 or re.search(r'%(?![0-9a-fA-F]{2})', values[0]):
         raise APIError(400, '请填写作品名称并选择上传文件', 'upload_metadata')
     try:
@@ -114,17 +114,17 @@ class MaterialUploads:
     def url(self, row):
         return self.s.origin + self.s.base_path + '/materials/' + row['id'] + '/' + quote(row['filename'], safe='')
 
-    def upload(self, handler, kind, length):
+    def upload(self, headers, read_chunk, kind, length):
         if length <= 0 or length > LIMITS[kind]:
             raise APIError(413, '文件超过大小限制或为空', 'upload_size')
-        project = header_text(handler.headers, 'X-GOTC-Project', allow_empty=True) or '作品'
-        original = header_text(handler.headers, 'X-GOTC-Filename')
+        project = header_text(headers, 'X-GOTC-Project', allow_empty=True) or '作品'
+        original = header_text(headers, 'X-GOTC-Filename')
         if len(project) > 140:
             raise APIError(400, '作品名称最多140字', 'upload_metadata')
         extension = Path(original).suffix.lower()
         if extension not in EXTENSIONS[kind]:
             raise APIError(415, '该提交项不支持此文件类型', 'upload_type')
-        cookie, login_id = handler.headers.get('Cookie', ''), handler.headers.get('X-GOTC-Login')
+        cookie, login_id = headers.get('Cookie', ''), headers.get('X-GOTC-Login')
         with self.s.db() as db:
             _, team = self.identity(db, cookie, login_id)
         team_id = team['id']
@@ -154,7 +154,7 @@ class MaterialUploads:
                 while remaining:
                     if time.monotonic() - started > 300:
                         raise APIError(408, '上传超时，请重新上传', 'upload_timeout')
-                    chunk = handler.rfile.read1(min(65536, remaining))
+                    chunk = read_chunk(min(65536, remaining))
                     if not chunk:
                         raise APIError(400, '文件上传不完整，请重试', 'upload_incomplete')
                     stream.write(chunk)
@@ -257,7 +257,7 @@ class MaterialUploads:
             if row['project_name'] != project_name or row['filename'] != expected_name:
                 raise APIError(400, '队名或作品名称已变化，请按新名称重新上传文件', 'upload_project')
 
-    def serve(self, handler, path):
+    def download(self, path):
         match = re.fullmatch(r'/materials/([A-Za-z0-9_-]{43})/([^/]+)', path)
         with self.s.db() as db:
             row = db.execute('SELECT * FROM material_uploads WHERE id=?', (match[1],)).fetchone() if match else None
@@ -273,8 +273,4 @@ class MaterialUploads:
                  'Referrer-Policy': 'no-referrer'}
         if html:
             extra.update({'Content-Security-Policy': HTML_CSP, 'Cross-Origin-Opener-Policy': 'same-origin'})
-        with source.open('rb') as stream:
-            handler.headers_out(200, MIMES[extension], row['size'], extra=extra)
-            if handler.command != 'HEAD':
-                while chunk := stream.read(65536):
-                    handler.wfile.write(chunk)
+        return source, MIMES[extension], extra

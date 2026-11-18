@@ -413,6 +413,7 @@ class RoadshowScoringTests(unittest.TestCase):
         self.assertEqual(self.board(), original)
         with self.service.db() as db:
             db.execute('DROP TRIGGER roadshow_scoring_team_metadata')
+            db.execute("PRAGMA user_version=0")  # Reproduce an unnumbered predecessor.
         self.service = EventService(data_dir=previous.data_dir, base_path=previous.base_path,
                                     origin=previous.origin, static_root=previous.root)
         self.server.service = self.service

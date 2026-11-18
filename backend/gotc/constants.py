@@ -10,6 +10,6 @@ DIMENSIONS = [
 ]
 SESSION_SECONDS = 12 * 3600
 # Bound password-check CPU/memory without holding the database writer lock.
-LOGIN_KDF_CONCURRENCY = 4
+LOGIN_KDF_CONCURRENCY = 2
 VOTE_LIMIT = 3
 COOKIE_NAME = "gotc_session"

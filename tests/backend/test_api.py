@@ -15,6 +15,35 @@ from backend.gotc.http.server import EventHTTPServer
 from backend.gotc.service import DIMENSIONS, EventService
 
 
+class LocalListener:
+    """Restart the real Uvicorn app on the same port for persisted-state tests."""
+
+    def __init__(self, service):
+        self.listener = EventHTTPServer(("127.0.0.1", 0), service)
+        self.server_port = self.listener.server_port
+        self._start()
+
+    def _start(self):
+        self.thread = threading.Thread(target=self.listener.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def service(self):
+        return self.listener.service
+
+    @service.setter
+    def service(self, restarted):
+        self.close()
+        self.listener = EventHTTPServer(("127.0.0.1", self.server_port), restarted)
+        self._start()
+
+    def close(self):
+        self.listener.server_close()
+        self.thread.join(timeout=5)
+        if self.thread.is_alive():
+            raise RuntimeError("Test listener did not shut down")
+
+
 class Client:
     def __init__(self, server):
         self.server = server
@@ -38,7 +67,7 @@ class Client:
         conn.request(method, self.server.service.base_path + path, body, request_headers)
         response = conn.getresponse()
         content = response.read()
-        response_headers = dict(response.getheaders())
+        response_headers = response.headers
         if "Set-Cookie" in response_headers:
             self.cookie = response_headers["Set-Cookie"].split(";", 1)[0]
         conn.close()
@@ -84,10 +113,8 @@ class APITests(unittest.TestCase):
         (static / "assets").mkdir()
         (static / "assets" / "secret.json").write_text('{"secret":true}', encoding="utf-8")
         self.service = EventService(data_dir=self.root / "private", origin="http://127.0.0.1", static_root=static)
-        self.server = EventHTTPServer(("127.0.0.1", 0), self.service)
+        self.server = LocalListener(self.service)
         self.service.origin = "http://127.0.0.1:" + str(self.server.server_port)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
         self.public = Client(self.server)
         self.admin = Client(self.server)
         self.admin_code = (self.root / "private" / "admin-access.txt").read_text().splitlines()[1]
@@ -95,9 +122,7 @@ class APITests(unittest.TestCase):
         self.assertEqual(status, 200)
 
     def tearDown(self):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=3)
+        self.server.close()
         self.temp.cleanup()
 
     def team(self, number=1, name="真实队伍", **more):
@@ -178,18 +203,18 @@ class APITests(unittest.TestCase):
         old, invitation = self.invitation()
         old_identity = old.get('/api/session')[1].get('loginId')
         entered, release = threading.Event(), threading.Event()
-        dispatch = self.service.dispatch
+        dispatch = self.service.dispatch_endpoint
         outcome = []
 
-        def paused(method, path, *args, **kwargs):
-            result = dispatch(method, path, *args, **kwargs)
+        def paused(endpoint, path, *args, **kwargs):
+            result = dispatch(endpoint, path, *args, **kwargs)
             if path == '/api/logout':
                 entered.set()
                 if not release.wait(10):
                     raise RuntimeError('Synthetic logout was not released')
             return result
 
-        self.service.dispatch = paused
+        self.service.dispatch_endpoint = paused
         thread = threading.Thread(target=lambda: outcome.append(old.post('/api/logout', {})))
         thread.start()
         try:
@@ -203,7 +228,7 @@ class APITests(unittest.TestCase):
         finally:
             release.set()
             thread.join(5)
-            self.service.dispatch = dispatch
+            self.service.dispatch_endpoint = dispatch
         status, _, headers = outcome[0]
         self.assertEqual(status, 200)
         self.assertNotIn('Set-Cookie', headers, 'late logout must not expire the shared new login cookie')

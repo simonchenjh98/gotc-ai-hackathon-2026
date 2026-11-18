@@ -3,6 +3,7 @@ from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 import json
 
+from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
 from backend.gotc.judging.finals import MAX_REVISION
 
@@ -233,8 +234,8 @@ class RoadshowScoring:
                 'roster': {'teamIds': [team['id'] for team in self.teams(db, state)],
                            'editable': self.s.judging.stage_view(state)['rosterEditable']}}
 
-    def save_teams(self, db, actor, state, body):
-        self.fields(body, {'runId', 'expectedRevision', 'teamIds'})
+    def save_teams(self, db, actor, state, body: inputs.RoadshowTeams):
+        self.fields(body, inputs.RoadshowTeams.__required_keys__)
         if not isinstance(body['runId'], str) or body['runId'] != state['run_id']:
             raise APIError(409, '路演轮次已更新，请核对最新页面', 'roadshow_run_conflict')
         self.next_revision(body, state['revision'])
@@ -250,11 +251,11 @@ class RoadshowScoring:
             'expectedRevision': body['expectedRevision'], 'teamIds': team_ids, 'judgeIds': judge_ids})
         return {'ok': True, **self.admin_view(db, self.s.judging.state(db, 'roadshow'))}
 
-    def save_score(self, db, actor, state, body):
+    def save_score(self, db, actor, state, body: inputs.RoadshowBallot):
         self.require_judge(db, actor, state)
         if isinstance(body, dict) and {'progressScore', 'progressNote'} & set(body):
             raise APIError(409, '路演已恢复六维100分直接计分，请刷新页面后重新提交', 'roadshow_rule_changed')
-        self.fields(body, {'runId', 'teamId', 'expectedRevision', 'status', 'scores', 'feedback'})
+        self.fields(body, inputs.RoadshowBallot.__required_keys__)
         if not isinstance(body['runId'], str) or body['runId'] != state['run_id']:
             raise APIError(409, '路演轮次已更新，请核对最新页面', 'roadshow_run_conflict')
         if not self.s.judging.window(state)['canEdit']:
@@ -299,8 +300,8 @@ class RoadshowScoring:
                          (state['run_id'], actor['id'], body['teamId'])).fetchone()
         return {'ok': True, 'score': self.score_view(row)}
 
-    def publish(self, db, actor, state, body):
-        self.fields(body, {'runId', 'expectedRevision', 'published'})
+    def publish(self, db, actor, state, body: inputs.RoadshowPublication):
+        self.fields(body, inputs.RoadshowPublication.__required_keys__)
         if not isinstance(body['runId'], str) or body['runId'] != state['run_id']:
             raise APIError(409, '路演轮次已更新，请核对最新页面', 'roadshow_run_conflict')
         revision = self.next_revision(body, self.publication_state(db)['revision'])
@@ -332,6 +333,11 @@ class RoadshowScoring:
         if query:
             raise APIError(400, '路演评分接口不接受查询参数')
         with self.s.db() as db:
+            if method == 'POST':
+                if path not in {'/api/roadshow/score', '/api/admin/roadshow/publish', '/api/admin/roadshow/teams'}:
+                    raise APIError(404, '路演评分接口不存在')
+                self.s.write_identity(db, cookie, 'admin' if path.startswith('/api/admin/') else 'judge',
+                                      expected_login_id, marker_required=True)
             db.execute('BEGIN IMMEDIATE' if method == 'POST' else 'BEGIN')
             state = self.s.judging.state(db, 'roadshow')
             if method == 'GET' and path == '/api/roadshow/board':

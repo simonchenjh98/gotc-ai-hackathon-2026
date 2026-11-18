@@ -6,7 +6,7 @@ import unittest
 from unittest import mock
 from urllib.parse import quote
 
-from backend.gotc.gateway import relay as gateway_relay
+from backend.gotc.gateway import async_text as gateway_relay
 from backend.gotc.gateway import protocol_errors as gateway_protocol_errors
 import test_keys
 

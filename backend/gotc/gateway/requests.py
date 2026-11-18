@@ -2,6 +2,8 @@
 
 import ipaddress
 import json
+import math
+import re
 import unicodedata
 import zlib
 
@@ -38,6 +40,9 @@ def gateway_json(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
 
 
+_SURROGATES = re.compile("[\ud800-\udfff]")
+
+
 def validate_json_depth(value):
     """Bound container depth before recursive schema/media inspection or serialization.
 
@@ -54,7 +59,13 @@ def validate_json_depth(value):
         if isinstance(item, (dict, list)):
             if len(stack) > JSON_DEPTH_LIMIT:
                 raise GatewayError("invalid", f"JSON 嵌套过深，最多允许 {JSON_DEPTH_LIMIT} 层")
+            if isinstance(item, dict) and any(_SURROGATES.search(key) for key in item):
+                raise ValueError("unpaired surrogate in property name")
             stack.append(iter(item.values() if isinstance(item, dict) else item))
+        elif isinstance(item, str) and _SURROGATES.search(item):
+            raise ValueError("unpaired surrogate in string")
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("non-finite number")
 
 
 def bound_output(body, inject=True):
@@ -128,31 +139,52 @@ def estimate_input(body):
     Only the image payload string itself is set aside; everything around it is still counted."""
     images = 0
 
-    def strip(node):
+    def string_size(value):
+        # Count the same UTF-8 bytes as json.dumps(ensure_ascii=False) without
+        # creating a second copy of an entire long prompt or inline document.
+        size = 2
+        for start in range(0, len(value), 32768):
+            fragment = value[start:start + 32768]
+            size += len(json.encoder.encode_basestring(fragment).encode()) - 2
+        return size
+
+    def measure(node, blank_field=None):
         nonlocal images
+        if isinstance(node, str):
+            return string_size(node)
         if isinstance(node, list):
-            return [strip(v) for v in node]
+            return 2 + max(0, len(node) - 1) * 2 + sum(measure(item) for item in node)
         if not isinstance(node, dict):
-            return node
-        out = {k: strip(v) for k, v in node.items()}
-        source = node.get("source")
-        if node.get("type") == "image" and isinstance(source, dict) and source.get("type") == "base64" \
-                and str(source.get("media_type", "")).startswith("image/") and isinstance(source.get("data"), str):
-            images += 1
-            out["source"] = {**out["source"], "data": ""}
-        url = node.get("image_url")
-        if node.get("type") in ("image_url", "input_image"):
-            target = url.get("url") if isinstance(url, dict) else url
-            if isinstance(target, str) and target.startswith("data:image/"):
+            return len(json.dumps(node))
+        size = 2 + max(0, len(node) - 1) * 2
+        for key, value in node.items():
+            size += string_size(key) + 2  # quoted key and ": "
+            if key == blank_field:
+                size += 2  # empty quoted image payload
+            elif key == "source" and node.get("type") == "image" and isinstance(value, dict) and (
+                value.get("type") == "base64" and str(value.get("media_type", "")).startswith("image/")
+                and isinstance(value.get("data"), str)
+            ):
                 images += 1
-                out["image_url"] = {**out["image_url"], "url": ""} if isinstance(url, dict) else ""
-        return out
-    text = json.dumps(strip(body), ensure_ascii=False).encode()
-    return len(text) // 4 + images * IMAGE_TOKENS
+                size += measure(value, "data")
+            elif key == "image_url" and node.get("type") in ("image_url", "input_image"):
+                target = value.get("url") if isinstance(value, dict) else value
+                if isinstance(target, str) and target.startswith("data:image/"):
+                    images += 1
+                    size += measure(value, "url") if isinstance(value, dict) else 2
+                else:
+                    size += measure(value)
+            else:
+                size += measure(value)
+        return size
+
+    return measure(body) // 4 + images * IMAGE_TOKENS
 
 
 def client_ip(handler):
     """The team's address: Nginx's X-Real-IP is trusted only from a loopback peer, as in app.py."""
+    if hasattr(handler, "client_ip"):
+        return handler.client_ip
     peer = handler.client_address[0]
     try:
         if ipaddress.ip_address(peer).is_loopback:
@@ -196,39 +228,49 @@ def request_text(body):
     return " ".join(unicodedata.normalize("NFKC", text).translate(ZERO_WIDTH).split()).lower()
 
 
-def read_body(handler):
-    if handler.headers.get("Transfer-Encoding") or len(handler.headers.get_all("Content-Length", [])) != 1:
+def json_body_length(headers):
+    if headers.get("Transfer-Encoding") or len(headers.get_all("Content-Length", [])) != 1:
         raise APIError(411, "请求需要 Content-Length")
     try:
-        length = int(handler.headers["Content-Length"])
+        length = int(headers["Content-Length"])
     except ValueError:
         raise APIError(400, "请求长度不正确") from None
     if not 0 < length <= BODY_LIMIT:
         raise GatewayError("too_large", f"请求内容超过 {BODY_LIMIT // 1048576}MB 限制")
-    if handler.headers.get_content_type() != "application/json":
+    if headers.get("Content-Type", "").partition(";")[0].strip().lower() != "application/json":
         raise APIError(415, "请使用JSON请求")
-    raw = handler.rfile.read(length)
-    encoding = (handler.headers.get("Content-Encoding") or "identity").strip().lower()
-    if encoding in ("gzip", "deflate"):
-        # As sub2api: compressed request bodies are accepted; the expanded size is bounded (no decompression bombs).
-        try:
-            inflater = zlib.decompressobj(47 if encoding == "gzip" else 15)
-            expanded = inflater.decompress(raw, BODY_LIMIT + 1)
-        except zlib.error:
-            raise APIError(400, "请求内容解压失败") from None
-        if len(expanded) > BODY_LIMIT or inflater.unconsumed_tail:
-            raise GatewayError("too_large", f"解压后的请求内容超过 {BODY_LIMIT // 1048576}MB 限制")
-        raw = expanded
-    elif encoding != "identity":
-        raise APIError(415, f"不支持的请求压缩格式：{encoding}")
-    handler.raw_body = raw
+    return length
 
+
+def json_inflater(encoding):
+    encoding = (encoding or "identity").strip().lower()
+    if encoding == "identity":
+        return None
+    if encoding in ("gzip", "deflate"):
+        return zlib.decompressobj(47 if encoding == "gzip" else 15)
+    raise APIError(415, f"不支持的请求压缩格式：{encoding}")
+
+
+def inflate_into(output, inflater, data):
+    try:
+        while data:
+            expanded = inflater.decompress(data, min(65536, BODY_LIMIT + 1 - output.tell()))
+            if output.tell() + len(expanded) > BODY_LIMIT:
+                raise GatewayError("too_large", f"解压后的请求内容超过 {BODY_LIMIT // 1048576}MB 限制")
+            output.write(expanded)
+            if inflater.unused_data:
+                raise APIError(400, "请求内容解压失败")
+            data = inflater.unconsumed_tail
+    except zlib.error:
+        raise APIError(400, "请求内容解压失败") from None
+
+
+def decode_json_body(raw):
     def reject_constant(name):
         raise ValueError(name)
     try:
         body = json.loads(raw, parse_constant=reject_constant)
         validate_json_depth(body)
-        gateway_json(body)  # 1e400 parses to inf: refuse here rather than send invalid JSON upstream
     except (UnicodeError, ValueError, RecursionError):
         raise APIError(400, "JSON格式不正确") from None
     if not isinstance(body, dict):

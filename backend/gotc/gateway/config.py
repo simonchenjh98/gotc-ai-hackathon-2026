@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 
 
 DEFAULTS = {"keys.maxKeys": 5, "keys.expiresAt": None,
-            "keys.logContent": True, "keys.teamRpm": 120, "keys.announcement": "", "keys.blockedWords": [],
+            "keys.logContent": False, "keys.teamRpm": 120, "keys.announcement": "", "keys.blockedWords": [],
             "keys.logRetentionHours": 72, "keys.logMaxMB": 2048}  # request content is bounded (sub2api keeps no bodies at all)
 
 

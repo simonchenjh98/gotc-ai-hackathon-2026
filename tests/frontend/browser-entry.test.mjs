@@ -16,7 +16,7 @@ async function openPage(hash, {beforeAsset, session = {role:null}, replies = {},
   function node() {
     const children = new Map(), field = {value:'', addEventListener() {}, removeEventListener() {}};
     return {
-      innerHTML:'', isConnected:true, classList, elements:{code:field, accountId:field, name:field},
+      innerHTML:'', isConnected:true, classList, elements:{code:{...field}, accountId:{...field}, name:{...field}, username:{...field}, totp:{...field}, legacyAdmin:{...field,checked:false}},
       addEventListener() {}, removeEventListener() {}, before() {},
       querySelectorAll: () => [],
       querySelector(selector) {
@@ -215,19 +215,22 @@ function deferred() {
 const ownerKey='gotc-login-owner:v1:'+encodeURIComponent('/gotc/');
 const ok=body=>({ok:true,status:200,json:async()=>body});
 
-async function loginFixture(role,route,delay='confirmation',returnedRole=role) {
+async function loginFixture(role,route,delay='confirmation',returnedRole=role,legacy=false) {
   const storage=new Map(), pending=deferred();
   const mine={role:returnedRole,loginId:'submitted-code-login'};
   let lookups=0;
   const browser=await openPage('#'+route,{storage,replies:{team:serviceUnavailable,'admin/team-workbench':noTeams},respond:(path,options)=>{
     if(path==='login'){
       assert.equal(options.method,'POST');
-      assert.deepEqual(JSON.parse(options.body),{role,code:'fixture-entry'});
+      assert.deepEqual(JSON.parse(options.body),{role,code:'fixture-entry',...(role==='admin' && !legacy?{username:'operator.test',totp:'000123'}:{})});
       return delay==='post'?pending.promise:ok(mine);
     }
     if(path==='session' && ++lookups>1)return delay==='confirmation'?pending.promise:ok(mine);
   }});
   const form=browser.nodes['login-form'];
+  form.elements.legacyAdmin.checked=legacy;
+  form.elements.username.value='operator.test';
+  form.elements.totp.value='000123';
   form.elements.code.value='fixture-entry';
   const submit=()=>form.onsubmit({preventDefault(){}});
   const submitted=submit();
@@ -247,18 +250,26 @@ for(const role of ['team','admin','judge','audience']){
   });
 }
 
-for(const [confirmedRole,endpoint] of [['team','team'],['admin','admin/team-workbench']]){
-  test(`a confirmed ${confirmedRole} login from the team form publishes the matching owner and opens its workbench`,async()=>{
-    const f=await loginFixture('team','team','confirmation',confirmedRole);
+for (const [role,legacy,endpoint] of [['team',false,'team'],['admin',false,'admin'],['admin',true,'admin']]) {
+  test(`confirmed ${legacy ? 'migration ' : ''}${role} credentials stay on their own portal`,async()=>{
+    const f=await loginFixture(role,role,'confirmation',role,legacy);
     assert.equal(f.storage.get(ownerKey),undefined);
     f.pending.resolve(ok(f.mine));
     await f.submitted;
     assert.equal(f.storage.get(ownerKey),f.mine.loginId);
     assert.equal(vm.runInContext('session.loginId',f.browser.context),f.mine.loginId);
-    assert.equal(f.browser.requests.at(-1),'/gotc/api/'+endpoint);
+    assert.ok(f.browser.requests.includes('/gotc/api/'+endpoint));
   });
 }
 
+test('a team entry rejects an organizer identity even if the cookie agrees',async()=>{
+  const f=await loginFixture('team','team','confirmation','admin');
+  f.pending.resolve(ok(f.mine));
+  await f.submitted;
+  assert.equal(vm.runInContext('session.role',f.browser.context),null);
+  assert.equal(f.storage.get(ownerKey),undefined);
+  assert.ok(!f.browser.requests.includes('/gotc/api/admin/team-workbench'));
+});
 test('an owner-marker change during confirmation rejects even a matching login response',async()=>{
   const f=await loginFixture('team','team');
   f.storage.set(ownerKey,'newer-tab');

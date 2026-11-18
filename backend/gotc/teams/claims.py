@@ -11,6 +11,7 @@ import secrets
 import sqlite3
 import unicodedata
 
+from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
 from backend.gotc.teams.claims_auto import AutoReview
 from backend.gotc.admin_data import TRACK_OPTIONS
@@ -77,8 +78,8 @@ class Claims:
         db.executescript(SCHEMA)
         self.auto.initialize(db)
 
-    def person(self,value):
-        if not isinstance(value,dict) or set(value)!={'id','name','school','notes','needsReview'}:
+    def person(self,value: inputs.RosterPerson):
+        if not inputs.accepts_fields(value, inputs.RosterPerson):
             raise APIError(400,'名单字段不正确')
         result={key:self.text(value[key],key,limit,True) for key,limit in [('id',100),('name',100),('school',200)]}
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',result['id']):raise APIError(400,'名单编号格式不正确')
@@ -96,7 +97,7 @@ class Claims:
 
     def import_roster(self,db,actor,body):
         if 'autoReview' in body:return self.auto.replace(db,actor,body)
-        if set(body)!={'people'} or not isinstance(body['people'],list) or not 1<=len(body['people'])<=MAX_CLAIM_PEOPLE:
+        if not inputs.accepts_fields(body, inputs.PeopleImport) or not isinstance(body['people'],list) or not 1<=len(body['people'])<=MAX_CLAIM_PEOPLE:
             raise APIError(400,f'一次导入 1–{MAX_CLAIM_PEOPLE} 名参赛者')
         people=[self.person(p) for p in body['people']]
         ids=[p['id'] for p in people];identities=[(normalize(p['name']),normalize(p['school'])) for p in people]
@@ -115,8 +116,8 @@ class Claims:
         self.s.audit(db,actor,'claims.roster.import',metadata={'added':added,'received':len(people)})
         return {'ok':True,'added':added,'total':len(current)+added}
 
-    def edit_person(self,db,actor,body):
-        if set(body)!={'person','expectedRevision'} or type(body['expectedRevision']) is not int:raise APIError(400,'需要名单修订号')
+    def edit_person(self,db,actor,body: inputs.PersonEdit):
+        if not inputs.accepts_fields(body, inputs.PersonEdit) or type(body['expectedRevision']) is not int:raise APIError(400,'需要名单修订号')
         p=self.person(body['person']);old=db.execute('SELECT * FROM claim_people WHERE id=?',(p['id'],)).fetchone()
         if body['expectedRevision']!=(old['revision'] if old else 0):raise APIError(409,'名单已变化，请重新读取后核对')
         if not old:ensure_roster_capacity(db,1)
@@ -130,13 +131,17 @@ class Claims:
         self.s.audit(db,actor,'claims.roster.edit',p['id'],{'before':dict(old) if old else None,'after':p})
         return {'ok':True,'revision':old['revision']+1 if old else 1}
 
-    def request(self,db,body):
-        if not {'name','school'}<=set(body) or not set(body)<={'name','school','members','teamName','track'}:raise APIError(400,'申请字段不正确')
+    def request_fields(self, body: inputs.ClaimRequest):
+        if not inputs.accepts_fields(body, inputs.ClaimRequest):raise APIError(400,'申请字段不正确')
         name=self.text(body['name'],'姓名',100,True);school=self.text(body['school'],'学校',200,True)
         declaration=self.validate_declaration(name,school,body['members']) if 'members' in body else None
         metadata=self.team_metadata(body)
         if metadata and not declaration:raise APIError(400,'请填写队长及全体组员')
         if declaration:declaration.update(metadata)
+        return name, school, declaration
+
+    def request(self,db,body):
+        name, school, declaration = self.request_fields(body)
         now=self.clock()
         db.execute("UPDATE claim_requests SET status='expired',revision=revision+1 WHERE status='pending' AND expires_at<=?",(now,))
         if db.execute("SELECT COUNT(*) FROM claim_requests WHERE status='pending'").fetchone()[0]>=1000:raise APIError(429,'申请较多，请稍后重试')
@@ -182,8 +187,8 @@ class Claims:
         if not row or not hmac.compare_digest(row['secret_hash'],digest('receipt',body['secret'])) or row['expires_at']<=self.clock():return None
         return row
 
-    def update(self,db,body):
-        if not {'requestId','secret','expectedRevision','members'}<=set(body) or not set(body)<={'requestId','secret','expectedRevision','members','teamName','track'}:raise APIError(400,'修改申请字段不正确')
+    def update(self,db,body: inputs.ClaimUpdate):
+        if not inputs.accepts_fields(body, inputs.ClaimUpdate):raise APIError(400,'修改申请字段不正确')
         row=self.receipt_row(db,body)
         if not row:return dict(INVALID)
         if type(body['expectedRevision']) is not int:raise APIError(400,'需要申请修订号')
@@ -198,8 +203,8 @@ class Claims:
         self.s.audit(db,None,'claims.update',row['id'],{'requestRevision':row['revision']+1})
         return self.bearer(db,{'requestId':body['requestId'],'secret':body['secret']})
 
-    def bearer(self,db,body,redeem=False):
-        if set(body)!={'requestId','secret'}:return dict(INVALID)
+    def bearer(self,db,body: inputs.ReceiptProof,redeem=False):
+        if not inputs.accepts_fields(body, inputs.ReceiptProof):return dict(INVALID)
         row=self.receipt_row(db,body)
         if not row:return dict(INVALID)
         if row['status']=='pending':
@@ -285,9 +290,8 @@ class Claims:
             raise APIError(400,'核验码不正确，请核对申请人的设备')
 
     def approve_open(self,db,actor,body):
-        fields={'requestId','expectedRevision','reviewContext','teamName','track','resolvedIdentity','note'}
-        online_fields=fields|{'verificationMethod','applicationReviewed'}
-        onsite_fields=fields|{'pin','inPersonVerified'}
+        online_fields=inputs.OnlineApproval.__required_keys__
+        onsite_fields=inputs.OnsiteApproval.__required_keys__
         reissue='reissueRevoked' in body
         online=set(body) in (online_fields,online_fields|{'teamId','teamContext'},online_fields|{'teamId','teamContext','reissueRevoked'})
         if not online and set(body) not in (onsite_fields,onsite_fields|{'teamId','teamContext'}):raise APIError(400,'开放申请审核字段不正确')
@@ -368,9 +372,8 @@ class Claims:
         return {'ok':True,'status':'approved','revision':row['revision']+1}
 
     def review(self,db,actor,body):
-        common={'requestId','expectedRevision','action','note'}
-        approve={'teamId','captainId','memberIds','memberRevisions','pin','inPersonVerified','resolvedIdentity'}
-        allowed=(common|approve,common|approve|{'declaredMemberIds'}) if body.get('action')=='approve' else (common,)
+        approval=inputs.ApproveClaim.__required_keys__
+        allowed=(approval,approval|{'declaredMemberIds'}) if body.get('action')=='approve' else (inputs.RejectClaim.__required_keys__,)
         if not isinstance(body.get('action'),str) or body['action'] not in {'approve','reject'} or set(body) not in allowed:raise APIError(400,'审核字段不正确')
         if type(body['expectedRevision']) is not int or not isinstance(body['requestId'],str):raise APIError(400,'需要申请修订号')
         note=self.text(body['note'],'审核备注',2000)
@@ -443,6 +446,18 @@ class Claims:
             if method!='POST' or path not in public_scopes:raise APIError(404,'接口不存在')
             self.s.rate_limit(ip,public_scopes[path])
         with self.s.db() as db:
+            if method == 'POST':
+                if admin:
+                    self.s.write_identity(db, cookie, 'admin', login_id, marker_required=True)
+                elif path == '/api/claims/request':
+                    self.request_fields(body)
+                elif path == '/api/claims/update':
+                    if not inputs.accepts_fields(body, inputs.ClaimUpdate):
+                        raise APIError(400, '修改申请字段不正确')
+                    if not self.receipt_row(db, body):
+                        return dict(INVALID)
+                elif not inputs.accepts_fields(body, inputs.ReceiptProof) or not self.receipt_row(db, body):
+                    return dict(INVALID)
             db.execute('BEGIN IMMEDIATE' if method=='POST' else 'BEGIN')
             if admin:
                 actor=self.s.account(db,cookie);self.s.require(actor,'admin')

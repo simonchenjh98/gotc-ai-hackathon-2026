@@ -1,0 +1,110 @@
+{
+  "date": "2026-11-18",
+  "workload": "Two synthetic teams call /v1/chat/completions over the gateway Unix socket. Each JSON request contains one user message consisting of repeated ASCII a. The local HTTP provider returns one assistant content string of repeated ASCII b and usage of one input and one output token. Half the input bodies in each batch use gzip; all provider replies use identity encoding.",
+  "measurement": "A signal in the benchmark launcher samples the gateway process's operating-system high-water RSS at readiness and after all calls. Each scenario starts fresh platform and gateway processes. The driver and loopback provider are separate from the measured process. All four calls start together per batch.",
+  "verification": "The driver compares every response byte and counts billing rows. With content capture enabled it decompresses each saved request and retained response prefix, compares their bytes and checks the recorded full lengths.",
+  "scope": "macOS process RSS. Linux cgroup memory.current and memory.peak, reclaimable filesystem pages and kernel socket buffers were not measured. Dense nested JSON, alternate Unicode input shapes, long-running traffic and unrelated host workloads were not exercised.",
+  "scenarios": [
+    {
+      "name": "maximum_input_reply_capture_off",
+      "command": ".runtime/protocol-venv/bin/python tests/performance/gateway_memory.py --body-mib 32 --max-text-reply --batches 2",
+      "result": {
+        "host": "macOS-27.0.1-arm64-arm-64bit",
+        "python": "3.12.12",
+        "method": "getrusage(RUSAGE_SELF).ru_maxrss",
+        "gateway_global_running": 4,
+        "teams": 2,
+        "batches": 2,
+        "verified_content_rows": 0,
+        "concurrent_calls": 4,
+        "identity_calls": 4,
+        "gzip_calls": 4,
+        "json_request_bytes": 33554432,
+        "gzip_request_bytes": 146503,
+        "json_reply_bytes": 50000000,
+        "log_content": false,
+        "usage_rows": 8,
+        "statuses": [
+          200,
+          200,
+          200,
+          200,
+          200,
+          200,
+          200,
+          200
+        ],
+        "elapsed_seconds": 4.557,
+        "provider_peak_inflight": 3,
+        "ready_high_water_bytes": 56344576,
+        "final_high_water_bytes": 276512768
+      }
+    },
+    {
+      "name": "maximum_input_reply_capture_on",
+      "command": ".runtime/protocol-venv/bin/python tests/performance/gateway_memory.py --body-mib 32 --max-text-reply --batches 2 --log-content",
+      "result": {
+        "host": "macOS-27.0.1-arm64-arm-64bit",
+        "python": "3.12.12",
+        "method": "getrusage(RUSAGE_SELF).ru_maxrss",
+        "gateway_global_running": 4,
+        "teams": 2,
+        "batches": 2,
+        "verified_content_rows": 8,
+        "concurrent_calls": 4,
+        "identity_calls": 4,
+        "gzip_calls": 4,
+        "json_request_bytes": 33554432,
+        "gzip_request_bytes": 146503,
+        "json_reply_bytes": 50000000,
+        "log_content": true,
+        "usage_rows": 8,
+        "statuses": [
+          200,
+          200,
+          200,
+          200,
+          200,
+          200,
+          200,
+          200
+        ],
+        "elapsed_seconds": 5.842,
+        "provider_peak_inflight": 2,
+        "ready_high_water_bytes": 56213504,
+        "final_high_water_bytes": 295567360
+      }
+    },
+    {
+      "name": "small_input_maximum_reply",
+      "command": ".runtime/protocol-venv/bin/python tests/performance/gateway_memory.py --small-input --max-text-reply",
+      "result": {
+        "host": "macOS-27.0.1-arm64-arm-64bit",
+        "python": "3.12.12",
+        "method": "getrusage(RUSAGE_SELF).ru_maxrss",
+        "gateway_global_running": 4,
+        "teams": 2,
+        "batches": 1,
+        "verified_content_rows": 0,
+        "concurrent_calls": 4,
+        "identity_calls": 2,
+        "gzip_calls": 2,
+        "json_request_bytes": 1024,
+        "gzip_request_bytes": 88,
+        "json_reply_bytes": 50000000,
+        "log_content": false,
+        "usage_rows": 4,
+        "statuses": [
+          200,
+          200,
+          200,
+          200
+        ],
+        "elapsed_seconds": 0.983,
+        "provider_peak_inflight": 4,
+        "ready_high_water_bytes": 56377344,
+        "final_high_water_bytes": 209092608
+      }
+    }
+  ]
+}

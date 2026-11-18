@@ -1,141 +1,213 @@
-"""Upstream HTTP connections, retry eligibility and network failure classification."""
-
-import http.client
+"""Pooled async HTTPX transport, bounded provider uploads and explicit generation retry policy."""
+import asyncio
+from http.cookiejar import CookieJar, DefaultCookiePolicy
+import re
 import socket
 import ssl
-import time
-import urllib.error
-import urllib.request
 from urllib.parse import urlsplit
+from weakref import WeakKeyDictionary
 
-from .gateway_uploads import LARGE_BODY_THRESHOLD, UploadLimitedConnectionMixin, UploadQueueFull
-from .protocol_errors import GatewayError
+import httpx
 
-
-UPSTREAM_TIMEOUT = 1200  # waiting for the reply to start
-CONNECT_TIMEOUT = 20  # connect + TLS handshake (sub2api dial and TLS timeouts), so a dead upstream frees the slot fast
-
-
-RETRY_STATUSES = {429, 503, 529}  # explicit "not processed" answers; 5xx/timeouts may already be billed upstream
+from . import gateway_uploads
+from .memory import BULK_BYTES
+from .protocol_errors import GatewayError, safe_header
 
 
-RETRY_DELAYS = (0.3, 0.6, 1.2, 2.4)  # sub2api: 5 attempts, 300 ms doubling, 3 s cap  # seconds; retried only before any byte reaches the client
-
-
-# Upstream reply headers passed to the team (sub2api responseheaders allowlist). Rate-limit headers are deliberately not
-# passed: they describe our shared upstream key, not the team.
+UPSTREAM_TIMEOUT = 1200
+CONNECT_TIMEOUT = 20
+POOL_TIMEOUT = 5
+RETRY_STATUSES = {429, 503, 529}
+RETRY_DELAYS = (0.3, 0.6, 1.2, 2.4)
 PASSED_HEADERS = ("x-request-id", "request-id", "retry-after", "openai-processing-ms")
-CLIENT_HEADERS = ("x-app", "x-claude-code-session-id", "accept-language")  # forwarded to Anthropic, as sub2api
+CLIENT_HEADERS = ("x-app", "x-claude-code-session-id", "accept-language")
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None  # never replay the upstream key to another location
+class UpstreamNetworkError(OSError):
+    def __init__(self, error, *, sent):
+        self.reason = error
+        self.request_sent = sent
+        super().__init__(type(error).__name__)  # Never put credentials, provider URLs or request contents in exceptions.
 
 
-class _ShortConnect(UploadLimitedConnectionMixin):
-    """Connect and TLS handshake within CONNECT_TIMEOUT; reads then use the request's own timeout."""
-
-    def connect(self):
-        read_timeout, self.timeout = self.timeout, CONNECT_TIMEOUT
-        try:
-            super().connect()
-        finally:
-            self.timeout = read_timeout
-        if self.sock is not None:
-            self.sock.settimeout(read_timeout)
-
-
-class _HTTPConnection(_ShortConnect, http.client.HTTPConnection):
-    pass
-
-
-class _HTTPSConnection(_ShortConnect, http.client.HTTPSConnection):
-    pass
-
-
-class _HTTPHandler(urllib.request.HTTPHandler):
-    def http_open(self, req):
-        try:
-            return self.do_open(_HTTPConnection, req, upload_admitted=getattr(req, "_gotc_upload_admitted", None))
-        except UploadQueueFull:
-            raise GatewayError("rate_limit", "中转站大请求上传繁忙，请稍后重试（请求尚未发出，不计费）", retry_after=5) from None
-
-
-class _HTTPSHandler(urllib.request.HTTPSHandler):
-    def https_open(self, req):
-        try:
-            return self.do_open(_HTTPSConnection, req, context=self._context,
-                                upload_admitted=getattr(req, "_gotc_upload_admitted", None))
-        except UploadQueueFull:
-            raise GatewayError("rate_limit", "中转站大请求上传繁忙，请稍后重试（请求尚未发出，不计费）", retry_after=5) from None
-
-
-def make_opener(proxies=None):
-    """Upstream HTTP client: no redirects, short connect timeout; proxies from the environment unless given."""
-    handlers = [_NoRedirect, _HTTPHandler(), _HTTPSHandler()]
-    if proxies is not None:
-        handlers.append(urllib.request.ProxyHandler(proxies))
-    return urllib.request.build_opener(*handlers)
-
-
-def passed_headers(headers):
-    return {name: headers[name][:200] for name in PASSED_HEADERS if headers.get(name)}
-
-
-def set_read_timeout(response, seconds):
-    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
-    if sock is not None:
-        sock.settimeout(seconds)
+def passed_headers(headers, secrets=()):
+    return {name: safe_header(headers[name], secrets) for name in PASSED_HEADERS if headers.get(name)}
 
 
 def request_was_sent(error):
-    """Whether the upstream can have received the whole request when this error occurred.
+    return getattr(error, "request_sent", True)
 
-    urllib wraps every failure that happens while connecting, during the TLS handshake (certificate checks included)
-    or while sending the request in URLError; failures after the request was sent (waiting for or reading the reply)
-    are raised unwrapped. HTTPError is a URLError but means the upstream answered.
-    """
-    return getattr(getattr(error, "reason", error), "request_sent", False) or isinstance(error, urllib.error.HTTPError) or not isinstance(error, urllib.error.URLError)
+
+def _causes(error):
+    pending = [getattr(error, "reason", error)]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        pending.append(current.__cause__ or current.__context__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+
+
+def is_timeout(error):
+    return any(isinstance(cause, (TimeoutError, httpx.TimeoutException)) for cause in _causes(error))
 
 
 def failure_reason(error):
-    """Admin-facing explanation of an upstream network failure."""
-    reason = getattr(error, "reason", error)
-    if isinstance(reason, ssl.SSLCertVerificationError):
-        return f"上游 TLS 证书校验失败（请检查上游地址与证书）：{reason.verify_message or reason}"
-    if isinstance(reason, ssl.SSLError):
-        return f"上游 TLS 握手失败（请检查上游地址是否为 HTTPS）：{reason.reason or reason}"
-    if isinstance(reason, socket.gaierror):
-        return "上游域名无法解析"
-    if isinstance(reason, ConnectionRefusedError):
-        return "上游拒绝连接"
-    if isinstance(reason, (TimeoutError, socket.timeout)):
+    causes = tuple(_causes(error))
+    if any(isinstance(cause, ssl.SSLCertVerificationError) for cause in causes):
+        return "上游 TLS 证书校验失败（请检查上游地址与证书）"
+    if is_timeout(error):
         return f"上游超时（{UPSTREAM_TIMEOUT} 秒）"
-    return f"上游连接失败：{type(reason).__name__}：{reason}"[:300]
+    if any(isinstance(cause, ssl.SSLError) for cause in causes):
+        return "上游 TLS 握手失败（请检查上游地址是否为 HTTPS）"
+    if any(isinstance(cause, socket.gaierror) for cause in causes):
+        return "上游域名无法解析"
+    if any(isinstance(cause, ConnectionRefusedError) for cause in causes):
+        return "上游拒绝连接"
+    if any(isinstance(cause, httpx.ProxyError) for cause in causes):
+        return "上游代理隧道连接失败（Tunnel connection failed）"
+    return f"上游连接失败：{type(causes[0]).__name__}" if causes else "上游连接失败"
 
 
-def open_with_retry(opener, request):
-    """Retry upstream overload and connection errors; safe because nothing has reached the client yet."""
-    large_upload = (urlsplit(request.full_url).hostname == "ai.gitee.com" and
-                    isinstance(request.data, (bytes, bytearray)) and len(request.data) >= LARGE_BODY_THRESHOLD)
-    # Replaying a large context up to five times worsens an already saturated exit link.
-    # Surface the provider's overload and Retry-After so the client can back off instead.
-    for delay in (*(RETRY_DELAYS if not large_upload else ()), None):
+async def _body_chunks(data):
+    # An exhausted async generator frees its payload. HTTPX and httpcore retain
+    # the request stream alongside the reply, including for long-lived SSE.
+    for start in range(0, len(data), 64 * 1024):
+        yield data[start:start + 64 * 1024]
+
+
+class AsyncProvider:
+    def __init__(self, *, proxies=None, transport=None):
+        # HTTPX verifies TLS, honors environment proxies/NO_PROXY and has zero transport retries by default.
+        limits = httpx.Limits(max_connections=12, max_keepalive_connections=4)
+        options = {"trust_env": proxies is None, "limits": limits, "follow_redirects": False}
+        if transport is not None:
+            options["transport"] = transport
+        if proxies:
+            options["mounts"] = {scheme + "://": httpx.AsyncHTTPTransport(proxy=url, limits=limits)
+                                 for scheme, url in proxies.items() if scheme in {"http", "https"}}
+        self.client = httpx.AsyncClient(cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=())), **options)
+        self.uploads = asyncio.Semaphore(gateway_uploads.UPLOAD_CONCURRENCY)
+
+    async def aclose(self):
+        await self.client.aclose()
+
+    async def open(self, method, url, *, headers, content=None, length=None, timeout=None, retry=False, recheck=None):
+        if re.search(r"[\x00-\x20\x7f]", url):
+            raise ValueError("Invalid upstream URL")
+        if length is None and isinstance(content, (bytes, bytearray)):
+            length = len(content)
+        if length is not None and not any(name.lower() == "content-length" for name in headers):
+            headers = {**headers, "Content-Length": str(length)}
+        large = urlsplit(url).hostname == "ai.gitee.com" and length is not None and length >= gateway_uploads.LARGE_BODY_THRESHOLD
+        replay = retry and not large and (content is None or isinstance(content, (bytes, bytearray))
+                                           or getattr(content, "replayable", False))
+        delays = RETRY_DELAYS if replay else ()
+        for delay in (*delays, None):
+            try:
+                response = await self._once(method, url, headers, content, timeout, large, recheck)
+            except UpstreamNetworkError as error:
+                transient = isinstance(error.reason, httpx.ConnectError) and not any(
+                    isinstance(cause, ssl.SSLError) for cause in _causes(error))
+                if delay is None or error.request_sent or not transient:
+                    raise
+            else:
+                if response.status_code not in RETRY_STATUSES or delay is None:
+                    return response
+                try:
+                    delay = min(3.0, max(delay, float(response.headers.get("retry-after", 0))))
+                except ValueError:
+                    pass
+                finally:
+                    await response.aclose()
+            await asyncio.sleep(delay)
+
+    async def _once(self, method, url, headers, content, timeout, large, recheck):
+        held = False
+        provider_write = False
+        sent = False
+
+        async def trace(name, info):
+            nonlocal held, provider_write, sent
+            # HTTPS proxy CONNECT shares the trace callback with the actual generation.
+            if name.endswith(".send_request_headers.started"):
+                provider_write = info["request"].method != b"CONNECT"
+            if provider_write and name.endswith((".send_request_body.complete", ".send_request_body.failed",
+                                                 ".send_request_headers.failed")):
+                sent = True  # A complete write or an ambiguous partial write cannot be replayed.
+                if held:
+                    self.uploads.release()
+                    held = False
+
         try:
-            return opener.open(request, timeout=UPSTREAM_TIMEOUT)
-        except urllib.error.HTTPError as error:
-            if delay is None or error.code not in RETRY_STATUSES:
-                raise
-            try:  # the upstream says when to come back; honoured up to the 3 s cap
-                delay = min(3.0, max(delay, float(error.headers.get("retry-after") or 0)))
-            except ValueError:
-                pass
-            error.close()
-        except OSError as error:
-            # Retry only when the request certainly never reached the upstream and the failure can be transient.
-            # TLS errors are configuration problems and timeouts would each wait the full upstream timeout again.
-            reason = getattr(error, "reason", error)
-            if delay is None or request_was_sent(error) or not isinstance(reason, (ConnectionError, socket.gaierror)):
-                raise
-        time.sleep(delay)
+            if large:
+                try:
+                    await asyncio.wait_for(self.uploads.acquire(), gateway_uploads.QUEUE_TIMEOUT)
+                except TimeoutError:
+                    raise GatewayError("rate_limit", "中转站大请求上传繁忙，请稍后重试（请求尚未发出，不计费）", retry_after=5) from None
+                held = True
+            if recheck is not None:
+                await recheck()
+            read = UPSTREAM_TIMEOUT if timeout is None else timeout
+            timing = httpx.Timeout(connect=CONNECT_TIMEOUT, read=read, write=read, pool=POOL_TIMEOUT)
+            # Build an independent request so a provider's Set-Cookie cannot introduce shared user state.
+            if isinstance(content, bytes) and len(content) >= BULK_BYTES:
+                content = _body_chunks(content)
+            request = httpx.Request(method, url, headers={"Accept-Encoding": "identity", **headers}, content=content,
+                                    extensions={"trace": trace, "timeout": timing.as_dict()})
+            try:
+                response = await self.client.send(request, stream=True, follow_redirects=False)
+                # Bound already parsed provider metadata even when the networking library
+                # receives an entire oversized header in one read.
+                fields = response.headers.raw
+                if len(fields) > 100 or any(len(key) + len(value) + 4 > 65536 for key, value in fields):
+                    await response.aclose()
+                    raise UpstreamNetworkError(httpx.RemoteProtocolError("Upstream header limit"), sent=True)
+                return response
+            except httpx.TransportError as error:
+                raise UpstreamNetworkError(error, sent=sent) from None
+        finally:
+            if held:
+                self.uploads.release()
+
+
+class ProviderClients:
+    """One pool per serving event loop. Tests can supply a direct or synthetic transport."""
+    def __init__(self, proxies=None, transport=None):
+        self.proxies, self.transport = proxies, transport
+        self._providers = WeakKeyDictionary()
+
+    def async_provider(self):
+        loop = asyncio.get_running_loop()
+        if loop not in self._providers:
+            self._providers[loop] = AsyncProvider(proxies=self.proxies, transport=self.transport)
+        return self._providers[loop]
+
+    async def close(self):
+        provider = self._providers.pop(asyncio.get_running_loop(), None)
+        if provider:
+            await provider.aclose()
+
+
+def make_opener(proxies=None, *, transport=None):
+    return ProviderClients(proxies, transport)
+
+
+async def probe(opener, method, url, headers, content):
+    response = await opener.async_provider().open(method, url, headers=headers, content=content, timeout=30)
+    try:
+        limit = 2_000_001 if response.is_success else 100_000
+        raw = bytearray()
+        async for part in response.aiter_raw():
+            raw.extend(part[:limit - len(raw)])
+            if len(raw) >= limit:
+                break
+        return response.status_code, bytes(raw)
+    except httpx.TransportError as error:
+        raise UpstreamNetworkError(error, sent=True) from None
+    finally:
+        await response.aclose()

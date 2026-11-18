@@ -1,230 +1,66 @@
 """Deployment entrypoint rehearsals: temporary paths and fake SSH only."""
-from contextlib import redirect_stdout
-import io
+from contextlib import ExitStack
+import hashlib
 import json
 import os
 from pathlib import Path
-import stat
 import sys
 import tempfile
 import types
 import unittest
 import subprocess
 import tarfile
-import re
-import selectors
+import time
 import shutil
 import signal
-import urllib.request
-import urllib.error
+import httpx
 from unittest.mock import patch
 
 
 from ops.deploy import deploy, install, pages
 
 
-class LocalDeploymentPrivacyTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='gotc-deploy-private-')
-        self.root = Path(self.temp.name)
-        self.installer = install
-        self.deployer = deploy
-        self.project = self.root / 'project'
-        self.project.mkdir()
-        for name in self.installer.FILES:
-            path = self.project / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text('Synthetic release file\n')
-        installer_path = self.project / 'ops/deploy/install.py'
-        installer_path.parent.mkdir()
-        installer_path.write_text('# Synthetic installer payload, never executed\n')
-        self.runtime = self.project / '.runtime'
-        self.secret = b'GOTC administrator access code (keep private):\nSYNTHETIC_REMOTE_ACCESS\n'
-        self.secret_reads = 0
-        self.check_before_read = lambda: None
-        self.fail_after_first_block = False
-        self.uploaded = []
-        self.remote_commands = []
-        self.closed_clients = 0
-        test = self
+WHEELHOUSE = Path(os.environ.get('WHEELHOUSE', deploy.PROJECT / '.runtime/wheels')).absolute()
 
-        class Channel:
-            def recv_exit_status(self):
-                return 0
 
-        class RemoteRead:
-            def __init__(self):
-                self.sent = False
-            def __enter__(self):
-                return self
-            def __exit__(self, *unused):
-                return False
-            def read(self, size):
-                if self.sent:
-                    if test.fail_after_first_block:
-                        raise OSError('Synthetic interrupted SFTP read')
-                    return b''
-                test.check_before_read()
-                test.secret_reads += 1
-                self.sent = True
-                return test.secret[:8] if test.fail_after_first_block else test.secret
+class LimitedDeploymentTests(unittest.TestCase):
+    def test_only_a_prebuilt_artifact_reaches_the_restricted_account(self):
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / 'release.tar.gz'
+            artifact.write_bytes(b'synthetic CI artifact')
+            artifact.with_suffix('.gz.sig').write_bytes(b'synthetic detached signature')
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            client = MagicMock()
+            stdout = MagicMock()
+            stdout.read.return_value = b'{"release":"synthetic"}'
+            stdout.channel.recv_exit_status.return_value = 0
+            client.exec_command.return_value = (None, stdout, None)
+            paramiko = types.SimpleNamespace(SSHClient=lambda: client, RejectPolicy=object)
+            with patch.dict(sys.modules, {'paramiko': paramiko}):
+                result = deploy.upload_release(artifact, digest, 'e' * 40, 'ci.example.test', Path('known_hosts'))
+            self.assertEqual(result['release'], 'synthetic')
+            self.assertEqual(client.connect.call_args.kwargs['username'], 'gotc-deploy')
+            client.load_host_keys.assert_called_once_with('known_hosts')
+            sftp = client.open_sftp.return_value.__enter__.return_value
+            remote, mode = sftp.open.call_args_list[0].args
+            self.assertRegex(remote, r'^/opt/gotc-hackathon/incoming/[A-Za-z0-9-]+\.tar\.gz$')
+            self.assertEqual(mode, 'wx')
+            self.assertEqual(sftp.open.call_args_list[1].args, (remote + '.sig', 'wx'))
+            self.assertEqual(sftp.open.call_count, 2)
+            writes = sftp.open.return_value.__enter__.return_value.write.call_args_list
+            self.assertEqual([call.args[0] for call in writes], [artifact.read_bytes(), b'synthetic detached signature'])
+            command, = client.exec_command.call_args.args
+            self.assertTrue(command.startswith('sudo -n /usr/local/sbin/gotc-install --archive '))
+            self.assertIn(digest, command)
+            client.close.assert_called_once()
 
-        class RemoteWrite(io.BytesIO):
-            def __exit__(self, *unused):
-                test.uploaded.append(self.getvalue())
-                self.close()
-
-        class SFTP:
-            def __enter__(self):
-                return self
-            def __exit__(self, *unused):
-                return False
-            def open(self, remote, mode):
-                if mode == 'wx':
-                    test.assertTrue(remote.startswith('/opt/gotc-hackathon/incoming/'))
-                    return RemoteWrite()
-                test.assertEqual(mode, 'rb')
-                test.assertEqual(remote, '/opt/gotc-hackathon/data/admin-access.txt')
-                return RemoteRead()
-            def chmod(self, remote, mode):
-                test.assertEqual(mode, 0o600)
-
-        class Client:
-            def load_host_keys(self, filename):
-                test.assertEqual(filename, str(test.root / 'fake-known-hosts'))
-            def set_missing_host_key_policy(self, policy):
-                pass
-            def connect(self, host, **options):
-                test.assertEqual(options['key_filename'], str(test.root / 'fake-key'))
-                test.assertFalse(options['look_for_keys'])
-                test.assertFalse(options['allow_agent'])
-            def exec_command(self, command, timeout):
-                test.remote_commands.append(command)
-                value = {'url': 'https://example.invalid/synthetic-gotc/', 'health': {'teams': 0}}
-                stdout = io.BytesIO((json.dumps(value) + '\n').encode())
-                stdout.channel = Channel()
-                return None, stdout, io.BytesIO(b'')
-            def open_sftp(self):
-                return SFTP()
-            def close(self):
-                test.closed_clients += 1
-
-        self.paramiko = types.SimpleNamespace(SSHClient=Client, RejectPolicy=object)
-
-    def tearDown(self):
-        self.temp.cleanup()
-
-    def run_main(self, execute=True):
-        arguments = ['deploy.py', '--source-sha', 'e' * 40] + (['--execute'] if execute else [])
-        output = io.StringIO()
-        with patch.object(self.deployer, 'PROJECT', self.project), \
-                patch.object(self.deployer, 'KNOWN_HOSTS', self.root / 'fake-known-hosts'), \
-                patch.object(self.deployer, 'IDENTITY', self.root / 'fake-key'), \
-                patch.dict(sys.modules, {'paramiko': self.paramiko}), \
-                patch.object(sys, 'argv', arguments), \
-                patch('socket.socket.connect', side_effect=AssertionError('No real network permitted')), \
-                patch.object(self.deployer.subprocess, 'check_output', side_effect=AssertionError('No real Git command needed')), \
-                redirect_stdout(output):
-            self.deployer.main()
-        return output.getvalue()
-
-    def check_private_paths(self):
-        self.assertFalse(self.runtime.is_symlink())
-        self.assertEqual(stat.S_IMODE(self.runtime.stat().st_mode), 0o700,
-                         'Existing runtime must be private before the first secret byte is read')
-        pending = self.runtime / 'admin-access.txt.pending'
-        self.assertFalse(pending.is_symlink())
-        self.assertEqual(stat.S_IMODE(pending.stat().st_mode), 0o600,
-                         'Pending credential must be private before any remote secret is read')
-
-    def test_execute_repairs_existing_runtime_permissions_before_sftp_reads_any_secret(self):
-        self.runtime.mkdir(mode=0o755)
-        os.chmod(self.runtime, 0o755)
-        self.check_before_read = self.check_private_paths
-        previous = os.umask(0o022)
-        try:
-            printed = self.run_main()
-        finally:
-            os.umask(previous)
-        self.assertEqual(self.secret_reads, 1)
-        self.assertEqual((self.runtime / 'admin-access.txt').read_bytes(), self.secret)
-        self.assertEqual(stat.S_IMODE((self.runtime / 'admin-access.txt').stat().st_mode), 0o600)
-        self.assertFalse((self.runtime / 'admin-access.txt.pending').exists())
-        self.assertNotIn('SYNTHETIC_REMOTE_ACCESS', printed)
-        self.assertNotIn('SYNTHETIC_REMOTE_ACCESS', (self.runtime / 'deployment.json').read_text())
-        self.assertEqual(self.closed_clients, 1)
-
-    def test_execute_creates_pending_credential_as_0600_before_first_secret_byte(self):
-        self.runtime.mkdir(mode=0o700)
-        os.chmod(self.runtime, 0o700)
-        self.check_before_read = self.check_private_paths
-        previous = os.umask(0o022)
-        try:
-            self.run_main()
-        finally:
-            os.umask(previous)
-        self.assertEqual(self.secret_reads, 1)
-        self.assertEqual(stat.S_IMODE((self.runtime / 'admin-access.txt').stat().st_mode), 0o600)
-
-    def test_runtime_symlink_is_rejected_before_writing_to_its_target(self):
-        external = self.root / 'not-owned-by-runtime'
-        external.mkdir()
-        sentinel = external / 'keep.txt'
-        sentinel.write_text('Unchanged sentinel')
-        self.runtime.symlink_to(external, target_is_directory=True)
-        with self.assertRaises((RuntimeError, ValueError, FileExistsError)):
-            self.run_main(execute=False)
-        self.assertEqual(list(external.iterdir()), [sentinel])
-        self.assertEqual(sentinel.read_text(), 'Unchanged sentinel')
-        self.assertEqual(self.remote_commands, [])
-
-    def test_runtime_regular_file_is_rejected_without_replacement(self):
-        self.runtime.write_text('Do not replace this file')
-        with self.assertRaises((RuntimeError, ValueError, FileExistsError)):
-            self.run_main(execute=False)
-        self.assertEqual(self.runtime.read_text(), 'Do not replace this file')
-        self.assertEqual(self.remote_commands, [])
-
-    def test_existing_pending_and_symlink_final_are_rejected_without_secret_reads(self):
-        for existing in ['pending', 'final-symlink']:
-            with self.subTest(existing=existing):
-                if self.runtime.exists():
-                    shutil.rmtree(self.runtime)
-                self.runtime.mkdir(mode=0o700)
-                final = self.runtime / 'admin-access.txt'
-                if existing == 'pending':
-                    final.write_bytes(b'OLD_FINAL')
-                    (self.runtime / 'admin-access.txt.pending').write_bytes(b'KEEP_PENDING')
-                else:
-                    target = self.root / 'private-sentinel'
-                    target.write_bytes(b'KEEP_EXTERNAL')
-                    final.symlink_to(target)
-                before_reads = self.secret_reads
-                with self.assertRaises((RuntimeError, ValueError, FileExistsError)):
-                    self.run_main()
-                self.assertEqual(self.secret_reads, before_reads)
-                self.assertEqual(final.read_bytes(), b'OLD_FINAL' if existing == 'pending' else b'KEEP_EXTERNAL')
-                if existing == 'pending':
-                    self.assertEqual((self.runtime / 'admin-access.txt.pending').read_bytes(), b'KEEP_PENDING')
-
-    def test_interrupted_private_retrieval_preserves_old_final(self):
-        self.runtime.mkdir(mode=0o700)
-        final = self.runtime / 'admin-access.txt'
-        final.write_bytes(b'PREVIOUS_FINAL')
-        os.chmod(final, 0o600)
-        self.check_before_read = self.check_private_paths
-        self.fail_after_first_block = True
-        previous = os.umask(0o022)
-        try:
-            with self.assertRaises(OSError):
-                self.run_main()
-        finally:
-            os.umask(previous)
-        self.assertEqual(final.read_bytes(), b'PREVIOUS_FINAL')
-        pending = self.runtime / 'admin-access.txt.pending'
-        if pending.exists():
-            self.assertEqual(stat.S_IMODE(pending.stat().st_mode), 0o600)
-        self.assertEqual(self.closed_clients, 1)
+    def test_digest_mismatch_refuses_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / 'release.tar.gz'
+            artifact.write_bytes(b'changed')
+            with self.assertRaisesRegex(ValueError, 'SHA-256'):
+                deploy.upload_release(artifact, '0' * 64, 'e' * 40, 'ci.example.test', Path('known_hosts'))
 
 
 class ReleaseArtifactAndInstallerTests(unittest.TestCase):
@@ -239,7 +75,7 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
         path = self.root / filename
         output = subprocess.check_output([
             sys.executable, '-B', str(project / 'ops/deploy/deploy.py'),
-            '--package', str(path), '--source-sha', '0' * 40,
+            '--package', str(path), '--source-sha', '0' * 40, '--wheelhouse', str(WHEELHOUSE),
         ], text=True, cwd=self.root)
         result = json.loads(output)
         self.assertFalse(result['remoteChanges'])
@@ -255,12 +91,13 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
         shutil.copyfile(deploy.PROJECT / 'Makefile', project / 'Makefile')
         shutil.copytree(deploy.PROJECT / 'backend', project / 'backend', ignore=shutil.ignore_patterns('__pycache__'))
         state = self.root / 'xdg-data'
-        env = {'PATH': os.defpath, 'XDG_DATA_HOME': str(state), 'PYTHON': sys.executable}
-        with subprocess.Popen([shutil.which('make'), 'dev', 'PORT=0'], env=env, cwd=project,
+        env = {'PATH': os.defpath, 'XDG_DATA_HOME': str(state), 'PYTHON': sys.executable,
+               'WHEELHOUSE': str(WHEELHOUSE), 'PIP_NO_INDEX': '1'}
+        with subprocess.Popen([shutil.which('make'), 'dev', 'PORT=5274'], env=env, cwd=project,
                               start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True) as process:
             try:
-                _, errors = process.communicate(timeout=8)
+                _, errors = process.communicate(timeout=30)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.communicate()
@@ -282,7 +119,7 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
 
     def test_source_archives_are_reproducible(self):
         project = self.root / 'source'
-        for name in install.FILES | {'ops/deploy/deploy.py', 'ops/deploy/install.py'}:
+        for name in install.FILES | {'ops/deploy/deploy.py', 'ops/deploy/install.py', 'ops/deploy/nginx.py', 'tools/build_frontend.py'}:
             target = project / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(deploy.PROJECT / name, target)
@@ -290,28 +127,39 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
         second = self.package('second.tar.gz', project)
         self.assertEqual(first.read_bytes(), second.read_bytes())
 
+    def test_runtime_wheel_hashes_are_checked_before_packaging(self):
+        wheelhouse = self.root / 'wheels'
+        wheelhouse.mkdir()
+        names = install.locked_wheels((deploy.PROJECT / 'backend/requirements.txt').read_text())
+        (wheelhouse / Path(next(iter(names))).name).write_bytes(b'incorrect release wheel')
+        with self.assertRaisesRegex(ValueError, 'Wrong SHA-256'):
+            deploy.release_blobs(deploy.PROJECT, wheelhouse)
+
     def test_pages_staging_contains_only_approved_landing_page_files(self):
         staged = self.root / 'pages'
-        pages.stage(staged)
+        origin = 'https://platform.example.invalid'
+        pages.stage(staged, public_origin=origin)
         names = {path.relative_to(staged).as_posix() for path in staged.rglob('*') if path.is_file()}
-        self.assertEqual(names - {'.nojekyll'}, {name.removeprefix('frontend/') for name in install.PAGES_FILES})
+        expected = {name.removeprefix('frontend/') for name in install.PAGES_FILES}
+        manifest = json.loads((staged / 'asset-manifest.json').read_text())['assets']
+        self.assertEqual(names, (expected - manifest.keys()) | {item['path'] for item in manifest.values()} | {'.nojekyll', 'asset-manifest.json'})
         self.assertIn('index.html', names)
-        self.assertIn('static/registration/directory.js', names)
+        self.assertIn('static/registration/directory.js', manifest)
         html = (staged / 'index.html').read_text()
         for attr, route in [('data-api', 'api/registration'), ('data-platform-base', ''),
                             ('href', 'platform.html#team'), ('href', 'teams.html')]:
-            self.assertIn(f'{attr}="{pages.PLATFORM_BASE}{route}"', html)
+            self.assertIn(f'{attr}="{origin}/gotc/{route}"', html)
         self.assertNotIn('href="platform.html', html)
         self.assertNotIn('href="teams.html', html)
         self.assertFalse(any(name.endswith('.py') or name.startswith(('backend/', 'ops/', 'tests/')) for name in names))
         with self.assertRaises(FileExistsError):
-            pages.stage(staged)
+            pages.stage(staged, public_origin=origin)
 
     def test_source_manifest_rejects_private_files_and_symlinked_ancestors(self):
         for name in ['backend/gotc/.env', 'backend/gotc/keys.sqlite3', 'frontend/downloads/admin-access.txt',
                      'frontend/assets/unapproved.jpg', 'frontend/../frontend/index.html', 'tests/backend/fixtures/legacy_e456bd3_app.py']:
             with self.subTest(name=name):
-                self.assertFalse(install.allowed(name))
+                self.assertNotIn(name, install.FILES)
         external = self.root / 'external'
         external.mkdir()
         (external / 'index.html').write_text('private sentinel')
@@ -324,18 +172,44 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
         extract = self.root / 'extracted'
         with tarfile.open(archive) as package:
             names = package.getnames()
-            self.assertEqual(set(names), install.FILES)
+            wheels = install.locked_wheels(package.extractfile('backend/requirements.txt').read().decode('utf-8'))
+            entries = {entry.name: entry for entry in package.getmembers()}
+            assets = json.load(package.extractfile('frontend/asset-manifest.json'))
+            self.assertEqual(set(names), install.validate_built_assets(package, entries, assets) | wheels.keys())
             self.assertEqual(names, sorted(set(names)))
             self.assertTrue(all(entry.isfile() for entry in package.getmembers()))
             self.assertIn('backend/gotc/__main__.py', names)
             self.assertIn('ops/backup_event.py', names)
             package.extractall(extract, filter='data')
 
-        # Seed local test accounts using only the extracted Python modules.
+        # A site-disabled interpreter has zero access to the builder's installed packages.
+        bare = "import sys; assert not any('site-packages' in path or 'dist-packages' in path for path in sys.path)"
+        subprocess.run([sys.executable, '-IS', '-c', bare], check=True, cwd=extract)
+        install.prepare_runtime(extract)
+        python = str(extract / '.venv/bin/python')
+        isolated = """
+from pathlib import Path
+from importlib.metadata import distribution
+import sys
+assert Path(sys.prefix).resolve() == (Path.cwd() / '.venv').resolve()
+for line in Path('backend/requirements.txt').read_text().splitlines():
+    if line.strip() and not line.startswith('#'):
+        name, version = line.split()[0].split('==')
+        installed = distribution(name)
+        assert installed.version == version and Path(installed.locate_file('')).is_relative_to(sys.prefix), name
+"""
+        subprocess.run([python, '-I', '-c', isolated], check=True, cwd=extract)
+        # Seed local test accounts using only the extracted release.
         origin = 'https://example.invalid'
         env = {'PATH': os.defpath, 'PYTHONDONTWRITEBYTECODE': '1',
                'GOTC_DATA_DIR': str(self.root / 'private-data'), 'GOTC_HOST': '127.0.0.1',
                'GOTC_PORT': '0', 'GOTC_BASE_PATH': '/gotc', 'GOTC_PUBLIC_ORIGIN': origin}
+        data = Path(env['GOTC_DATA_DIR'])
+        data.mkdir(mode=0o700)
+        upstream = data / 'gateway.json'
+        upstream.write_text(json.dumps({'openai': {'url': 'https://provider.example.invalid', 'key': 'synthetic',
+                                                   'models': {'synthetic-model': [0, 0]}}}))
+        upstream.chmod(0o600)
         seed = """
 import json, os
 from backend.gotc.service import EventService
@@ -350,47 +224,54 @@ with service.db() as db:
 print(json.dumps([team_id, team_code, judge_code]))
 """
         team_id, team_code, judge_code = json.loads(subprocess.check_output(
-            [sys.executable, '-c', seed], cwd=extract, env=env, text=True, timeout=15))
-        with subprocess.Popen([sys.executable, '-m', 'backend.gotc'], cwd=extract, env=env,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as server:
-            try:
-                with selectors.DefaultSelector() as selector:
-                    selector.register(server.stdout, selectors.EVENT_READ)
-                    self.assertTrue(selector.select(15), 'Timed out waiting for packaged app')
-                ready = server.stdout.readline()
-                if not ready and server.poll() is not None:
-                    self.fail('Packaged app exited: ' + server.stderr.read()[-1200:])
-                match = re.search(r'GOTC service ready on (127\.0\.0\.1:\d+)/gotc/', ready)
-                self.assertIsNotNone(match, ready)
-                base = 'http://' + match.group(1) + '/gotc/'
-                self.exercise_packaged_service(base, origin, team_id, team_code, judge_code)
-            finally:
-                server.terminate()
-                server.wait(timeout=5)
+            [python, '-EsB', '-c', seed], cwd=extract, env=env, text=True, timeout=15))
+        with ExitStack() as stack:
+            sockets = Path(stack.enter_context(tempfile.TemporaryDirectory(dir='/tmp', prefix='gotc-sockets-')))
+            clients = {}
+            for role in ('platform', 'gateway'):
+                sock = sockets / (role + '.sock')
+                server = subprocess.Popen([python, '-EsBu', '-m', 'backend.gotc', '--service', role, '--uds', str(sock)],
+                                          cwd=extract, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                def stop(process=server):
+                    if process.poll() is None:
+                        process.terminate()
+                    process.wait(timeout=15)
+                    process.stderr.close()
+                stack.callback(stop)
+                client = stack.enter_context(httpx.Client(transport=httpx.HTTPTransport(uds=str(sock)),
+                                                           base_url='http://localhost', timeout=5))
+                clients[role] = client
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    if server.poll() is not None:
+                        self.fail(f'{role} exited: ' + server.stderr.read()[-1000:])
+                    try:
+                        if sock.exists() and client.get('/readyz', headers={'Host': 'localhost'}).status_code == 200:
+                            break
+                    except httpx.TransportError:
+                        pass
+                    time.sleep(.1)
+                else:
+                    self.fail(f'{role} failed readiness')
+                self.assertEqual(client.get('/livez', headers={'Host': 'localhost'}).status_code, 200)
+            self.exercise_packaged_service(clients['platform'], origin, team_id, team_code, judge_code)
+            self.assertEqual(clients['gateway'].get('/gotc/v1/models').status_code, 401)
+            helper = assets['assets']['static/platform/team/draft-store.js']['path']
+            self.assertIn(b'GotcDraftRecovery', (extract / 'frontend' / helper).read_bytes())
 
-    def exercise_packaged_service(self, base, origin, team_id, team_code, judge_code):
+    def exercise_packaged_service(self, client, origin, team_id, team_code, judge_code):
         def request(route, body=None, cookie=''):
-            payload = None if body is None else json.dumps(body).encode()
-            headers = {'Origin': origin, 'Content-Type': 'application/json', 'Cookie': cookie}
-            return urllib.request.urlopen(urllib.request.Request(base + route, payload, headers), timeout=5)
+            return client.request('GET' if body is None else 'POST', '/gotc/' + route,
+                                  headers={'Origin': origin, 'Cookie': cookie}, json=body)
 
         def api(route, body=None, cookie=''):
-            with request(route, body, cookie) as response:
-                return json.load(response), response.headers
+            response = request(route, body, cookie)
+            response.raise_for_status()
+            return response.json(), response.headers
 
-        self.assertEqual(install.health(base + 'api/registration'), {'registeredTeams': 0})
-        with self.assertRaises(urllib.error.HTTPError) as private_board:
-            request('api/board')
-        self.assertEqual(private_board.exception.code, 401)
-        private_board.exception.close()
-        with request('index.html') as static:
-            self.assertIn(b'<!doctype html', static.read(200).lower())
-        with request('static/platform/team/draft-store.js') as helper:
-            self.assertIn(b'GotcDraftRecovery', helper.read())
-        with self.assertRaises(urllib.error.HTTPError) as denied:
-            request('api/team')
-        self.assertEqual(denied.exception.code, 401)
-        denied.exception.close()
+        self.assertIsInstance(request('api/registration').json()['teams'], list)
+        self.assertEqual(request('api/board').status_code, 401)
+        self.assertEqual(request('api/team').status_code, 401)
 
         _, login = api('api/login', {'role': 'team', 'code': team_code})
         cookie = login['Set-Cookie']

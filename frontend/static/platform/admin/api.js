@@ -10,9 +10,11 @@ const apiPages=[['dashboard','仪表盘','AI API 概览与今日统计'],['ops',
   ['accounts','账号管理','模型上游账号：接口地址、API Key 与可用模型'],['usage','使用记录','按队伍、密钥、模型查看用量与调用明细'],['audit','操作日志','AI API 相关的管理操作'],['settings','系统设置','密钥上限、限流、公告与调用内容保存']];
 const priceColumns=['输入','输出','5分钟缓存写入','缓存读取','1小时缓存写入'];
 const msText=v=>v===null || v===undefined?'—':`${Number(v)}ms`;
-const apiTable=(head,rows,empty='暂无数据')=>`<div class="table-wrap"><table class="board-table api-table"><thead><tr>${head.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('') || `<tr><td colspan="${head.length}">${empty}</td></tr>`}</tbody></table></div>`;
-const apiCards=cards=>`<div class="api-cards">${cards.map(([label,value,sub])=>`<div class="api-stat"><span>${label}</span><strong>${value}</strong><small>${sub}</small></div>`).join('')}</div>`;
-const apiBadge=(text,tone='gray')=>`<span class="api-badge ${tone}">${esc(text)}</span>`;
+// Cells may contain first-party markup (actions and badges). At call sites, escape
+// remote text before composing a cell. Headers, empty messages and metric cards are text.
+const apiTable=(head,rows,empty='暂无数据')=>`<div class="table-wrap"><table class="board-table api-table"><thead><tr>${head.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('') || `<tr><td colspan="${head.length}">${esc(empty)}</td></tr>`}</tbody></table></div>`;
+const apiCards=cards=>`<div class="api-cards">${cards.map(([label,value,sub])=>`<div class="api-stat"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(sub)}</small></div>`).join('')}</div>`;
+const apiBadge=(text,tone='gray')=>`<span class="api-badge ${esc(tone)}">${esc(text)}</span>`;
 const apiGiteeAccount=u=>String(u.url || '').replace(/\/+$/,'')==='https://ai.gitee.com/v1';
 const apiAccountName=(kind,u)=>u.name || apiPresets.find(([,k,url])=>k===kind && url===u.url)?.[0] || (()=>{try{return new URL(u.url).host;}catch{return u.url;}})();
 let currentApiAdmin=null;
@@ -70,6 +72,10 @@ async function renderApiAdmin(version){
   apiPageRenderers[page[0]](c);
 }
 
+function apiConcurrency(inflight,waiting){
+  return Number.isInteger(inflight) && Number.isInteger(waiting) ? `${inflight} / ${waiting}` : '暂不可用';
+}
+
 function apiRanking(c){
   // Rank only amounts recorded in the same currency; never imply an exchange rate.
   const currencies=[...new Set(c.data.teams.flatMap(t=>(t.billing24h || []).map(r=>r.currency)))].sort();
@@ -78,7 +84,7 @@ function apiRanking(c){
     const amount=(r,field)=>(r[field] || []).find(x=>x.currency===currency)?.cost || 0;
     const ranked=c.data.teams.filter(r=>(r.billing24h || []).some(x=>x.currency===currency))
       .sort((a,b)=>amount(b,'billing24h')-amount(a,'billing24h'));
-    return `<h3>${esc(currency==='legacy'?'历史原计价':currency)}</h3>`+apiTable(['#','队伍','近24小时','累计（同币种）','进行中 / 排队'],ranked.map((r,i)=>[i+1,esc(c.team(r.teamId))+(r.active?'':' '+apiBadge('已停用')),usd(amount(r,'billing24h'),currency),usd(amount(r,'billing'),currency),`${Number(r.inflight)} / ${Number(r.waiting || 0)}`]),'尚未开通队伍');
+    return `<h3>${esc(currency==='legacy'?'历史原计价':currency)}</h3>`+apiTable(['#','队伍','近24小时','累计（同币种）','进行中 / 排队'],ranked.map((r,i)=>[i+1,esc(c.team(r.teamId))+(r.active?'':' '+apiBadge('已停用')),usd(amount(r,'billing24h'),currency),usd(amount(r,'billing'),currency),apiConcurrency(r.inflight,r.waiting)]),'尚未开通队伍');
   }).join('');
 }
 
@@ -95,7 +101,7 @@ const apiPageRenderers={
   },
   ops(c){
     const o=c.data.overview,inflight=c.data.teams.reduce((n,t)=>n+Number(t.inflight),0),waiting=c.data.teams.reduce((n,t)=>n+Number(t.waiting || 0),0);
-    c.box.innerHTML=apiCards([['请求',`${o.rpm ?? 0} RPM`,`${tokens(o.tpm ?? 0)} TPM（近5分钟）`],['请求时长',msText(o.p95Ms),`P95 · 平均 ${msText(o.avgMs)}`],['首 Token 延迟',msText(o.avgFirstTokenMs),'今日平均'],['并发 / 排队',`${inflight} / ${waiting}`,'每队最多 15 并发，排队最多 30 秒']])+
+    c.box.innerHTML=apiCards([['请求',`${o.rpm ?? 0} RPM`,`${tokens(o.tpm ?? 0)} TPM（近5分钟）`],['请求时长',msText(o.p95Ms),`P95 · 平均 ${msText(o.avgMs)}`],['首 Token 延迟',msText(o.avgFirstTokenMs),'今日平均'],['并发 / 排队',c.data.runtimeAvailable===false?'暂不可用':apiConcurrency(inflight,waiting),c.data.runtimeAvailable===false?'未能读取网关实时数据':'当前正在执行及等待容量的请求']])+
       (o.authFailuresHour?`<div class="info-banner warning">近1小时有 ${Number(o.authFailuresHour)} 次无效密钥尝试${o.blockedClients?`，${Number(o.blockedClients)} 个来源地址已被临时封禁（每个地址每分钟错误超过 120 次即封禁 60 秒）`:''}。</div>`:'')+
       '<section class="api-card"><h2>今日失败原因</h2><div id="api-failures"><p class="small-note">读取中…</p></div></section><div id="key-detail"></div>';
     c.request('admin/keys/stats',{days:1,granularity:'day'}).then(s=>{if(c.alive())document.getElementById('api-failures').innerHTML=apiTable(['责任方','阶段','类型','上游状态','请求'],(s.byFailure || []).map(r=>[esc(ownerName[r.owner] || r.owner || '—'),esc(phaseName[r.phase] || r.phase || '—'),esc(r.type || '—'),r.upstreamStatus===null || r.upstreamStatus===undefined?'—':Number(r.upstreamStatus),Number(r.requests)]),'今日没有失败请求');}).catch(e=>toast(e.message));
@@ -103,7 +109,7 @@ const apiPageRenderers={
   },
   teams(c){
     c.actions.innerHTML='<input type="search" class="api-search" placeholder="搜索队伍…" aria-label="搜索队伍">';
-    const rows=c.teams.map(t=>{const r=c.data.teams.find(x=>x.teamId===t.id);return `<tr data-team-row="${esc(teamLabel(t).toLowerCase())}"><td>${esc(teamLabel(t))}</td><td>${r?r.active?apiBadge('已开通','success'):apiBadge('已停用','danger'):apiBadge('未开通')}</td><td>${r?Number(r.keyCount):'—'}</td><td>${r?billingAmount(r.billing24h,r.used24h):'—'}</td><td>${r?billingAmount(r.billing,r.usedTotal):'—'}</td><td>${r?`${Number(r.inflight)} / ${Number(r.waiting || 0)}`:'—'}</td><td class="api-row-actions">${r?`<button type="button" class="link-button" data-key-stats="${esc(t.id)}">用量</button><button type="button" class="link-button" data-key-logs="${esc(t.id)}">调用记录</button>`:''}${r?.active?`<button type="button" class="link-button danger" data-key-revoke="${esc(t.id)}">停用 API</button>`:`<button type="button" class="link-button" data-key-provision="${esc(t.id)}">${r?'重新开通':'开通 API'}</button>`}</td></tr>`;}).join('');
+    const rows=c.teams.map(t=>{const r=c.data.teams.find(x=>x.teamId===t.id);return `<tr data-team-row="${esc(teamLabel(t).toLowerCase())}"><td>${esc(teamLabel(t))}</td><td>${r?r.active?apiBadge('已开通','success'):apiBadge('已停用','danger'):apiBadge('未开通')}</td><td>${r?Number(r.keyCount):'—'}</td><td>${r?billingAmount(r.billing24h,r.used24h):'—'}</td><td>${r?billingAmount(r.billing,r.usedTotal):'—'}</td><td>${r?apiConcurrency(r.inflight,r.waiting):'—'}</td><td class="api-row-actions">${r?`<button type="button" class="link-button" data-key-stats="${esc(t.id)}">用量</button><button type="button" class="link-button" data-key-logs="${esc(t.id)}">调用记录</button>`:''}${r?.active?`<button type="button" class="link-button danger" data-key-revoke="${esc(t.id)}">停用 API</button>`:`<button type="button" class="link-button" data-key-provision="${esc(t.id)}">${r?'重新开通':'开通 API'}</button>`}</td></tr>`;}).join('');
     c.box.innerHTML=`${c.data.enabled?'':'<div class="info-banner warning">尚未配置模型账号：开通后队伍可以创建密钥，但调用会失败。</div>'}<section class="api-card flush"><div class="table-wrap"><table class="board-table api-table"><thead><tr><th>队伍</th><th>状态</th><th>密钥</th><th>近24小时</th><th>累计</th><th>进行中 / 排队</th><th>操作</th></tr></thead><tbody>${rows || '<tr><td colspan="7">录入队伍后可开通。</td></tr>'}</tbody></table></div></section><div id="key-detail" aria-live="polite"></div>`;
     c.actions.querySelector('input').oninput=e=>{const q=e.target.value.trim().toLowerCase();c.box.querySelectorAll('[data-team-row]').forEach(row=>row.hidden=!!q && !row.dataset.teamRow.includes(q));};
     c.box.querySelectorAll('[data-key-stats]').forEach(b=>b.onclick=()=>withBusy(b,()=>c.alive() && showKeyStats({teamId:b.dataset.keyStats},c.team(b.dataset.keyStats),7)));
@@ -114,7 +120,7 @@ const apiPageRenderers={
     const saved=c.data.upstreams,free=Object.keys(apiPlatforms).filter(k=>!saved[k]);
     c.actions.innerHTML=`<button type="button" class="btn secondary small" data-refresh>刷新</button><button type="button" class="btn small" data-add ${free.length?'':'disabled title="每个平台最多一个账号"'}>添加账号</button>`;
     const pricing=u=>apiGiteeAccount(u)?apiBadge('人民币 · 目录计价'):u.defaultPrice?`默认 $${Number(u.defaultPrice[0])} / $${Number(u.defaultPrice[1])}`:Object.values(u.models).some(p=>!p.length)?apiBadge('部分模型未定价，不计费','warning'):'按模型定价';
-    c.box.innerHTML=`<section class="api-card flush">${apiTable(['名称','平台/类型','状态','接口地址','模型','计费','操作'],Object.entries(saved).map(([kind,u])=>{const names=Object.keys(u.models);return [
+    c.box.innerHTML=`<section class="api-card flush">${apiTable(['名称','平台/类型','状态','接口地址','模型','计费','操作'],Object.entries(saved).filter(([kind])=>Object.hasOwn(apiPlatforms,kind)).map(([kind,u])=>{const names=Object.keys(u.models);return [
       `<strong>${esc(apiAccountName(kind,u))}</strong>`,`<span class="api-platform ${kind}"><b>${esc(apiPlatforms[kind].label)}</b><i>Key</i></span>`,apiBadge('正常','success'),`<code>${esc(u.url)}</code>`,
       `${names.slice(0,3).map(m=>`<span class="api-chip">${esc(m)}</span>`).join('')}${names.length>3?`<small> 等 ${names.length} 个</small>`:''}${Object.keys(u.aliases || {}).length?`<br><small>${Object.keys(u.aliases).length} 条映射</small>`:''}`,pricing(u),
       `<span class="api-row-actions"><button type="button" class="link-button" data-edit="${kind}">编辑</button><button type="button" class="link-button" data-test="${kind}">测试连接</button><button type="button" class="link-button danger" data-delete="${kind}">删除</button></span>`];}),'还没有账号。点击右上角“添加账号”，填写接口地址与 API Key，再同步上游模型即可。')}</section>`;
@@ -181,7 +187,7 @@ function apiAccountDialog(c,kind,editing){
   const drawChips=()=>{q('[data-chips]').innerHTML=s.models.map(m=>`<span class="api-chip">${esc(m)}<button type="button" data-remove="${esc(m)}" aria-label="移除 ${esc(m)}">×</button></span>`).join('');
     q('[data-count]').textContent=s.models.length?`已选择 ${s.models.length} 个模型`:'尚未选择模型：至少选择 1 个，队伍只能调用白名单中的模型。';
     d.querySelectorAll('[data-pick]').forEach(box=>box.checked=s.models.includes(box.value));drawPrices();drawAliases();};
-  const drawPrices=()=>{q('[data-prices]').innerHTML=s.models.length?`<p class="small-note">留空的模型按默认单价计费。缓存价可留空，按输入价比例计。</p><div class="table-wrap"><table class="board-table api-table"><thead><tr><th>模型</th>${priceColumns.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${s.models.map(m=>`<tr><td>${esc(m)}</td>${priceColumns.map((h,i)=>`<td><input class="api-price" inputmode="decimal" data-price="${esc(m)}" data-index="${i}" value="${esc((s.prices[m] || [])[i] ?? '')}" aria-label="${esc(m)} ${h}价"></td>`).join('')}</tr>`).join('')}</tbody></table></div>`:'<p class="small-note">先在模型白名单中选择模型。</p>';};
+  const drawPrices=()=>{q('[data-prices]').innerHTML=s.models.length?`<p class="small-note">留空的模型按默认单价计费。缓存价可留空，按输入价比例计。</p><div class="table-wrap"><table class="board-table api-table"><thead><tr><th>模型</th>${priceColumns.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${s.models.map(m=>`<tr><td>${esc(m)}</td>${priceColumns.map((h,i)=>`<td><input class="api-price" inputmode="decimal" data-price="${esc(m)}" data-index="${i}" value="${esc((s.prices[m] || [])[i] ?? '')}" aria-label="${esc(m)} ${h}价"></td>`).join('')}</tr>`).join('')}</tbody></table></div>`:'<p class="small-note">先在模型白名单中选择模型。</p>';};
   const drawAliases=()=>{q('[data-aliases]').innerHTML=s.aliases.map(([from,to],i)=>`<div class="api-alias"><input data-alias-from="${i}" value="${esc(from)}" placeholder="请求模型" aria-label="请求模型"><span>→</span><select data-alias-to="${i}" aria-label="实际模型">${s.models.map(m=>`<option ${m===to?'selected':''}>${esc(m)}</option>`).join('')}${s.models.includes(to)?'':`<option selected value="${esc(to)}">${esc(to || '请选择')}（不在白名单）</option>`}</select><button type="button" class="link-button danger" data-alias-del="${i}" aria-label="删除映射">删除</button></div>`).join('') || '<p class="small-note">暂无映射。</p>';};
   const add=names=>{for(const n of names)if(n && !s.models.includes(n))s.models.push(n);if(s.models.length>500){s.models.length=500;toast('每个账号最多 500 个模型。');}drawChips();};
   d.addEventListener('input',e=>{const t=e.target;

@@ -11,6 +11,7 @@ import secrets
 import sqlite3
 import re
 
+from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
 
 MAX_REVISION = 9007199254740991
@@ -123,10 +124,10 @@ class FinalsService:
         return db.execute('SELECT * FROM finals_config WHERE id=1').fetchone()
 
     def access_code(self):
-        path = Path(self.s.data_dir) / 'finals-access-code.txt'
         try:
-            code = path.read_text(encoding='utf-8').rstrip('\r\n')
-        except OSError:
+            raw = self.s.credentials.read('finals-access-code.txt')
+            code = (raw or b'').decode('ascii').rstrip('\r\n')
+        except (OSError, ValueError, RuntimeError):
             raise APIError(503, '决赛邀请入口尚未配置，请联系组织方', 'finals_access_unavailable')
         if not re.fullmatch(r'[0-9]{6,32}', code):
             raise APIError(503, '决赛邀请入口尚未配置，请联系组织方', 'finals_access_unavailable')
@@ -136,15 +137,17 @@ class FinalsService:
     def access_tag(code, token):
         return hmac.new(code.encode('utf-8'), b'gotc-finals-access-v1\0'+token.encode('ascii'), hashlib.sha256).hexdigest()
 
-    def grant_access(self, db, body, ip):
-        # This independent invitation never calls login() or creates an accounts/sessions row.
-        self.s.rate_limit(ip, 'finals-access')
+    def verify_invitation(self, body):
         configured = self.access_code()
-        if not isinstance(body, dict) or set(body) != {'code'}:
+        if not inputs.accepts_fields(body, inputs.CodeBody):
             raise APIError(400, '请填写决赛邀请码')
         code = self.text(body['code'], '决赛邀请码', 160, True)
         if not hmac.compare_digest(code.encode('utf-8'), configured.encode('utf-8')):
             raise APIError(401, '决赛邀请码不正确，请核对后重试', 'finals_access_required')
+        return configured
+
+    def grant_access(self, db, body):
+        configured = self.verify_invitation(body)
         token = secrets.token_urlsafe(32)
         expires = self.clock() + FINALS_ACCESS_TTL_MS
         db.execute('DELETE FROM finals_access_tokens WHERE expires_at<=?', (self.clock(),))
@@ -479,8 +482,8 @@ class FinalsService:
                      {'sourceRunId': source_run_id, 'teamIds': ordered_team_ids, 'teamCount': len(ordered_team_ids)})
         return len(ordered_team_ids)
 
-    def save_roster(self, db, actor, state, body):
-        self.fields(body, {'expectedRevision', 'teamIds', 'judgeIds'})
+    def save_roster(self, db, actor, state, body: inputs.RosterSelection):
+        self.fields(body, inputs.RosterSelection.__required_keys__)
         revision = self.next_revision(body, state['revision'])
         if state['roster_locked']:
             raise APIError(409, '决赛已开放过，名单已锁定，不能覆盖现有评审身份和记录')
@@ -505,7 +508,7 @@ class FinalsService:
         return self.admin_view(db, self.state(db))
 
     def create_judges(self, db, actor, state, body):
-        self.fields(body, {'expectedRevision'})
+        self.fields(body, inputs.RevisionBody.__required_keys__)
         revision = self.next_revision(body, state['revision'])
         if state['roster_locked'] or state['judges_created'] or self.judges(db, state['run_id']):
             raise APIError(409, '决赛评委已配置，不能重复批量创建')
@@ -519,7 +522,7 @@ class FinalsService:
         return {'config': self.config(db, self.state(db)), 'judges': judges}
 
     def save_settings(self, db, actor, state, body):
-        self.fields(body, {'expectedRevision', 'open', 'published'})
+        self.fields(body, inputs.FinalsSettings.__required_keys__)
         revision = self.next_revision(body, state['revision'])
         if type(body['open']) is not bool or type(body['published']) is not bool:
             raise APIError(400, '开放和发布开关必须为布尔值')
@@ -545,8 +548,8 @@ class FinalsService:
         self.s.audit(db, actor, 'finals.settings', state['run_id'], {'open': body['open'], 'published': body['published'], 'revision': revision})
         return self.admin_view(db, self.state(db))
 
-    def confirm_awards(self, db, actor, state, body):
-        self.fields(body, {'expectedRevision', 'selections'})
+    def confirm_awards(self, db, actor, state, body: inputs.AwardSelection):
+        self.fields(body, inputs.AwardSelection.__required_keys__)
         revision = self.next_revision(body, state['revision'])
         if state['open']:
             raise APIError(409, '请先关闭决赛评分和提名，再确认专项奖')
@@ -573,8 +576,8 @@ class FinalsService:
         self.s.audit(db, actor, 'finals.awards-confirmed', state['run_id'], {'revision': revision, 'awardLimit': 1})
         return self.admin_view(db, self.state(db))
 
-    def save_score(self, db, actor, state, body):
-        self.fields(body, {'runId', 'teamId', 'expectedRevision', 'status', 'scores', 'feedback'})
+    def save_score(self, db, actor, state, body: inputs.NumericBallot):
+        self.fields(body, inputs.NumericBallot.__required_keys__)
         self.require_judge(db, actor, state, writing=True)
         if body['runId'] != state['run_id']:
             raise APIError(409, '决赛轮次不匹配，请核对最新页面', 'finals_run_conflict')
@@ -616,8 +619,8 @@ class FinalsService:
         self.s.audit(db, actor, 'finals.score.' + status, body['teamId'], {'runId': state['run_id'], 'revision': revision, 'total': total / 10 if total is not None else None})
         return {'score': {'teamId': body['teamId'], 'revision': revision, 'status': status, 'scores': values, 'feedback': feedback, 'updatedAt': now}}
 
-    def save_nominations(self, db, actor, state, body):
-        self.fields(body, {'runId', 'expectedRevision', 'status', 'nominations'})
+    def save_nominations(self, db, actor, state, body: inputs.Nominations):
+        self.fields(body, inputs.Nominations.__required_keys__)
         self.require_judge(db, actor, state, writing=True)
         if body['runId'] != state['run_id']:
             raise APIError(409, '决赛轮次不匹配，请核对最新页面', 'finals_run_conflict')
@@ -640,6 +643,17 @@ class FinalsService:
         self.s.audit(db, actor, 'finals.nominations.' + status, state['run_id'], {'revision': revision, 'nominatedAwards': sum(v is not None for v in nominations.values())})
         return {'nominations': {'revision': revision, 'status': status, 'nominations': nominations, 'updatedAt': now}}
 
+    @staticmethod
+    def seat_account(db, state, finals_judge_id):
+        if not isinstance(finals_judge_id, str) or not finals_judge_id:
+            raise APIError(400, '请先选择你的决赛评委姓名或席位', 'finals_seat_required')
+        actor = db.execute('''SELECT a.* FROM accounts a JOIN finals_judges j ON j.judge_id=a.id
+                              WHERE j.run_id=? AND a.id=? AND a.role='judge' AND a.active=1''',
+                           (state['run_id'], finals_judge_id)).fetchone()
+        if actor is None:
+            raise APIError(403, '所选决赛评委席位无效或已停用，请重新选择', 'finals_seat_invalid')
+        return actor
+
     def dispatch(self, db, actor, method, path, body, query, expected_login_id, cookie, finals_judge_id=None, access_token=None, ip=''):
         if query:
             raise APIError(400, '决赛接口不接受查询参数')
@@ -651,7 +665,7 @@ class FinalsService:
             if method != 'POST':
                 raise APIError(404, '决赛接口不存在')
             self.s.judge_login_schedule.require_open(db, 'finals')
-            return self.grant_access(db, body, ip)
+            return self.grant_access(db, body)
         if path in FINALS_ACCESS_PATHS:
             self.require_access(db, access_token)
             self.s.judge_login_schedule.require_open(db, 'finals')
@@ -676,13 +690,7 @@ class FinalsService:
         elif path in {'/api/finals/judge', '/api/finals/score', '/api/finals/nominations'}:
             # Invitation access is checked independently before seat selection. The seat
             # identifies attribution only and grants no ordinary judge/admin API access.
-            if not isinstance(finals_judge_id, str) or not finals_judge_id:
-                raise APIError(400, '请先选择你的决赛评委姓名或席位', 'finals_seat_required')
-            actor = db.execute('''SELECT a.* FROM accounts a JOIN finals_judges j ON j.judge_id=a.id
-                                  WHERE j.run_id=? AND a.id=? AND a.role='judge' AND a.active=1''',
-                               (state['run_id'], finals_judge_id)).fetchone()
-            if actor is None:
-                raise APIError(403, '所选决赛评委席位无效或已停用，请重新选择', 'finals_seat_invalid')
+            actor = self.seat_account(db, state, finals_judge_id)
         else:
             raise APIError(404, '决赛接口不存在')
         if method == 'GET' and path == '/api/admin/finals':

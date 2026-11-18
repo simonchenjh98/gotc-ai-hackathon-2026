@@ -6,6 +6,7 @@ import re
 import secrets
 import sqlite3
 
+from backend.gotc.http import request_models as inputs
 from backend.gotc.teams.claims import normalize, fingerprint
 from backend.gotc.errors import APIError
 from backend.gotc.teams.team_registration import code_hash
@@ -210,7 +211,7 @@ class TeamLifecycle:
 
     def validate_mutation(self,db,actor,body,restore=False):
         self.s.require(actor,'admin')
-        allowed={'teamId','expectedRevision','reason','name' if restore else 'recycleContext'}
+        allowed=(inputs.RestoreTeam if restore else inputs.RecycleTeam).__required_keys__
         if not isinstance(body,dict) or not set(body).issubset(allowed):raise APIError(400,'队伍操作字段不正确')
         if 'expectedRevision' not in body:raise APIError(428,'请先读取队伍最新版本','revision_required')
         revision=body['expectedRevision']
@@ -243,7 +244,7 @@ class TeamLifecycle:
         detail=self.detail(db,team_id)
         return {'ok':True,'team':detail['team'],'recycle':detail['recycle'],'access':self.access_state(db,team_id)}
 
-    def recycle(self,db,actor,body):
+    def recycle(self,db,actor,body: inputs.RecycleTeam):
         team,reason,_=self.validate_mutation(db,actor,body)
         team_id=team['id'];self.require_available(db,team_id)
         if not hmac.compare_digest(body['recycleContext'],self.recycle_context(db,team_id)):
@@ -270,7 +271,7 @@ class TeamLifecycle:
             'after':{'status':'withdrawn','revision':team['revision']+1},'memberCount':len(memberships)})
         return self.response(db,team_id)
 
-    def restore(self,db,actor,body):
+    def restore(self,db,actor,body: inputs.RestoreTeam):
         team,reason,name=self.validate_mutation(db,actor,body,restore=True)
         team_id=team['id'];event=self.current_event(db,team_id)
         if not event:raise APIError(409,'该队伍不在回收站','team_not_recycled')

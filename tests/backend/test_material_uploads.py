@@ -369,11 +369,29 @@ class MaterialUploadTests(unittest.TestCase):
                    'X-GOTC-Filename': 'fixture.pdf', 'Content-Length': str(len(PDF) + 10)}
         request = ('POST ' + self.service.base_path + '/api/team/uploads/slides HTTP/1.1\r\n' +
                    ''.join(key + ': ' + value + '\r\n' for key, value in headers.items()) + '\r\n').encode() + PDF
-        with socket.create_connection(('127.0.0.1', self.server.server_port), timeout=5) as connection:
-            connection.sendall(request); connection.shutdown(socket.SHUT_WR)
-            response = b''
-            while chunk := connection.recv(65536): response += chunk
-        self.assertIn(b'400 Bad Request', response)
+        received, finished = threading.Event(), threading.Event()
+        upload = self.service.material_uploads.upload
+
+        def observe(headers, read_chunk, kind, length):
+            def observed_read(size):
+                data = read_chunk(size)
+                if data:
+                    received.set()
+                return data
+            try:
+                return upload(headers, observed_read, kind, length)
+            finally:
+                finished.set()
+
+        with patch.object(self.service.material_uploads, 'upload', observe):
+            with socket.create_connection(('127.0.0.1', self.server.server_port), timeout=5) as connection:
+                connection.sendall(request)
+                self.assertTrue(received.wait(3))
+                connection.shutdown(socket.SHUT_WR)
+                # Uvicorn reports a truncated peer as http.disconnect and closes
+                # its transport, so no HTTP response reaches that peer.
+                self.assertEqual(connection.recv(65536), b'')
+            self.assertTrue(finished.wait(3))
         self.assertEqual(self.rows(), [])
         self.assertEqual(list(self.service.material_uploads.root.iterdir()), [])
         connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port)

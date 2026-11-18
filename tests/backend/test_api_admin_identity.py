@@ -2,6 +2,7 @@
 import unittest
 from unittest.mock import patch
 
+from backend.gotc.gateway import transport
 import test_api
 import test_keys
 
@@ -30,12 +31,12 @@ class ApiAdminIdentityTests(unittest.TestCase):
             ('GET', '/api/admin/keys/upstreams/models/openai', None),
             ('POST', '/api/admin/keys/upstreams/models', {'kind': 'openai', 'url': self.upstreams['openai']['url'], 'key': ''}),
         ]
-        with patch.object(self.service.keys.opener, 'open', side_effect=AssertionError('must not call upstream')) as opened:
+        with patch.object(transport, 'probe', side_effect=AssertionError('must not probe upstream')) as probe:
             for marker, expected in [('', 428), (previous_login, 401)]:
                 for method, path, body in requests:
                     with self.subTest(marker=bool(marker), path=path):
                         self.assertEqual(second.request(method, path, body, headers={'X-GOTC-Login': marker})[0], expected)
-            opened.assert_not_called()
+            probe.assert_not_called()
         with self.service.db() as db:
             self.assertEqual(self.service.keys.raw_config(db), self.upstreams)
             self.assertEqual(self.service.keys.settings(db)['maxKeys'], 5)

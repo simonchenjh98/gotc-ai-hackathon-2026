@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
 
 URL_FIELDS=('codeUrl','readmeUrl','licenseUrl','demoUrl','slidesUrl','videoUrl','filesUrl','repositoryMaterialsUrl')
@@ -90,9 +91,8 @@ class SubmissionRecords:
         error.request_id=receipt['requestId']
         return error
 
-    def validate_envelope(self,body):
-        if (not isinstance(body,dict) or set(body)-{'expectedVersion','status','materials','requestId','repoPreviewId'}
-                or not {'expectedVersion','status','materials'}.issubset(body)
+    def validate_envelope(self,body: inputs.SubmissionBody):
+        if (not inputs.accepts_fields(body, inputs.SubmissionBody)
                 or type(body['expectedVersion']) is not int or not 0<=body['expectedVersion']<=9007199254740991
                 or not isinstance(body['status'],str) or body['status'] not in {'draft','submitted'} or not isinstance(body['materials'],dict)):
             raise APIError(400,'提交字段或状态不正确','submission_envelope_invalid')
@@ -179,8 +179,8 @@ class SubmissionRecords:
                           'checkedAt':row['checked_at'] if row else None,'actor':{'id':row['actor_id'],'name':row['actor_name']} if row else None,'note':row['note'] if row else ''})
         return {'teamId':team_id,'version':version,'latestVersion':latest,'items':items}
 
-    def save_check(self,db,actor,team_id,body):
-        if not isinstance(body,dict) or set(body)!={'version','field','expectedRevision','status','note'}:raise APIError(400,'人工访问记录字段不正确')
+    def save_check(self,db,actor,team_id,body: inputs.MaterialCheck):
+        if not inputs.accepts_fields(body, inputs.MaterialCheck):raise APIError(400,'人工访问记录字段不正确')
         version=self.positive(body['version'],'正式版本');field=body['field'];revision=body['expectedRevision']
         if type(revision) is not int or revision<0 or not isinstance(field,str) or field not in URL_FIELDS:raise APIError(400,'材料项或修订号不正确')
         if not isinstance(body['status'],str) or body['status'] not in CHECK_STATUSES:raise APIError(400,'人工访问状态不正确')

@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 from contextlib import closing, contextmanager
+import errno
 import os
 import secrets
 import sqlite3
+import threading
+import time
+import weakref
+from pathlib import Path
 
 
 SCHEMA = """
@@ -103,14 +108,196 @@ def migrate_accounts(db_path, clock):
 
 
 @contextmanager
-def connection(db_path):
-    db = sqlite3.connect(db_path, timeout=10)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys=ON")
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA busy_timeout=10000")
-    try:
-        with db:
-            yield db
-    finally:
-        db.close()
+def startup_lock(directory):
+    """Serialize schema upgrades and first-run private-file creation across processes."""
+    fd = os.open(directory / ".schema.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "rb+") as lock:
+        if os.name == "nt":
+            import msvcrt
+
+            # Lock the same first byte even for a newly created, empty file.
+            while True:
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as error:
+                    if error.errno != errno.EACCES:
+                        raise
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+
+def _close_idle(handles):
+    while handles:
+        handles.pop().close()
+
+
+class EventConnection(sqlite3.Connection):
+    """Measure time spent explicitly acquiring a SQLite writer reservation."""
+
+    def execute(self, sql, parameters=()):
+        if sql.strip().upper() != "BEGIN IMMEDIATE":
+            return super().execute(sql, parameters)
+        from .observability import record_db_lock_wait
+
+        start = time.monotonic()
+        try:
+            cursor = super().execute(sql, parameters)
+        except sqlite3.OperationalError as error:
+            if getattr(error, "sqlite_errorcode", 0) & 255 in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                record_db_lock_wait(time.monotonic() - start, failed=True)
+            raise
+        record_db_lock_wait(time.monotonic() - start)
+        return cursor
+
+
+class ConnectionPool:
+    """A bounded pool for one process. Each lease has one owning thread."""
+
+    def __init__(self, path, *, limit=8, timeout=10.0):
+        self.path = Path(path)
+        self.limit = limit
+        self.timeout = timeout
+        self._idle = []
+        self._count = 0
+        self._closed = False
+        self._condition = threading.Condition()
+        self._local = threading.local()
+        weakref.finalize(self, _close_idle, self._idle)
+
+    def _open(self):
+        db = sqlite3.connect(self.path, timeout=self.timeout, check_same_thread=False, factory=EventConnection)
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            if db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
+                raise RuntimeError("The event database requires SQLite WAL support")
+            db.execute("PRAGMA synchronous=FULL")
+            return db
+        except BaseException:
+            db.close()
+            raise
+
+    def _checkout(self):
+        with self._condition:
+            ready = self._condition.wait_for(
+                lambda: self._closed or self._idle or self._count < self.limit, self.timeout
+            )
+            if self._closed:
+                raise RuntimeError("Event database pool is closed")
+            if not ready:
+                raise sqlite3.OperationalError("Event database connection pool is busy")
+            if self._idle:
+                return self._idle.pop()
+            self._count += 1
+        try:
+            return self._open()
+        except BaseException:
+            self._release(None)
+            raise
+
+    def _release(self, db):
+        with self._condition:
+            if db is None or self._closed:
+                if db is not None:
+                    db.close()
+                self._count -= 1
+            else:
+                self._idle.append(db)
+            self._condition.notify()
+
+    @contextmanager
+    def connection(self):
+        outer = getattr(self._local, "connection", None)
+        if outer is not None:
+            # SAVEPOINT inside an explicit transaction keeps nested success provisional.
+            # Opening a top-level savepoint alone would commit on its RELEASE.
+            if not outer.in_transaction:
+                outer.execute("BEGIN")
+            outer.execute("SAVEPOINT gotc_nested")
+            try:
+                yield outer
+            except BaseException:
+                outer.execute("ROLLBACK TO gotc_nested")
+                raise
+            finally:
+                outer.execute("RELEASE gotc_nested")
+            return
+        db = self._checkout()
+        self._local.connection = db
+        try:
+            with db:
+                yield db
+        finally:
+            del self._local.connection
+            try:
+                if db.in_transaction:
+                    db.rollback()
+                db.set_trace_callback(None)
+                db.row_factory = sqlite3.Row
+                db.execute("PRAGMA foreign_keys=ON")
+                db.execute(f"PRAGMA busy_timeout={int(self.timeout * 1000)}")
+            except sqlite3.Error:
+                db.close()
+                db = None
+            self._release(db)
+
+    def close(self):
+        """Stop new leases. Active leases close as their owners return them."""
+        with self._condition:
+            self._closed = True
+            self._count -= len(self._idle)
+            _close_idle(self._idle)
+            self._condition.notify_all()
+
+
+class DatabaseMaintenance:
+    """Platform-owned periodic cleanup, with short transactions and a passive checkpoint."""
+
+    def __init__(self, event, interval=300):
+        self.event = event
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+
+    def run_once(self):
+        now = self.event.clock()
+        with self.event.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for table in ("sessions", "finals_access_tokens", "import_previews"):
+                db.execute(
+                    f"DELETE FROM {table} WHERE rowid IN "
+                    f"(SELECT rowid FROM {table} WHERE expires_at <= ? ORDER BY expires_at LIMIT 512)",
+                    (now,),
+                )
+        with self.event.db() as db:
+            return tuple(db.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone())
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                self.run_once()
+            except sqlite3.Error:
+                import logging
+
+                logging.getLogger(__name__).warning("Event database maintenance deferred")
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="gotc-db-maintenance")
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()

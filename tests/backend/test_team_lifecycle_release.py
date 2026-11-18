@@ -12,7 +12,7 @@ from backend.gotc.teams import team_lifecycle
 import test_keys as gateway_helpers
 import test_team_lifecycle as lifecycle_helpers
 import test_revoked_claims as recovery_helpers
-from test_submission_records_release import snapshot
+from test_submission_records_release import snapshot, unrelated_numbered_migrations
 
 
 TABLES={'team_recycle_events','team_recycle_memberships'}
@@ -29,7 +29,7 @@ class LifecycleMigrationReleaseTests(unittest.TestCase):
 
     def legacy(self):
         # Suppress only the additive feature initializer to reproduce its predecessor layout.
-        with patch.object(team_lifecycle.TeamLifecycle,'initialize',return_value=None):service=self.service()
+        with patch('backend.gotc.migrations.apply', unrelated_numbered_migrations), patch.object(team_lifecycle.TeamLifecycle,'initialize',return_value=None):service=self.service()
         with service.db() as db:
             db.execute("INSERT INTO teams VALUES ('Tlegacy',71,'Synthetic legacy','Synthetic project','AI for Science',100)")
             db.execute("INSERT INTO team_details(team_id) VALUES ('Tlegacy')")
@@ -140,12 +140,16 @@ class LifecycleGatewayReleaseTests(unittest.TestCase):
 
     def test_actual_queued_http_call_fails_after_recycle_before_fake_provider(self):
         team,_,key=self.enabled_key();service=self.service.keys
-        queued=threading.Event();original_wait=service.slot_free.wait
-        def observed_wait(timeout=None):queued.set();return original_wait(timeout)
         with service.lock:service.inflight[team]=keys.TEAM_CONCURRENCY
-        with patch.object(service.slot_free,'wait',observed_wait),ThreadPoolExecutor(max_workers=1) as pool:
+        with ThreadPoolExecutor(max_workers=1) as pool:
             call=pool.submit(self.call,'/v1/chat/completions',{'model':'cheap'},key)
-            self.assertTrue(queued.wait(5),'HTTP request never queued')
+            for _ in range(100):
+                with service.lock:
+                    if service.waiting[team]:
+                        break
+                threading.Event().wait(0.05)
+            else:
+                self.fail('HTTP request never queued')
             try:self.assertEqual(self.recycle(team)[0],200)
             finally:service.release(team)
             self.assertEqual(call.result(timeout=10)[0],401)
@@ -154,12 +158,12 @@ class LifecycleGatewayReleaseTests(unittest.TestCase):
 
     def test_already_admitted_call_may_finish_and_remains_auditable_after_recycle(self):
         team,_,key=self.enabled_key();service=self.service.keys
-        admitted=threading.Event();resume=threading.Event();forward=service.forward
-        def paused_forward(*args,**kwargs):
+        admitted=threading.Event();resume=threading.Event();provider=gateway_helpers.FakeUpstream.do_POST
+        def paused_provider(handler):
             admitted.set()
             if not resume.wait(10):raise RuntimeError('Synthetic admission barrier timed out')
-            return forward(*args,**kwargs)
-        with patch.object(service,'forward',paused_forward),ThreadPoolExecutor(max_workers=1) as pool:
+            return provider(handler)
+        with patch.object(gateway_helpers.FakeUpstream,'do_POST',paused_provider),ThreadPoolExecutor(max_workers=1) as pool:
             call=pool.submit(self.call,'/v1/chat/completions',{'model':'cheap'},key)
             self.assertTrue(admitted.wait(5),'HTTP request never passed final recheck')
             try:self.assertEqual(self.recycle(team)[0],200)

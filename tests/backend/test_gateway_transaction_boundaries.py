@@ -33,6 +33,20 @@ class GatewayTransactionTests(unittest.TestCase):
     assertReleased = test_keys.GatewayTests.assertReleased
     sse = test_keys.GatewayTests.sse
 
+    def test_optional_content_failure_never_replays_or_discards_the_usage_charge(self):
+        team_id, _, token = self.enabled_key()
+        store = self.service.keys.ledger.content
+        with patch.object(store, "insert", side_effect=sqlite3.OperationalError("synthetic storage failure")):
+            with self.assertLogs("gotc.maintenance", "ERROR"):
+                status, _ = self.call('/v1/chat/completions', {'model': 'cheap'}, token)
+            self.assertReleased(team_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(FakeUpstream.calls), 1)
+        with self.service.db() as db:
+            amounts = [row[0] for row in db.execute("SELECT cost_micro FROM api_usage")]
+        self.assertEqual(amounts, [4000])
+        self.assertEqual(store.summary()["rows"], 0)
+
     def test_real_sqlite_write_lock_retries_record_once_without_recalling_upstream(self):
         team_id, _, token = self.enabled_key()
         original_db = self.service.db
@@ -75,7 +89,8 @@ class GatewayTransactionTests(unittest.TestCase):
             self.assertReleased(team_id)
         with original_db() as db:
             rows = list(db.execute('SELECT * FROM api_usage'))
-            logs = list(db.execute('SELECT * FROM api_logs'))
+        with self.service.keys.ledger.content.connection() as db:
+            logs = list(db.execute('SELECT * FROM content'))
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(content)['choices'][0]['message']['content'], 'hi')
         self.assertEqual(failures, ['database is locked'])
@@ -110,23 +125,81 @@ class GatewayTransactionTests(unittest.TestCase):
                 yield proxy
                 if proxy.usage_written and not failed.is_set():
                     failed.set()
-                    # Fail at transaction exit, after usage, last_used_at and content have all been written.
+                    # Fail after the usage and last-used writes. The sidecar must wait for this commit.
                     raise sqlite3.OperationalError('injected commit failure')
             if proxy.usage_written:
                 committed.set()
 
+        request = {'model': 'cheap', 'messages': [{'role': 'user', 'content': 'synthetic ' * 125000}]}
         with patch.object(self.service, 'db', failed_transaction), patch.object(traceback, 'print_exc'):
-            status, content = self.call('/v1/chat/completions', {'model': 'cheap'}, token)
+            status, content = self.call('/v1/chat/completions', request, token)
             self.assertTrue(committed.wait(1), 'request finalization must retry the rolled-back usage write')
             self.assertReleased(team_id)
         with original_db() as db:
             rows = list(db.execute('SELECT status,cost_micro FROM api_usage'))
-            logs = list(db.execute('SELECT response FROM api_logs'))
+        with self.service.keys.ledger.content.connection() as db:
+            logs = list(db.execute('SELECT response,request,request_bytes FROM content'))
         self.assertTrue(failed.is_set())
         self.assertEqual(status, 200)
         self.assertEqual(len(FakeUpstream.calls), 1)
         self.assertEqual([tuple(row) for row in rows], [(200, 4000)])
         self.assertEqual([zlib.decompress(row['response']) for row in logs], [content])
+        raw = json.dumps(request).encode()
+        self.assertEqual(logs[0]['request_bytes'], len(raw))
+        self.assertEqual(zlib.decompress(logs[0]['request']), raw)
+
+    def test_organizer_runtime_fetch_runs_after_the_database_scope(self):
+        depth = threading.local()
+        original_db, original_snapshot = self.service.db, self.service.keys.read_runtime
+        observed = []
+        @contextmanager
+        def tracked_db():
+            with original_db() as db:
+                depth.count = getattr(depth, "count", 0) + 1
+                try:
+                    yield db
+                finally:
+                    depth.count -= 1
+        def snapshot():
+            observed.append(getattr(depth, "count", 0))
+            return original_snapshot()
+        with patch.object(self.service, "db", tracked_db), patch.object(self.service.keys, "read_runtime", snapshot):
+            self.assertEqual(self.admin.get("/api/admin/keys")[0], 200)
+        self.assertEqual(observed, [0])
+
+    def test_catalog_response_keeps_its_config_when_an_organizer_replaces_upstreams(self):
+        _, _, credential = self.enabled_key()
+        entered, resume = threading.Event(), threading.Event()
+        authenticate = self.service.keys.authenticate
+        def paused(handler, call=None):
+            result = authenticate(handler, call)
+            entered.set()
+            resume.wait(3)
+            return result
+        with patch.object(self.service.keys, "authenticate", side_effect=paused), ThreadPoolExecutor(1) as pool:
+            pending = pool.submit(self.call, "/v1/models", None, credential, method="GET")
+            try:
+                self.assertTrue(entered.wait(2))
+                changed = {"openai": {**self.upstreams["openai"], "models": {"after-edit": [1, 2]}}}
+                self.assertEqual(self.admin.post("/api/admin/keys/upstreams", {"upstreams": changed})[0], 200)
+            finally:
+                resume.set()
+            status, data = pending.result(3)
+        self.assertEqual(status, 200)
+        self.assertIn("cheap", {row["id"] for row in json.loads(data)["data"]})
+        _, later = self.call("/v1/models", None, credential, method="GET")
+        self.assertEqual([row["id"] for row in json.loads(later)["data"]], ["after-edit"])
+
+    def test_separate_gateway_observes_committed_platform_config_changes(self):
+        from backend.gotc.service import EventService
+        reader = EventService(data_dir=self.service.data_dir, origin=self.service.origin, static_root=self.service.root)
+        self.addCleanup(reader.connections.close)
+        self.assertIn("cheap", reader.keys.refresh_config()["openai"]["models"])
+        updated = {"openai": {**self.upstreams["openai"], "models": {"rotated-model": [4, 8]}}}
+        self.assertEqual(self.admin.post("/api/admin/keys/upstreams", {"upstreams": updated})[0], 200)
+        self.assertEqual(set(reader.keys.refresh_config()["openai"]["models"]), {"rotated-model"})
+        self.assertEqual(self.admin.post("/api/admin/keys/upstreams", {"upstreams": {}})[0], 200)
+        self.assertIsNone(reader.keys.refresh_config())
 
     def config_state(self):
         with self.service.db() as db:

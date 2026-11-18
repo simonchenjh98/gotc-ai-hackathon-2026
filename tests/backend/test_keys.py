@@ -1,6 +1,7 @@
 """Built-in AI gateway: team keys, usage metering against fake upstream providers."""
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import asyncio
 import http.client
 import json
 import shutil
@@ -15,10 +16,9 @@ import threading
 import unittest
 
 import test_api
-from backend.gotc.http.server import EventHandler
 from test_api import Client
 from backend.gotc.gateway import transport as gateway_transport
-from backend.gotc.gateway import relay as gateway_relay
+from backend.gotc.gateway import async_text as gateway_relay
 from backend.gotc.gateway import usage as gateway_usage
 from backend.gotc.gateway import requests as gateway_requests
 from backend.gotc.gateway import config as gateway_config
@@ -39,7 +39,7 @@ class FakeUpstream(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):  # upstream model list, for the admin "fetch models" button
-        FakeUpstream.calls.append((self.path, dict(self.headers), None))
+        FakeUpstream.calls.append((self.path, {key.title(): value for key, value in self.headers.items()}, None))
         payload = json.dumps({"data": [{"id": "model-b"}, {"id": "model-a"}, {"id": "model-a"}]}).encode()
         self.send_response(FakeUpstream.status if FakeUpstream.status != 200 else 200)
         self.send_header("Content-Type", "application/json")
@@ -49,7 +49,7 @@ class FakeUpstream(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        FakeUpstream.calls.append((self.path, dict(self.headers), body))
+        FakeUpstream.calls.append((self.path, {key.title(): value for key, value in self.headers.items()}, body))
         if FakeUpstream.hang:
             if FakeUpstream.hang == "body":
                 self.send_response(200)
@@ -160,6 +160,8 @@ class GatewayTests(unittest.TestCase):
         self.fake = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
         threading.Thread(target=self.fake.serve_forever, daemon=True).start()
         test_api.APITests.setUp(self)
+        # Logging fixtures exercise the explicit organizer opt-in on synthetic data.
+        self.assertEqual(self.admin.post("/api/admin/keys/settings", {"logContent": True})[0], 200)
         self.direct = gateway_transport.make_opener({})
         self.service.keys.opener = self.direct  # ignore this machine's proxy settings
         url = f"http://127.0.0.1:{self.fake.server_port}/v1"
@@ -355,7 +357,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("SECRET_PROMPT", detail["request"])
         self.assertIn('"prompt_tokens"', detail["response"])
-        self.assertEqual(detail["headers"]["X-Trace"], "t1")
+        self.assertEqual({k.lower(): v for k, v in detail["headers"].items()}["x-trace"], "t1")
         self.assertNotIn(key, json.dumps(detail))  # credentials never stored
         self.assertIn("message_stop", self.admin.post("/api/admin/keys/log", {"id": logs["items"][1]["id"]})[1]["response"])
 
@@ -385,17 +387,29 @@ class GatewayTests(unittest.TestCase):
         team_id, _, key = self.enabled_key()
         history = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"第{i}轮：" + "上下文" * 4000} for i in range(40)]
         raw = {"model": "claude-latest", "system": "你是代码助手", "messages": history, "stream": True}
-        self.assertEqual(self.call("/v1/messages", raw, key)[0], 200)
+        import gzip
+        expanded = json.dumps(raw).encode()
+        provider_key = self.upstreams["anthropic"]["key"]
+        with closing(http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=20)) as conn:
+            conn.request("POST", self.service.base_path + "/v1/messages", gzip.compress(expanded),
+                         {"Content-Type": "application/json", "Content-Encoding": "gzip",
+                          "Authorization": "Bearer " + key, "X-Trace": "run-" + provider_key})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
         item = self.admin.post("/api/admin/keys/logs", {})[1]["items"][0]
-        sent = len(json.dumps(raw).encode())
+        sent = len(expanded)
         self.assertEqual(item["requestBytes"], sent)
         self.assertGreater(sent, 64 * 1024)
         detail = self.admin.post("/api/admin/keys/log", {"id": item["id"]})[1]
-        self.assertEqual(json.loads(detail["request"]), raw)  # every message, and the model name the client sent
+        headers = {name.lower(): value for name, value in detail["headers"].items()}
+        self.assertNotIn("authorization", headers)
+        self.assertEqual(headers["x-trace"], "run-***")
+        self.assertEqual(detail["request"].encode(), expanded)  # preserves spacing, escaping and original model alias
         self.assertIn("message_stop", detail["response"])
         self.assertFalse(detail["responseTruncated"])
-        with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
-            stored = db.execute("SELECT length(request) FROM api_logs WHERE usage_id=?", (item["id"],)).fetchone()[0]
+        with self.service.keys.ledger.content.connection() as db:
+            stored = db.execute("SELECT length(request) FROM content WHERE usage_id=?", (item["id"],)).fetchone()[0]
         self.assertLess(stored, sent / 5)  # compressed on disk
 
     def test_client_headers_are_unrestricted_with_legacy_rules_after_restart(self):
@@ -629,7 +643,7 @@ class GatewayTests(unittest.TestCase):
         waiter = threading.Thread(target=lambda: result.update(status=self.call("/v1/chat/completions", {"model": "cheap"}, key)[0]))
         waiter.start()
         for _ in range(100):
-            if service.slot_free._waiters:  # the request is now waiting for a slot
+            if service.waiting[team_id]:  # the request is now waiting for a slot
                 break
             threading.Event().wait(0.02)
         self.assertEqual(self.admin.post("/api/admin/keys/revoke", {"teamId": team_id})[0], 200)
@@ -640,6 +654,45 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(len(FakeUpstream.calls), before)  # never reached the upstream
         self.assertEqual(service.inflight[team_id], keys.TEAM_CONCURRENCY - 1)  # its slot was given back
         self.assertReleased(team_id, keys.TEAM_CONCURRENCY - 1)
+
+    def test_saturated_gateway_still_allows_organizer_revocation(self):
+        team, _, credential = self.enabled_key()
+        provider_entered, release_provider = threading.Event(), threading.Event()
+        original = FakeUpstream.do_POST
+
+        def paused(handler):
+            provider_entered.set()
+            release_provider.wait(5)
+            original(handler)
+
+        results = {}
+        path, body = "/v1/chat/completions", {"model": "cheap"}
+        def call(label):
+            results[label] = self.call(path, body, credential)[0]
+
+        with mock.patch.object(keys, "GLOBAL_RUNNING", 1), mock.patch.object(keys, "GLOBAL_QUEUE_CAP", 1), \
+                mock.patch.object(FakeUpstream, "do_POST", paused):
+            running = threading.Thread(target=call, args=("running",))
+            queued = threading.Thread(target=call, args=("queued",))
+            running.start()
+            try:
+                self.assertTrue(provider_entered.wait(3))
+                queued.start()
+                for _ in range(150):
+                    if self.service.keys.waiting[team] == 1:
+                        break
+                    threading.Event().wait(0.01)
+                self.assertEqual(self.service.keys.waiting[team], 1)
+                self.assertEqual(self.call(path, body, credential)[0], 429)
+                self.assertEqual(self.admin.post("/api/admin/keys/revoke", {"teamId": team})[0], 200)
+            finally:
+                release_provider.set()
+                running.join(5)
+                if queued.ident is not None:
+                    queued.join(5)
+        self.assertEqual(results, {"running": 200, "queued": 401})
+        self.assertEqual(len(FakeUpstream.calls), 1)
+        self.assertReleased(team)
 
     def test_output_limits_and_single_completions(self):
         team_id, _, key = self.enabled_key()
@@ -688,6 +741,7 @@ class GatewayTests(unittest.TestCase):
         with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
             db.execute("ALTER TABLE api_usage DROP COLUMN incomplete")
             db.execute("ALTER TABLE api_usage DROP COLUMN estimated")
+            db.execute("PRAGMA user_version=0")  # This fixture predates numbered migrations.
             db.commit()
         restarted = test_api.EventService(data_dir=self.root / "private", origin=self.service.origin, static_root=self.root / "public")
         with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
@@ -804,7 +858,7 @@ class GatewayTests(unittest.TestCase):
                     real_lookup = socket.getaddrinfo
 
                     def lookup(host, *args, **kwargs):  # deterministic DNS failure, whatever resolver this machine uses
-                        if host.endswith(".invalid"):
+                        if host.endswith(b".invalid" if isinstance(host, bytes) else ".invalid"):
                             raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
                         return real_lookup(host, *args, **kwargs)
                     with mock.patch("socket.getaddrinfo", lookup):
@@ -824,7 +878,11 @@ class GatewayTests(unittest.TestCase):
         finally:
             gateway_transport.UPSTREAM_TIMEOUT, gateway_transport.CONNECT_TIMEOUT, FakeUpstream.hang, FakeUpstream.status = timeout, connect, None, 200
             for server in servers:
-                (server.close if isinstance(server, socket.socket) else server.shutdown)()
+                if isinstance(server, socket.socket):
+                    server.close()
+                else:
+                    server.shutdown()
+                    server.server_close()
 
     def test_unexpected_gateway_error_never_records_status_zero(self):
         team_id, _, key = self.enabled_key()
@@ -847,16 +905,32 @@ class GatewayTests(unittest.TestCase):
 
     def test_stream_is_drained_and_billed_when_the_client_left_before_headers(self):
         _, client, key = self.enabled_key()
-        real_headers_out = EventHandler.headers_out
+        arrived, resume = threading.Event(), threading.Event()
+        provider = FakeUpstream.do_POST
 
-        def broken(handler, status, content_type, *args, **kwargs):
-            if content_type.startswith("text/event-stream"):
-                raise BrokenPipeError()
-            return real_headers_out(handler, status, content_type, *args, **kwargs)
-        with mock.patch.object(EventHandler, "headers_out", broken):
-            with self.assertRaises(http.client.RemoteDisconnected):  # the client is "gone": nothing is sent back
-                self.call("/v1/messages", {"model": "claude-x", "stream": True, "max_tokens": 1000}, key)
-        item = self.latest()
+        def wait_for_disconnect(handler):
+            arrived.set()
+            if not resume.wait(5):
+                raise RuntimeError("Timed out waiting for synthetic client disconnect")
+            provider(handler)
+
+        with mock.patch.object(FakeUpstream, "do_POST", wait_for_disconnect):
+            conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+            try:
+                conn.request("POST", self.service.base_path + "/v1/messages",
+                             json.dumps({"model": "claude-x", "stream": True, "max_tokens": 1000}),
+                             {"Content-Type": "application/json", "Authorization": "Bearer " + key})
+                self.assertTrue(arrived.wait(5))
+            finally:
+                conn.close()
+                resume.set()
+            for _ in range(100):
+                items = client.get("/api/team/keys/logs")[1]["items"]
+                if items:
+                    break
+                threading.Event().wait(0.05)
+            self.assertTrue(items, "the disconnected call must still be recorded")
+            item = items[0]
         self.assertEqual((item["status"], item["input"], item["output"], item["incomplete"]), (200, 1000, 500, 0))  # usage read to the end
         self.assertGreater(item["cost"], 0)
 
@@ -948,7 +1022,7 @@ class GatewayTests(unittest.TestCase):
         sock.sendall(b"POST " + self.service.base_path.encode() + b"/v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
                      b"Authorization: Bearer " + key.encode() + b"\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
         for _ in range(100):
-            if service.slot_free._waiters:
+            if service.waiting[team_id]:
                 break
             threading.Event().wait(0.02)
         sock.close()  # the student gives up while queued
@@ -979,6 +1053,7 @@ class GatewayTests(unittest.TestCase):
         with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
             for column in ("error_type", "error_phase", "error_owner", "upstream_status", "error_message"):
                 db.execute(f"ALTER TABLE api_usage DROP COLUMN {column}")
+            db.execute("PRAGMA user_version=0")  # This fixture predates numbered migrations.
             db.commit()
         test_api.EventService(data_dir=self.root / "private", origin=self.service.origin, static_root=self.root / "public")
         with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
@@ -1026,7 +1101,7 @@ class GatewayTests(unittest.TestCase):
         item = self.latest()
         # claude-x [3, 15] -> 5m write 3.75, 1h write 6: 100*3 + 10*15 + 400*3.75 + 600*6 = 5550 micro-USD
         self.assertEqual(round(item["cost"] * 1e6), 5550)
-        self.assertEqual((item["cacheWrite1h"], item["clientIp"], item["requestedModel"]), (600, "10.1.2.3", "claude-x"))
+        self.assertEqual((item["cacheWrite1h"], item["clientIp"], item["requestedModel"]), (600, "127.0.0.1", "claude-x"))  # TCP clients cannot supply a trusted proxy IP
         self.assertIsNotNone(item["firstTokenMs"])
         self.call("/v1/messages", {"model": "claude-latest", "max_tokens": 50}, key)
         self.assertEqual((self.latest()["requestedModel"], self.latest()["model"]), ("claude-latest", "claude-x"))
@@ -1191,15 +1266,17 @@ class GatewayTests(unittest.TestCase):
             for team_key in (key, other_key):
                 self.assertEqual(self.call("/v1/responses", {"model": "cheap", "input": "hi", **extra}, team_key)[0], 400, extra)
         # Without a client limit, OpenAI-compatible routes estimate the full output cap (nothing injected upstream).
-        service = self.service.keys
         seen = []
-        real = service.recheck_access
-        service.recheck_access = lambda handler, call: (seen.append(call["output_estimate"]), real(handler, call))[1]
-        try:
-            self.call("/v1/chat/completions", {"model": "cheap"}, key)
-            self.call("/v1/chat/completions", {"model": "cheap", "max_tokens": 100}, key)
-        finally:
-            service.recheck_access = real
+        service = self.service.keys
+        record = service.record
+
+        def capture_estimate(handler, call):
+            seen.append(call["output_estimate"])
+            return record(handler, call)
+
+        with mock.patch.object(service, "record", capture_estimate):
+            self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, key)[0], 200)
+            self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap", "max_tokens": 100}, key)[0], 200)
         self.assertEqual(seen, [gateway_requests.OUTPUT_CAP, 100])
         self.assertNotIn("max_tokens", FakeUpstream.calls[-2][2])
 
@@ -1236,8 +1313,8 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(client.get("/api/admin/keys/upstreams/test/openai")[0], 403)
         # Request content: retention, size cap and clearing; call metadata (usage) is never deleted.
         calls_before = len(self.admin.post("/api/admin/keys/logs", {})[1]["items"])
-        with closing(sqlite3.connect(self.root / "private" / "event.sqlite3")) as db:
-            db.execute("UPDATE api_usage SET at=at-? WHERE id=(SELECT MIN(id) FROM api_usage)", (100 * 3600_000,))
+        with self.service.keys.ledger.content.connection() as db:
+            db.execute("UPDATE content SET at=at-? WHERE usage_id=(SELECT MIN(usage_id) FROM content)", (100 * 3600_000,))
             db.commit()
         with self.service.db() as db:
             settings = self.service.keys.settings(db)
@@ -1320,9 +1397,9 @@ class GatewayTests(unittest.TestCase):
         try:
             service.inflight["T1"] = keys.TEAM_CONCURRENCY
             with self.assertRaises(keys.APIError):
-                service.admit("T1", 0)  # times out while the team is full
+                asyncio.run(service.admit_async("T1", 0))  # times out while the team is full
             threading.Timer(0.1, service.release, ("T1",)).start()
-            service.admit("T1", 0)  # a slot frees up during the wait
+            asyncio.run(service.admit_async("T1", 0))  # a slot frees up during the wait
             self.assertEqual(service.inflight["T1"], keys.TEAM_CONCURRENCY)
         finally:
             keys.QUEUE_WAIT = delay

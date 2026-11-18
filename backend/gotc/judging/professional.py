@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from decimal import Decimal, InvalidOperation
 
+from backend.gotc.http import request_models as inputs
 from ..constants import DIMENSIONS, VOTE_LIMIT
 from ..errors import APIError
 from ..validation import text_field
@@ -26,7 +27,7 @@ def judge_page(event, db, actor):
     return {"teams": event.teams(db), "myScores": scores, "dimensions": DIMENSIONS, "scoringOpen": event.config(db)["scoringOpen"], "name": actor["name"], "submissions": event.submissions.judge_submissions(db)}, None, None
 
 
-def save_score(event, db, actor, body):
+def save_score(event, db, actor, body: inputs.ScoreBody):
     event.require(actor, "judge")
     if not event.config(db)["scoringOpen"]:
         raise APIError(409, "评分尚未开放或已关闭")
@@ -67,7 +68,7 @@ def audience_page(event, db, actor):
             'votingDeadline':window['deadline'],'window':window,"name": actor["name"]}, None, None
 
 
-def vote(event, db, actor, body):
+def vote(event, db, actor, body: inputs.TeamIdBody):
     event.require(actor, "audience")
     if not event.voting_window(db)['canEdit']:
         raise APIError(409, "观众投票尚未开放、已关闭或已截止")

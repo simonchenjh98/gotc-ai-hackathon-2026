@@ -98,8 +98,7 @@ class GatewayProtocolErrorTests(unittest.TestCase):
         for path, model in (("/v1/messages", "claude-x"), ("/v1/chat/completions", "cheap"), ("/v1/responses", "cheap")):
             with self.subTest(path=path):
                 before_rows = self.usage_rows()
-                # http.client raises InvalidURL locally, before opening a connection.
-                # It is an HTTPException, but unlike bad response syntax it proves no upstream work occurred.
+                # The configured URL contains an invalid raw space and must fail before any send.
                 with redirect_stderr(io.StringIO()):
                     status, _ = self.call(path, {"model": model, "max_tokens": 1000}, key)
                 self.assertEqual(test_keys.FakeUpstream.calls, [])

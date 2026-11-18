@@ -1,50 +1,33 @@
-# GOTC 活动后端
+# GOTC backend
 
-服务使用 Python 3.11+ 标准库和 SQLite。在仓库根目录运行以下命令，可在本机打开 `http://127.0.0.1:5274/gotc/platform.html`。
+Use Python 3.11 or later. Start a local instance from the repository root with `make dev`. Open <http://127.0.0.1:5274/gotc/platform.html>. The launcher installs the locked runtime dependencies in a project virtual environment.
 
-```sh
-GOTC_PUBLIC_ORIGIN=http://127.0.0.1:5274 python3 -m backend.gotc
-```
+In production, the platform and gateway each run one Uvicorn worker on a private Unix socket. Provide the approved public HTTPS origin and persistent data directory explicitly. The platform owns repository workers and SQLite maintenance. The gateway owns provider requests, asynchronous task reconciliation and content retention. [Network and process architecture](../docs/architecture.md) · [Installation and rollback](../ops/deploy/README.md)
 
-首次启动会在私有数据目录创建数据库与 `admin-access.txt`。开发默认目录为 `${XDG_DATA_HOME:-$HOME/.local/share}/gotc`。生产通过 `GOTC_DATA_DIR` 指向原有持久化目录。升级未设置此变量的旧安装时，若项目中仍存在有内容的 `server/data/` 或 `.runtime/local-data/`，程序会在创建新库前停止并给出路径。可将 `GOTC_DATA_DIR` 显式指向原目录，或停机迁移完整私有目录后指向新位置。
-
-## 当前服务结构
-
-| 模块 | 职责 |
+| Package | Responsibility |
 | --- | --- |
-| `gotc/cli.py` · `gotc/service.py` | 应用入口、服务组装、身份及会话、后台任务生命周期 |
-| `gotc/bootstrap.py` · `gotc/database.py` | 私有配置与初始账号、按序迁移、SQLite 连接和基础表 |
-| `gotc/http/` · `gotc/api.py` | HTTP 输入输出、静态白名单、同源校验、身份和事务边界 |
-| `gotc/teams/` | 认领、登记、审核、回收与代管 |
-| `gotc/submissions/` | 草稿与正式提交、历史和回执、材料上传、仓库封存和备份 |
-| `gotc/judging/` | 专业评分与投票、队伍查分、路演和决赛 |
-| `gotc/gateway/` | API 模型目录、鉴权、配额、代理协议、异步任务与计费 |
-| `gotc/organizer.py` · `gotc/admin_data.py` | 组织方配置、导入导出、名单维护及审计查询 |
+| `gotc/http/`, `gotc/api.py` | Declared platform endpoints, request policy and domain operations |
+| `gotc/bootstrap.py`, `gotc/database.py`, `gotc/migrations/` | Event initialization, pooled SQLite connections and schema versions |
+| `gotc/credentials.py`, `gotc/admin_auth.py` | Private credential sources and named organizer authentication |
+| `gotc/teams/` | Registration, membership claims, delegation and team lifecycle |
+| `gotc/submissions/` | Drafts, receipts, uploads, repository integration and backups |
+| `gotc/judging/` | Professional, exhibition, roadshow, finals and voting workflows |
+| `gotc/gateway/` | Team keys, admission, HTTPX transport, streaming, tasks and accounting |
+| `gotc/observability.py` | Local health endpoints, request IDs, structured logs and metrics |
 
-本次重构以 2026 年 11 月 8 日的运行版本为基准。`GET /api/board` 要求管理员会话。正式提交要求提供演示文稿和作品压缩包；其他材料按填写情况校验。决赛设七个评委席位，通过已确认名单或路演发布结果确定入围队伍。详见[工程审计](../docs/audits/2026-11-18-platform.md)。
+Stable generated keys remain with the private event state. A mounted systemd credential can supply an initial value. An existing event rejects a conflicting provisioned key. Local development also accepts the documented private files. Preserve the complete private event directory and the service configuration for full-host recovery. [Organizer enrollment](../docs/organizer-accounts.md)
 
-## 历史运维手册
+## Historical operations manual
 
-以下为上一版项目保留的接口与运维记录。活动规则和发布差异以本页上方的现行说明及工程审计为准。命令路径已更新至当前仓库结构。
+The following Chinese-language reference records earlier event workflows. Use the current architecture, deployment and migration guides above for the running software.
 
 ## 启动
 
-在项目根目录运行：
-
-```sh
-GOTC_DATA_DIR=/opt/gotc-hackathon/data \
-GOTC_BASE_PATH=/gotc \
-GOTC_HOST=127.0.0.1 \
-GOTC_PORT=5274 \
-GOTC_PUBLIC_ORIGIN=https://8.141.114.201 \
-python3 -m backend.gotc
-```
-
-环境变量均为可选，默认值依次为 `${XDG_DATA_HOME:-$HOME/.local/share}/gotc`、`/gotc`、`127.0.0.1`、`5274`、`https://8.141.114.201`。生产必须使用独立、持久化的数据目录，以及非 root 专用服务用户。程序拒绝绑定非 loopback IP。
+在开发环境使用 `make dev`。生产环境由 `gotc-platform`、`gotc-gateway` 分别绑定 `/run/gotc-platform/http.sock`、`/run/gotc-gateway/http.sock`，共用私有数据目录。Nginx 终止 HTTPS 并提供公开静态文件。运维人员在 `/etc/gotc/public-origin` 指定活动的 HTTPS 源，由安装器配置两个服务。离线发布、就绪检查和回滚步骤见[部署手册](../ops/deploy/README.md)。
 
 首次启动在数据目录生成 `admin-access.txt`，包含随机管理码，只创建一次。它不会打印到日志、返回给公开接口或写入仓库。Linux 上数据目录为 0700，管理码文件、数据库为 0600，进程 umask 为 0077。Windows 的 chmod 不替代 ACL，正式部署以 Linux 私有数据目录为准。不要删除或覆盖数据库来更新网页。备份时使用 SQLite backup API 或 `sqlite3 .backup`，避免单独复制正在写入的主数据库文件。
 
-Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，覆盖 `X-Real-IP` 为 `$remote_addr`，保留 Host，使用 HTTPS。服务只接受 Origin 与 `GOTC_PUBLIC_ORIGIN` 完全一致的 POST；不要将 `Origin` 改写成可信值。管理页面为 `/gotc/platform.html#admin`，在浏览器填写管理码。首次进入后台后录入正式队伍、创建评委/观众邀请码，并在活动开始时开放评分。
+Nginx 将平台和网关请求按原路径分别代理到对应的 Unix socket，覆盖 `X-Real-IP` 为 `$remote_addr`，保留 Host，使用 HTTPS。服务只接受 Origin 与 `GOTC_PUBLIC_ORIGIN` 完全一致的 POST；不要将 `Origin` 改写成可信值。管理页面为 `/gotc/platform.html#admin`，在浏览器填写管理码。首次进入后台后录入正式队伍、创建评委/观众邀请码，并在活动开始时开放评分。
 
 本地浏览器测试可将 `GOTC_PUBLIC_ORIGIN` 设为 `http://127.0.0.1:5274`。此时 Cookie 不带 Secure；HTTPS 正式地址自动启用 Secure。身份 Cookie 为 HttpOnly、SameSite=Strict，12 小时过期；邀请码和会话令牌的明文均不存入数据库。
 
@@ -200,7 +183,7 @@ Nginx 应将 `/gotc/` **保留完整路径**代理到 `http://127.0.0.1:5274`，
 
 观众投票与展示/路演评审的网页读写也须携带页面原登录的 `X-GOTC-Login`；缺失返回 428，切换身份后旧页面返回 401。刷新并核对当前身份后继续，公开进度看板不需要此标识。
 
-服务内置 AI API 网关（标准库实现，不需要单独部署 sub2api）：组织方在后台“AI API 管理”为每队开通 API 访问权限，队伍在作品提交页自行创建 / 删除密钥，按队伍和密钥统计用量与费用。完整密钥只在创建响应中返回一次，数据库只保存加入服务端密钥（私有数据目录 `api-key-pepper`，首次启动自动生成，0600）的 PBKDF2-HMAC-SHA256 哈希。备份或迁移时须连同 `api-key-pepper` 一起保存，丢失后所有已发放的 API 密钥都会失效。网关用组织方的上游密钥转发请求，按对应上游的计价规则记录费用，队伍看不到上游密钥。
+服务内置 AI API 网关。组织方在后台“AI API 管理”为每队开通 API 访问权限，队伍在作品提交页自行创建 / 删除密钥，按队伍和密钥统计用量与费用。完整密钥只在创建响应中返回一次，数据库只保存加入服务端密钥（私有数据目录 `api-key-pepper`，首次启动自动生成，0600）的 PBKDF2-HMAC-SHA256 哈希。备份或迁移时须连同 `api-key-pepper` 一起保存，丢失后所有已发放的 API 密钥都会失效。网关用组织方的上游密钥转发请求，按对应上游的计价规则记录费用，队伍看不到上游密钥。
 
 模型上游在后台“AI API 管理 → 模型上游”中配置（类似 sub2api 的渠道）：每类上游（OpenAI 兼容、Anthropic）填写接口地址、API Key、开放模型和别名，保存后立即生效，无需重启。内置 Gitee AI（模力方舟，`https://ai.gitee.com/v1`）、DeepSeek、Anthropic 官方地址模板。上游 API Key 保存在私有数据库，不会返回给浏览器，留空保存表示沿用原密钥；修改记录写入 API 管理操作记录（不含密钥）。
 
@@ -278,7 +261,11 @@ Claude Code 会按自己的默认模型名请求（如 `claude-opus-…`、`clau
 - 缓存读写 token 按输入单价计，偏保守。上游返回 401/403/5xx 时统一返回 502，不暴露上游信息；参数错误、限流等 4xx 原样返回便于调试。
 - 服务器访问不到上游时，在 systemd 单元设置 `HTTPS_PROXY`。Nginx 需为 `/gotc/v1/` 关闭缓冲、放宽超时与请求体（`ops/deploy/install.py` 已包含）。
 - 网关不可用或访问权限到期只影响 API 调用，提交与评分不受影响。
-- 调用记录：每次通过密钥认证的调用（包括被规则、到期时间或模型白名单拒绝的）都会记录时间、队伍、密钥、模型、状态、token、费用、耗时和 User-Agent。开启“记录请求与回复内容”（默认开启）时，另存请求头（去除 Authorization、x-api-key、Cookie）、客户端原样发送的完整请求体（即完整上下文，最大 4MB）和回复（最多 16MB），以 zlib 压缩保存；队伍页会提示正在记录。后台“查看上下文”提供对话视图（system、每条消息、工具调用与结果、由流式事件还原的回复）、原始内容、请求头和 JSON 下载；查看单条内容会写入审计日志。Agent 每次请求都会重发整段对话，存储增长较快，记录没有自动清理，活动结束后按需删除 `api_logs`。
+- 用量、费用和错误分类保存在 `event.sqlite3`，供队伍核对账单、管理员统计和导出。新活动默认关闭对话内容记录。管理员可显式开启，队伍页会显示提示。请求和回复按已有大小限制压缩保存在私有文件 `gateway-content.sqlite3`。允许保存的请求头为 Content-Type、Content-Length、Accept、User-Agent 和 X-Trace。查看内容需要管理员身份，操作会进入审计记录。
+- 网关启动后每分钟检查保留时长（默认 72 小时），写入时同步检查总容量（默认 2048 MiB），即使没有新请求也会删除过期内容。调整这两个设置或清空内容不会删除账单。存储失效时，已提交的用量和费用仍可查询。
+- 从旧版升级时，迁移会先将未过期的内容持久化到独立数据库，然后清空赛事库内的旧内容表，保留用量元数据。旧版曾默认开启记录，只有设置审计能证明管理员主动开启过时才会沿用。旧版程序回滚后产生的旧表数据会在再次升级时迁移。
+- 常规赛事数据库备份只包含用量元数据。默认不归档内容库。若活动另行授权保留内容，需通过 SQLite backup API 对该库单独做加密备份，按同一到期时间销毁，并使用同一活动的快照配对恢复。不要将其他活动的内容文件放入恢复目录。升级不会擦除旧备份及已有 WAL 中的历史内容；这些副本的到期处置由组织方负责。
+- 两个服务分别提供本机探针 `GET /livez`、`GET /readyz` 和 Prometheus 文本格式的 `GET /metrics`。使用本地 Unix socket 和 `Host: localhost` 访问。就绪检查读取赛事数据库，网关还检查内容库。指标包括请求耗时直方图、错误数、排队与运行请求数、活动流数、SQLite 写锁等待及可用磁盘。服务级 JSON 日志按生成的请求 ID 关联，仅记录路由类别、方法、状态和耗时。
 
 | 方法与路径 | 身份 | 请求及响应 |
 |---|---|---|
@@ -401,7 +388,7 @@ python3 -B ops/backup_event.py restore /private/backups/event-copy.sqlite3 /priv
 
 ## 安全与静态资源
 
-Python 在 loopback 接收 Nginx 代理的请求。公开文件位于 `frontend/`，入口为 `index.html`、`teams.html`、`platform.html` 和 `favicon.svg`。`static/` 中的脚本和样式、`assets/` 中的图片和字体、`downloads/` 中的指南、日程和清单均按文件类型响应。静态文件支持 GET、HEAD 和 ETag 条件请求。接口、网关以及参赛者上传的材料使用 `Cache-Control: no-store`。
+生产服务通过各自的 Unix socket 接收 Nginx 代理的请求。公开文件位于 `frontend/`，入口为 `index.html`、`teams.html`、`platform.html` 和 `favicon.svg`。`static/` 中的脚本和样式、`assets/` 中的图片和字体、`downloads/` 中的指南、日程和清单均按文件类型响应。静态文件支持 GET、HEAD 和 ETag 条件请求。接口、网关以及参赛者上传的材料使用 `Cache-Control: no-store`。
 
 ## 验证
 

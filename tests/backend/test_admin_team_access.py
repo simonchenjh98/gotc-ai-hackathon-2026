@@ -39,7 +39,7 @@ class AdminTeamAccessTests(unittest.TestCase):
         self.service = EventService(data_dir=old.data_dir, origin=old.origin, static_root=old.root, base_path=old.base_path)
         self.server.service = self.service
 
-    def admin_login(self, role='team', code=SHARED_ADMIN_CODE, account_id=None):
+    def admin_login(self, role='admin', code=SHARED_ADMIN_CODE, account_id=None):
         client = test_api.Client(self.server)
         status, result, _ = client.post('/api/login', {'role': role, 'code': code, **({'accountId': account_id} if account_id else {})})
         self.assertEqual(status, 200, result)
@@ -71,7 +71,7 @@ class AdminTeamAccessTests(unittest.TestCase):
         with self.service.db() as db:
             return {table: [tuple(row) for row in db.execute('SELECT * FROM '+table)] for table in ('accounts', 'team_accounts')}
 
-    def test_shared_admin_code_at_team_login_keeps_real_admin_identity_and_selection(self):
+    def test_only_admin_portal_accepts_legacy_organizer_credentials_and_selection(self):
         before = self.credential_snapshot()
         client = self.admin_login()
         self.assertEqual(client.get('/api/session')[1]['role'], 'admin')
@@ -79,6 +79,9 @@ class AdminTeamAccessTests(unittest.TestCase):
         with self.service.db() as db:
             second, _ = self.service.create_account(db, 'admin', 'Second fixture administrator')
         status, choices, _ = self.public.post('/api/login', {'role': 'team', 'code': SHARED_ADMIN_CODE})
+        self.assertEqual(status, 401)
+        self.assertNotIn('accounts', choices)
+        status, choices, _ = self.public.post('/api/login', {'role': 'admin', 'code': SHARED_ADMIN_CODE})
         self.assertEqual(status, 200)
         self.assertTrue(choices['selectAccount'])
         self.assertEqual({row['id'] for row in choices['accounts']}, {self.admin_id, second['id']})

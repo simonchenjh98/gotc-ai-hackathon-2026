@@ -4,7 +4,7 @@ CI's old-schema fixture suppresses only the new initializer, then exercises the
 unchanged original save_submission method. No /tmp fixture or Git history is
 required. All identities, material URLs and credentials are synthetic.
 """
-from contextlib import closing, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stdout
 import hashlib
 import importlib.util
 import io
@@ -14,7 +14,6 @@ from pathlib import Path
 import sqlite3
 import stat
 import sys
-import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -22,6 +21,7 @@ from unittest.mock import patch
 from backend.gotc import cli
 from backend.gotc import service as service_module
 from backend.gotc.submissions.submission_records import SubmissionRecords
+from ops.deploy import deploy
 import test_submissions
 
 ROOT=Path(__file__).resolve().parents[2]
@@ -33,6 +33,17 @@ def load_module(name,path):
     module=importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def unrelated_numbered_migrations(event):
+    # These historical feature fixtures intentionally omit one part of baseline 001.
+    # Retain the unrelated current components while presenting an unnumbered store.
+    from backend.gotc.migrations import v002_admin_auth, v003_content_store
+
+    with event.db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        v002_admin_auth.apply(db)
+        v003_content_store.apply(db, event)
 
 
 def snapshot(path):
@@ -77,7 +88,7 @@ class SubmissionRecordsReleaseTests(unittest.TestCase):
     def fixture(self,name='legacy',legacy=True):
         data=self.root/name
         if legacy:
-            with patch.object(SubmissionRecords,'initialize',return_value=None):service=self.service(data)
+            with patch('backend.gotc.migrations.apply', unrelated_numbered_migrations), patch.object(SubmissionRecords,'initialize',return_value=None):service=self.service(data)
         else:service=self.service(data)
         admin_code=(data/'admin-access.txt').read_text().splitlines()[1]
         _,token,_=service.dispatch('POST','/api/login',{'role':'admin','code':admin_code},'','127.0.0.1')
@@ -267,23 +278,31 @@ class SubmissionRecordsReleaseTests(unittest.TestCase):
         self.assertEqual(self.call(restored_service,'GET','/api/submission/requests/synthetic-request-1',cookie=fixture['cookie'])['version'],2)
         restored_checks=self.call(restored_service,'GET','/api/admin/submissions/'+fixture['team']+'/checks',cookie=fixture['admin'],query={'version':'2'})
         self.assertEqual(next(item for item in restored_checks['items'] if item['field']=='codeUrl')['note'],'Synthetic manual check')
-        installer=load_module('gotc_records_installer',ROOT/'ops/deploy/install.py')
+        from ops.deploy import install as installer
         tree=self.root/'installer'
         for name in ('incoming','releases','backups','data'):(tree/name).mkdir(parents=True,exist_ok=True)
         (tree/'.gotc-owned').write_text('synthetic isolated installer')
         old=tree/'releases'/'old';old.mkdir()
         (tree/'current').symlink_to(old,target_is_directory=True)
         backup_tool.copy_database(service.db_path,tree/'data'/'event.sqlite3')
-        nginx=self.root/'nginx.conf';nginx.write_text('server { listen 443; server_name 8.141.114.201; }\n')
-        unit=self.root/'unit';unit.write_text('synthetic old unit\n')
-        package=tree/'incoming'/'test.tar.gz'
-        with tarfile.open(package,'w:gz') as archive:
-            for name in sorted(installer.FILES):
-                archive.add(ROOT/name,arcname=name)
+        origin=self.root/'public-origin';origin.write_text('https://event.example.test')
+        nginx=self.root/'nginx.conf';nginx.write_text('server { listen 443 ssl http2; server_name event.example.test; }\n')
+        units=self.root/'units';units.mkdir()
         release='20261101T000000Z-records'
+        package=tree/'incoming'/(release+'.tar.gz')
+        wheelhouse = Path(os.environ.get('WHEELHOUSE', ROOT / '.runtime/wheels'))
+        deploy.write_archive(package, deploy.release_blobs(ROOT, wheelhouse))
         argv=['install.py','--archive',str(package),'--sha256',hashlib.sha256(package.read_bytes()).hexdigest(),'--release',release,'--source-sha','a'*40]
         class Result:returncode=0
-        with patch.object(installer,'ROOT',tree),patch.object(installer,'NGINX',nginx),patch.object(installer,'UNIT',unit),patch.object(installer,'run',return_value=Result()),patch.object(installer,'health',return_value={'teams':1,'serverTime':1}),patch.object(installer.os,'geteuid',return_value=0),patch.object(sys,'argv',argv),redirect_stdout(io.StringIO()):
+        with ExitStack() as stack:
+            stack.enter_context(patch.multiple(installer, ROOT=tree, NGINX=nginx, UNIT_DIR=units, PUBLIC_ORIGIN_FILE=origin))
+            stack.enter_context(patch.object(installer, 'run', return_value=Result()))
+            stack.enter_context(patch.object(installer, 'health', return_value={'teams': 1, 'serverTime': 1}))
+            stack.enter_context(patch.object(installer, 'verify_ci_signature'))
+            stack.enter_context(patch.object(installer, 'verify_runtime_accounts'))
+            stack.enter_context(patch.object(installer.os, 'geteuid', return_value=0))
+            stack.enter_context(patch.object(sys, 'argv', argv))
+            stack.enter_context(redirect_stdout(io.StringIO()))
             installer.main()
         installed_backup=tree/'backups'/release/'event.sqlite3'
         self.assertEqual(snapshot(installed_backup),before)

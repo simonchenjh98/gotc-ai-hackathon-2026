@@ -3,6 +3,7 @@ import hashlib
 import secrets
 from http.cookies import SimpleCookie
 
+from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
 
 
@@ -85,7 +86,7 @@ class AdminTeamAccess:
                 return {'teams': teams, **self.session_view(actor, cookie)}, None, None
             if method != 'POST':
                 raise APIError(405, '请使用队伍选择入口')
-            if set(body) != {'teamId'}:
+            if not inputs.accepts_fields(body, inputs.TeamIdBody):
                 raise APIError(400, '请选择一支队伍')
             team_id = self.s.team_exists(db, body['teamId'])
             self.s.team_lifecycle.require_available(db,team_id)

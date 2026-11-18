@@ -10,15 +10,19 @@ import re
 import secrets
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
+from contextlib import contextmanager
 from http.cookies import CookieError, SimpleCookie
-from urllib.parse import urlsplit
 
-from . import api, bootstrap, database
+from backend.gotc.http import request_models as inputs
+from . import admin_auth, api, bootstrap, database, migrations
 from .admin_data import AdminDataService
 from .constants import COOKIE_NAME, DIMENSIONS, LOGIN_KDF_CONCURRENCY, SESSION_SECONDS, VOTE_LIMIT
 from .errors import APIError
-from .gateway.keys import KeyService, load_config
+from .http.routes import resolve_endpoint
+from .credentials import Credentials
+from .gateway.keys import KeyService
+from .settings import public_origin
 from .judging.finals import FinalsService
 from .judging.judge_login_schedule import JudgeLoginSchedule
 from .judging.judging import JudgingService
@@ -34,7 +38,7 @@ from .teams.admin_team_access import AdminTeamAccess, operator_for
 from .teams.claims import Claims
 from .teams.team_lifecycle import TeamLifecycle
 from .teams.team_registration import TeamRegistration
-from .validation import csv_safe, text_field
+from .validation import csv_safe, text_field, validate_unicode
 from .write_conflicts import WriteConflicts
 
 
@@ -57,18 +61,17 @@ class EventService:
         self.base_path = (base_path if base_path is not None else os.environ.get("GOTC_BASE_PATH", "/gotc")).rstrip("/")
         if self.base_path and not re.fullmatch(r"/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*", self.base_path):
             raise ValueError("GOTC_BASE_PATH must be a plain absolute URL path")
-        self.origin = (origin or os.environ.get("GOTC_PUBLIC_ORIGIN", "https://8.141.114.201")).rstrip("/")
-        parsed = urlsplit(self.origin)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.path or parsed.query or parsed.fragment or parsed.username or parsed.password:
-            raise ValueError("GOTC_PUBLIC_ORIGIN must be an exact http(s) origin without a path")
-        self.secure = parsed.scheme == "https"
+        self.origin = public_origin(origin)
+        self.secure = self.origin.startswith("https://")
         self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.data_dir, 0o700)
-        self.shared_login_codes = bootstrap.shared_login_codes(self.data_dir)
+        self.credentials = Credentials(self.data_dir)
+        self.shared_login_codes = bootstrap.shared_login_codes(self.credentials)
         self.db_path = self.data_dir / "event.sqlite3"
-        database_existed=self.db_path.exists()
+        self.connections = database.ConnectionPool(self.db_path)
+        self.database_maintenance = database.DatabaseMaintenance(self)
         self.rate_lock = threading.Lock()
-        self.login_attempts = defaultdict(deque)
+        self.login_attempts = OrderedDict()
         self.login_kdf_slots = threading.BoundedSemaphore(LOGIN_KDF_CONCURRENCY)
         self.judging=JudgingService(clock=self.clock,text=text_field,audit=self.audit,touch=self.touch,
             history=lambda *args,**kwargs:self.admin_data.record_review_change(*args,**kwargs),
@@ -85,17 +88,23 @@ class EventService:
         self.repository_backups=RepositoryBackups(self)
         self.write_conflicts=WriteConflicts(self)
         self.finals=FinalsService(self,self.clock,text_field)
-        self.roadshow_access=RoadshowAccess(self,self.clock,text_field,scrypt_hash)
-        self.roadshow_scoring=RoadshowScoring(self,self.clock,text_field)
-        self.judge_login_schedule=JudgeLoginSchedule(self,self.clock)
-        self.write_conflicts.backup_before_upgrade()
-        self.admin_data.backup_before_upgrade()
-        self.keys=KeyService(self, load_config(self.data_dir / "gateway.json"), text_field)
-        self.csv_safe=csv_safe
-        bootstrap.initialize_state(self, database_existed=database_existed, hash_code=scrypt_hash)
+        # Both service processes may boot together. Serialize private-key provisioning,
+        # historical snapshots and SQLite schema changes before accepting traffic.
+        with database.startup_lock(self.data_dir):
+            database_existed = self.db_path.exists()
+            previous_version = migrations.inspect_existing(self.db_path)
+            self.roadshow_access=RoadshowAccess(self,self.clock,text_field,scrypt_hash)
+            self.roadshow_scoring=RoadshowScoring(self,self.clock,text_field)
+            self.judge_login_schedule=JudgeLoginSchedule(self,self.clock)
+            if previous_version == 0:
+                self.write_conflicts.backup_before_upgrade()
+                self.admin_data.backup_before_upgrade()
+            self.keys=KeyService(self, self.credentials.read_json("gateway.json"), text_field)
+            self.csv_safe=csv_safe
+            bootstrap.initialize_state(self, database_existed=database_existed, previous_version=previous_version, hash_code=scrypt_hash)
 
     def db(self):
-        return database.connection(self.db_path)
+        return self.connections.connection()
 
     def teams(self, db, public=True):
         return self.standings.teams(db, public)
@@ -111,8 +120,18 @@ class EventService:
 
     def dispatch(self, method, path, body, cookie, ip, query=None, expected_login_id=None,
                  server_received_at=None, finals_judge_id=None, finals_access_token=None):
-        return api.dispatch(self, method, path, body, cookie, ip, query, expected_login_id,
-                            server_received_at, finals_judge_id, finals_access_token)
+        endpoint = resolve_endpoint(method, path)
+        return self.dispatch_endpoint(endpoint, path, body, cookie, ip, query, expected_login_id,
+                                      server_received_at, finals_judge_id, finals_access_token)
+
+    def dispatch_endpoint(self, endpoint, path, body, cookie, ip, query=None, expected_login_id=None,
+                          server_received_at=None, finals_judge_id=None, finals_access_token=None):
+        validate_unicode(body)
+        if endpoint.method == "POST" and not isinstance(body, dict):
+            raise APIError(400, "JSON内容必须是对象")
+        command = api.Command(endpoint, path, body, cookie, ip, query or {}, expected_login_id,
+                              server_received_at, finals_judge_id, finals_access_token)
+        return endpoint.controller(self, command)
 
     def config(self, db):
         result = {r["key"]: json.loads(r["value"]) for r in db.execute("SELECT * FROM settings") if not r["key"].startswith("keys.")}
@@ -124,8 +143,8 @@ class EventService:
         return {'open':config['votingOpen'],'deadline':config['votingDeadline'],
                 'canEdit':config['votingOpen'] and (config['votingDeadline'] is None or current<config['votingDeadline']),'serverTime':current}
 
-    def credential_action(self, db, actor, body):
-        if set(body)!={'role','id','action'} or not isinstance(body['role'],str) or body['role'] not in {'judge','audience'} \
+    def credential_action(self, db, actor, body: inputs.ManageCredential):
+        if not inputs.accepts_fields(body, inputs.ManageCredential) or not isinstance(body['role'],str) or body['role'] not in {'judge','audience'} \
                 or not isinstance(body['action'],str) or body['action'] not in {'rotate','revoke'} or not isinstance(body['id'],str):
             raise APIError(400,'凭据操作目标不正确')
         target=db.execute('SELECT * FROM accounts WHERE id=? AND role=?',(body['id'],body['role'])).fetchone()
@@ -162,21 +181,56 @@ class EventService:
                    (account_id, role, name, salt, scrypt_hash(code, salt), self.clock()))
         return {"id": account_id, "role": role, "name": name}, code
 
-    def rate_limit(self, ip, role):
-        current = time.monotonic()
+    def reserve_attempts(self, keys):
+        now = time.monotonic()
+        ticket = (now, object())
         with self.rate_lock:
-            # Nginx's trusted X-Real-IP is used only for loopback peers.
-            for key in [("ip", ip, role), ("global", role)]:
-                bucket = self.login_attempts[key]
-                while bucket and bucket[0] < current - 60:
+            buckets = []
+            for key in keys:
+                bucket = self.login_attempts.get(key)
+                if bucket is None:
+                    bucket = deque()
+                while bucket and bucket[0][0] <= now - 60:
                     bucket.popleft()
-                limit = 20 if key[0] == "ip" else 400
-                if len(bucket) >= limit:
+                if len(bucket) >= 20:
                     raise APIError(429, "登录尝试过于频繁，请一分钟后重试")
-            for key in [("ip", ip, role), ("global", role)]:
-                self.login_attempts[key].append(current)
-            if len(self.login_attempts) > 5000:
-                self.login_attempts = defaultdict(deque, {k: v for k, v in self.login_attempts.items() if v and v[-1] >= current - 60})
+                buckets.append(bucket)
+            for key, bucket in zip(keys, buckets):
+                bucket.append(ticket)
+                self.login_attempts[key] = bucket
+                self.login_attempts.move_to_end(key)
+            while len(self.login_attempts) > 8192:
+                self.login_attempts.popitem(last=False)
+        return ticket, buckets
+
+    def rate_limit(self, ip, scope):
+        # Public invitation and registration actions retain their own IP budgets.
+        self.reserve_attempts([("public", scope, ip)])
+
+    @contextmanager
+    def login_attempt(self, ip, role, selector):
+        # Count simultaneous attempts immediately. Only unsuccessful credentials
+        # remain charged, so participants sharing an IP can sign in normally.
+        digest = hashlib.sha256(selector.encode()).digest()
+        ticket, buckets = self.reserve_attempts([("login-ip", ip), ("login-account", role, digest)])
+        try:
+            yield
+        except APIError as error:
+            if error.status == 401:
+                raise
+            self.refund_attempt(ticket, buckets)
+            raise
+        except BaseException:
+            self.refund_attempt(ticket, buckets)
+            raise
+        else:
+            self.refund_attempt(ticket, buckets)
+
+    def refund_attempt(self, ticket, buckets):
+        with self.rate_lock:
+            for bucket in buckets:
+                if ticket in bucket:
+                    bucket.remove(ticket)
 
     @staticmethod
     def login_id(cookie):
@@ -219,6 +273,15 @@ class EventService:
         if actor["role"] != role:
             raise APIError(403, "当前身份无权访问")
 
+    def write_identity(self, db, cookie, role, marker, *, marker_required=False):
+        actor = self.account(db, cookie)
+        self.require(actor, role)
+        if marker_required and not marker:
+            raise APIError(428, '请刷新页面并核对登录身份', 'login_required')
+        if marker is not None and marker != self.login_id(cookie):
+            raise APIError(401, '登录身份已变化，请重新登录')
+        return actor
+
     def issue_session(self, db, account):
         """Issue a session only after the caller authenticates inside its write transaction."""
         if account['role'] == 'judge' and self.roadshow_access.owns_account(db, account['id']):
@@ -229,40 +292,65 @@ class EventService:
         self.audit(db, account, "login")
         return {"ok": True, **self.admin_team_access.session_view(account, f"{COOKIE_NAME}={token}")}, token, "set"
 
-    def login(self, body, ip):
+    def login(self, body: inputs.LoginBody, ip):
         """Verify outside the writer lock, then recheck the proof before issuing a session."""
         role = body.get("role")
         if not isinstance(role, str) or role not in {"admin", "judge", "audience", "team"}:
             raise APIError(400, "登录身份不正确")
-        self.rate_limit(ip, role)
         code = text_field(body.get("code"), "邀请码", 160, True)
-        admin_code = self.shared_login_codes.get('admin')
-        if role == 'team' and admin_code and hmac.compare_digest(code.encode(), admin_code.encode()):
-            role = 'admin'
         selector = body.get("accountId")
         if selector is not None and (not isinstance(selector, str) or len(selector) > 80):
             raise APIError(400, "登录身份不正确")
+        named = admin_auth.username(body.get("username")) if role == "admin" else None
+        claimed = named or selector or code.split(".", 1)[0]
+        with self.login_attempt(ip, role, claimed):
+            return self.verify_login(role, code, selector, named, body.get("totp"))
+
+    def verify_login(self, role, code, selector, named, otp):
         with self.db() as db:
-            shared_code = self.shared_login_codes.get(role)
-            if selector is None and shared_code and hmac.compare_digest(code.encode(), shared_code.encode()):
-                candidates = db.execute("SELECT id,name FROM accounts WHERE role=? AND active=1 AND id NOT IN (SELECT account_id FROM credential_overrides) ORDER BY created_at,id", (role,)).fetchall()
-                if len(candidates) > 1:
-                    return {"selectAccount": True, "accounts": [{"id": a["id"], "name": a["name"]} for a in candidates]}, None, None
-                if candidates:
-                    selector = candidates[0]["id"]
-            selector = selector or code.split(".", 1)[0]
-            account = db.execute("SELECT * FROM accounts WHERE id=? AND role=? AND active=1", (selector, role)).fetchone()
+            named_mode = role == "admin" and db.execute("SELECT 1 FROM named_admins LIMIT 1").fetchone()
+            if named_mode:
+                account = db.execute("""SELECT a.*, n.totp_seed, n.last_step FROM named_admins n
+                    JOIN accounts a ON a.id=n.account_id
+                    WHERE n.username=? AND a.role='admin' AND a.active=1""", (named,)).fetchone()
+            else:
+                if named is not None or otp is not None:
+                    raise APIError(401, "管理员账号或验证码无效")
+                shared_code = self.shared_login_codes.get(role)
+                if selector is None and shared_code and hmac.compare_digest(code.encode(), shared_code.encode()):
+                    candidates = db.execute("""SELECT id,name FROM accounts WHERE role=? AND active=1
+                        AND id NOT IN (SELECT account_id FROM credential_overrides) ORDER BY created_at,id""",
+                        (role,)).fetchall()
+                    if len(candidates) > 1:
+                        return {"selectAccount": True, "accounts": [dict(a) for a in candidates]}, None, None
+                    if candidates:
+                        selector = candidates[0]["id"]
+                selector = selector or code.split(".", 1)[0]
+                account = db.execute("SELECT * FROM accounts WHERE id=? AND role=? AND active=1", (selector, role)).fetchone()
         salt = account["salt"] if account else b"gotc-dummy-salt!"
-        # Waiting for a password-check slot must not reserve a SQLite write transaction.
-        with self.login_kdf_slots:
+        if not self.login_kdf_slots.acquire(blocking=False):
+            raise APIError(429, "登录繁忙，请稍后重试", "login_busy")
+        try:
             hashed = scrypt_hash(code, salt)
+        finally:
+            self.login_kdf_slots.release()
         if not account or not hmac.compare_digest(hashed, account["code_hash"]):
             raise APIError(401, "邀请码无效或已停用")
+        if named_mode and admin_auth.verified_step(account['totp_seed'], otp, self.clock(), account['last_step']) is None:
+            raise APIError(401, "管理员账号或验证码无效")
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             current = db.execute("SELECT * FROM accounts WHERE id=? AND role=? AND active=1", (account["id"], role)).fetchone()
             if not current or not hmac.compare_digest(current["salt"], account["salt"]) or not hmac.compare_digest(current["code_hash"], account["code_hash"]):
                 raise APIError(401, "邀请码无效或已停用")
+            if named_mode:
+                credential = db.execute("SELECT totp_seed,last_step FROM named_admins WHERE account_id=? AND username=?",
+                                        (current['id'], named)).fetchone()
+                step = (admin_auth.verified_step(credential['totp_seed'], otp, self.clock(), credential['last_step'])
+                        if credential else None)
+                if step is None:
+                    raise APIError(401, "管理员账号或验证码无效")
+                db.execute("UPDATE named_admins SET last_step=? WHERE account_id=?", (step, current['id']))
             return self.issue_session(db, current)
 
     def bound_submission_team(self,db,actor):
@@ -278,8 +366,8 @@ class EventService:
         self.team_lifecycle.require_available(db,team['id'])
         return team
 
-    def team_access(self, db, actor, body):
-        if set(body)!={"teamId", "action"} or (not isinstance(body.get("action"), str) or body["action"] not in {"issue", "rotate", "revoke"}):
+    def team_access(self, db, actor, body: inputs.ManageTeamAccess):
+        if not inputs.accepts_fields(body, inputs.ManageTeamAccess) or (not isinstance(body.get("action"), str) or body["action"] not in {"issue", "rotate", "revoke"}):
             raise APIError(400, "提交码操作不正确")
         team_id=self.team_exists(db, body["teamId"])
         action=body["action"]

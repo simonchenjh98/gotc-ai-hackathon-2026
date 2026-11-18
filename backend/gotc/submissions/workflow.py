@@ -29,6 +29,9 @@ class SubmissionWorkflow:
                 if not isinstance(request_id,str) or not db.execute('SELECT 1 FROM submission_requests WHERE team_id=? AND request_id=?',(team['id'],request_id)).fetchone():raise
             proof=None
         with self.event.db() as db:
+            preliminary = self.event.write_identity(db, cookie, 'team', expected_login_id)
+            if operator_for(preliminary) and not expected_login_id:
+                raise APIError(428, '请刷新页面并核对当前代管队伍', 'login_required')
             db.execute('BEGIN IMMEDIATE')
             actor=self.event.account(db,cookie);self.event.require(actor,'team')
             if operator_for(actor) and not expected_login_id:raise APIError(428,'请刷新页面并核对当前代管队伍','login_required')

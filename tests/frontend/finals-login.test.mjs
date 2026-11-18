@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 const platform=platformFixtureSource();
 function loginPage(route,role){
-  const main={innerHTML:''},form={elements:{code:{addEventListener(){}},accountId:{}},querySelector:()=>({before(){}})};
+  const main={innerHTML:''},form={elements:{code:{addEventListener(){}},accountId:{},username:{},totp:{},legacyAdmin:{addEventListener(){}}},querySelector:()=>({before(){}})};
   const ctx=vm.createContext({document:{getElementById:id=>id==='platform-main'?main:form,createElement:()=>({})},location:{href:'https://example.test/platform.html'},URL,setTimeout,clearTimeout});
   vm.runInContext(platform+`\nroute=${JSON.stringify(route)};renderLogin(${JSON.stringify(role)});`,ctx);
   return main.innerHTML;

@@ -1,33 +1,36 @@
 """Team API keys, organizer configuration and gateway service entry points."""
 
+import asyncio
 import hashlib
-import http.client
 import ipaddress
 import json
-import os
 import secrets
-import select
-import socket
+import sqlite3
 import threading
 import time
-import traceback
-import urllib.error
-import urllib.request
+import logging
 from collections import defaultdict, deque
+from contextlib import closing
 from urllib.parse import urlsplit
 
+import anyio
+import httpx
+
+from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
-from . import relay, sdk, transport
+from backend.gotc.observability import GATEWAY_RUNTIME_PATH
+from . import transport
+from .memory import BulkMemory
 from .accounting import (
-    DAY_MS, RESPONSE_LOG_CAP, UsageLedger, beijing_midnight, initialize_schema, now_ms,
+    CAPTURE_BLOCK, DAY_MS, RESPONSE_LOG_CAP, UsageLedger, beijing_midnight, initialize_schema, now_ms,
     task_price, unpack,
 )
 from .config import DEFAULTS, check_url, load_config, parse_config, settings
 from .gateway_media import MediaGateway
 from .gateway_pricing import Catalog
 from .gateway_tasks import AsyncTasks
-from .protocol_errors import ClientGone, GatewayError, error_info, upstream_message
-from .requests import client_ip, gateway_json, read_body
+from .protocol_errors import GatewayError, error_info, upstream_message
+from .requests import client_ip, gateway_json
 
 
 __all__ = ["KeyService", "load_config"]
@@ -41,23 +44,32 @@ KEY_CREATE_PER_HOUR = 60  # as sub2api; deleting a key does not give the quota b
 QUEUE_WAIT = 30  # seconds a request waits for a free team slot before 429 (agent tools send bursts)
 
 
-TEAM_CONCURRENCY = 15
+COUNT_TOKENS_CONCURRENCY = 15
+TEAM_CONCURRENCY = 2
+GLOBAL_RUNNING = 4
+GLOBAL_QUEUE_CAP = 4
 
 
 KEY_HASH_ITERATIONS = 1000  # keys are 256-bit random, so the server-side pepper, not iterations, carries the strength
 
 
-def load_pepper(data_dir):
-    """Private random secret mixed into key hashes, so a leaked database alone cannot be used to check keys."""
-    path = data_dir / "api-key-pepper"
-    if not path.exists():
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)  # never overwrite: that would void every key
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                stream.write(secrets.token_hex(32))
-        except FileExistsError:
-            pass
-    return bytes.fromhex(path.read_text(encoding="utf-8").strip())
+def load_pepper(service):
+    def no_issued_keys():
+        if not service.db_path.exists():
+            return True
+        with closing(sqlite3.connect(service.db_path.as_uri() + "?mode=ro", uri=True, timeout=10)) as db:
+            schema = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='api_keys'").fetchone()
+            return not schema or not db.execute("SELECT 1 FROM api_keys LIMIT 1").fetchone()
+
+    raw = service.credentials.stable_key("api-key-pepper", lambda: secrets.token_hex(32).encode(),
+                                         can_generate=no_issued_keys)
+    try:
+        key = bytes.fromhex(raw.decode("ascii"))
+    except ValueError:
+        raise RuntimeError("Invalid API key pepper") from None
+    if len(key) != 32:
+        raise RuntimeError("Invalid API key pepper")
+    return key
 
 
 class KeyService:
@@ -65,12 +77,13 @@ class KeyService:
 
     def __init__(self, service, config, text):
         self.service, self.text = service, text
-        self.pepper = load_pepper(service.data_dir)
+        self.pepper = load_pepper(service)
         self.seed = config  # raw gateway.json content, copied into the database once
         self.config = parse_config(config)
         self.lock = threading.Lock()
         self.config_publish_lock = threading.Lock()
-        self.slot_free = threading.Condition(self.lock)
+        self.async_waiters = set()
+        self.memory = BulkMemory(self.wake_waiters)
         # ponytail: in-memory per-team concurrency; correct because the service is a single process.
         self.inflight = defaultdict(int)
         self.recent = defaultdict(deque)  # team -> monotonic times of requests in the last minute
@@ -79,6 +92,7 @@ class KeyService:
         self.ledger = UsageLedger(service, self.currency)
         self.auth_failures, self.auth_blocked = defaultdict(deque), {}
         self.auth_failures_seen = deque(maxlen=100000)  # failed key attempts, for the admin overview
+        self.runtime_client = None  # The combined developer app owns the live counters locally.
         self.opener = transport.make_opener()  # honours HTTPS_PROXY for reaching upstreams
         self.catalog = Catalog()
         self.tasks = AsyncTasks(self, pricing=self.task_price)
@@ -100,13 +114,30 @@ class KeyService:
 
     def initialize(self, db):
         initialize_schema(db)
+        self.tasks.initialize(db)
+        self.load_runtime(db)
+
+    def load_runtime(self, db):
         for key, value in DEFAULTS.items():
             db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, json.dumps(value)))
+        # Replay rows added if this data directory was temporarily served by an older release.
+        if db.execute("PRAGMA user_version").fetchone()[0] >= 3:
+            self.ledger.content.migrate(db, now_ms())
         if self.seed:
             db.execute("INSERT OR IGNORE INTO gateway_config VALUES (1,?,?)", (json.dumps(self.seed, ensure_ascii=False), now_ms()))
         row = db.execute("SELECT data FROM gateway_config WHERE id=1").fetchone()
-        self.config = parse_config(json.loads(row["data"])) if row else None
-        self.tasks.initialize(db)
+        self._config_raw = row["data"] if row else None
+        self.config = parse_config(json.loads(self._config_raw)) if row else None
+
+    def refresh_config(self):
+        # The platform and gateway have separate processes. Read only committed state.
+        with self.config_publish_lock, self.service.db() as db:
+            row = db.execute("SELECT data FROM gateway_config WHERE id=1").fetchone()
+            raw = row["data"] if row else None
+            if raw != self._config_raw:
+                self.config = parse_config(json.loads(raw)) if raw else None
+                self._config_raw = raw
+            return self.config
 
     def raw_config(self, db):
         row = db.execute("SELECT data FROM gateway_config WHERE id=1").fetchone()
@@ -117,9 +148,9 @@ class KeyService:
         return {name: {**{k: v for k, v in item.items() if k != "key"}, "keyHint": "…" + item["key"][-4:] if len(item["key"]) > 8 else "已设置"}
                 for name, item in self.raw_config(db).items()}
 
-    def save_upstreams(self, db, actor, body):
+    def save_upstreams(self, db, actor, body: inputs.UpstreamSettings):
         """Replace the upstream list. An empty or missing "key" keeps the saved key for that upstream."""
-        if not isinstance(body, dict) or set(body) != {"upstreams"} or not isinstance(body["upstreams"], dict):
+        if not inputs.accepts_fields(body, inputs.UpstreamSettings) or not isinstance(body["upstreams"], dict):
             raise APIError(400, "上游设置格式不正确")
         old, new = self.raw_config(db), {}
         for name, item in body["upstreams"].items():
@@ -154,6 +185,7 @@ class KeyService:
         with self.config_publish_lock:
             db.commit()
             self.config = config
+            self._config_raw = json.dumps(new, ensure_ascii=False)
         return result
 
     def settings(self, db):
@@ -208,7 +240,7 @@ class KeyService:
                     item.pop(field)
             return items
         if method == "POST" and path == "/api/team/keys":
-            if set(body) != {"name"}:
+            if not inputs.accepts_fields(body, inputs.NameBody):
                 raise APIError(400, "密钥字段不正确")
             name = self.text(body["name"], "密钥名称", 40, True)
             if db.execute("SELECT COUNT(*) FROM api_keys WHERE team_id=? AND active=1", (team_id,)).fetchone()[0] >= settings["maxKeys"]:
@@ -225,7 +257,7 @@ class KeyService:
             # The only response that ever carries the full key; only its hash is stored.
             return {"ok": True, "key": key, "item": {"id": key_id, "name": name, "masked": masked}}
         if method == "POST" and path == "/api/team/keys/delete":
-            if set(body) != {"id"} or not isinstance(body["id"], str):
+            if not inputs.accepts_fields(body, inputs.DeleteKey) or not isinstance(body["id"], str):
                 raise APIError(400, "密钥编号不正确")
             if not db.execute("UPDATE api_keys SET active=0 WHERE id=? AND team_id=? AND active=1", (body["id"], team_id)).rowcount:
                 raise APIError(404, "密钥不存在")
@@ -252,22 +284,15 @@ class KeyService:
             overview["p95Ms"] = db.execute("""SELECT duration_ms FROM api_usage WHERE at>=? AND status<400 AND incomplete=0
               ORDER BY duration_ms LIMIT 1 OFFSET ?""", (today, max(0, int(ok * 0.95) - 1))).fetchone()[0] if ok else None
             overview["avgFirstTokenMs"] = db.execute("SELECT CAST(AVG(first_token_ms) AS INTEGER) FROM api_usage WHERE at>=?", (today,)).fetchone()[0]
-            storage = dict(db.execute("SELECT COUNT(*) AS rows, COALESCE(SUM(length(request)+length(response)),0) AS bytes FROM api_logs").fetchone())
+            storage = self.ledger.content.summary()
             changes = [{"at": r["at"], "action": r["action"], "target": r["target"], "metadata": json.loads(r["metadata"])}
                        for r in db.execute("SELECT at,action,target,metadata FROM audit WHERE action LIKE 'api-%' ORDER BY id DESC LIMIT 50")]
-            with self.lock:
-                inflight = {k: v for k, v in self.inflight.items() if v}
-                waiting = {k: v for k, v in self.waiting.items() if v}
-                hour_ago = time.monotonic() - 3600
-                overview_auth = {"authFailuresHour": sum(1 for t in self.auth_failures_seen if t > hour_ago),
-                                 "blockedClients": sum(1 for t in self.auth_blocked.values() if t > time.monotonic())}
-            overview.update(overview_auth)
             overview["billing"] = self.ledger.billing_summary(db, since=today)
             overview["cost"] = self.ledger.billing_total(overview["billing"])
             return {"enabled": self.config is not None, "settings": settings, "models": self.models(), "overview": overview, "currency": self.currency(),
                     "upstreams": self.public_config(db), "storage": storage,
                     "changes": changes,
-                    "teams": [{"teamId": r["team_id"], "active": bool(r["active"]), "keyCount": r["key_count"], "inflight": inflight.get(r["team_id"], 0), "waiting": waiting.get(r["team_id"], 0),
+                    "teams": [{"teamId": r["team_id"], "active": bool(r["active"]), "keyCount": r["key_count"],
                                "used24h": self.ledger.billing_total(day), "usedTotal": self.ledger.billing_total(total),
                                "billing24h": day, "billing": total} for r in rows
                               for day, total in [(self.ledger.billing_summary(db, r["team_id"], since),
@@ -276,8 +301,7 @@ class KeyService:
             self.service.audit(db, actor, "api-usage.export")
             return self.ledger.export(db)
         if method == "POST" and path == "/api/admin/keys/settings":
-            if not body or not set(body).issubset({"maxKeys", "expiresAt", "logContent", "teamRpm",
-                                                   "announcement", "blockedWords", "logRetentionHours", "logMaxMB"}):
+            if not body or not inputs.accepts_fields(body, inputs.GatewaySettings):
                 raise APIError(400, "API 设置字段不正确")
             before = dict(settings)
             for key, value in body.items():
@@ -304,6 +328,8 @@ class KeyService:
                                                "blockedWords": "屏蔽词最多200个，每个1至100字",
                                                "logRetentionHours": "调用内容保留时长应为1至8760小时", "logMaxMB": "调用内容总容量应为50至102400MB"}.get(key, "API 设置值不正确"))
                 db.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(value), "keys." + key))
+            if "logContent" in body and before["logContent"] != body["logContent"]:
+                db.execute("INSERT OR REPLACE INTO settings VALUES ('keys.contentEpoch',json_quote(lower(hex(randomblob(16)))))")
             changed = {k: [before.get(k), v] for k, v in self.settings(db).items() if k in body and before.get(k) != v}
             self.service.audit(db, actor, "api-key.settings", metadata=changed)
             return {"ok": True, "settings": self.settings(db)}
@@ -326,9 +352,9 @@ class KeyService:
         if method == "POST" and path == "/api/admin/keys/logs":
             return self.ledger.logs(db, body)
         if method == "POST" and path == "/api/admin/keys/log":
-            if set(body) != {"id"} or type(body["id"]) is not int:
+            if not inputs.accepts_fields(body, inputs.LogDetails) or type(body["id"]) is not int:
                 raise APIError(400, "记录编号不正确")
-            row = db.execute("SELECT l.*, u.request_id FROM api_logs l JOIN api_usage u ON u.id=l.usage_id WHERE l.usage_id=?", (body["id"],)).fetchone()
+            row = self.ledger.content.detail(db, body["id"])
             if not row:
                 raise APIError(404, "该请求没有记录内容")
             self.service.audit(db, actor, "api-log.view", str(body["id"]))
@@ -336,7 +362,7 @@ class KeyService:
                     "requestBytes": row["request_bytes"], "responseBytes": row["response_bytes"],
                     "responseTruncated": row["response_bytes"] > RESPONSE_LOG_CAP}
         if method == "POST" and path in {"/api/admin/keys/provision", "/api/admin/keys/revoke"}:
-            if set(body) != {"teamId"} or not isinstance(body["teamId"], str):
+            if not inputs.accepts_fields(body, inputs.TeamIdBody) or not isinstance(body["teamId"], str):
                 raise APIError(400, "队伍不正确")
             team_id = self.service.team_exists(db, body["teamId"])
             if path.endswith("/revoke"):
@@ -353,7 +379,7 @@ class KeyService:
             return {"ok": True}
         raise APIError(404, "接口不存在")
 
-    def detect_models(self, body, cookie, expected_login_id):
+    def detect_models(self, body: inputs.ProbeModels, cookie, expected_login_id):
         """Read a draft upstream's catalog without saving configuration or holding the writer lock."""
         with self.service.db() as db:
             self.service.require(self.service.account(db, cookie), "admin")
@@ -361,7 +387,7 @@ class KeyService:
                 raise APIError(428, "请刷新页面并核对管理员登录身份")
             if expected_login_id != self.service.login_id(cookie):
                 raise APIError(401, "登录身份已变化，请重新登录后操作")
-            if set(body) != {"kind", "url", "key"} or not isinstance(body["kind"], str) or body["kind"] not in {"openai", "anthropic"}:
+            if not inputs.accepts_fields(body, inputs.ProbeModels) or not isinstance(body["kind"], str) or body["kind"] not in {"openai", "anthropic"}:
                 raise APIError(400, "模型列表请求字段不正确")
             kind, key = body["kind"], body["key"]
             try:
@@ -393,24 +419,29 @@ class KeyService:
         else:
             headers["x-api-key"], headers["anthropic-version"] = upstream["key"], "2023-06-01"
         if models_only:
-            request = urllib.request.Request(upstream["url"] + "/models", headers=headers, method="GET")
+            method, url, content = "GET", upstream["url"] + "/models", None
         else:
             model = next(iter(upstream["models"]))
             body = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
-            request = urllib.request.Request(upstream["url"] + ("/chat/completions" if kind == "openai" else "/messages"),
-                                             data=gateway_json(body), headers=headers, method="POST")
+            url = upstream["url"] + ("/chat/completions" if kind == "openai" else "/messages")
+            method, content = "POST", gateway_json(body)
         started = time.monotonic()
         try:
-            with self.opener.open(request, timeout=30) as response:
-                status, payload = response.status, response.read(2_000_001)
-        except urllib.error.HTTPError as error:
-            status, payload = error.code, error.read(100_000) if error.fp else b""
-        except (OSError, http.client.HTTPException) as error:
+            try:
+                status, payload = anyio.from_thread.run(transport.probe, self.opener, method, url, headers, content)
+            except anyio.NoEventLoopError:
+                async def standalone_probe():
+                    try:
+                        return await transport.probe(self.opener, method, url, headers, content)
+                    finally:
+                        await self.opener.close()
+                status, payload = asyncio.run(standalone_probe())
+        except OSError as error:
             return {"ok": False, "status": None, "latencyMs": int((time.monotonic() - started) * 1000), "message": transport.failure_reason(error)}
         latency = int((time.monotonic() - started) * 1000)
         if len(payload) > 2_000_000:
             return {"ok": False, "status": status, "latencyMs": latency, "message": "上游返回内容过大，请手动填写模型"}
-        if status >= 400:
+        if not 200 <= status < 300:
             return {"ok": False, "status": status, "latencyMs": latency,
                     "message": upstream_message(payload, self.error_secrets() + (upstream["key"],))}
         if not models_only:
@@ -424,37 +455,106 @@ class KeyService:
         return {"ok": bool(ids), "status": status, "latencyMs": latency, "models": ids[:500],
                 "message": f"上游提供 {len(ids)} 个模型" if ids else "上游未返回模型列表"}
 
-    def admit(self, team, rpm, slot=True):
-        """Per-team requests-per-minute and concurrency gate; caller must release() when slot=True.
+    def connect_runtime_socket(self, path):
+        limits = httpx.Limits(max_connections=3, max_keepalive_connections=0)
+        self.runtime_client = httpx.Client(
+            base_url="http://localhost", transport=httpx.HTTPTransport(uds=path, limits=limits, retries=0),
+            trust_env=False, follow_redirects=False, timeout=httpx.Timeout(0.5, connect=0.2, pool=0.1),
+        )
 
-        As sub2api: waiters are capped (QUEUE_CAP), and a request counts towards the RPM only once it actually proceeds,
-        so timeouts and queue rejections do not use up the minute. count_tokens takes an RPM entry but no slot.
-        """
-        def window_checked(now):
-            window = self.recent[team]
-            while window and window[0] <= now - 60:
-                window.popleft()
-            if rpm and len(window) >= rpm:
-                raise GatewayError("rate_limit", f"本队每分钟最多 {rpm} 次请求，请稍后重试", retry_after=max(1, int(window[0] + 60 - now) + 1))
-            return window
-
+    def runtime_snapshot(self):
+        now = time.monotonic()
         with self.lock:
-            window_checked(time.monotonic())
-            if slot and self.inflight[team] >= TEAM_CONCURRENCY:
-                if self.waiting[team] >= QUEUE_CAP:
-                    raise GatewayError("rate_limit", f"本队排队请求已满（最多 {QUEUE_CAP} 个），请稍后重试", retry_after=2)
-                self.waiting[team] += 1
+            teams = self.inflight.keys() | self.counting.keys()
+            return {
+                "sampledAt": now_ms(),
+                "inflight": {key: self.inflight.get(key, 0) + self.counting.get(key, 0) for key in teams
+                             if self.inflight.get(key, 0) or self.counting.get(key, 0)},
+                "waiting": {key: value for key, value in self.waiting.items() if value},
+                "authFailuresHour": sum(at > now - 3600 for at in self.auth_failures_seen),
+                "blockedClients": sum(until > now for until in self.auth_blocked.values()),
+            }
+
+    def read_runtime(self):
+        if self.runtime_client is None:
+            return self.runtime_snapshot()
+        try:
+            with self.runtime_client.stream("GET", GATEWAY_RUNTIME_PATH, headers={"Accept-Encoding": "identity"}) as response:
+                if response.status_code != 200 or response.headers.get("content-encoding", "identity") != "identity":
+                    return None
+                raw = bytearray()
+                for part in response.iter_raw():
+                    if len(raw) + len(part) > 32768:
+                        return None
+                    raw.extend(part)
+            data = json.loads(raw)
+            counters = [data[k] for k in ("sampledAt", "authFailuresHour", "blockedClients")]
+            for key in ("inflight", "waiting"):
+                if not isinstance(data[key], dict):
+                    return None
+                counters.extend(data[key].values())
+            if all(type(n) is int and n >= 0 for n in counters):
+                return data
+        except (httpx.HTTPError, OSError, ValueError, KeyError, TypeError, RecursionError):
+            pass
+        return None
+
+    def add_runtime(self, overview):
+        snapshot = self.read_runtime()
+        overview["runtimeAvailable"] = snapshot is not None
+        overview["runtimeSampledAt"] = snapshot["sampledAt"] if snapshot is not None else None
+        for field in ("authFailuresHour", "blockedClients"):
+            overview["overview"][field] = snapshot[field] if snapshot is not None else None
+        for team in overview["teams"]:
+            for field in ("inflight", "waiting"):
+                team[field] = snapshot[field].get(team["teamId"], 0) if snapshot is not None else None
+
+    def _window(self, team, rpm):
+        now = time.monotonic()
+        window = self.recent[team]
+        while window and window[0] <= now - 60:
+            window.popleft()
+        if rpm and len(window) >= rpm:
+            raise GatewayError("rate_limit", f"本队每分钟最多 {rpm} 次请求，请稍后重试", retry_after=max(1, int(window[0] + 60 - now) + 1))
+        return window
+
+    def charge_rpm(self, team, rpm):
+        with self.lock:
+            self._window(team, rpm).append(time.monotonic())
+
+    def _has_capacity(self, team, count_tokens):
+        return ((self.counting[team] < COUNT_TOKENS_CONCURRENCY if count_tokens else self.inflight[team] < TEAM_CONCURRENCY)
+                and sum(self.inflight.values()) + sum(self.counting.values()) < GLOBAL_RUNNING)
+
+    async def admit_async(self, team, rpm, *, count_tokens=False, defer_rpm=False, bulk_lease=None):
+        loop = asyncio.get_running_loop()
+        wake = asyncio.Event()
+        waiter = (loop, wake)
+        deadline = loop.time() + QUEUE_WAIT
+        try:
+            while True:
+                with self.lock:
+                    window = self._window(team, rpm)
+                    if self._has_capacity(team, count_tokens) and (bulk_lease is None or bulk_lease.try_acquire()):
+                        if not defer_rpm:
+                            window.append(time.monotonic())
+                        (self.counting if count_tokens else self.inflight)[team] += 1
+                        return
+                    if waiter not in self.async_waiters:
+                        if self.waiting[team] >= QUEUE_CAP or sum(self.waiting.values()) >= GLOBAL_QUEUE_CAP:
+                            raise GatewayError("rate_limit", "排队请求已满，请稍后重试", retry_after=2)
+                        self.async_waiters.add(waiter)
+                        self.waiting[team] += 1
+                    wake.clear()
                 try:
-                    # Agent tools fire bursts; queue briefly for a slot instead of failing at once.
-                    ready = self.slot_free.wait_for(lambda: self.inflight[team] < TEAM_CONCURRENCY, timeout=QUEUE_WAIT)
-                finally:
+                    await asyncio.wait_for(wake.wait(), max(0, deadline - loop.time()))
+                except TimeoutError:
+                    raise GatewayError("rate_limit", "中转请求排队超时，请稍后重试", retry_after=2) from None
+        finally:
+            with self.lock:
+                if waiter in self.async_waiters:
+                    self.async_waiters.remove(waiter)
                     self.waiting[team] -= 1
-                if not ready:
-                    raise GatewayError("rate_limit", f"本队同时进行的请求最多 {TEAM_CONCURRENCY} 个，排队超时", retry_after=2)
-            now = time.monotonic()
-            window_checked(now).append(now)
-            if slot:
-                self.inflight[team] += 1
 
     def recheck_access(self, handler, call):
         """Re-check key, team and expiry after waiting for a concurrency slot."""
@@ -466,10 +566,15 @@ class KeyService:
             if settings["expiresAt"] is not None and now_ms() >= settings["expiresAt"]:
                 raise GatewayError("billing", "本活动 API 访问权限已到期")
 
-    def release(self, team):
+    def wake_waiters(self):
         with self.lock:
-            self.inflight[team] -= 1
-            self.slot_free.notify_all()
+            for loop, event in self.async_waiters:
+                loop.call_soon_threadsafe(event.set)
+
+    def release(self, team, *, count_tokens=False):
+        with self.lock:
+            (self.counting if count_tokens else self.inflight)[team] -= 1
+        self.wake_waiters()
 
     def note_error(self, call, error):
         """Attach the final status and classification to a call that has not been written yet."""
@@ -481,40 +586,29 @@ class KeyService:
             self.keep(call, (detail + error.message).encode())
         return info
 
-    def client_gone(self, handler):
-        """Whether the team's client has closed its connection (its request body was already read in full)."""
-        try:
-            readable, _, _ = select.select([handler.connection], [], [], 0)
-            return bool(readable) and handler.connection.recv(1, socket.MSG_PEEK) == b""
-        except (OSError, ValueError):
-            return True
-
     def safe_record(self, handler, call):
         """record(), but a storage failure must not hide the original error or leave the client without a reply."""
         try:
             self.record(handler, call)
         except Exception:
-            traceback.print_exc()
-
-    def send(self, handler, call, status, content_type, payload=None, length=None):
-        """Write to the team's client; a closed connection becomes ClientGone so it is never mistaken for an upstream error."""
-        try:
-            if not call.get("headers_sent"):
-                extra = {"X-Client-Request-ID": call["request_id"], **call["reply_headers"]}
-                if payload is None:
-                    extra["X-Accel-Buffering"] = "no"
-                handler.headers_out(status, content_type, len(payload) if length is None and payload is not None else length, extra=extra)
-                call["headers_sent"] = True
-            if payload:
-                handler.wfile.write(payload)
-        except OSError:
-            raise ClientGone() from None
+            logging.getLogger(__name__).error("gateway_accounting_failed", extra={"request_id": call["request_id"]})
 
     def keep(self, call, data):
-        if call["log"]:
-            if call["size"] < RESPONSE_LOG_CAP:
-                call["response"].append(data)
-            call["size"] += len(data)  # true size, even past the cap
+        if not call["log"] or not data:
+            return
+        available = RESPONSE_LOG_CAP - call["size"]
+        call["size"] += len(data)  # count the full reply even when the stored prefix is truncated
+        if available <= 0:
+            return
+        length = min(len(data), available)
+        blocks = call["response"]
+        if length >= CAPTURE_BLOCK:
+            # Reuse a complete immutable chunk. A clipped view would pin its oversized owner.
+            blocks.append(data if isinstance(data, bytes) and len(data) == length else bytes(memoryview(data)[:length]))
+        else:
+            if not blocks or not isinstance(blocks[-1], bytearray) or len(blocks[-1]) + length > CAPTURE_BLOCK:
+                blocks.append(bytearray())
+            blocks[-1].extend(memoryview(data)[:length])
 
     def lookup(self, db, handler):
         parts = handler.headers.get("Authorization", "").split(None, 1)
@@ -585,29 +679,8 @@ class KeyService:
                     raise GatewayError("billing", "本活动 API 访问权限已到期")
         return row
 
-    def upload_ready(self, handler, call):
-        """Recheck access after the global upload queue, before sending any upstream bytes."""
-        self.recheck_access(handler, call)
-        if self.client_gone(handler):
-            raise GatewayError("client_closed", "客户端已断开，请求未发出，不计费")
-
     def prune_logs(self, db, settings, everything=False):
         return self.ledger.prune_logs(db, settings, everything)
 
     def record(self, handler, call):
         return self.ledger.record(handler, call)
-
-    def gateway(self, handler, path):
-        return sdk.handle_request(self, handler, path)
-
-    def read_body(self, handler):
-        return read_body(handler)
-
-    def open_with_retry(self, request):
-        return transport.open_with_retry(self.opener, request)
-
-    def forward(self, handler, name, upstream, suffix, body, stream, call):
-        return relay.forward(self, handler, name, upstream, suffix, body, stream, call)
-
-    def relay_stream(self, handler, name, response, content_type, call):
-        return relay.relay_stream(self, handler, name, response, content_type, call)

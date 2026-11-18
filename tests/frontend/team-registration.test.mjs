@@ -10,7 +10,7 @@ test('public directory escapes text, preserves same-name members, and links only
   const html=context.ui.card(team);
   assert(!html.includes('<img'));assert(!html.includes('<script>'));assert(html.includes('&lt;img'));
   assert.equal([...html.matchAll(/ · 队长/g)].length,1);assert.equal([...html.matchAll(/class="captain"/g)].length,1);assert.match(html,/>Alex<\/span>/);
-  assert.match(html,/href="https:\/\/8\.141\.114\.201\/gotc\/platform.html#team-profile"/);
+  assert.match(html,/href="platform\.html#team-profile"/);
   assert(!html.includes('teamId='));assert(!html.includes('管理码'));
 });
 test('public search still supports school/member keywords and recruitment filter',()=>{
@@ -158,4 +158,11 @@ test('typing during a legacy reread is retained and requires a later explicit re
 });
 test('an authorization failure clears private legacy fields but keeps the user existing cached credential',async()=>{
   let calls=0;const f=legacyFixture(async()=>++calls===1?ready({team:legacyTeam()}):{ok:false,status:403,json:async()=>({error:'Revoked code'})});f.setCode(oldCode);await f.open();f.input('summary','Unsaved');await f.save();assert.equal(f.form.elements.phone.value,'');assert.equal(f.node('[data-reg-editor]').hidden,true);assert.equal(f.values.get(storageKey),oldCode);assert.deepEqual(f.removals,[]);
+});
+
+test('directory renders markup-like jersey numbers and roster limits as visible text',()=>{
+  const marker='<team & "roster">';
+  const html=context.ui.card({...team,number:marker,targetSize:marker});
+  assert.ok(!html.includes(marker));
+  assert.equal(html.match(/&lt;team &amp; &quot;roster&quot;&gt;/g)?.length,2);
 });

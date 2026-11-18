@@ -125,17 +125,25 @@ class LoginConcurrencyTests(unittest.TestCase):
         old_code, new_code = 'SYNTHETIC_SHARED_BEFORE', 'SYNTHETIC_SHARED_AFTER'
         shared_path = self.service.data_dir / 'shared-login-codes.json'
 
-        def restart_with(code):
+        def service_with_shared_code(code):
             shared_path.write_text(json.dumps({'judge': code}), encoding='utf-8')
             previous = self.service
-            self.service = service_module.EventService(data_dir=previous.data_dir, base_path=previous.base_path,
-                                            origin=previous.origin, static_root=previous.root)
-            self.server.service = self.service
+            instance = service_module.EventService(data_dir=previous.data_dir, base_path=previous.base_path,
+                                                   origin=previous.origin, static_root=previous.root)
+            self.addCleanup(instance.connections.close)
+            return instance
 
-        restart_with(old_code)
+        self.service = service_with_shared_code(old_code)
+        self.server.service = self.service
+
+        def rotate_credentials():
+            # Startup of another instance commits the new salt/hash to the shared DB.
+            # Keep the original listener alive to finish validating its in-flight proof.
+            self.service = service_with_shared_code(new_code)
+
         client, (status, result, headers) = self.login_while_hash_is_paused(
-            {'role': 'judge', 'code': old_code, 'accountId': invitation['id']},
-            lambda: restart_with(new_code))
+            {'role': 'judge', 'code': old_code, 'accountId': invitation['id']}, rotate_credentials)
+        self.server.service = self.service
         self.assertEqual(status, 401, result)
         self.assertNotIn('Set-Cookie', headers)
         self.assertIsNone(client.get('/api/session')[1]['role'])
@@ -149,19 +157,10 @@ class LoginConcurrencyTests(unittest.TestCase):
     def test_concurrent_password_checks_are_bounded_and_do_not_hold_the_writer_lock(self):
         _, invitation = self.invitation('judge', 'Synthetic bounded login')
         capacity = service_module.LOGIN_KDF_CONCURRENCY
-        attempts = capacity + 2
-        release_hash, slots_full, all_attempted = (threading.Event() for _ in range(3))
+        release_hash, slots_full = threading.Event(), threading.Event()
         counter_lock = threading.Lock()
-        active = peak = attempted = 0
-        original_hash, original_limit = service_module.scrypt_hash, self.service.rate_limit
-
-        def counted_rate_limit(ip, role):
-            nonlocal attempted
-            original_limit(ip, role)
-            with counter_lock:
-                attempted += 1
-                if attempted == attempts:
-                    all_attempted.set()
+        active = peak = 0
+        original_hash = service_module.scrypt_hash
 
         def bounded_hash(code, salt):
             nonlocal active, peak
@@ -180,42 +179,36 @@ class LoginConcurrencyTests(unittest.TestCase):
                 with counter_lock:
                     active -= 1
 
-        with patch.object(service_module, 'scrypt_hash', bounded_hash), patch.object(self.service, 'rate_limit', counted_rate_limit):
-            with ThreadPoolExecutor(max_workers=attempts) as pool:
+        with patch.object(service_module, 'scrypt_hash', bounded_hash):
+            with ThreadPoolExecutor(max_workers=capacity) as pool:
                 futures = [pool.submit(fixtures.Client(self.server).post, '/api/login', {
-                    'role': 'judge', 'code': invitation['code']}) for _ in range(attempts)]
+                    'role': 'judge', 'code': invitation['code']}) for _ in range(capacity)]
                 try:
                     self.assertTrue(slots_full.wait(3))
-                    self.assertTrue(all_attempted.wait(3))
-                    # A legitimate write can finish while all hash slots and queued logins are occupied.
+                    with self.assertRaises(service_module.APIError) as busy:
+                        self.service.login({'role': 'judge', 'code': invitation['code']}, 'synthetic-ip')
+                    self.assertEqual((busy.exception.status, busy.exception.code), (429, 'login_busy'))
                     self.assertEqual(self.admin.settings({'submissionsOpen': True})[0], 200)
                 finally:
                     release_hash.set()
-                self.assertEqual([future.result(5)[0] for future in futures], [200] * attempts)
+                self.assertEqual([future.result(5)[0] for future in futures], [200] * capacity)
         self.assertEqual(peak, capacity)
 
-    def test_rate_limit_keeps_same_ip_and_global_role_buckets_atomic(self):
-        statuses = []
-        lock = threading.Lock()
-
-        def attempt(ip):
+    def test_failed_attempts_limit_one_ip_and_one_account_without_a_role_lock(self):
+        def failure(ip, target):
             try:
-                self.service.rate_limit(ip, 'team')
-                status = 200
+                with self.service.login_attempt(ip, 'judge', target):
+                    raise service_module.APIError(401, 'synthetic authentication failure')
             except service_module.APIError as error:
-                status = error.status
-            with lock:
-                statuses.append(status)
-
-        with ThreadPoolExecutor(max_workers=12) as pool:
-            list(pool.map(attempt, ['192.0.2.1'] * 25))
-        self.assertEqual(statuses.count(200), 20)
-        self.assertEqual(statuses.count(429), 5)
-        for index in range(380):
-            self.service.rate_limit('198.51.100.' + str(index), 'team')
-        with self.assertRaises(service_module.APIError) as error:
-            self.service.rate_limit('203.0.113.1', 'team')
-        self.assertEqual(error.exception.status, 429)
+                return error.status
+        for index in range(20):
+            self.assertEqual(failure(str(index), 'target'), 401)
+            self.assertEqual(failure('one-ip', 'other-' + str(index)), 401)
+        self.assertEqual(failure('new-ip', 'target'), 429)
+        self.assertEqual(failure('one-ip', 'fresh'), 429)
+        for _ in range(25):
+            with self.service.login_attempt('new-ip', 'judge', 'fresh'):
+                pass
 
 
 if __name__ == '__main__':

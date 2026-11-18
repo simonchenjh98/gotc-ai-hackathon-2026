@@ -3,11 +3,11 @@ import base64
 from contextlib import closing
 import hashlib
 import hmac
-import os
 import secrets
 import sqlite3
 import unicodedata
 
+from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
 
 MAX_NAMES = 100
@@ -32,30 +32,23 @@ CREATE TRIGGER IF NOT EXISTS roadshow_access_stage_revision
 class RoadshowAccess:
     def __init__(self, service, clock, text, password_hash):
         self.s, self.clock, self.text, self.password_hash = service, clock, text, password_hash
-        path = service.data_dir / 'roadshow-claim-key'
-        if path.is_symlink():
-            raise RuntimeError('Roadshow claim key must not be a symlink')
-        if not path.exists() and service.db_path.exists():
-            with closing(sqlite3.connect(service.db_path.as_uri() + '?mode=ro', uri=True)) as database:
-                roster = database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadshow_access_roster'").fetchone()
-                if roster and database.execute('SELECT 1 FROM roadshow_access_roster LIMIT 1').fetchone():
-                    raise RuntimeError('The original roadshow claim key is missing; restore it with the database')
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            pass
-        else:
-            with os.fdopen(fd, 'wb') as stream:
-                stream.write(secrets.token_bytes(32))
-                stream.flush()
-                os.fsync(stream.fileno())
-        self.key = path.read_bytes()
+        def no_existing_roster():
+            if not service.db_path.exists():
+                return True
+            with closing(sqlite3.connect(service.db_path.as_uri() + '?mode=ro', uri=True)) as db:
+                exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='roadshow_access_roster'").fetchone()
+                return not exists or not db.execute('SELECT 1 FROM roadshow_access_roster LIMIT 1').fetchone()
+
+        self.key = service.credentials.stable_key(
+            'roadshow-claim-key', lambda: secrets.token_bytes(32), can_generate=no_existing_roster)
         if len(self.key) != 32:
             raise RuntimeError('Roadshow claim key has an invalid length')
-        os.chmod(path, 0o600)
 
     def initialize(self, db):
         db.executescript(SCHEMA)
+        self.verify_key(db)
+
+    def verify_key(self, db):
         digest = hashlib.sha256(self.key).hexdigest()
         db.execute('INSERT OR IGNORE INTO roadshow_access_config(id,key_digest) VALUES (1,?)', (digest,))
         if not hmac.compare_digest(db.execute('SELECT key_digest FROM roadshow_access_config WHERE id=1').fetchone()[0], digest):
@@ -130,8 +123,8 @@ class RoadshowAccess:
                             'claimed': row['claimed_at'] is not None, 'canClaim': self.claimable(row),
                             'canLogin': self.claimable(row)} for row in rows]}
 
-    def save_names(self, db, actor, state, body):
-        if not isinstance(body, dict) or set(body) != {'expectedRevision', 'runId', 'names'}:
+    def save_names(self, db, actor, state, body: inputs.RoadshowNames):
+        if not inputs.accepts_fields(body, inputs.RoadshowNames):
             raise APIError(400, '请提交名单、轮次和编辑版本')
         if type(body['expectedRevision']) is not int or not 0 <= body['expectedRevision'] <= MAX_REVISION:
             raise APIError(400, '名单编辑版本不正确')
@@ -176,8 +169,8 @@ class RoadshowAccess:
         self.s.touch(db)
         return {'ok': True, **self.admin_view(db, self.s.judging.state(db, 'roadshow'))}
 
-    def resolve_name(self, db, state, body):
-        if not isinstance(body, dict) or set(body) != {'name'}:
+    def resolve_name(self, db, state, body: inputs.NameBody):
+        if not inputs.accepts_fields(body, inputs.NameBody):
             raise APIError(400, '请输入评委完整姓名')
         canonical = self.normalized(self.clean_name(body['name']))
         if not self.public_view(db, state)['configured']:
@@ -219,6 +212,14 @@ class RoadshowAccess:
         if method == 'POST' and path == '/api/roadshow/login':
             self.s.rate_limit(ip, 'roadshow-name-login')
         with self.s.db() as db:
+            if method == 'POST':
+                if path == '/api/admin/roadshow-access':
+                    self.s.write_identity(db, cookie, 'admin', expected_login_id, marker_required=True)
+                elif path in {'/api/roadshow/login', '/api/roadshow/claim'}:
+                    self.s.judge_login_schedule.require_open(db, 'roadshow')
+                    self.resolve_name(db, self.s.judging.state(db, 'roadshow'), body)
+                else:
+                    raise APIError(404, '路演领码接口不存在')
             db.execute('BEGIN IMMEDIATE' if method == 'POST' else 'BEGIN')
             state = self.s.judging.state(db, 'roadshow')
             if method == 'GET' and path == '/api/roadshow/access':

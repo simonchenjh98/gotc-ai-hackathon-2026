@@ -1,155 +1,311 @@
-"""Application routing, authorization and transaction boundaries."""
+"""Event domain controllers and their authorization and SQLite transaction boundaries."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+from functools import wraps
 import hashlib
 from http.cookies import CookieError, SimpleCookie
+from typing import TYPE_CHECKING
 
 from . import organizer
 from .constants import COOKIE_NAME
 from .errors import APIError
 from .judging import professional
-from .teams.admin_team_access import PATHS as ADMIN_TEAM_PATHS, operator_for
-from .teams.team_lifecycle import PATHS as TEAM_LIFECYCLE_PATHS
-from .validation import validate_unicode
+from .teams.admin_team_access import operator_for
+
+if TYPE_CHECKING:
+    from .http.routes import Endpoint
 
 
-def dispatch(event, method, path, body, cookie, ip, query=None, expected_login_id=None, server_received_at=None, finals_judge_id=None, finals_access_token=None):
-    """Return (JSON object or CSV bytes, optional session token, cookie action)."""
-    validate_unicode(body)
-    if event.roadshow_scoring.supports(path):
-        return event.roadshow_scoring.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
-    if event.roadshow_access.supports(path):
-        result = event.roadshow_access.dispatch(method,path,body,cookie,ip,expected_login_id,query)
-        return result if method == 'POST' and path == '/api/roadshow/login' else (result,None,None)
-    if path.startswith(("/api/registration", "/api/admin/registration")):
-        return event.registration.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
-    if path.startswith(("/api/claims/","/api/admin/claims")):
-        return event.claims.dispatch(method,path,body,cookie,ip,expected_login_id,query),None,None
-    if method == "POST" and path == "/api/login":
-        return event.login(body, ip)
-    if method=='POST' and path=='/api/submission':return event.dispatch_submission(body,cookie,expected_login_id,server_received_at)
-    if path.startswith(('/api/team/repository','/api/admin/repositories')):
-        return event.repositories.dispatch(method,path,body,cookie,expected_login_id,query or {}),None,None
-    if method == 'POST' and path == '/api/admin/keys/upstreams/models':
-        return event.keys.detect_models(body, cookie, expected_login_id), None, None
-    with event.db() as db:
-        # Resolve write identities only after the lock: revocation may have committed while queued.
-        if method=="POST":
-            db.execute("BEGIN IMMEDIATE")
-        elif method=="GET" and (event.finals.supports(path) or path in TEAM_LIFECYCLE_PATHS or path in {"/api/admin", "/api/team/profile", "/api/team/score", "/api/board", "/api/judge", "/api/audience"}):
-            # Keep release settings, aggregates and editor revisions in one read snapshot.
-            db.execute("BEGIN")
-        actor = event.account(db, cookie)
-        if path=='/api/team/profile':
-            event.require(actor,'team')
-            if operator_for(actor):raise APIError(403,'本队资料仅供参赛队伍登录管理；组织方请使用独立后台')
-            if not expected_login_id:raise APIError(428,'请刷新页面并核对登录队伍','login_required')
-            if expected_login_id!=event.login_id(cookie):raise APIError(401,'登录身份已变化，请重新登录')
-            if query:raise APIError(400,'本队资料由当前登录队伍确定，不接受查询参数')
-            team=event.bound_submission_team(db,actor)
-            if event.admin_data.team(db,team['id'])['status']!='active':raise APIError(409,'本队资料已暂停，请联系组织方','team_ineligible')
-            if method=='GET':
-                if body:raise APIError(400,'读取本队资料不接受请求字段')
-                return {**event.registration.profile(db,team['id']),'loginId':event.login_id(cookie)},None,None
-            if method=='POST':return {**event.registration.save_profile(db,actor,team['id'],body),'loginId':event.login_id(cookie)},None,None
-            raise APIError(405,'本队资料仅支持读取和保存')
-        if path in TEAM_LIFECYCLE_PATHS:
-            return event.team_lifecycle.dispatch(db,actor,method,path,body,query or {},cookie,expected_login_id),None,None
-        if path in ADMIN_TEAM_PATHS:
-            return event.admin_team_access.dispatch(db,actor,method,path,body,cookie,expected_login_id,query or {})
-        if operator_for(actor) and (path in {'/api/team','/api/submission','/api/logout'} or path.startswith('/api/submission/')) and not expected_login_id:
-            raise APIError(428,'请刷新页面并核对当前代管队伍','login_required')
-        if actor and path in {'/api/judge', '/api/score', '/api/judging/exhibition', '/api/judging/exhibition/', '/api/judging/exhibition/review'} and event.roadshow_access.owns_account(db,actor['id']):
-            raise APIError(403, '此邀请码仅用于路演评审，请从路演入口进入')
-        if event.finals.supports(path):
-            return event.finals.dispatch(db,actor,method,path,body,query or {},expected_login_id,cookie,finals_judge_id,finals_access_token,ip),None,None
-        if path == "/api/admin/judging/roadshow/window":
-            event.require(actor, "admin")
-            if not expected_login_id:
-                raise APIError(428, "请刷新路演窗口页面并核对登录身份", "login_required")
-            if expected_login_id != event.login_id(cookie):
-                raise APIError(401, "管理员登录身份已变化，请重新进入路演窗口")
-        page_role = ("audience" if path in {"/api/audience", "/api/vote"} else
-                     "judge" if path in {"/api/judging/exhibition", "/api/judging/exhibition/", "/api/judging/exhibition/review",
-                                          "/api/judging/roadshow", "/api/judging/roadshow/", "/api/judging/roadshow/review"} else None)
-        if page_role:
-            event.require(actor, page_role)
-            if not expected_login_id:
-                raise APIError(428, "缺少页面登录信息，请刷新页面并核对登录身份后重试", "login_required")
-            if expected_login_id != event.login_id(cookie):
-                raise APIError(401, "登录身份已变化，请重新登录后操作")
-        if path in {'/api/judging/roadshow', '/api/judging/roadshow/', '/api/judging/roadshow/review'}:
-            event.judge_login_schedule.require_open(db, 'roadshow')
-        if path == "/api/team/score":
-            event.require(actor, "team")
-            if method != "GET":
-                raise APIError(405, "请使用查询入口读取成绩")
-            if query:
-                raise APIError(400, "查分由当前登录队伍确定")
-            if not expected_login_id:
-                raise APIError(428, "请刷新页面并核对登录队伍", "login_required")
-            if expected_login_id != event.login_id(cookie):
-                raise APIError(401, "登录身份已变化，请重新登录")
-            return event.standings.own_team_score(db, actor), None, None
-        team_keys_route = path == "/api/team/keys" or path.startswith("/api/team/keys/")
-        admin_keys_route = path == "/api/admin/keys" or path.startswith("/api/admin/keys/")
-        if admin_keys_route:
-            event.require(actor, "admin")
-            # Download links cannot attach a page marker; all console reads, writes and probes must.
-            if not expected_login_id and not (method == "GET" and path == "/api/admin/keys/export"):
-                raise APIError(428, "缺少页面登录信息，请刷新页面并核对登录身份后重试", "login_required")
-            if expected_login_id is not None and expected_login_id != event.login_id(cookie):
-                raise APIError(401, "登录身份已变化，请重新登录后操作")
-        if team_keys_route:
-            event.require(actor, "team")
-            # An old tab shares the new login's cookie. Require its own page marker,
-            # including for reads, before any key data or mutation is dispatched.
-            if not expected_login_id:
-                raise APIError(428, "缺少页面登录信息，请刷新页面并核对登录身份后重试", "login_required")
-        if (team_keys_route or path in {"/api/team", "/api/submission", "/api/logout", "/api/judge", "/api/score", "/api/admin", "/api/admin/settings"} or path.startswith("/api/submission/")) and expected_login_id is not None and (not actor or expected_login_id != event.login_id(cookie)):
-            raise APIError(401, "登录身份已变化，请重新登录后操作")
-        if path.startswith('/api/submission/backups/'):return event.repository_backups.download(db,actor,method,path,query or {}),None,None
-        if event.submission_records.supports(path):return event.submission_records.dispatch(db,actor,method,path,body,query or {}),None,None
-        if path.startswith('/api/admin/data/'):
-            parsed_cookie=SimpleCookie()
-            try:parsed_cookie.load(cookie)
-            except CookieError:pass
-            session_token=parsed_cookie[COOKIE_NAME].value if COOKIE_NAME in parsed_cookie else ''
-            session_hash=hashlib.sha256(session_token.encode()).hexdigest()
-            return event.admin_data.dispatch(db,actor,method,path,body,query or {},session_hash),None,None
-        if path.startswith(("/api/judging/","/api/admin/judging/")):
-            return event.judging.dispatch(db,actor,method,path,body), None, None
-        if path.startswith(("/api/team/keys", "/api/admin/keys")):
-            return event.keys.dispatch(db, actor, method, path, body), None, None
-        if method == "GET" and path == "/api/session":
-            return event.admin_team_access.session_view(actor,cookie), None, None
-        if method == "GET" and path == "/api/board":
-            return professional.board(event, db, actor)
-        if method == "POST" and path == "/api/logout":
-            if actor:
-                try:
-                    parsed = SimpleCookie(cookie)
-                    token = parsed[COOKIE_NAME].value
-                    db.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),))
-                except (KeyError, ValueError, CookieError):
-                    pass
-            # Revocation is authoritative. A late expiry header would erase a newer login's cookie.
-            return {"ok": True}, None, None
-        if method == "GET" and path == "/api/judge":
-            return professional.judge_page(event, db, actor)
-        if method == "POST" and path == "/api/score":
-            return professional.save_score(event, db, actor, body)
-        if method == "GET" and path == "/api/audience":
-            return professional.audience_page(event, db, actor)
-        if method == "POST" and path == "/api/vote":
-            return professional.vote(event, db, actor, body)
-        if path in {"/api/team", "/api/submission"}:
-            event.require(actor, "team")
-            bound=event.bound_submission_team(db,actor)
-            if method=="GET" and path=="/api/team":
-                return {**event.submissions.team_submission_response(db, bound), "loginId": event.login_id(cookie), 'operator':operator_for(actor)}, None, None
-            if method=="POST" and path=="/api/submission":
-                return event.save_submission(db, actor, bound, body), None, None
-        if path.startswith("/api/admin"):
-            return organizer.dispatch(event, db, actor, method, path, body)
-        raise APIError(404, "接口不存在")
+@dataclass(frozen=True)
+class Command:
+    endpoint: Endpoint
+    path: str
+    body: dict
+    cookie: str
+    ip: str
+    query: dict
+    login_id: str | None
+    received_at: int | None
+    finals_judge: str | None
+    finals_access: str | None
+
+    @property
+    def method(self):
+        return self.endpoint.method
+
+
+def marker(event, command, *, required=True):
+    if required and not command.login_id:
+        raise APIError(428, "缺少页面登录信息，请刷新后核对身份", "login_required")
+    if command.login_id is not None and command.login_id != event.login_id(command.cookie):
+        raise APIError(401, "登录身份已变化，请重新登录后操作")
+
+
+def preauthorize_write(event, db, command):
+    """Verify the declared actor before acquiring SQLite's only writer."""
+    endpoint = command.endpoint
+    if endpoint.controller is finals:
+        if command.query:
+            raise APIError(400, "决赛接口不接受查询参数")
+        if command.path == "/api/finals/access":
+            event.judge_login_schedule.require_open(db, "finals")
+            event.rate_limit(command.ip, "finals-access")
+            event.finals.verify_invitation(command.body)
+            return
+        if endpoint.actor == "finals-access":
+            event.finals.require_access(db, command.finals_access)
+            event.judge_login_schedule.require_open(db, "finals")
+            event.finals.seat_account(db, event.finals.state(db), command.finals_judge)
+            return
+    requires_marker = (
+        endpoint.controller in {team_workbench, team_lifecycle, team_profile, vote, finals, gateway_keys}
+        or command.path == "/api/admin/judging/roadshow/window"
+        or (endpoint.controller is judging and endpoint.actor == "judge")
+    )
+    optional_marker = endpoint.controller is score or command.path == "/api/admin/settings"
+    event.write_identity(db, command.cookie, endpoint.actor,
+                         command.login_id if requires_marker or optional_marker else None,
+                         marker_required=requires_marker)
+
+
+def transaction(controller):
+    """Share write preflight, revocation rechecks and selected consistent read snapshots."""
+    @wraps(controller)
+    def execute(event, command):
+        with event.db() as db:
+            if command.method == "POST":
+                if command.endpoint.controller is logout:
+                    previous = event.account(db, command.cookie)
+                    marker(event, command, required=bool(operator_for(previous)))
+                    if previous is None:
+                        if command.login_id is not None:
+                            raise APIError(401, "登录身份已变化，请重新登录后操作")
+                        return {"ok": True}, None, None
+                else:
+                    preauthorize_write(event, db, command)
+                db.execute("BEGIN IMMEDIATE")
+            elif command.endpoint.snapshot:
+                db.execute("BEGIN")
+            actor = event.account(db, command.cookie)
+            if command.endpoint.actor in {"admin", "team", "audience", "judge"}:
+                event.require(actor, command.endpoint.actor)
+            return controller(event, command, db, actor)
+    return execute
+
+
+# These domain controllers own their own transactions (some release SQLite
+# before performing KDFs or provider I/O).
+def login(event, command):
+    return event.login(command.body, command.ip)
+
+
+def submission(event, command):
+    return event.dispatch_submission(command.body, command.cookie, command.login_id, command.received_at)
+
+
+def detect_models(event, command):
+    return event.keys.detect_models(command.body, command.cookie, command.login_id), None, None
+
+
+def repositories(event, command):
+    value = event.repositories.dispatch(command.method, command.path, command.body, command.cookie,
+                                        command.login_id, command.query)
+    return value, None, None
+
+
+def registration(event, command):
+    value = event.registration.dispatch(command.method, command.path, command.body, command.cookie,
+                                        command.ip, command.login_id, command.query)
+    return value, None, None
+
+
+def claims(event, command):
+    value = event.claims.dispatch(command.method, command.path, command.body, command.cookie,
+                                  command.ip, command.login_id, command.query)
+    return value, None, None
+
+
+def roadshow_scoring(event, command):
+    value = event.roadshow_scoring.dispatch(command.method, command.path, command.body, command.cookie,
+                                            command.ip, command.login_id, command.query)
+    return value, None, None
+
+
+def roadshow_access(event, command):
+    value = event.roadshow_access.dispatch(command.method, command.path, command.body, command.cookie,
+                                           command.ip, command.login_id, command.query)
+    return value if command.path == "/api/roadshow/login" else (value, None, None)
+
+
+@transaction
+def team_profile(event, command, db, actor):
+    if operator_for(actor):
+        raise APIError(403, "本队资料仅供参赛队伍登录管理；组织方请使用独立后台")
+    marker(event, command)
+    if command.query:
+        raise APIError(400, "本队资料由当前登录队伍确定，不接受查询参数")
+    bound = event.bound_submission_team(db, actor)
+    if event.admin_data.team(db, bound["id"])["status"] != "active":
+        raise APIError(409, "本队资料已暂停，请联系组织方", "team_ineligible")
+    if command.method == "GET":
+        if command.body:
+            raise APIError(400, "读取本队资料不接受请求字段")
+        value = event.registration.profile(db, bound["id"])
+    else:
+        value = event.registration.save_profile(db, actor, bound["id"], command.body)
+    return {**value, "loginId": event.login_id(command.cookie)}, None, None
+
+
+@transaction
+def team_lifecycle(event, command, db, actor):
+    value = event.team_lifecycle.dispatch(db, actor, command.method, command.path, command.body,
+                                          command.query, command.cookie, command.login_id)
+    return value, None, None
+
+
+@transaction
+def team_workbench(event, command, db, actor):
+    return event.admin_team_access.dispatch(db, actor, command.method, command.path, command.body,
+                                            command.cookie, command.login_id, command.query)
+
+
+@transaction
+def finals(event, command, db, actor):
+    value = event.finals.dispatch(db, actor, command.method, command.path, command.body, command.query,
+                                  command.login_id, command.cookie, command.finals_judge,
+                                  command.finals_access, command.ip)
+    return value, None, None
+
+
+@transaction
+def team_score(event, command, db, actor):
+    if command.query:
+        raise APIError(400, "查分由当前登录队伍确定")
+    marker(event, command)
+    return event.standings.own_team_score(db, actor), None, None
+
+
+@transaction
+def gateway_keys(event, command, db, actor):
+    # A download link cannot attach the administrator's page identity marker.
+    marker(event, command, required=command.path != "/api/admin/keys/export")
+    return event.keys.dispatch(db, actor, command.method, command.path, command.body), None, None
+
+
+def gateway_overview(event, command):
+    # Complete the authenticated dashboard read before contacting the sibling process.
+    value, token, action = gateway_keys(event, command)
+    event.keys.add_runtime(value)
+    return value, token, action
+
+
+@transaction
+def backups(event, command, db, actor):
+    marker(event, command, required=bool(operator_for(actor)))
+    return event.repository_backups.download(db, actor, command.method, command.path, command.query), None, None
+
+
+@transaction
+def submission_records(event, command, db, actor):
+    if command.endpoint.actor == "team":
+        marker(event, command, required=bool(operator_for(actor)))
+    value = event.submission_records.dispatch(db, actor, command.method, command.path, command.body, command.query)
+    return value, None, None
+
+
+def session_token(cookie):
+    parsed = SimpleCookie()
+    try:
+        parsed.load(cookie)
+    except CookieError:
+        return ""
+    return parsed[COOKIE_NAME].value if COOKIE_NAME in parsed else ""
+
+
+@transaction
+def admin_data(event, command, db, actor):
+    token_hash = hashlib.sha256(session_token(command.cookie).encode()).hexdigest()
+    value = event.admin_data.dispatch(db, actor, command.method, command.path, command.body, command.query, token_hash)
+    return value, None, None
+
+
+def ordinary_judge(event, db, actor):
+    if event.roadshow_access.owns_account(db, actor["id"]):
+        raise APIError(403, "此邀请码仅用于路演评审，请从路演入口进入")
+
+
+@transaction
+def judging(event, command, db, actor):
+    if command.endpoint.actor == "judge":
+        if command.path.startswith("/api/judging/exhibition"):
+            ordinary_judge(event, db, actor)
+        marker(event, command)
+        if command.path.startswith("/api/judging/roadshow"):
+            event.judge_login_schedule.require_open(db, "roadshow")
+    elif command.path == "/api/admin/judging/roadshow/window":
+        marker(event, command)
+    return event.judging.dispatch(db, actor, command.method, command.path, command.body), None, None
+
+
+@transaction
+def session(event, command, db, actor):
+    return event.admin_team_access.session_view(actor, command.cookie), None, None
+
+
+@transaction
+def board(event, command, db, actor):
+    return professional.board(event, db, actor)
+
+
+@transaction
+def logout(event, command, db, actor):
+    marker(event, command, required=bool(operator_for(actor)))
+    if command.login_id is not None and actor is None:
+        raise APIError(401, "登录身份已变化，请重新登录后操作")
+    if actor:
+        token = session_token(command.cookie)
+        db.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),))
+    # An expiry header here could erase a newer login's cookie.
+    return {"ok": True}, None, None
+
+
+@transaction
+def judge(event, command, db, actor):
+    ordinary_judge(event, db, actor)
+    marker(event, command, required=False)
+    return professional.judge_page(event, db, actor)
+
+
+@transaction
+def score(event, command, db, actor):
+    ordinary_judge(event, db, actor)
+    marker(event, command, required=False)
+    return professional.save_score(event, db, actor, command.body)
+
+
+@transaction
+def audience(event, command, db, actor):
+    marker(event, command)
+    return professional.audience_page(event, db, actor)
+
+
+@transaction
+def vote(event, command, db, actor):
+    marker(event, command)
+    return professional.vote(event, db, actor, command.body)
+
+
+@transaction
+def team(event, command, db, actor):
+    marker(event, command, required=bool(operator_for(actor)))
+    bound = event.bound_submission_team(db, actor)
+    value = event.submissions.team_submission_response(db, bound)
+    return {**value, "loginId": event.login_id(command.cookie), "operator": operator_for(actor)}, None, None
+
+
+@transaction
+def organizer_console(event, command, db, actor):
+    if command.path in {"/api/admin", "/api/admin/settings"}:
+        marker(event, command, required=False)
+    return organizer.dispatch(event, db, actor, command.method, command.path, command.body)

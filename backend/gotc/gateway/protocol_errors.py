@@ -115,6 +115,10 @@ def redact_error_payload(payload, secrets=()):
     return json.dumps(sanitized, ensure_ascii=False).encode() if sanitized != data else payload
 
 
+def safe_header(value, secrets, limit=200):
+    return redact_error_payload(value.encode(), secrets).decode("utf-8", errors="replace")[:limit]
+
+
 def upstream_message(payload, secret=""):
     """The upstream's own error message, cut down and with our upstream key and key-like strings removed."""
     payload = redact_error_payload(payload, secret)

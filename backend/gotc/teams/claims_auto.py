@@ -2,6 +2,7 @@
 import json
 import re
 from collections import Counter
+from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
 
 SCHEMA='''
@@ -36,10 +37,10 @@ class AutoReview:
         if type(value) is not int or value<0:raise APIError(400,'需要自动审核名单修订号')
         if value!=self.summary(db)['revision']:raise APIError(409,'自动审核名单已变化，请刷新后核对')
 
-    def replace(self,db,actor,body):
-        if set(body)!={'autoReview'} or not isinstance(body['autoReview'],dict):raise APIError(400,'自动审核导入字段不正确')
+    def replace(self,db,actor,body: inputs.AutoReviewImport):
+        if not inputs.accepts_fields(body, inputs.AutoReviewImport) or not isinstance(body['autoReview'],dict):raise APIError(400,'自动审核导入字段不正确')
         value=body['autoReview']
-        if set(value)!={'expectedRevision','sourceName','sourceSha256','entries'}:raise APIError(400,'自动审核导入字段不正确')
+        if not inputs.accepts_fields(value, inputs.AutoReviewRoster):raise APIError(400,'自动审核导入字段不正确')
         self.revision(db,value['expectedRevision'])
         source=self.c.text(value['sourceName'],'名单来源',200,True)
         if not isinstance(value['sourceSha256'],str) or not re.fullmatch('[a-f0-9]{64}',value['sourceSha256']):raise APIError(400,'需要来源文件 SHA-256')
@@ -47,7 +48,7 @@ class AutoReview:
         if not isinstance(entries,list) or len(entries)>500:raise APIError(400,'自动审核名单最多 500 人')
         rows=[];ids=set()
         for p in entries:
-            if not isinstance(p,dict) or set(p)!={'id','name','school','eligible','notes'} or type(p['eligible']) is not bool:raise APIError(400,'自动审核名单字段不正确')
+            if not inputs.accepts_fields(p, inputs.AutoReviewPerson) or type(p['eligible']) is not bool:raise APIError(400,'自动审核名单字段不正确')
             pid=self.c.text(p['id'],'编号',100,True)
             if not re.fullmatch('[A-Za-z0-9_-]{1,100}',pid) or pid in ids:raise APIError(400,'自动审核名单编号不正确或重复')
             ids.add(pid)
@@ -60,8 +61,8 @@ class AutoReview:
         summary=self.summary(db);self.c.s.audit(db,actor,'claims.auto-review.import',metadata=summary)
         return {'ok':True,'autoReview':summary}
 
-    def configure(self,db,actor,body):
-        if set(body)!={'expectedRevision','enabled'} or type(body['enabled']) is not bool:raise APIError(400,'自动审核设置字段不正确')
+    def configure(self,db,actor,body: inputs.AutoReviewSetting):
+        if not inputs.accepts_fields(body, inputs.AutoReviewSetting) or type(body['enabled']) is not bool:raise APIError(400,'自动审核设置字段不正确')
         self.revision(db,body['expectedRevision'])
         if body['enabled'] and not self.summary(db)['eligibleCount']:raise APIError(409,'请先导入有效的自动审核名单')
         db.execute('UPDATE claim_auto_config SET revision=revision+1,enabled=? WHERE id=1',(int(body['enabled']),))

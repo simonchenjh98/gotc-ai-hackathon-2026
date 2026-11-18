@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import secrets
 
+from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
 
 STAGES={"exhibition":"展示评审","roadshow":"路演评审"}
@@ -170,8 +171,8 @@ class JudgingService:
                                             "submittedAt":saved["submitted_at"],"capturedAt":current}
         return result
 
-    def set_roster(self, db, actor, state, body):
-        self.exact_fields(body,("expectedRevision","teamIds","judgeIds"))
+    def set_roster(self, db, actor, state, body: inputs.RosterSelection):
+        self.exact_fields(body,inputs.RosterSelection.__required_keys__)
         self.expected_revision(body,state)
         frozen=db.execute("SELECT frozen_at FROM judging_runs WHERE id=?",(state["run_id"],)).fetchone()[0]
         if state["open"] or frozen is not None or state["numeric_count"] or db.execute("SELECT 1 FROM judging_reviews WHERE run_id=? LIMIT 1",(state["run_id"],)).fetchone():
@@ -197,7 +198,7 @@ class JudgingService:
 
     def set_window(self, db, actor, state, body):
         start_roadshow=state["stage"]=="roadshow" and "start90Minutes" in body
-        self.exact_fields(body,("expectedRevision","open","start90Minutes") if start_roadshow else ("expectedRevision","open","deadline"))
+        self.exact_fields(body,(inputs.StartRoadshow if start_roadshow else inputs.JudgingDeadline).__required_keys__)
         self.expected_revision(body,state)
         if type(body["open"]) is not bool:
             raise APIError(400,"评审开放状态必须为布尔值")
@@ -237,8 +238,8 @@ class JudgingService:
         self.admin_change(db,actor,state,"window",{"open":body["open"],"deadline":deadline,
                           'before':{'open':bool(state['open']),'deadline':state['deadline']},'after':{'open':body['open'],'deadline':deadline}})
 
-    def reset(self, db, actor, state, body):
-        self.exact_fields(body,("expectedRevision","reason"))
+    def reset(self, db, actor, state, body: inputs.ResetJudging):
+        self.exact_fields(body,inputs.ResetJudging.__required_keys__)
         self.expected_revision(body,state)
         if state["open"]:
             raise APIError(409,"请先关闭本轮评审，再填写理由创建新轮次")
@@ -259,9 +260,9 @@ class JudgingService:
         self.audit(db,actor,"judging."+action,state["stage"],{"runId":state["run_id"],**metadata})
         self.touch(db)
 
-    def save_review(self, db, actor, state, body):
+    def save_review(self, db, actor, state, body: inputs.QualitativeReview):
         self.require_grant(db,actor,state)
-        self.exact_fields(body,("runId","teamId","expectedVersion","status","feedback","scores"))
+        self.exact_fields(body,inputs.QualitativeReview.__required_keys__)
         if not isinstance(body["runId"],str) or body["runId"]!=state["run_id"]:
             raise APIError(409,"评审轮次已更新，请重新读取；当前输入不会覆盖新轮次")
         version=body["expectedVersion"]
@@ -320,7 +321,7 @@ class JudgingService:
                 {"roster":self.set_roster,"window":self.set_window,"reset":self.reset}[action](db,actor,state,body)
                 return {"ok":True,**self.admin_view(db,self.state(db,stage))}
             if method=="POST" and action=="publish":
-                self.exact_fields(body,("runId",))
+                self.exact_fields(body,inputs.RunBody.__required_keys__)
                 raise APIError(409,BLOCKER)
         else:
             if method=="GET" and action=="board":

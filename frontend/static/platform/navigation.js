@@ -32,7 +32,7 @@ async function renderRoute(){
   account();
   root.innerHTML = '<div class="loading-state">正在读取活动数据…</div>';
   try {
-    if (target.files.length) await loadPlatformAssets(target.files);
+    if (target.files.length) await loadPlatformAssets(target.files, () => version === routeVersion && session === owner && requestedRoute() === page);
     if (version !== routeVersion || requestedRoute() !== page) return;
     if (session !== owner) return renderRoute();
     if (owner.loginId && (!ownsBrowserLogin(owner) || browserLogoutOwner() === owner.loginId)) {

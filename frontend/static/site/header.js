@@ -5,7 +5,7 @@
   const page = header.dataset.page;
   const local = new URL('./', location.href);
   // The same homepage is also published on GitHub Pages, where the platform lives separately.
-  const platform = page === 'home' && !local.pathname.startsWith('/gotc/')
+  const platform = page === 'home'
     ? new URL(header.dataset.platformBase, local) : local;
   const entry = hash => page === 'platform' ? `#${hash}` : new URL(`platform.html#${hash}`, platform).href;
   // Stay in the current homepage document so section navigation keeps unsaved form input.

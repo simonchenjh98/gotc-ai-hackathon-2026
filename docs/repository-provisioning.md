@@ -31,7 +31,7 @@
 
 组织和分支只允许 1–100 位 ASCII 字母、数字、下划线与连字符，首位须为字母或数字。修改配置不会改变已有申请/绑定的组织或分支；组织不匹配时停止远端访问，由管理员人工核对。分支创建以初始化 README 的默认分支为起点，不覆盖已有分支。仓库公开，初始化只含非敏感 README，不自动选择项目许可证。
 
-调用主机固定为 `https://api.github.com`、`https://gitee.com/api/v5`；不支持自定义 API 主机、GitHub Enterprise Server 或自建 Gitee。禁止 HTTP 重定向，单次请求 8 秒超时、响应最多 2 MiB。上游错误只保留通用提示，丢弃响应正文和含认证信息的 URL。Gitee API v5 按官方文档通过 `access_token` 参数认证，运维代理不得记录其请求 URL。服务自身不记录这些请求/令牌。
+Repository traffic uses the fixed GitHub and Gitee API origins. Both reads and writes use the HTTP Authorization bearer header, with redirects disabled, an eight-second timeout and a 2 MiB response limit. Gitee’s OpenAPI v5.4.93 lists an optional query parameter. OSChina’s own REST client uses the header, and the synthetic contract test verifies that credentials are absent from URLs and logs. [Gitee OpenAPI](https://gitee.com/api/v5/doc_json) · [OSChina REST client](https://github.com/oschina/mcp-gitee/blob/150246f3a53a5ba1c6afcd05704378722e486339/utils/gitee_client.go#L180) · [GitHub documentation](https://docs.github.com/en/rest/authentication/authenticating-to-the-rest-api)
 
 GitHub 凭据须允许创建组织仓库、读元数据/分支、添加仓库协作者并写分支保护。优先用组织批准的 GitHub App 或最小范围的 fine-grained token：仓库 Administration write（建仓、邀请、保护）及 Contents read/write（读取提交、必要时创建正式分支），仅允许活动组织和所需仓库。具体组织策略、App 安装的仓库覆盖和套餐必须实测；经典 PAT 公开仓库至少涉及 `public_repo`，权限更宽，勿授予不必要的组织管理权限。开发者通过仓库协作者接口仅获得 `permission: push`，不获得组织/企业管理员权限。
 

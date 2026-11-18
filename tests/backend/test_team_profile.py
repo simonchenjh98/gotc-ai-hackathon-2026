@@ -229,6 +229,7 @@ class TeamProfileTests(unittest.TestCase):
         before=self.snapshot(['team_registrations','accounts','sessions','team_accounts'])
         with self.service.db() as db:
             db.execute('DROP TABLE team_profile_visibility')
+            db.execute("PRAGMA user_version=0")  # Reproduce an unnumbered predecessor.
             self.service.registration.initialize(db)
             self.service.registration.initialize(db)
         self.assertEqual(self.snapshot(list(before)),before)

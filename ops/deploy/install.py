@@ -2,130 +2,58 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import closing
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import shutil
-import socket
+import stat
 import sqlite3
 import subprocess
+import sys
 import tarfile
+import tempfile
 import time
 import urllib.request
 
 ROOT = Path('/opt/gotc-hackathon')
-UNIT = Path('/etc/systemd/system/gotc-hackathon.service')
+UNIT_DIR = Path('/etc/systemd/system')
 NGINX = Path('/etc/nginx/sites-enabled/realtalk.conf')
+PUBLIC_ORIGIN_FILE = Path('/etc/gotc/public-origin')
 OLD_SERVICES = ['etown-hackathon', 'nginx', 'realtalk-api', 'dapm']
-BEGIN = '    # BEGIN GOTC HACKATHON MANAGED LOCATION\n'
-END = '    # END GOTC HACKATHON MANAGED LOCATION\n'
-LOCATIONS = BEGIN + '''    location = /gotc { return 308 /gotc/; }
-    location = /gotc/api/admin/data/import/preview {
-        proxy_pass http://127.0.0.1:5274;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 30s;
-        proxy_send_timeout 30s;
-        client_max_body_size 2m;
-    }
-    location = /gotc/api/admin/claims/roster {
-        proxy_pass http://127.0.0.1:5274;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 30s;
-        proxy_send_timeout 30s;
-        client_max_body_size 2m;
-    }
-    location = /gotc/api/admin/claims/review {
-        proxy_pass http://127.0.0.1:5274;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 30s;
-        proxy_send_timeout 30s;
-        client_max_body_size 128k;
-    }
-    location ^~ /gotc/api/team/uploads/ {
-        proxy_pass http://127.0.0.1:5274;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_request_buffering off;
-        proxy_read_timeout 330s;
-        proxy_send_timeout 330s;
-        client_body_timeout 30s;
-        client_max_body_size 100m;
-    }
-    location ^~ /gotc/v1/ {
-        # Realtime model sessions (gateway_websocket) need the WebSocket upgrade.
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_pass http://127.0.0.1:5274;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_buffering off;
-        # Queue (30s), connection (20s), initial upstream read (1200s), plus error delivery margin.
-        proxy_read_timeout 1260s;
-        proxy_send_timeout 330s;
-        client_max_body_size 32m;
-    }
-    location ^~ /gotc/ {
-        proxy_pass http://127.0.0.1:5274;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 30s;
-        proxy_send_timeout 30s;
-        client_max_body_size 32k;
-    }
-''' + END
-SERVICE = '''[Unit]
-Description=GOTC 2026 event scoring service
-After=network-online.target
-Wants=network-online.target
+SERVICES = ('gotc-platform', 'gotc-gateway')
+LEGACY_SERVICE = 'gotc-hackathon'
+OPERATOR_UID = 0
+SIGNATURE_NAMESPACE = 'gotc-ci-release-v1'
+CI_SIGNER = 'gotc-ci-main'
+HARDENING = (
+    'NoNewPrivileges=yes', 'CapabilityBoundingSet=', 'PrivateTmp=yes',
+    'ProtectSystem=strict', 'ProtectHome=yes', 'ProtectKernelTunables=yes',
+    'ProtectKernelModules=yes', 'ProtectKernelLogs=yes', 'ProtectControlGroups=yes',
+    'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6', 'RestrictNamespaces=yes',
+    'LockPersonality=yes', 'SystemCallFilter=~@mount @reboot @swap @raw-io @module',
+)
+def unit_text(service, release, origin):
+    role = service.removeprefix('gotc-')
+    sock = f'/run/{service}/http.sock'
+    return '\n'.join((
+        '[Unit]', f'Description=GOTC {role}', 'After=network-online.target', 'Wants=network-online.target',
+        '', '[Service]', 'Type=simple', 'User=gotc-hackathon', 'Group=gotc-proxy',
+        f'WorkingDirectory={release}', f'Environment=GOTC_PUBLIC_ORIGIN={origin}',
+        f'Environment=GOTC_DATA_DIR={ROOT}/data', 'Environment=GOTC_BASE_PATH=/gotc',
+        'EnvironmentFile=-/etc/gotc/event.env',
+        f'RuntimeDirectory={service}', 'RuntimeDirectoryMode=0750', 'UMask=0077',
+        f'ExecStart={release}/.venv/bin/python -EsBu -m backend.gotc --service {role} --uds {sock}',
+        'Restart=on-failure', 'RestartSec=4',
+        'MemoryMax=256M' if role == 'platform' else 'MemoryMax=384M',
+        'TimeoutStopSec=35' if role == 'platform' else 'TimeoutStopSec=55',
+        'TasksMax=80' if role == 'platform' else 'TasksMax=48',
+        *HARDENING, f'ReadWritePaths={ROOT}/data', '', '[Install]', 'WantedBy=multi-user.target', '',
+    ))
 
-[Service]
-Type=simple
-User=gotc-hackathon
-Group=gotc-hackathon
-WorkingDirectory=/opt/gotc-hackathon/current
-Environment=PYTHONDONTWRITEBYTECODE=1
-Environment=PYTHONUNBUFFERED=1
-Environment=GOTC_HOST=127.0.0.1
-Environment=GOTC_PORT=5274
-Environment=GOTC_DATA_DIR=/opt/gotc-hackathon/data
-Environment=GOTC_BASE_PATH=/gotc
-Environment=GOTC_PUBLIC_ORIGIN=https://8.141.114.201
-ExecStart=/usr/bin/python3 -m backend.gotc
-Restart=on-failure
-RestartSec=4
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/gotc-hackathon/data
-UMask=0077
-MemoryMax=512M
 
-[Install]
-WantedBy=multi-user.target
-'''
 # Release manifests are shared with the builder and embedded in this standalone
 # installer, which validates downloaded members before extracting a release.
 def manifest(groups):
@@ -141,7 +69,7 @@ PAGES_FILES = manifest({
 })
 FILES = PAGES_FILES | manifest({
     'frontend': 'platform.html teams.html',
-    'frontend/static/platform': 'navigation.js platform.css routes.js shell.js workspaces.css',
+    'frontend/static/platform': 'navigation.js platform.css route-assets.js routes.js shell.js workspaces.css',
     'frontend/static/platform/admin': 'api.css api.js dashboard.css directory.js event.js settings.js submissions.js',
     'frontend/static/platform/claims': 'application.js form.js receipt.js review.js',
     'frontend/static/platform/finals': 'dashboard.js finals.css judges.js organizer.js shared.js',
@@ -151,18 +79,19 @@ FILES = PAGES_FILES | manifest({
     'frontend/static/platform/submissions': 'history.js materials.js uploads.js',
     'frontend/static/platform/team': 'delegation.js draft-store.js recovery.js repository.js score.js submission.js',
     'frontend/static/registration': 'admin.js profile.js',
-    'backend': '__init__.py',
+    'backend': '__init__.py requirements.txt',
     'backend/gotc': (
-        '__init__.py __main__.py admin_data.py api.py bootstrap.py cli.py constants.py '
-        'database.py errors.py organizer.py service.py validation.py write_conflicts.py'
+        '__init__.py __main__.py admin_auth.py admin_data.py api.py bootstrap.py cli.py constants.py credentials.py '
+        'database.py errors.py listener.py observability.py organizer.py service.py settings.py validation.py write_conflicts.py'
     ),
     'backend/gotc/gateway': (
-        '__init__.py accounting.py config.py gateway_catalog.json gateway_cors.py '
+        '__init__.py accounting.py asgi.py asgi_context.py async_media.py async_tasks.py async_text.py config.py content_store.py gateway_catalog.json gateway_cors.py '
         'gateway_media.py gateway_pricing.py gateway_tasks.py gateway_uploads.py '
-        'gateway_websocket.py keys.py protocol_errors.py relay.py requests.py sdk.py '
-        'transport.py usage.py'
+        'gateway_websocket.py keys.py memory.py protocol_errors.py requests.py '
+        'stream_events.py text_policy.py transport.py usage.py'
     ),
-    'backend/gotc/http': '__init__.py server.py static.py',
+    'backend/gotc/http': '__init__.py app.py policy.py request_models.py routes.py server.py static.py',
+    'backend/gotc/migrations': '__init__.py v001_baseline.py v002_admin_auth.py v003_content_store.py',
     'backend/gotc/judging': (
         '__init__.py finals.py judge_login_schedule.py judging.py professional.py '
         'roadshow_access.py roadshow_progress.py roadshow_scoring.py standings.py'
@@ -179,17 +108,45 @@ FILES = PAGES_FILES | manifest({
 })
 
 
-def run(*args, check=True):
-    result = subprocess.run(args, text=True, capture_output=True, timeout=45)
+def run(*args, check=True, umask=-1, cwd=None):
+    result = subprocess.run(args, text=True, capture_output=True, timeout=45, umask=umask, cwd=cwd)
     if check and result.returncode:
         # Never emit service journals or environment values in deployment logs.
         raise RuntimeError(f'Command failed ({result.returncode}): {" ".join(args)}')
     return result
 
 
-def allowed(name):
-    # Exact canonical POSIX names only. Alternate spellings and private files fail closed.
-    return name in FILES
+def locked_wheels(requirements):
+    """Map pinned, portable wheel archive names to their required hashes."""
+    wheels = {}
+    for line in requirements.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        match = re.fullmatch(r'([a-z0-9]+(?:[-._][a-z0-9]+)*)==([0-9]+(?:\.[0-9]+)*)\s+--hash=sha256:([0-9a-f]{64})', line)
+        if not match:
+            raise ValueError('Each runtime requirement needs an exact version and one universal wheel SHA-256')
+        package, version, digest = match.groups()
+        wheel_name = re.sub('[-.]', '_', package)
+        name = f'wheels/{wheel_name}-{version}-py3-none-any.whl'
+        if name in wheels:
+            raise ValueError(f'Duplicate locked wheel: {name}')
+        wheels[name] = digest
+    if not wheels:
+        raise ValueError('Empty runtime requirements')
+    return wheels
+
+
+def prepare_runtime(release, prefix=()):
+    """Create an isolated environment at its final path before switching the unit."""
+    environment = release / '.venv'
+    # root owns the files, while the dedicated service user must be able to read them.
+    run(*prefix, sys.executable, '-I', '-m', 'venv', str(environment), umask=0o022)
+    python = str(environment / 'bin/python')
+    run(*prefix, python, '-I', '-m', 'pip', '--isolated', '--disable-pip-version-check', 'install',
+        '--no-index', '--no-cache-dir', '--only-binary=:all:', '--require-hashes',
+        '--find-links', str(release / 'wheels'), '-r', str(release / 'backend/requirements.txt'), umask=0o022)
+    run(*prefix, python, '-I', '-m', 'pip', '--isolated', '--disable-pip-version-check', 'check')
 
 
 # Keep this small helper standalone: the installer runs before release extraction.
@@ -229,44 +186,6 @@ def copy_roadshow_claim_key(database, source_directory, destination_directory):
     return True
 
 
-def nginx_candidate(source):
-    # Tokenize braces without counting braces in comments or quoted strings.
-    pattern = r'''#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[{};]|[^\s{};#"']+'''
-    tokens = [m for m in re.finditer(pattern, source) if not m.group().startswith('#')]
-    candidates = []
-    for i, token in enumerate(tokens[:-1]):
-        if token.group() != 'server' or tokens[i + 1].group() != '{':
-            continue
-        depth = 0
-        for closing in tokens[i + 1:]:
-            if closing.group() == '{':
-                depth += 1
-            elif closing.group() == '}':
-                depth -= 1
-                if depth == 0:
-                    start, end = tokens[i + 1].end(), closing.start()
-                    body = source[start:end]
-                    if re.search(r'\blisten\s+(?:0\.0\.0\.0:)?443(?:\s|;)', body) and re.search(r'\bserver_name\s+[^;]*\b8\.141\.114\.201\b', body):
-                        candidates.append((start, end, body))
-                    break
-    if len(candidates) != 1:
-        raise RuntimeError('Expected exactly one IP HTTPS server block; no Nginx changes made')
-    start, end, body = candidates[0]
-    if BEGIN in body or END in body:
-        if body.count(BEGIN) != 1 or body.count(END) != 1:
-            raise RuntimeError('Ambiguous existing GOTC location markers')
-        begin, finish = body.index(BEGIN), body.index(END) + len(END)
-        outside = body[:begin] + body[finish:]
-        if re.search(r'\blocation\s+[^\n{]*\/gotc(?:\s|/|\{)', outside):
-            raise RuntimeError('Unmanaged GOTC location already exists')
-        body = body[:begin] + LOCATIONS + body[finish:]
-    else:
-        if re.search(r'\blocation\s+[^\n{]*\/gotc(?:\s|/|\{)', source):
-            raise RuntimeError('Unmanaged GOTC location already exists')
-        body = body.rstrip() + '\n\n' + LOCATIONS
-    return source[:start] + body + source[end:]
-
-
 def atomic_text(path, text, mode=0o644):
     temporary = path.with_name(path.name + '.gotc-pending')
     if temporary.exists() or temporary.is_symlink():
@@ -283,72 +202,221 @@ def point_current(target, release_id):
     os.replace(temporary, ROOT / 'current')
 
 
-def health(url):
-    with urllib.request.urlopen(url, timeout=8) as response:
-        if response.status != 200:
-            raise RuntimeError('Team directory HTTP health failed')
-        data = json.load(response)
-    if not isinstance(data, dict) or not isinstance(data.get('teams'), list):
-        raise RuntimeError('Team directory response has an unexpected schema')
-    return {'registeredTeams': len(data['teams'])}
+def health(url, sock=None):
+    if sock:
+        reply = run('curl', '--fail', '--silent', '--max-time', '5', '--unix-socket', sock, url)
+        if json.loads(reply.stdout).get('status') != 'ready':
+            raise RuntimeError('Service is not ready')
+        return
+    with urllib.request.urlopen(url, timeout=8) as reply:
+        if reply.status != 200 or reply.geturl() != url or not isinstance(json.load(reply).get('teams'), list):
+            raise RuntimeError('Public team directory health check failed')
+
+
+def wait_for_health(url, sock=None, attempts=20):
+    for attempt in range(attempts):
+        try:
+            health(url, sock)
+            return
+        except (OSError, RuntimeError, ValueError):
+            if attempt + 1 == attempts:
+                raise RuntimeError('Release health check failed') from None
+            time.sleep(1)
+
+
+def release_statement(source_sha, digest):
+    return (f'gotc-ci-release-v1\nref refs/heads/main\nsource-sha {source_sha}\n'
+            f'archive-sha256 {digest}\n').encode('ascii')
+
+
+def verify_ci_signature(archive_path, source_sha, digest):
+    """Verify a protected-main build using the operator's independently provisioned key."""
+    signers = PUBLIC_ORIGIN_FILE.parent / 'ci-release-signers'
+    for path, required_type in ((signers.parent, stat.S_ISDIR), (signers, stat.S_ISREG)):
+        metadata = path.lstat()
+        if metadata.st_uid != OPERATOR_UID or metadata.st_mode & 0o022 or not required_type(metadata.st_mode):
+            raise RuntimeError('CI allowed signers must be a protected operator-owned file and directory')
+    signature_path = archive_path.with_suffix(archive_path.suffix + '.sig')
+    fd = os.open(signature_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as source:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or not 0 < metadata.st_size <= 16384:
+            raise RuntimeError('Expected a bounded regular CI signature')
+        signature = source.read(16385)
+        if len(signature) != metadata.st_size:
+            raise RuntimeError('Incomplete or changing CI signature')
+    with tempfile.NamedTemporaryFile(dir=ROOT) as snapshot:
+        snapshot.write(signature)
+        snapshot.flush()
+        checked = subprocess.run(
+            ['/usr/bin/ssh-keygen', '-Y', 'verify', '-f', str(signers), '-I', CI_SIGNER,
+             '-n', SIGNATURE_NAMESPACE, '-s', snapshot.name],
+            input=release_statement(source_sha, digest), capture_output=True, timeout=10,
+        )
+    if checked.returncode:
+        raise RuntimeError('CI signature does not authorize this commit and archive SHA-256')
 
 
 def main():
     import fcntl
     parser = argparse.ArgumentParser()
-    parser.add_argument('--archive', required=True)
+    parser.add_argument('--archive', required=True, type=Path)
     parser.add_argument('--sha256', required=True)
     parser.add_argument('--release', required=True)
     parser.add_argument('--source-sha', required=True)
     args = parser.parse_args()
-    if os.geteuid() != 0 or ROOT.is_symlink() or not (ROOT / '.gotc-owned').is_file():
-        raise RuntimeError('Expected root and the isolated GOTC ownership marker')
+    if os.geteuid() != OPERATOR_UID or ROOT.is_symlink() or not (ROOT / '.gotc-owned').is_file():
+        raise RuntimeError('Expected the pre-provisioned GOTC installation and its privileged helper')
     if not re.fullmatch(r'[A-Za-z0-9-]{12,96}', args.release) or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', args.source_sha):
         raise RuntimeError('Invalid release identity')
-    archive = Path(args.archive).resolve()
-    if archive.parent != (ROOT / 'incoming').resolve() or hashlib.sha256(archive.read_bytes()).hexdigest() != args.sha256:
-        raise RuntimeError('Release archive path or digest mismatch')
-    with (ROOT / '.deploy.lock').open('a') as lock:
+    if not re.fullmatch(r'[0-9a-f]{64}', args.sha256) or args.archive != ROOT / 'incoming' / (args.release + '.tar.gz'):
+        raise RuntimeError('Invalid staged archive or digest')
+    with (ROOT / '.deploy.lock').open('a') as lock, tempfile.TemporaryFile(dir=ROOT) as snapshot:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        install_release(args, archive)
+        verify_ci_signature(args.archive, args.source_sha, args.sha256)
+        # The upload directory is writable by the deploy account. Validate and install
+        # the same private snapshot even if the uploader changes its file concurrently.
+        fd = os.open(args.archive, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as source:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > 64 * 1024 * 1024:
+                raise RuntimeError('Expected one bounded regular archive')
+            remaining = metadata.st_size
+            while remaining and (chunk := source.read(min(remaining, 1024 * 1024))):
+                snapshot.write(chunk)
+                remaining -= len(chunk)
+        snapshot.seek(0)
+        if hashlib.file_digest(snapshot, 'sha256').hexdigest() != args.sha256:
+            raise RuntimeError('CI archive SHA-256 mismatch')
+        snapshot.seek(0)
+        install_release(args, snapshot)
 
 
-def install_release(args, archive):
+def extract_release(snapshot, release):
+    with tarfile.open(fileobj=snapshot, mode='r:gz') as package:
+        entries = {}
+        size = 0
+        for item in package:
+            size += item.size
+            if item.name in entries or not item.isfile() or len(entries) >= 1024 or size > 96 * 1024 * 1024:
+                raise RuntimeError('Unexpected archive member, size or duplicate')
+            entries[item.name] = item
+        for required in ('backend/requirements.txt', 'frontend/asset-manifest.json'):
+            if required not in entries:
+                raise RuntimeError(f'Release is missing {required}')
+        lock = package.extractfile(entries['backend/requirements.txt']).read().decode()
+        wheels = locked_wheels(lock)
+        assets = json.load(package.extractfile(entries['frontend/asset-manifest.json']))
+        expected = validate_built_assets(package, entries, assets) | wheels.keys()
+        if set(entries) != expected:
+            raise RuntimeError('Release is missing required files or includes a non-allowlisted entry')
+        package.extractall(release, members=entries.values(), filter='data')
+    release.chmod(0o755)
+    for path in release.rglob('*'):
+        path.chmod(0o755 if path.is_dir() else 0o644)
+
+
+def validate_built_assets(package, entries, manifest):
+    source_assets = {name for name in FILES if name.startswith('frontend/') and name.endswith(('.js', '.css'))}
+    expected = FILES - source_assets | {'frontend/asset-manifest.json'}
+    assets = manifest.get('assets', {})
+    if manifest.get('version') != 1 or set(assets) != {name.removeprefix('frontend/') for name in source_assets}:
+        raise RuntimeError('Built frontend asset list differs from the public allowlist')
+    for source, record in assets.items():
+        stem, ext = source.rsplit('.', 1)
+        path = record['path']
+        if not re.fullmatch(re.escape(stem) + r'\.[a-f0-9]{16}\.' + ext, path):
+            raise RuntimeError('Unexpected generated asset name')
+        name = 'frontend/' + path
+        data = package.extractfile(entries[name]).read()
+        integrity = 'sha384-' + base64.b64encode(hashlib.sha384(data).digest()).decode()
+        if path != f'{stem}.{hashlib.sha256(data).hexdigest()[:16]}.{ext}' or record['integrity'] != integrity:
+            raise RuntimeError('Generated asset integrity mismatch')
+        expected.add(name)
+    return expected
+
+
+def service_state(name):
+    return (run('systemctl', 'is-active', name, check=False).returncode == 0,
+            run('systemctl', 'is-enabled', name, check=False).returncode == 0)
+
+
+def verify_legacy_overrides():
+    directory = UNIT_DIR / (LEGACY_SERVICE + '.service.d')
+    paths = sorted(directory.glob('*.conf'))
+    previous = UNIT_DIR / (LEGACY_SERVICE + '.service')
+    if previous.is_file():
+        known = {'PYTHONDONTWRITEBYTECODE=1', 'PYTHONUNBUFFERED=1', 'GOTC_HOST=127.0.0.1',
+                 'GOTC_PORT=5274', f'GOTC_DATA_DIR={ROOT}/data', 'GOTC_BASE_PATH=/gotc'}
+        for line in previous.read_text().splitlines():
+            key, _, value = line.strip().partition('=')
+            if (key in ('EnvironmentFile', 'PassEnvironment', 'LoadCredential', 'LoadCredentialEncrypted',
+                        'SetCredential', 'SetCredentialEncrypted')
+                    or (key == 'Environment' and value not in known
+                        and not re.fullmatch(r'GOTC_PUBLIC_ORIGIN=https://[A-Za-z0-9.-]+(?::[0-9]+)?', value))):
+                paths.append(previous)
+                break
+    if not paths:
+        return
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.name.encode() + b'\0' + hashlib.sha256(path.read_bytes()).digest())
+    review = PUBLIC_ORIGIN_FILE.parent / 'legacy-dropins.sha256'
+    if not review.is_file() or review.read_text().strip() != digest.hexdigest():
+        raise RuntimeError('Map the legacy GOTC settings into the successor units and record their reviewed digest: ' +
+                           digest.hexdigest())
+
+
+def verify_runtime_accounts():
+    names = {'gotc-build', 'gotc-deploy', 'gotc-hackathon'}
+    output = run('getent', 'passwd', *sorted(names)).stdout
+    entries = {row[0]: row for line in output.splitlines() if len(row := line.split(':')) == 7}
+    if set(entries) != names or len({int(row[2]) for row in entries.values()} - {0}) != len(names):
+        raise RuntimeError('Provision distinct, non-root GOTC build, upload and service identities')
+    if entries['gotc-build'][-1] not in ('/sbin/nologin', '/usr/sbin/nologin', '/bin/false', '/usr/bin/false'):
+        raise RuntimeError('The GOTC runtime builder must have a non-login shell')
+    run('getent', 'group', 'gotc-proxy')
+
+
+def install_release(args, snapshot):
+    from ops.deploy.nginx import nginx_candidate
+
+    origin = PUBLIC_ORIGIN_FILE.read_text().strip()
+    if not re.fullmatch(r'https://(?:[a-zA-Z0-9.-]+|\[[a-fA-F0-9:]+\])(?::[0-9]{1,5})?', origin):
+        raise RuntimeError('Configure /etc/gotc/public-origin with the public HTTPS origin')
+    options = PUBLIC_ORIGIN_FILE.with_name('event.env')
+    if options.exists() and re.search(r'^\s*GOTC_PUBLIC_ORIGIN\s*=', options.read_text(), re.MULTILINE):
+        raise RuntimeError('Configure the origin only in /etc/gotc/public-origin')
     run('nginx', '-t')
     for service in OLD_SERVICES:
         run('systemctl', 'is-active', service)
+    verify_runtime_accounts()
     nginx_path = NGINX.resolve(strict=True)
     old_nginx = nginx_path.read_text()
-    new_nginx = nginx_candidate(old_nginx)
-    old_unit = UNIT.read_text() if UNIT.is_file() else None
+    new_nginx = nginx_candidate(old_nginx, origin)
     current = ROOT / 'current'
     if current.exists() and not current.is_symlink():
         raise RuntimeError('GOTC current must be a symlink')
     old_current = current.resolve() if current.is_symlink() else None
     if old_current and not old_current.is_relative_to(ROOT / 'releases'):
         raise RuntimeError('Existing GOTC release is outside its directory')
-    old_active = run('systemctl', 'is-active', 'gotc-hackathon', check=False).returncode == 0
-    old_enabled = run('systemctl', 'is-enabled', 'gotc-hackathon', check=False).returncode == 0
-    if not old_current:
-        with socket.socket() as sock:
-            sock.bind(('127.0.0.1', 5274))
-    run('getent', 'passwd', 'gotc-hackathon', check=False)
-    if run('id', 'gotc-hackathon', check=False).returncode:
-        run('useradd', '--system', '--home-dir', str(ROOT), '--shell', '/usr/sbin/nologin', 'gotc-hackathon')
-    for directory in ['releases', 'backups']:
-        (ROOT / directory).mkdir(exist_ok=True, mode=0o755)
+    unit_paths = {name: UNIT_DIR / f'{name}.service' for name in SERVICES}
+    units = {name: path.read_text() if path.is_file() else None for name, path in unit_paths.items()}
+    states = {name: service_state(name) for name in (*SERVICES, LEGACY_SERVICE)}
+    # Carry an explicitly reviewed migration across repeat releases. Hash only the old
+    # drop-in metadata/content, never copy private directives into a generated service.
+    if states[LEGACY_SERVICE][0] or states[LEGACY_SERVICE][1]:
+        verify_legacy_overrides()
+    # Root-owned parent directories and the private data directory are pre-provisioned.
     data = ROOT / 'data'
-    data.mkdir(exist_ok=True, mode=0o700)
-    if data.is_symlink():
-        raise RuntimeError('GOTC data must not be a symlink')
-    run('chown', 'gotc-hackathon:gotc-hackathon', str(data))
-    os.chmod(data, 0o700)
+    if data.is_symlink() or not data.is_dir():
+        raise RuntimeError('Expected the provisioned private data directory')
     backup = ROOT / 'backups' / args.release
     backup.mkdir(mode=0o700)
     (backup / 'nginx.conf').write_text(old_nginx)
-    os.chmod(backup / 'nginx.conf', 0o600)
-    if old_unit:
-        (backup / 'gotc-hackathon.service').write_text(old_unit)
+    for name, original in units.items():
+        if original is not None:
+            (backup / f'{name}.service').write_text(original)
     if (data / 'event.sqlite3').is_file():
         with closing(sqlite3.connect(data / 'event.sqlite3')) as source, closing(sqlite3.connect(backup / 'event.sqlite3')) as target:
             source.backup(target)
@@ -356,89 +424,77 @@ def install_release(args, archive):
         os.chmod(backup / 'event.sqlite3', 0o600)
     release = ROOT / 'releases' / args.release
     release.mkdir(mode=0o755)
-    with tarfile.open(archive, 'r:gz') as package:
-        members = package.getmembers()
-        if len({m.name for m in members}) != len(members) or any(not m.isfile() or not allowed(m.name) for m in members):
-            raise RuntimeError('Archive contains a duplicate or non-allowlisted entry')
-        if {m.name for m in members} != FILES:
-            raise RuntimeError('Release is missing required application files')
-        package.extractall(release, members=members, filter='data')
-    for file in release.rglob('*'):
-        os.chmod(file, 0o755 if file.is_dir() else 0o644)
-    # Compile in memory so the immutable release needs no runtime write access.
-    for file in release.rglob('*.py'):
-        compile(file.read_text(encoding='utf-8'), str(file), 'exec')
-    nginx_changed = False
-    switched = False
-    unit_changed = False
+    extract_release(snapshot, release)
+    # The SSH uploader can write only the inbox. A separate non-login identity prepares
+    # signed wheels inside the root-owned release, then relinquishes the environment.
+    environment = release / '.venv'
+    environment.mkdir(mode=0o755)
+    environment.chmod(0o755)
+    run('chown', 'gotc-build', str(environment))
+    prepare_runtime(release, prefix=('runuser', '-u', 'gotc-build', '--'))
+    run('chown', '-hR', 'root:root', '--', str(environment))
+    run('chmod', '-R', 'u-s,g-s,go-w', '--', str(environment))
+    python = str(environment / 'bin/python')
+    run('runuser', '-u', 'gotc-hackathon', '--', python, '-EsB', '-c', 'import backend.gotc.cli', cwd=release)
+    touched = []
+    switched = nginx_changed = legacy_touched = False
     try:
-        atomic_text(UNIT, SERVICE)
-        unit_changed = True
+        for name, path in unit_paths.items():
+            atomic_text(path, unit_text(name, release, origin))
+            touched.append(name)
+        run('systemctl', 'daemon-reload')
+        # Stop the old writer first so schema baselining / workers run once per event.
+        if states[LEGACY_SERVICE][0]:
+            legacy_touched = True
+            run('systemctl', 'stop', LEGACY_SERVICE)
+        for name in SERVICES:
+            if states[name][0]:
+                run('systemctl', 'stop', name)
+        for name in SERVICES:
+            run('systemctl', 'restart', name)
+            wait_for_health('http://localhost/readyz', f'/run/{name}/http.sock')
         point_current(release, args.release)
         switched = True
-        run('systemctl', 'daemon-reload')
-        run('systemctl', 'restart', 'gotc-hackathon')
-        for attempt in range(25):
-            try:
-                health('http://127.0.0.1:5274/gotc/api/registration')
-                break
-            except Exception:
-                if attempt == 24:
-                    raise RuntimeError('New GOTC release failed its local health check') from None
-                time.sleep(1)
         if nginx_path.read_text() != old_nginx:
             raise RuntimeError('Nginx changed concurrently; refusing to overwrite it')
         atomic_text(nginx_path, new_nginx)
         nginx_changed = True
         run('nginx', '-t')
         run('systemctl', 'reload', 'nginx')
-        # systemctl reload returns before Nginx's new workers accept requests.
-        # An immediate connection can still reach an old worker's routing table.
-        for attempt in range(5):
-            try:
-                status = health('https://8.141.114.201/gotc/api/registration')
-                break
-            except Exception:
-                if attempt == 4:
-                    raise
-                time.sleep(1)
-        for service in [*OLD_SERVICES, 'gotc-hackathon']:
-            run('systemctl', 'is-active', service)
-        run('systemctl', 'enable', 'gotc-hackathon')
-        metadata = {'release': args.release, 'sourceSha': args.source_sha, 'archiveSha256': args.sha256,
-                    'url': 'https://8.141.114.201/gotc/', 'health': status, 'deployedAt': int(time.time())}
-        atomic_text(ROOT / 'last-deployment.json', json.dumps(metadata, indent=2) + '\n', 0o600)
-        print(json.dumps(metadata))
+        wait_for_health(origin + '/gotc/api/registration', attempts=5)
+        for name in (*OLD_SERVICES, *SERVICES):
+            run('systemctl', 'is-active', name)
+        run('systemctl', 'enable', *SERVICES)
+        if states[LEGACY_SERVICE][1]:
+            legacy_touched = True
+            run('systemctl', 'disable', LEGACY_SERVICE)
+        result = {'release': args.release, 'sourceSha': args.source_sha, 'archiveSha256': args.sha256,
+                  'url': origin + '/gotc/', 'deployedAt': int(time.time())}
+        atomic_text(ROOT / 'last-deployment.json', json.dumps(result, indent=2) + '\n', 0o600)
+        print(json.dumps(result))
     except Exception:
-        errors = []
-        if nginx_changed:
-            if nginx_path.read_text() == new_nginx:
-                atomic_text(nginx_path, old_nginx)
-                if run('nginx', '-t', check=False).returncode == 0:
-                    run('systemctl', 'reload', 'nginx', check=False)
-            else:
-                errors.append('Nginx changed concurrently; saved backup requires review')
+        if nginx_changed and nginx_path.read_text() == new_nginx:
+            atomic_text(nginx_path, old_nginx)
+            if run('nginx', '-t', check=False).returncode == 0:
+                run('systemctl', 'reload', 'nginx', check=False)
         if switched:
             if old_current:
                 point_current(old_current, args.release + '-rollback')
-            elif current.is_symlink() and current.resolve() == release:
-                current.unlink()
-        if unit_changed:
-            if old_unit is not None:
-                atomic_text(UNIT, old_unit)
             else:
-                run('systemctl', 'stop', 'gotc-hackathon', check=False)
-                run('systemctl', 'disable', 'gotc-hackathon', check=False)
-                UNIT.unlink(missing_ok=True)
-            run('systemctl', 'daemon-reload', check=False)
-            if old_current and old_active:
-                run('systemctl', 'restart', 'gotc-hackathon', check=False)
-            elif not old_active:
-                run('systemctl', 'stop', 'gotc-hackathon', check=False)
-            if old_unit is not None:
-                run('systemctl', 'enable' if old_enabled else 'disable', 'gotc-hackathon', check=False)
-        if errors:
-            raise RuntimeError('; '.join(errors)) from None
+                current.unlink()
+        for name in touched:
+            run('systemctl', 'stop', name, check=False)
+            if units[name] is None:
+                run('systemctl', 'disable', name, check=False)
+                unit_paths[name].unlink(missing_ok=True)
+            else:
+                atomic_text(unit_paths[name], units[name])
+        run('systemctl', 'daemon-reload', check=False)
+        for name in (*touched, *((LEGACY_SERVICE,) if legacy_touched else ())):
+            active, enabled = states[name]
+            if name == LEGACY_SERVICE or units[name] is not None:
+                run('systemctl', 'enable' if enabled else 'disable', name, check=False)
+                run('systemctl', 'restart' if active else 'stop', name, check=False)
         raise
 
 

@@ -15,7 +15,7 @@ from urllib.parse import urlencode
 from unittest.mock import patch
 
 from backend.gotc import service
-from backend.gotc.http.server import IMPORT_BODY_LIMIT
+from backend.gotc.http.routes import IMPORT_BODY_LIMIT
 from backend.gotc.service import EventService
 import test_api as fixtures
 import test_roadshow as stage_fixtures
@@ -584,6 +584,7 @@ class AdminDataTests(unittest.TestCase):
         with self.service.db() as db:
             db.execute('DROP TABLE judging_review_history')
             db.execute('DROP TABLE admin_data_meta')
+            db.execute("PRAGMA user_version=0")  # Reproduce an unnumbered predecessor.
         self.restart()
         target={'runId':run,'teamId':team_id,'judgeId':invitation['id']}
         history=self.get_data('review-history',**target)

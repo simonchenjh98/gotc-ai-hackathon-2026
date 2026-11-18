@@ -56,3 +56,16 @@ def participants(service):
     api("admin/finals/settings", {"expectedRevision": roster["config"]["revision"], "open": True, "published": False})
     return {"team": team["code"], "admin": admin, "judge": judge["code"], "audience": audience["code"],
             "finals": finals_code, "seat": seats["judges"][0]["id"], "teamId": team_id}
+
+
+def activate_organizer(service):
+    from pyotp import TOTP
+    from unittest.mock import patch
+    from backend.gotc.admin_auth import activate, prepare_enrollment
+
+    organizer = prepare_enrollment("browser-organizer", "Browser Fixture Organizer")
+    # Model an enrollment completed a minute before this real browser login.
+    enrolled_ms = service.clock() - 60000
+    with patch.object(service, "clock", return_value=enrolled_ms):
+        activate(service, organizer, TOTP(organizer["seed"]).at(enrolled_ms // 1000))
+    return organizer

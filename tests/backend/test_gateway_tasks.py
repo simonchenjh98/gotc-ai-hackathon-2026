@@ -1,4 +1,5 @@
 """Async ownership, immutable upstream identity and exactly-once accounting."""
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from decimal import Decimal
@@ -13,7 +14,11 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import httpx
+
 from backend.gotc.errors import APIError
+from backend.gotc.gateway.async_tasks import recover_once
+from backend.gotc.gateway.memory import BULK_BYTES, BulkMemory
 from backend.gotc.gateway.gateway_tasks import AsyncTasks, TASK_ROUTE
 from backend.gotc.gateway import transport as gateway_transport
 from backend.gotc.gateway import accounting as gateway_accounting
@@ -45,7 +50,7 @@ class AsyncTaskTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.service = Service(str(Path(self.temp.name) / "tasks.sqlite"))
         self.expiry = None
-        self.gateway = SimpleNamespace(service=self.service, settings=lambda db: {"expiresAt": self.expiry})
+        self.gateway = SimpleNamespace(service=self.service, settings=lambda db: {"expiresAt": self.expiry}, memory=BulkMemory())
         self.gateway.config = {"openai": {"url": "https://new.invalid/v1", "key": "rotated-secret"}}
         self.owner = {"id": "key-a", "team_id": "team-a"}
         self.other = {"id": "key-b", "team_id": "team-b"}
@@ -230,6 +235,48 @@ class AsyncTaskTests(unittest.TestCase):
         self.assertEqual(result, {"checked": 1, "settled": 1, "failed": 0})
         self.assertEqual(self.rows("api_usage")[0]["cost_micro"], 1250000)
 
+    def test_native_recovery_reuses_submission_credentials_after_restart_and_settles_once(self):
+        self.register()
+        self.succeed()
+        self.current["output"]["large_result"] = "a" * BULK_BYTES
+        self.due()
+        self.gateway.tasks = AsyncTasks(self.gateway, pricing=self.price)
+        requests = []
+
+        async def respond(request):
+            requests.append((request.method, str(request.url), request.headers["authorization"]))
+            return httpx.Response(200, stream=httpx.ByteStream(json.dumps(self.current).encode()),
+                                  headers={"x-request-id": "id-" + self.upstream["key"]})
+
+        async def reconcile():
+            provider = gateway_transport.AsyncProvider(transport=httpx.MockTransport(respond))
+            try:
+                async with self.gateway.memory.lease() as foreground:
+                    await foreground.acquire()
+                    job = asyncio.create_task(recover_once(self.gateway, provider, asyncio.to_thread))
+                    try:
+                        async with asyncio.timeout(5):
+                            while not self.gateway.memory.pending:
+                                await asyncio.sleep(.005)
+                        self.assertFalse(job.done())
+                        self.assertEqual(self.rows("api_async_tasks")[0]["settled"], 0)
+                    finally:
+                        foreground.release()
+                        await asyncio.wait_for(job, 5)
+                await recover_once(self.gateway, provider, asyncio.to_thread)
+                self.assertIsNone(self.gateway.memory.owner)
+            finally:
+                await provider.aclose()
+
+        asyncio.run(reconcile())
+        self.assertEqual(requests, [("GET", self.upstream["url"] + "/task/upstream-task-1",
+                                     "Bearer " + self.upstream["key"])])
+        self.assertEqual(len(self.rows("api_usage")), 1)
+        row = self.rows("api_usage")[0]
+        self.assertEqual((row["billing_status"], row["cost_micro"]), ("settled", 1250000))
+        self.assertNotIn(self.upstream["key"], row["upstream_request_id"])
+        self.assertEqual(self.rows("api_async_tasks")[0]["upstream_key"], "")
+
     def test_missing_price_is_pending_and_result_is_available_then_reconciled(self):
         _, public = self.register()
         self.succeed(price=None)
@@ -395,10 +442,13 @@ class AsyncTaskTests(unittest.TestCase):
         worker = threading.Thread(target=server.serve_forever, daemon=True)
         worker.start()
         try:
-            snapshot = {"upstream_url": "http://127.0.0.1:" + str(server.server_port), "upstream_key": self.upstream["key"]}
-            original_opener = gateway_transport.make_opener
-            with patch.object(gateway_transport, "make_opener", side_effect=lambda: original_opener(proxies={})), self.assertRaises(APIError) as caught:
-                self.tasks._transport(snapshot, "GET", "/task/remote")
+            snapshot = {"upstream_url": "http://127.0.0.1:" + str(server.server_port), "upstream_key": self.upstream["key"],
+                        "remote_id": "remote"}
+            from backend.gotc.gateway.async_tasks import _fetch
+            self.tasks.transport = None
+            self.gateway.opener = gateway_transport.make_opener(proxies={})
+            with self.assertRaises(APIError) as caught:
+                self.tasks._run_provider(_fetch, snapshot)
             self.assertEqual(received, ["/task/remote"])
             self.assertNotIn(self.upstream["key"], caught.exception.message)
         finally:

@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import secrets
 
-from . import database
+from . import database, migrations
 
 
 def data_directory(configured, project_root):
@@ -25,9 +25,8 @@ def data_directory(configured, project_root):
     return (data_home / "gotc").resolve()
 
 
-def shared_login_codes(data_dir):
-    shared_file = data_dir / "shared-login-codes.json"
-    codes = json.loads(shared_file.read_text(encoding="utf-8")) if shared_file.exists() else {}
+def shared_login_codes(credentials):
+    codes = credentials.read_json("shared-login-codes.json", default={})
     if not isinstance(codes, dict) or not set(codes).issubset({"admin", "judge"}):
         raise ValueError("Shared login configuration supports admin and judge roles only")
     for value in codes.values():
@@ -44,6 +43,11 @@ def _initialize_settings(db, now):
     db.execute("INSERT OR IGNORE INTO settings VALUES ('votingDeadline','null')")
 
 
+def _named_admins_enabled(db):
+    table = db.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='named_admins'").fetchone()
+    return bool(table and db.execute("SELECT 1 FROM named_admins LIMIT 1").fetchone())
+
+
 def _initialize_accounts(db, event, hash_code):
     if not db.execute("SELECT 1 FROM accounts WHERE role='admin'").fetchone():
         account, code = event.create_account(db, "admin", "活动管理员")
@@ -55,6 +59,8 @@ def _initialize_accounts(db, event, hash_code):
         os.chmod(access_file, 0o600)
         event.audit(db, account, "bootstrap")
     for role, code in event.shared_login_codes.items():
+        if role == "admin" and _named_admins_enabled(db):
+            continue
         for account in db.execute("SELECT * FROM accounts WHERE role=? AND id NOT IN (SELECT account_id FROM credential_overrides)", (role,)).fetchall():
             if not hmac.compare_digest(hash_code(code, account["salt"]), account["code_hash"]):
                 salt = secrets.token_bytes(16)
@@ -66,7 +72,8 @@ def _initialize_accounts(db, event, hash_code):
         event.audit(db, account, "bootstrap.shared-judge")
 
 
-def initialize_state(event, *, database_existed, hash_code):
+def legacy_schema(event, *, database_existed, hash_code):
+    """Upgrade unnumbered predecessor releases in their original recovery order."""
     database.migrate_accounts(event.db_path, event.clock)
     with event.db() as db:
         db.executescript(database.SCHEMA)
@@ -81,14 +88,6 @@ def initialize_state(event, *, database_existed, hash_code):
         event.repositories.initialize(db)
         _initialize_settings(db, event.clock())
         _initialize_accounts(db, event, hash_code)
-    if "admin" in event.shared_login_codes:
-        access_file = event.data_dir / "admin-access.txt"
-        temporary = event.data_dir / (".admin-access-" + secrets.token_hex(8))
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write("GOTC administrator access code (keep private):\n" + event.shared_login_codes["admin"] + "\n")
-        os.replace(temporary, access_file)
-        os.chmod(access_file, 0o600)
     os.chmod(event.db_path, 0o600)
     event.submission_records.initialize(backup=database_existed)
     with event.db() as db:event.repository_backups.initialize(db)
@@ -96,3 +95,30 @@ def initialize_state(event, *, database_existed, hash_code):
     event.write_conflicts.initialize()
     event.finals.initialize()
     with event.db() as db:event.team_lifecycle.initialize(db)
+
+
+def initialize_state(event, *, database_existed, previous_version, hash_code):
+    if previous_version == 0:
+        legacy_schema(event, database_existed=database_existed, hash_code=hash_code)
+    else:
+        # A compatible previous binary can add reviews and submissions after rollback.
+        # Reconcile those rows and hydrate the per-process controller configuration.
+        with event.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            event.admin_data.reconcile(db)
+            event.roadshow_access.verify_key(db)
+            event.keys.load_runtime(db)
+            event.submission_records.seed_current(db)
+            _initialize_accounts(db, event, hash_code)
+    if previous_version < migrations.LATEST:
+        migrations.apply(event)
+    with event.db() as db:
+        write_shared_admin = "admin" in event.shared_login_codes and not _named_admins_enabled(db)
+    if write_shared_admin:
+        access_file = event.data_dir / "admin-access.txt"
+        temporary = event.data_dir / (".admin-access-" + secrets.token_hex(8))
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write("GOTC administrator access code (keep private):\n" + event.shared_login_codes["admin"] + "\n")
+        os.replace(temporary, access_file)
+        os.chmod(access_file, 0o600)

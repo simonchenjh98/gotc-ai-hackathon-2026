@@ -5,13 +5,14 @@ import re
 import secrets
 from collections import Counter
 
+from backend.gotc.http import request_models as inputs
 from backend.gotc.teams.claims import normalize, ensure_roster_capacity
 from backend.gotc.errors import APIError
 
 PUBLIC_PATHS = {'/api/registration','/api/registration/open','/api/registration/save'}
 RETIRED_PATHS = {'/api/registration/create'}
 PUBLIC_ORIGINS = {'https://etownyouthai.com', 'https://www.etownyouthai.com', 'https://simonchenjh98.github.io'}
-FIELDS = {'name', 'captain', 'school', 'phone', 'targetSize', 'members', 'project', 'summary'}
+FIELDS = inputs.TeamRegistration.__required_keys__
 PLACEHOLDERS = {'', '欢迎', '欢迎加入', '待定', '暂无', '无'}
 BAD_NAMES = PLACEHOLDERS | {'不知道', '暂时未定', '未定', '暂定'}
 SCHEMA = '''
@@ -231,16 +232,16 @@ class TeamRegistration:
         if row['status']!='active':raise APIError(409,'本队登记已暂停，请联系组织方')
         return row
 
-    def legacy_save(self,db,body):
-        if set(body)!={'code','expectedRevision','team'}:raise APIError(400,'登记字段不正确')
+    def legacy_save(self,db,body: inputs.LegacyRegistrationSave):
+        if not inputs.accepts_fields(body, inputs.LegacyRegistrationSave):raise APIError(400,'登记字段不正确')
         row=self.legacy_registration(db,body['code'])
         team=self.s.admin_data.team(db,row['team_id'])
         self.save_profile(db,None,row['team_id'],{'team':body['team'],'expectedRevision':body['expectedRevision'],
             'expectedTeamRevision':team['revision']},legacy=True)
         return {'ok':True,'team':self.private(self.row(db,row['team_id']))}
 
-    def save_profile(self,db,actor,team_id,body,*,legacy=False):
-        if set(body)!={'team','expectedRevision','expectedTeamRevision'}:raise APIError(400,'本队资料字段不正确')
+    def save_profile(self,db,actor,team_id,body: inputs.TeamProfileSave,*,legacy=False):
+        if not inputs.accepts_fields(body, inputs.TeamProfileSave):raise APIError(400,'本队资料字段不正确')
         current=self.profile(db,team_id)
         if type(body['expectedRevision']) is not int or body['expectedRevision']!=current['revision'] or type(body['expectedTeamRevision']) is not int or body['expectedTeamRevision']!=current['teamRevision']:
             raise APIError(409, '队伍资料已变化，本次未保存。请复制当前输入，再重新读取本队资料')
@@ -285,7 +286,7 @@ class TeamRegistration:
             raise APIError(400, '一次导入 1–100 队')
         added, skipped, access = 0, 0, []
         for item in rows:
-            if not isinstance(item, dict) or set(item) != {'sourceKey', 'team', 'raw'} or not isinstance(item['raw'], dict):
+            if not inputs.accepts_fields(item, inputs.RegistrationRow) or not isinstance(item['raw'], dict):
                 raise APIError(400, '导入字段不正确')
             source = self.text(item['sourceKey'], '来源编号', 120, True)
             if db.execute('SELECT 1 FROM team_registrations WHERE source_key=?', (source,)).fetchone():
@@ -309,7 +310,13 @@ class TeamRegistration:
         if method == 'POST' and not admin:
             self.s.rate_limit(ip, 'registration')
         with self.s.db() as db:
-            db.execute('BEGIN IMMEDIATE' if method == 'POST' else 'BEGIN')
+            if method == 'POST' and admin:
+                self.s.write_identity(db, cookie, 'admin', login_id, marker_required=True)
+            elif method == 'POST' and path == '/api/registration/save':
+                if not inputs.accepts_fields(body, inputs.LegacyRegistrationSave):
+                    raise APIError(400, '登记字段不正确')
+                self.legacy_registration(db, body['code'])
+            db.execute('BEGIN IMMEDIATE' if method == 'POST' and (admin or path == '/api/registration/save') else 'BEGIN')
             if admin:
                 actor = self.s.account(db, cookie)
                 self.s.require(actor, 'admin')
@@ -319,7 +326,7 @@ class TeamRegistration:
                     raise APIError(401, '登录身份已变化，请重新登录')
                 if method == 'GET' and path == '/api/admin/registration':
                     return self.listing(db, admin=True)
-                if method == 'POST' and path == '/api/admin/registration/import' and set(body) == {'rows'}:
+                if method == 'POST' and path == '/api/admin/registration/import' and inputs.accepts_fields(body, inputs.RegistrationImport):
                     return self.import_rows(db, actor, body['rows'])
                 if method == 'POST' and path == '/api/admin/registration/rotate':
                     raise APIError(410,'队伍管理码已停用，不再重发；队伍资料使用原参赛码登录选手工作台管理','registration_code_retired')
@@ -327,7 +334,7 @@ class TeamRegistration:
                 if method == 'GET' and path == '/api/registration':
                     return self.listing(db)
                 if method=='POST' and path=='/api/registration/open':
-                    if set(body)!={'code'}:raise APIError(400,'读取登记只接受原队伍管理码')
+                    if not inputs.accepts_fields(body, inputs.CodeBody):raise APIError(400,'读取登记只接受原队伍管理码')
                     return {'team':self.private(self.legacy_registration(db,body['code']))}
                 if method=='POST' and path=='/api/registration/save':
                     return self.legacy_save(db,body)

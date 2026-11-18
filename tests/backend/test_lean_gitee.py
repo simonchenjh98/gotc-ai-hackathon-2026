@@ -2,7 +2,6 @@
 import os
 import unittest
 from unittest.mock import patch
-from urllib.error import HTTPError
 
 from backend.gotc.errors import APIError
 from backend.gotc.submissions.repositories import Provider, UpstreamError
@@ -157,10 +156,11 @@ class LeanGiteeTests(unittest.TestCase):
         self.assertEqual(self.invites,1)
 
     def test_generic_failures_never_invite(self):
+        row = self.application()
         for error in [UpstreamError(401),UpstreamError(403),UpstreamError(429),UpstreamError(500),UpstreamError()]:
             with self.subTest(error=error.upstream_status):
                 self.membership_fixture(error=error)
-                row=self.admin_action(self.application())[1]['repository'] if self.invites==0 and not self.remote.repo else self.admin_action(row,'reconcile')[1]['repository']
+                row=self.admin_action(row, 'approve' if row['state']=='requested' else 'reconcile')[1]['repository']
                 self.assertEqual(row['state'],'reconcile')
                 self.assertEqual(self.invites,0)
                 self.assertEqual(self.granted(),[])
@@ -182,10 +182,11 @@ class LeanGiteeTests(unittest.TestCase):
 
     def test_unavailable_member_api_falls_back_to_verified_repository_grant(self):
         # Token without enterprise scope / free-plan seat limits: still grant push on the team repo.
+        row = self.application()
         for error in [UpstreamError(401),UpstreamError(403),UpstreamError(500)]:
             with self.subTest(error=error.upstream_status):
                 self.membership_fixture(error=error,grant_requires_member=False)
-                row=self.admin_action(self.application())[1]['repository'] if not self.remote.repo else self.admin_action(row,'reconcile')[1]['repository']
+                row=self.admin_action(row, 'approve' if row['state']=='requested' else 'reconcile')[1]['repository']
                 self.assertEqual(row['state'],'ready')
                 self.assertEqual(self.invites,0)
                 self.assertEqual(len(self.granted()),1)
@@ -403,12 +404,14 @@ class LeanGiteeTests(unittest.TestCase):
 class ProviderErrorRedactionTests(unittest.TestCase):
     def test_upstream_errors_discard_bodies_instead_of_inferencing_membership(self):
         provider=Provider('gitee','org','never-live','main',True)
-        for status in (400,403,404,422,429):
-            with self.subTest(status=status),patch('backend.gotc.submissions.repositories.build_opener') as opener:
-                error=HTTPError('https://gitee.com/redacted',status,'Forbidden',{},None)
-                error.read=lambda *args: self.fail('HTTP error bodies must not be inspected')
-                opener.return_value.open.side_effect=error
+        self.addCleanup(provider.close)
+        for status in (302,400,403,404,422,429):
+            with self.subTest(status=status), patch.object(provider.http, 'stream') as request:
+                response = request.return_value.__enter__.return_value
+                response.status_code = status
                 with self.assertRaises(UpstreamError) as caught:
                     provider.request('GET','/enterprises/org/members/Developer')
                 self.assertEqual(caught.exception.upstream_status,status)
                 self.assertNotIn('redacted',caught.exception.message)
+                response.iter_raw.assert_not_called()
+                request.return_value.__exit__.assert_called_once()

@@ -50,7 +50,7 @@ def invalid_proof():
 class RepositorySeals:
     def __init__(self, repositories):
         self.repos = repositories
-        self.enabled = os.environ.get('GOTC_REPO_GITEE_SEAL_ENABLED') == '1'
+        self.enabled = repositories.s.credentials.repository_settings().get('GOTC_REPO_GITEE_SEAL_ENABLED') == '1'
 
     def applies(self, binding):
         return self.enabled and binding['provider'] == 'gitee'

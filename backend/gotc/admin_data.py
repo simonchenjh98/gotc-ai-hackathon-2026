@@ -10,6 +10,7 @@ import secrets
 import sqlite3
 from pathlib import Path
 
+from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
 from backend.gotc.judging.judging import STAGES
 
@@ -57,6 +58,9 @@ class AdminDataService:
 
     def initialize(self, db):
         db.executescript(SCHEMA)
+        self.reconcile(db)
+
+    def reconcile(self, db):
         db.execute("INSERT OR IGNORE INTO admin_data_meta VALUES ('historyAvailableFrom',?)",(str(self.now()),))
         db.execute("INSERT OR IGNORE INTO team_details(team_id) SELECT id FROM teams")
         rows=db.execute("""SELECT r.* FROM judging_reviews r WHERE NOT EXISTS
@@ -110,8 +114,8 @@ class AdminDataService:
             raise APIError(400,'路演顺序应为1至9999的整数或空值')
         return result
 
-    def save_team(self, db, actor, values, batch=None, *, require_revision=False):
-        allowed=set(TEAM_FIELDS)|{'id','expectedRevision'}
+    def save_team(self, db, actor, values: inputs.TeamEdit, batch=None, *, require_revision=False):
+        allowed=inputs.TeamEdit.__optional_keys__
         if not set(values).issubset(allowed):
             raise APIError(400,'队伍字段不正确')
         team_id=values.get('id')
@@ -160,8 +164,8 @@ class AdminDataService:
             value={key:(value.hex() if isinstance(value,bytes) else value) for key,value in dict(target).items()} if target else None
         return hashlib.sha256(json.dumps(value,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
 
-    def preview_import(self, db, actor, body, session_hash):
-        if set(body)!={'kind','csv'} or not isinstance(body['kind'],str) or body['kind'] not in {'teams','judges'} or not isinstance(body['csv'],str):
+    def preview_import(self, db, actor, body: inputs.ImportPreviewBody, session_hash):
+        if not inputs.accepts_fields(body, inputs.ImportPreviewBody) or not isinstance(body['kind'],str) or body['kind'] not in {'teams','judges'} or not isinstance(body['csv'],str):
             raise APIError(400,'导入应包含kind和CSV文字')
         content=body['csv']
         if len(content.encode('utf-8'))>262144:
@@ -238,8 +242,8 @@ class AdminDataService:
         return {'previewId':preview_id,'kind':kind,'rows':[{key:value for key,value in row.items() if not key.startswith('_')} for row in rows],
                 'counts':counts,'canCommit':plan['canCommit'],'expiresAt':now+900000}
 
-    def commit_import(self, db, actor, body, session_hash):
-        if set(body)!={'previewId'} or not isinstance(body['previewId'],str):
+    def commit_import(self, db, actor, body: inputs.ImportCommitBody, session_hash):
+        if not inputs.accepts_fields(body, inputs.ImportCommitBody) or not isinstance(body['previewId'],str):
             raise APIError(400,'请提交预览编号')
         preview=db.execute('SELECT * FROM import_previews WHERE id=?',(body['previewId'],)).fetchone()
         if not preview or preview['account_id']!=actor['id'] or preview['session_hash']!=session_hash:
@@ -367,8 +371,8 @@ class AdminDataService:
                                     'canEdit':self.s.judging.window(row,current)['canEdit']}
         return {'reviewRevision':revision, 'stages':stages}
 
-    def set_validity(self, db, actor, body):
-        if set(body)!={'runId','teamId','judgeId','expectedVersion','invalidated','reason'}:
+    def set_validity(self, db, actor, body: inputs.ReviewValidityBody):
+        if not inputs.accepts_fields(body, inputs.ReviewValidityBody):
             raise APIError(400,'作废或恢复字段不正确')
         for key in ('runId','teamId','judgeId'):
             if not isinstance(body[key],str) or not 1<=len(body[key])<=80:

@@ -91,14 +91,19 @@ class GatewayCorsIntegrationTests(unittest.TestCase):
             ("duplicate_fetch_site", [("Sec-Fetch-Site", "same-origin"), ("sec-fetch-site", "same-origin")]),
         ]
         before = self.usage_count()
-        with mock.patch.object(self.service.keys, "gateway", wraps=self.service.keys.gateway) as dispatch:
+        with mock.patch.object(self.service.keys, "authenticate", wraps=self.service.keys.authenticate) as dispatch:
             for label, method, path, body, raw, transport_headers in routes:
                 for source, source_headers in sources:
                     with self.subTest(transport=label, source=source):
                         status, data, headers = self.request(method, path, body, raw=raw,
                                                              headers=transport_headers + source_headers)
-                        self.assertEqual(status, 403)
-                        self.assertEqual(json.loads(data)["code"], "origin_not_allowed")
+                        if label.endswith("_ws") and source in {"duplicate_same", "duplicate_external"}:
+                            # websockets validates a single Origin during negotiation before ASGI,
+                            # so the server rejects a malformed handshake before application CORS.
+                            self.assertEqual(status, 400)
+                        else:
+                            self.assertEqual(status, 403)
+                            self.assertEqual(json.loads(data)["code"], "origin_not_allowed")
                         self.assertNotIn("access-control-allow-origin", headers)
                         self.assert_no_credentials(headers)
             dispatch.assert_not_called()
@@ -151,7 +156,7 @@ class GatewayCorsIntegrationTests(unittest.TestCase):
         fields = [("Origin", self.service.origin), ("Sec-Fetch-Site", "same-origin"),
                   ("Access-Control-Request-Method", "POST"),
                   ("Access-Control-Request-Headers", "authorization, Content-Type, X-API-Key, anthropic-version")]
-        with mock.patch.object(self.service.keys, "gateway", wraps=self.service.keys.gateway) as dispatch:
+        with mock.patch.object(self.service.keys, "authenticate", wraps=self.service.keys.authenticate) as dispatch:
             for path in ("/v1/chat/completions", "/%76%31/audio/transcriptions", "/v1/async/images/generations"):
                 with self.subTest(path=path):
                     status, data, headers = self.request("OPTIONS", path, headers=fields, authenticated=False)
@@ -181,12 +186,12 @@ class GatewayCorsIntegrationTests(unittest.TestCase):
             ("cookie_header", base + [("Access-Control-Request-Headers", "cookie")], "cors_preflight_not_allowed"),
             ("non_ascii_header", base + [("Access-Control-Request-Headers", "\u00a0Authorization")], "cors_preflight_not_allowed"),
             ("invalid_token", base + [("Access-Control-Request-Headers", "!" * 8192)], "cors_preflight_not_allowed"),
-            ("oversized_header", base + [("Access-Control-Request-Headers", "Authorization" + " " * 8192)], "cors_preflight_not_allowed"),
+            ("oversized_header", base + [("Access-Control-Request-Headers", "Authorization," + " " * 8192 + "Content-Type")], "cors_preflight_not_allowed"),
             ("duplicate_origin", base + [("Origin", self.service.origin)], "origin_not_allowed"),
             ("duplicate_method", base + [("Access-Control-Request-Method", "GET")], "cors_preflight_not_allowed"),
             ("duplicate_headers", base + [("Access-Control-Request-Headers", "authorization"), ("access-control-request-headers", "content-type")], "cors_preflight_not_allowed"),
         ]
-        with mock.patch.object(self.service.keys, "gateway", wraps=self.service.keys.gateway) as dispatch:
+        with mock.patch.object(self.service.keys, "authenticate", wraps=self.service.keys.authenticate) as dispatch:
             for label, fields, code in cases:
                 with self.subTest(case=label):
                     status, data, headers = self.request("OPTIONS", "/v1/chat/completions", headers=fields, authenticated=False)

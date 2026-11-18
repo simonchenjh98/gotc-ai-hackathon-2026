@@ -5,26 +5,21 @@ the upstream's account APIs, forwards client credentials, or treats media bytes 
 """
 from __future__ import annotations
 
-from contextlib import closing
 from email.message import Message
-import http.client
-import io
 import json
 import re
-import tempfile
-import time
 import unicodedata
-import urllib.error
-import urllib.request
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl
 import wave
 
+from python_multipart import MultipartParser
+from python_multipart.exceptions import MultipartParseError
+
 from backend.gotc.errors import APIError
-from . import gateway_pricing, transport, usage
+from . import gateway_pricing, usage
 from .gateway_pricing import PricingError
-from .gateway_uploads import SizedUpload
-from .protocol_errors import GatewayError, redact_error_payload, upstream_http_error, upstream_message
-from .requests import client_ip, gateway_json, reject_stored_file_references, request_text, validate_json_depth
+from .protocol_errors import GatewayError, upstream_message
+from .requests import gateway_json, reject_stored_file_references, request_text, validate_json_depth
 
 UPLOAD_LIMIT = 32 * 1024 * 1024
 REPLY_LIMIT = 64 * 1024 * 1024
@@ -57,32 +52,6 @@ def _length(handler):
     if not 0 < length <= UPLOAD_LIMIT:
         raise APIError(413, "媒体请求超过 32MB 限制")
     return length
-
-
-def _find(stream, marker):
-    """Find a MIME delimiter without reading an entire binary part into memory."""
-    start = stream.tell()
-    overlap = b""
-    cursor = start
-    while True:
-        chunk = stream.read(CHUNK)
-        if not chunk:
-            raise APIError(400, "multipart 请求边界不完整")
-        block = overlap + chunk
-        base = cursor - len(overlap)
-        pos = block.find(marker)
-        while pos >= 0:
-            found = base + pos
-            saved = stream.tell()
-            stream.seek(found + len(marker))
-            suffix = stream.read(2)
-            stream.seek(saved)
-            if suffix in (b"\r\n", b"--"):
-                stream.seek(found + len(marker))
-                return found
-            pos = block.find(marker, pos + 1)
-        overlap = block[-(len(marker) - 1):]
-        cursor += len(chunk)
 
 
 class _Slice:
@@ -158,75 +127,155 @@ def _put(body, name, value):
         body[name] = value
 
 
-def parse_multipart(stream, content_type):
+def _part_metadata(headers):
+    if headers.get_content_disposition() != "form-data":
+        raise APIError(400, "multipart 字段必须是 form-data")
+    params = headers.get_params(header="content-disposition")[1:]
+    if len({k.lower() for k, _ in params}) != len(params):
+        raise APIError(400, "multipart 字段参数重复")
+    name = headers.get_param("name", header="content-disposition")
+    if not isinstance(name, str):
+        raise APIError(400, "multipart 字段缺少名称")
+    if headers.get("Content-Transfer-Encoding", "binary").strip().lower() not in ("binary", "8bit") or headers.get_content_type().startswith("multipart/"):
+        raise APIError(400, "不支持嵌套或编码的 multipart 字段")
+    filename = headers.get_filename()
+    if filename is not None and name == "model":
+        raise APIError(400, "model 必须是文本字段")
+    return name, filename, headers.get_content_type()
+
+
+class _MediaForm:
+    """Metadata-only callbacks. All byte ranges refer to the original upload spool."""
+    def __init__(self, stream, boundary):
+        self.stream = stream
+        self.boundary_line_size = len(boundary) + 4  # --boundary plus CRLF or --
+        self.header_start = self.boundary_line_size
+        self.body = {}
+        self.parts = 0
+        self.metadata_bytes = 0
+        self.complete = False
+
+    def begin_part(self):
+        self.parts += 1
+        if self.parts > PART_LIMIT:
+            raise APIError(413, "multipart 字段数量超过限制")
+        self.headers = Message()
+        self.key = bytearray()
+        self.value = bytearray()
+        self.header_tail = self.header_start
+        self.size = 0
+
+    def _header_fragment(self, target, data, start, end):
+        self.header_tail = self.chunk_offset + end
+        if self.header_tail - self.header_start > HEADER_LIMIT:
+            raise APIError(400, "multipart 字段头过长")
+        target.extend(data[start:end])
+
+    def header_field(self, data, start, end):
+        if not self.headers and not self.key and self.chunk_offset + start != self.header_start:
+            raise APIError(400, "multipart 字段边界不正确")
+        self._header_fragment(self.key, data, start, end)
+
+    def header_value(self, data, start, end):
+        self._header_fragment(self.value, data, start, end)
+
+    def end_header(self):
+        if not re.fullmatch(rb"[A-Za-z0-9-]+", self.key) or b"\n" in self.value:
+            raise APIError(400, "multipart 字段头不正确")
+        key = self.key.decode("ascii")
+        if key in self.headers:
+            raise APIError(400, "multipart 字段头重复")
+        try:
+            self.headers[key] = self.value.strip().decode("utf-8")
+        except UnicodeDecodeError:
+            raise APIError(400, "multipart 字段头编码不正确") from None
+        self.key.clear()
+        self.value.clear()
+
+    def end_headers(self):
+        self.name, self.filename, self.content_type = _part_metadata(self.headers)
+        # Callbacks omit the final line ending and any whitespace after an empty
+        # header. Locate the payload in the spool, accounting for those wire bytes.
+        self.stream.seek(self.header_tail)
+        remaining = self.header_start + HEADER_LIMIT - self.header_tail - 2
+        if remaining < 2 or not self.stream.readline(remaining).endswith(b"\r\n"):
+            raise APIError(400, "multipart 字段头过长或不完整")
+        self.data_start = self.stream.tell() + 2
+
+    def part_data(self, data, start, end):
+        self.size += end - start
+        if self.filename is None and self.size > FIELD_LIMIT:
+            raise APIError(413, "multipart 文本字段超过 1MB")
+
+    def end_part(self):
+        if self.filename is None:
+            self.stream.seek(self.data_start)
+            try:
+                value = self.stream.read(self.size).decode("utf-8")
+            except UnicodeError:
+                raise APIError(400, "multipart 文本字段必须为 UTF-8") from None
+        else:
+            value = {"filename": str(self.filename).replace("\\", "/").rsplit("/", 1)[-1][:200],
+                     "content_type": self.content_type, "size": self.size}
+            duration = _wav_duration(self.stream, self.data_start, self.size)
+            if duration is not None:
+                value["duration"] = duration
+        self.metadata_bytes += self.data_start - self.header_start
+        if self.filename is None:
+            self.metadata_bytes += self.size
+        _put(self.body, self.name, value)
+        self.header_start = self.data_start + self.size + 2 + self.boundary_line_size
+
+    def end(self):
+        # The library permits epilogues. The gateway requires the closing delimiter
+        # to be followed by at most the optional CRLF, even within the same chunk.
+        self.stream.seek(self.header_start)
+        if self.stream.read(3) not in (b"", b"\r\n"):
+            raise APIError(400, "multipart 结束边界后存在多余内容")
+        self.complete = True
+
+
+def _parse_multipart(stream, content_type):
     header = Message()
     header["content-type"] = content_type
     boundaries = [v for k, v in header.get_params()[1:] if k.lower() == "boundary"]
-    if len(boundaries) != 1 or not re.fullmatch(r"[0-9A-Za-z'()+_,\-./:=? ]{1,70}", boundaries[0]) or boundaries[0].endswith(" "):
+    if (len(boundaries) != 1 or not isinstance(boundaries[0], str) or
+            not re.fullmatch(r"[0-9A-Za-z'()+_,\-./:=? ]{1,70}", boundaries[0]) or boundaries[0].endswith(" ")):
         raise APIError(400, "multipart boundary 不正确")
     boundary = boundaries[0].encode("ascii")
     stream.seek(0)
     if stream.read(len(boundary) + 4) != b"--" + boundary + b"\r\n":
         raise APIError(400, "multipart 起始边界不正确")
-    body = {}
-    for _ in range(PART_LIMIT):
-        headers, total = Message(), 0
-        while True:
-            line = stream.readline(HEADER_LIMIT - total + 1)
-            total += len(line)
-            if total > HEADER_LIMIT or not line.endswith(b"\r\n"):
-                raise APIError(400, "multipart 字段头过长或不完整")
-            if line == b"\r\n":
+
+    form = _MediaForm(stream, boundary)
+    parser = MultipartParser(boundary, {
+        "on_part_begin": form.begin_part, "on_part_data": form.part_data,
+        "on_part_end": form.end_part, "on_end": form.end,
+        "on_header_field": form.header_field, "on_header_value": form.header_value,
+        "on_header_end": form.end_header, "on_headers_finished": form.end_headers,
+    }, max_header_size=HEADER_LIMIT, max_header_count=HEADER_LIMIT // 4)
+    offset = 0
+    try:
+        while not form.complete:
+            # Metadata callbacks may seek on the spool to inspect a completed part.
+            stream.seek(offset)
+            chunk = stream.read(CHUNK)
+            if not chunk:
                 break
-            if b":" not in line or line[:1] in b" \t":
-                raise APIError(400, "multipart 字段头不正确")
-            key, value = line[:-2].split(b":", 1)
-            try:
-                key, value = key.decode("ascii"), value.strip().decode("utf-8")
-            except UnicodeError:
-                raise APIError(400, "multipart 字段头编码不正确") from None
-            if not re.fullmatch(r"[A-Za-z0-9-]+", key) or headers.get(key) is not None:
-                raise APIError(400, "multipart 字段头重复或不正确")
-            headers[key] = value
-        if headers.get_content_disposition() != "form-data":
-            raise APIError(400, "multipart 字段必须是 form-data")
-        params = headers.get_params(header="content-disposition")[1:]
-        if len({k.lower() for k, _ in params}) != len(params):
-            raise APIError(400, "multipart 字段参数重复")
-        name = headers.get_param("name", header="content-disposition")
-        if not isinstance(name, str):
-            raise APIError(400, "multipart 字段缺少名称")
-        if headers.get("Content-Transfer-Encoding", "binary").lower() not in ("binary", "8bit") or headers.get_content_type().startswith("multipart/"):
-            raise APIError(400, "不支持嵌套或编码的 multipart 字段")
-        start = stream.tell()
-        end = _find(stream, b"\r\n--" + boundary)
-        suffix = stream.read(2)
-        next_pos = stream.tell()
-        filename = headers.get_filename()
-        if filename is not None:
-            if name == "model":
-                raise APIError(400, "model 必须是文本字段")
-            value = {"filename": str(filename).replace("\\", "/").rsplit("/", 1)[-1][:200],
-                     "content_type": headers.get_content_type(), "size": end - start}
-            duration = _wav_duration(stream, start, end - start)
-            if duration is not None:
-                value["duration"] = duration
-        else:
-            if end - start > FIELD_LIMIT:
-                raise APIError(413, "multipart 文本字段超过 1MB")
-            stream.seek(start)
-            try:
-                value = stream.read(end - start).decode("utf-8")
-            except UnicodeError:
-                raise APIError(400, "multipart 文本字段必须为 UTF-8") from None
-        _put(body, name, value)
-        stream.seek(next_pos)
-        if suffix == b"--":
-            if stream.read() not in (b"", b"\r\n"):
-                raise APIError(400, "multipart 结束边界后存在多余内容")
-            stream.seek(0)
-            return body
-    raise APIError(413, "multipart 字段数量超过限制")
+            form.chunk_offset = offset
+            parser.write(chunk)
+            offset += len(chunk)
+        parser.finalize()
+    except MultipartParseError:
+        raise APIError(400, "multipart 表单格式不正确") from None
+    if not form.complete:
+        raise APIError(400, "multipart 请求边界不完整")
+    stream.seek(0)
+    return form.body, form.metadata_bytes
+
+
+def parse_multipart(stream, content_type):
+    return _parse_multipart(stream, content_type)[0]
 
 
 class MediaGateway:
@@ -236,47 +285,24 @@ class MediaGateway:
     def supports(self, path):
         return path in self.catalog.paths() and path not in _CHAT_PATHS and not path.endswith("/ws")
 
-    def read_request(self, handler):
-        """Return (pricing metadata, exact replayable payload, content type, byte length)."""
-        content_type = handler.headers.get("Content-Type", "")
-        mime = handler.headers.get_content_type()
-        if mime == "application/json":
-            body = self.gateway.read_body(handler)
-            payload = io.BytesIO(gateway_json(body))
-            return body, payload, "application/json", len(payload.getbuffer())
-        length = _length(handler)
-        if handler.headers.get("Content-Encoding", "identity").lower() != "identity":
-            raise APIError(415, "媒体表单不支持 Content-Encoding")
-        if mime not in ("multipart/form-data", "application/x-www-form-urlencoded"):
-            raise APIError(415, "请使用 JSON、multipart/form-data 或表单请求")
-        spool = tempfile.SpooledTemporaryFile(max_size=SPOOL_MEMORY, mode="w+b")
-        try:
-            remaining = length
-            while remaining:
-                block = handler.rfile.read(min(CHUNK, remaining))
-                if not block:
-                    raise APIError(400, "请求内容未完整发送")
-                spool.write(block)
-                remaining -= len(block)
-            spool.seek(0)
-            if mime == "multipart/form-data":
-                body = parse_multipart(spool, content_type)
-            else:
-                if length > FIELD_LIMIT:
-                    raise APIError(413, "URL 编码表单超过 1MB")
-                try:
-                    pairs = parse_qsl(spool.read().decode("utf-8"), keep_blank_values=True,
-                                      strict_parsing=True, max_num_fields=PART_LIMIT, errors="strict")
-                except (UnicodeError, ValueError):
-                    raise APIError(400, "表单编码不正确") from None
-                body = {}
-                for name, value in pairs:
-                    _put(body, name, value)
-            spool.seek(0)
-            return body, spool, content_type, length
-        except BaseException:
-            spool.close()
-            raise
+    @staticmethod
+    def parse_form(spool, mime, content_type, length):
+        spool.seek(0)
+        if mime == "multipart/form-data":
+            return _parse_multipart(spool, content_type)
+        else:
+            if length > FIELD_LIMIT:
+                raise APIError(413, "URL 编码表单超过 1MB")
+            try:
+                pairs = parse_qsl(spool.read().decode("utf-8"), keep_blank_values=True,
+                                  strict_parsing=True, max_num_fields=PART_LIMIT, errors="strict")
+            except (UnicodeError, ValueError):
+                raise APIError(400, "表单编码不正确") from None
+            body = {}
+            for name, value in pairs:
+                _put(body, name, value)
+        spool.seek(0)
+        return body, length
 
     def _quote(self, call, response=None):
         if not call.get("forwarded"):
@@ -290,66 +316,46 @@ class MediaGateway:
         except PricingError:
             call["billing"] = _pending("invalid_provider_billing_evidence")
 
-    def serve(self, handler, path, call, upstream):
-        gateway = self.gateway
-        if handler.command != "POST" or not self.supports(path):
-            raise APIError(404, "接口不存在")
-        if urlsplit(handler.path).query:
-            raise APIError(400, "模型请求参数请放在请求体中")
-        call["metered_media"], call["requested_at"] = True, time.time()
-        call["billing"] = _zero("not_forwarded")
-        call["secrets"] += (upstream["key"],)
-        key = gateway.authenticate(handler, call)
-        call["user_agent"] = (handler.headers.get("User-Agent") or "")[:300]
-        call["client_ip"] = client_ip(handler)
-        body, payload, content_type, length = self.read_request(handler)
-        with closing(payload):
-            model = body.get("model")
-            if not isinstance(model, str) or not model or len(model) > 100:
-                raise APIError(400, "请求必须指定模型名称")
-            call["model"] = call["requested_model"] = model
-            if model not in upstream.get("models", {}):
-                raise GatewayError("not_found", "模型不在本活动开放列表中")
-            call["request_bytes"] = length
-            # Multipart binary input is never persisted in request-content logs.
-            call["request"] = gateway_json(body) if call["log"] else b""
-            reject_stored_file_references(body)
-            self._check_shared_state(body)
-            settings = call["settings"]
-            if settings["blockedWords"]:
-                text = request_text(body)
-                if any(" ".join(unicodedata.normalize("NFKC", w).split()).lower() in text
-                       for w in settings["blockedWords"] if w.strip()):
-                    raise GatewayError("forbidden", "请求内容包含本活动禁止的词语，已拦截")
-            if "stream" in body and type(body["stream"]) is not bool:
-                raise APIError(400, "stream 必须是布尔值")
-            routing_headers = {}
-            for name in ("X-Compute-Id", "X-Pipeline-Tag"):
-                values = handler.headers.get_all(name, [])
-                if len(values) > 1:
-                    raise APIError(400, "模型路由请求头不能重复")
-                if values:
-                    value = values[0].strip()
-                    if not value or len(value) > 200 or any(ord(c) < 32 or ord(c) > 126 for c in value):
-                        raise APIError(400, "模型路由请求头不正确")
-                    routing_headers[name] = value
-            try:
-                snapshot = self.catalog.resolve(model, path, body, headers=routing_headers)
-            except PricingError as error:
-                raise GatewayError("not_found", str(error)) from None
-            call["pricing_snapshot"], call["pricing_request"] = snapshot, body
-            call["routing_headers"] = routing_headers
-            call["stream"] = body.get("stream") is True
-            if path.startswith("/v1/async/") and self.tasks is None:
-                raise GatewayError("internal", "异步任务服务未初始化")
-            gateway.admit(key["team_id"], settings["teamRpm"])
-            try:
-                gateway.recheck_access(handler, call)
-                if gateway.client_gone(handler):
-                    raise GatewayError("client_closed", "客户端已断开，请求未发出，不计费")
-                self.forward(handler, path, call, upstream, body, payload, content_type, length)
-            finally:
-                gateway.release(key["team_id"])
+    def prepare_request(self, handler, path, call, upstream, body, length, encoded_request=None):
+        model = body.get("model")
+        if not isinstance(model, str) or not model or len(model) > 100:
+            raise APIError(400, "请求必须指定模型名称")
+        call["model"] = call["requested_model"] = model
+        if model not in upstream.get("models", {}):
+            raise GatewayError("not_found", "模型不在本活动开放列表中")
+        call["request_bytes"] = length
+        # Multipart binary input is never persisted in request-content logs.
+        if call["log"]:
+            call["request"] = encoded_request if encoded_request is not None else gateway_json(body)
+        reject_stored_file_references(body)
+        self._check_shared_state(body)
+        settings = call["settings"]
+        if settings["blockedWords"]:
+            text = request_text(body)
+            if any(" ".join(unicodedata.normalize("NFKC", w).split()).lower() in text
+                   for w in settings["blockedWords"] if w.strip()):
+                raise GatewayError("forbidden", "请求内容包含本活动禁止的词语，已拦截")
+        if "stream" in body and type(body["stream"]) is not bool:
+            raise APIError(400, "stream 必须是布尔值")
+        routing_headers = {}
+        for name in ("X-Compute-Id", "X-Pipeline-Tag"):
+            values = handler.headers.get_all(name, [])
+            if len(values) > 1:
+                raise APIError(400, "模型路由请求头不能重复")
+            if values:
+                value = values[0].strip()
+                if not value or len(value) > 200 or any(ord(c) < 32 or ord(c) > 126 for c in value):
+                    raise APIError(400, "模型路由请求头不正确")
+                routing_headers[name] = value
+        try:
+            snapshot = self.catalog.resolve(model, path, body, headers=routing_headers)
+        except PricingError as error:
+            raise GatewayError("not_found", str(error)) from None
+        call["pricing_snapshot"], call["pricing_request"] = snapshot, body
+        call["routing_headers"] = routing_headers
+        call["stream"] = body.get("stream") is True
+        if path.startswith("/v1/async/") and self.tasks is None:
+            raise GatewayError("internal", "异步任务服务未初始化")
 
     @staticmethod
     def _check_shared_state(value):
@@ -363,121 +369,16 @@ class MediaGateway:
             for item in value:
                 MediaGateway._check_shared_state(item)
 
-    def forward(self, handler, path, call, upstream, body, payload, content_type, length):
-        gateway = self.gateway
-        headers = {"Authorization": "Bearer " + upstream["key"], "Content-Type": content_type,
-                   "Content-Length": str(length), "Accept-Encoding": "identity",
-                   "User-Agent": (handler.headers.get("User-Agent") or "gotc-gateway/1.0")[:300]}
-        headers.update(call.get("routing_headers", {}))
-        if "X-Compute-Id" in headers:
-            headers["X-Failover-Enabled"] = "false"
-        request = urllib.request.Request(upstream["url"].rstrip("/") + path[len("/v1"):],
-                                         data=SizedUpload(payload, length), headers=headers, method="POST")
-        request._gotc_upload_admitted = lambda: gateway.upload_ready(handler, call)
-        handler.connection.settimeout(transport.UPSTREAM_TIMEOUT)
+    def response_json(self, raw, call, status):
         try:
-            # Generations can have side effects. A submitted request is never automatically replayed.
-            response = gateway.opener.open(request, timeout=transport.UPSTREAM_TIMEOUT)
-        except urllib.error.HTTPError as error:
-            with error:
-                raw = error.read(FIELD_LIMIT)
-                call["upstream_request_id"] = error.headers.get("request-id") or error.headers.get("x-request-id") or ""
-                raw = redact_error_payload(raw, gateway.error_secrets(call))
-                message = upstream_message(raw, gateway.error_secrets(call)) or f"HTTP {error.code}"
-                mapped = upstream_http_error(path, error.code, message)
-                if mapped:
-                    raise mapped from None
-                raise GatewayError("upstream_invalid", message, status=400, upstream_status=error.code,
-                                        upstream_message=message) from None
-        except (OSError, http.client.HTTPException) as error:
-            if transport.request_was_sent(error):
-                call["billing"] = _pending("submission_outcome_unknown")
-            raise GatewayError("network", "上游连接失败；已提交请求的费用等待核对",
-                                    upstream_message=transport.failure_reason(error)) from None
-        call["forwarded"], call["status"] = True, response.status
-        call["billing"] = _pending("provider_usage_not_received")
-        call["upstream_request_id"] = response.headers.get("request-id") or response.headers.get("x-request-id") or ""
-        call["reply_headers"] = transport.passed_headers(response.headers)
-        call["pricing_headers"] = {k: v for k, v in response.headers.items()
-                                   if k.lower() in {"inference-cost", "inference-currency", "inference-cost-currency"}}
-        call["first_token_ms"] = int((time.monotonic() - call["started"]) * 1000)
-        with response:
-            mime = response.headers.get("Content-Type", "application/json").split(";", 1)[0].strip().lower()
-            if response.headers.get("Content-Encoding", "identity").lower() != "identity":
-                raise GatewayError("upstream", "上游返回了不支持的媒体压缩编码")
-            if mime == "text/event-stream":
-                if path.startswith("/v1/async/"):
-                    raise GatewayError("upstream", "异步任务提交未返回任务 JSON")
-                call["stream"] = True
-                call["billing_finalize"] = lambda: self._quote(call)
-                try:
-                    gateway.relay_stream(handler, "openai", response, "text/event-stream", call)
-                finally:
-                    self._quote(call)
-                return
-            with tempfile.SpooledTemporaryFile(max_size=SPOOL_MEMORY, mode="w+b") as output:
-                size = self._read_response(response, output)
-                call["reply_bytes"] = size
-                output.seek(0)
-                if mime == "application/json" or mime.endswith("+json"):
-                    raw = output.read()
-                    try:
-                        data = json.loads(raw, parse_constant=lambda s: (_ for _ in ()).throw(ValueError(s)))
-                        validate_json_depth(data)
-                        gateway_json(data)
-                    except (ValueError, RecursionError, UnicodeError):
-                        raise GatewayError("upstream", "上游返回了无法解析的 JSON") from None
-                    if isinstance(data, dict) and isinstance(data.get("error"), (dict, str)):
-                        call["forwarded"], call["billing"] = False, _zero("provider_rejected")
-                        raise GatewayError("upstream", "上游模型服务返回错误", upstream_status=response.status,
-                                                upstream_message=upstream_message(raw, gateway.error_secrets(call)))
-                    usage.read_usage("openai", data, call["usage"], call)
-                    if path.startswith("/v1/async/"):
-                        data = self.tasks.register(call, upstream, data, request=body, headers=dict(response.headers))
-                        raw = gateway_json(data)
-                    else:
-                        self._quote(call, data)
-                    call["done"] = True
-                    gateway.keep(call, raw)
-                    gateway.safe_record(handler, call)
-                    gateway.send(handler, call, response.status, "application/json", raw)
-                    return
-                if path.startswith("/v1/async/") or not (mime.startswith(("audio/", "image/")) or mime == "application/octet-stream"):
-                    raise GatewayError("upstream", "上游返回了不支持的媒体类型")
-                metadata = {"_binary": {"bytes": size, "content_type": mime}}
-                duration = _wav_duration(output, 0, size)
-                if duration is not None:
-                    metadata["duration"] = duration
-                self._quote(call, metadata)
-                call["done"] = True
-                gateway.keep(call, gateway_json(metadata))
-                gateway.safe_record(handler, call)
-                gateway.send(handler, call, response.status, mime, length=size)
-                output.seek(0)
-                while True:
-                    block = output.read(CHUNK)
-                    if not block:
-                        break
-                    gateway.send(handler, call, response.status, mime, block)
-
-    @staticmethod
-    def _read_response(response, output):
-        declared = response.headers.get("Content-Length")
-        if declared is not None and (not declared.isdigit() or int(declared) > REPLY_LIMIT):
-            raise GatewayError("upstream", "上游媒体响应长度不正确或超过 64MB 限制")
-        total = 0
-        try:
-            while True:
-                block = response.read(min(CHUNK, REPLY_LIMIT - total + 1))
-                if not block:
-                    break
-                total += len(block)
-                if total > REPLY_LIMIT:
-                    raise GatewayError("upstream", "上游媒体响应超过 64MB 限制")
-                output.write(block)
-        except (OSError, http.client.HTTPException) as error:
-            raise GatewayError("network", "上游媒体响应中断，费用等待核对",
-                                    upstream_message=transport.failure_reason(error)) from None
-        if declared is not None and total != int(declared):
-            raise GatewayError("network", "上游媒体响应未完整接收，费用等待核对")
-        return total
+            data = json.loads(raw, parse_constant=lambda s: (_ for _ in ()).throw(ValueError(s)))
+            validate_json_depth(data)
+            gateway_json(data)
+        except (ValueError, RecursionError, UnicodeError):
+            raise GatewayError("upstream", "上游返回了无法解析的 JSON") from None
+        if isinstance(data, dict) and isinstance(data.get("error"), (dict, str)):
+            call["forwarded"], call["billing"] = False, _zero("provider_rejected")
+            raise GatewayError("upstream", "上游模型服务返回错误", upstream_status=status,
+                                    upstream_message=upstream_message(raw, self.gateway.error_secrets(call)))
+        usage.read_usage("openai", data, call["usage"], call)
+        return data

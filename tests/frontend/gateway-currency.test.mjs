@@ -65,6 +65,13 @@ test('ranking orders CNY and USD independently, without converting or combining 
   assert.doesNotMatch(html,/¥10\.00|\$10\.00/);
 });
 
+test('organizer distinguishes an unavailable gateway from a live idle queue',()=>{
+  const f=fixture();
+  assert.equal(f.run('apiConcurrency(null,null)'), '暂不可用');
+  assert.equal(f.run('apiConcurrency(0,0)'), '0 / 0');
+  assert.equal(f.run('apiConcurrency(2,1)'), '2 / 1');
+});
+
 test('admin overview main fee card is split even when the selected upstream is CNY',()=>{
   const f=fixture();
   f.ctx.consoleContext={data:{enabled:true,overview:{cost:null,billing:mixed},teams:[],upstreams:{},models:{}},
