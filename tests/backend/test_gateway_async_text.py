@@ -26,6 +26,7 @@ class Context:
     def __init__(self, url, path, payload, result, extra_headers=None):
         self.out = []
         self.recorded = self.attempts = 0
+        self.admissions = 0
         self.call = {"path": path, "usage": [0] * 5, "secrets": (), "stream": False, "log": True, "reply_bytes": 0,
                      "started": time.monotonic(), "forwarded": False, "done": False, "settings": {"blockedWords": []}}
         config = {kind: {"url": url, "key": "synthetic-private", "models": {"model-x": [1, 2]}, "aliases": {}}
@@ -53,6 +54,11 @@ class Context:
 
     @asynccontextmanager
     async def admitted(self, count_tokens=False, defer_rpm=False):
+        self.admissions += 1
+        yield
+
+    @asynccontextmanager
+    async def uploading(self):
         yield
 
     async def reserve_bulk_memory(self):
@@ -60,6 +66,12 @@ class Context:
 
     def release_bulk_memory(self):
         pass
+
+    def retain_spool(self, size):
+        self.spool_bytes = size
+
+    def release_spool(self, size):
+        self.spool_bytes -= size
 
     async def charge_rpm(self):
         pass
@@ -83,6 +95,30 @@ class TextTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(ctx.upstream.aclose)
         return ctx
 
+    async def test_paused_upload_acquires_model_capacity_only_after_validation(self):
+        payload = b'{"model":"model-x","messages":[]}'
+        paused, resume = asyncio.Event(), asyncio.Event()
+        async def stream():
+            yield payload[:10]
+            paused.set()
+            await resume.wait()
+            yield payload[10:]
+
+        for path in ("/v1/chat/completions", "/v1/messages/count_tokens"):
+            with self.subTest(path=path):
+                paused.clear()
+                resume.clear()
+                ctx = self.ctx(path, payload, lambda _: httpx.Response(200, json={}))
+                ctx.request = SimpleNamespace(stream=stream)
+                job = asyncio.create_task(serve_text(ctx, path))
+                try:
+                    await asyncio.wait_for(paused.wait(), 2)
+                    self.assertEqual(ctx.admissions, 0)
+                finally:
+                    resume.set()
+                    await asyncio.wait_for(job, 2)
+                self.assertEqual((ctx.admissions, ctx.attempts), (1, 1))
+
     async def test_chat_request_usage_json_response_and_header_allowlist(self):
         raw = b'{ "model": "model-x", "messages": [], "service_tier": "priority" }'
         response = b'{ "choices": [], "usage": {"prompt_tokens":4,"completion_tokens":2} }'
@@ -105,6 +141,7 @@ class TextTests(unittest.IsolatedAsyncioTestCase):
             await serve_text(ctx, ctx.call["path"])
         self.assertEqual(caught.exception.status, 400)
         self.assertEqual(ctx.attempts, 0)
+        self.assertEqual(ctx.admissions, 0)
 
     async def test_count_tokens_error_is_free_and_sdk_fallback_supported(self):
         ctx = self.ctx("/v1/messages/count_tokens", b'{"model":"model-x"}',

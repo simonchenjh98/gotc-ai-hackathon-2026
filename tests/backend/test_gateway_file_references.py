@@ -23,7 +23,7 @@ class GatewayFileReferenceTests(unittest.TestCase):
         item = self.latest()
         self.assertEqual((item['status'], item['cost'], item['estimated']), (400, 0, 0))
         self.assertReleased(team)
-        self.assertEqual(self.service.keys.counting[team], 0)
+        self.assertEqual(self.service.keys.task_slots.running[team], 0)
 
     def assert_forwarded(self, path, body, key):
         before = len(test_keys.FakeUpstream.calls)

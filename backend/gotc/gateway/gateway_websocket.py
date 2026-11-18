@@ -197,16 +197,17 @@ async def speech_session(websocket, ctx, path, first_event):
         if set(query) != {'model'} or len(query.getlist('model')) != 1:
             raise GatewayError('invalid', 'Exactly one model query parameter is required')
         protocols = browser_credentials(websocket, ctx)
-        async with ctx.admitted():
-            model = resolve(upstream, query['model'])
-            if model is None:
-                raise GatewayError('not_found', '模型不在本活动开放列表中')
-            try:
-                snapshot = gateway.catalog.resolve(model, path, {})
-            except PricingError:
-                raise GatewayError('invalid', '实时语音模型定价不可用') from None
-            call.update(model=model, requested_model=query['model'], pricing_snapshot=snapshot, pricing_request={'model': model})
-            call['secrets'] += (upstream['key'],)
+        await ctx.authenticate()
+        model = resolve(upstream, query['model'])
+        if model is None:
+            raise GatewayError('not_found', '模型不在本活动开放列表中')
+        try:
+            snapshot = gateway.catalog.resolve(model, path, {})
+        except PricingError:
+            raise GatewayError('invalid', '实时语音模型定价不可用') from None
+        call.update(model=model, requested_model=query['model'], pricing_snapshot=snapshot, pricing_request={'model': model})
+        call['secrets'] += (upstream['key'],)
+        async with ctx.admitted(lane="speech"):
             try:
                 remote = await provider_connection(upstream, path, model, protocols)
             except (OSError, WebSocketException, ValueError):

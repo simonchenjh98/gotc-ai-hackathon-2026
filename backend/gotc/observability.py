@@ -100,10 +100,8 @@ class ObservabilityMiddleware:
             waits = DB_WAITS.copy()
         running = queued = 0
         if self.role == "gateway":
-            keys = self.service.keys
-            with keys.lock:
-                running = sum(keys.inflight.values()) + sum(keys.counting.values())
-                queued = sum(keys.waiting.values())
+            active_teams, queued_teams = self.service.keys.admission_snapshot()
+            running, queued = sum(active_teams.values()), sum(queued_teams.values())
         lines = [
             f"gotc_requests_total {counts['requests']}",
             f"gotc_request_errors_total {counts['errors']}",

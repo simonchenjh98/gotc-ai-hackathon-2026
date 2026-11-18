@@ -85,7 +85,7 @@ FILES = PAGES_FILES | manifest({
         'database.py errors.py listener.py observability.py organizer.py service.py settings.py validation.py write_conflicts.py'
     ),
     'backend/gotc/gateway': (
-        '__init__.py accounting.py asgi.py asgi_context.py async_media.py async_tasks.py async_text.py config.py content_store.py gateway_catalog.json gateway_cors.py '
+        '__init__.py accounting.py admission.py asgi.py asgi_context.py async_media.py async_tasks.py async_text.py config.py content_store.py gateway_catalog.json gateway_cors.py '
         'gateway_media.py gateway_pricing.py gateway_tasks.py gateway_uploads.py '
         'gateway_websocket.py keys.py memory.py protocol_errors.py requests.py '
         'stream_events.py text_policy.py transport.py usage.py'

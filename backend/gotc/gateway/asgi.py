@@ -12,7 +12,7 @@ from starlette.websockets import WebSocket
 
 from ..errors import APIError
 from ..http.policy import HTTPPolicy, api_error
-from . import keys
+from .admission import CONTROL_RESERVE
 from .asgi_context import GatewayContext
 from .async_media import reconcile_tasks, serve_media, serve_task
 from .async_text import ROUTES as TEXT_ROUTES, serve_text
@@ -55,13 +55,8 @@ class GatewayEndpoint:
 
     async def __call__(self, scope, receive, send):
         websocket = scope["type"] == "websocket"
-        async def body_event():
-            try:
-                async with asyncio.timeout(15):
-                    return await receive()
-            except TimeoutError:
-                raise APIError(408, "请求上传超时") from None
-        request = WebSocket(scope, receive, send) if websocket else Request(scope, body_event)
+        # request_chunks applies idle and total upload deadlines solely while reading the body.
+        request = WebSocket(scope, receive, send) if websocket else Request(scope, receive)
         scope["gateway_send"] = send
         path = scope["path"][len(self.service.base_path):]
         ctx = GatewayContext(self.service.keys, request, path)
@@ -84,7 +79,11 @@ class GatewayEndpoint:
         entered = False
         try:
             state = scope["app"].state
-            if state.ingress >= keys.GLOBAL_RUNNING + keys.GLOBAL_QUEUE_CAP:
+            # Long-lived work leaves space for catalog queries and fast policy denials.
+            limit = gateway.capacity.total_requests
+            if self.operation in (serve_text, serve_media, serve_task, serve_websocket):
+                limit -= CONTROL_RESERVE
+            if state.ingress >= limit:
                 raise GatewayError("rate_limit", "中转服务排队请求已满，请稍后重试", retry_after=2)
             state.ingress += 1
             entered = True
@@ -99,6 +98,9 @@ class GatewayEndpoint:
             return await self.operation(ctx, path)
         except asyncio.CancelledError:
             disconnected = True
+            if not ctx.call["status"]:
+                # Forced server shutdown can also cancel an authenticated, queued ASGI task.
+                gateway.note_error(ctx.call, GatewayError("client_closed", "请求在完成前已取消"))
             raise
         except (ClientGone, ClientDisconnect):
             disconnected = True

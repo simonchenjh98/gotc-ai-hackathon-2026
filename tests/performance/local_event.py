@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 BASE = "/gotc"
@@ -81,20 +82,36 @@ class Client:
 
 def child(kind, source, work):
     sys.path.insert(0, str(source))
-    # Fixture size is fixed and small on both revisions. There are no waiters.
-    from backend.gotc.gateway import keys
+    if os.environ.get("GOTC_QA_RESOURCES"):
+        sampled_peak = 0
 
-    if os.environ.get("GOTC_QA_PEAK_RSS") and kind == "gateway":
-        def write_peak(*_):
+        def sample_fds():
+            nonlocal sampled_peak
+            path = "/dev/fd" if sys.platform == "darwin" else "/proc/self/fd"
+            while True:
+                # Listing includes one temporary descriptor for the directory itself.
+                count = sum(name.isdigit() for name in os.listdir(path)) - 1
+                sampled_peak = max(sampled_peak, count)
+                time.sleep(.02)
+
+        if os.environ["GOTC_QA_RESOURCES"] == "rss-fds":
+            threading.Thread(target=sample_fds, daemon=True).start()
+
+        def snapshot(*_):
             units = 1 if sys.platform == "darwin" else 1024
             peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * units
-            (work / "gateway-peak").write_text(str(peak))
-        signal.signal(signal.SIGUSR1, write_peak)
-    else:
+            data = {"rss_high_water_bytes": peak, "sampled_peak_fds": sampled_peak}
+            tmp = work / (kind + ".snapshot.tmp")
+            tmp.write_text(json.dumps(data))
+            tmp.replace(work / (kind + ".snapshot"))
+
+        signal.signal(signal.SIGUSR1, snapshot)
+    if kind == "baseline":
+        # Only the archived one-process reference uses Python constants for admission.
+        from backend.gotc.gateway import keys
         keys.TEAM_CONCURRENCY = SLOTS
         if hasattr(keys, "GLOBAL_RUNNING"):
             keys.GLOBAL_RUNNING = SLOTS
-    if kind == "baseline":
         from backend.gotc.http.server import EventHTTPServer
         from backend.gotc.service import EventService
 
@@ -125,7 +142,7 @@ def stop(process):
 
 
 @contextmanager
-def event(source, layout, *, gateway_measurement=None):
+def event(source, layout, *, gateway_measurement=None, capacity_measurement=None):
     with tempfile.TemporaryDirectory(
         prefix="gotc-qa-", dir="/tmp"
     ) as directory, ExitStack() as stack:
@@ -141,18 +158,26 @@ def event(source, layout, *, gateway_measurement=None):
             NO_PROXY="127.0.0.1,localhost",
             GOTC_GATEWAY_SOCKET=str(work / "gateway.sock"),
         )
-        if gateway_measurement is not None:
-            env["GOTC_QA_PEAK_RSS"] = "1"
-        def peak_rss():
-            peak = work / "gateway-peak"
-            peak.unlink(missing_ok=True)
-            process.send_signal(signal.SIGUSR1)  # The last process in the pair owns the gateway.
-            cutoff = time.monotonic() + 2
-            while time.monotonic() < cutoff:
-                if peak.exists() and (value := peak.read_text()).isdigit():
-                    return int(value)
-                time.sleep(0.01)
-            raise RuntimeError("Gateway RSS sample timed out")
+        if capacity_measurement is not None:
+            env["GOTC_QA_RESOURCES"] = "rss-fds"  # Run at the service's actual capacity defaults.
+        else:
+            env["GOTC_GATEWAY_TEAM_RUNNING"] = str(SLOTS)
+            env["GOTC_GATEWAY_GLOBAL_RUNNING"] = "4" if gateway_measurement is not None else str(SLOTS)
+            if gateway_measurement is not None:
+                env["GOTC_QA_RESOURCES"] = "rss"
+
+        processes = {}
+
+        def snapshot(role):
+            path = work / (role + ".snapshot")
+            path.unlink(missing_ok=True)
+            processes[role].send_signal(signal.SIGUSR1)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if path.exists():
+                    return json.loads(path.read_text())
+                time.sleep(.01)
+            raise RuntimeError(f"{role} resource snapshot timed out")
         endpoints = {}
         for kind in (["baseline"] if layout == "baseline" else ["platform", "gateway"]):
             diagnostic = stack.enter_context((work / (kind + ".stderr")).open("w+b"))
@@ -164,6 +189,7 @@ def event(source, layout, *, gateway_measurement=None):
                 stdout=subprocess.DEVNULL,
                 stderr=diagnostic,
             )
+            processes[kind] = process
             stack.callback(stop, process)
             marker = work / ("port" if kind == "baseline" else kind + ".sock")
             deadline = time.monotonic() + 15
@@ -212,10 +238,14 @@ def event(source, layout, *, gateway_measurement=None):
             assert Client(platform).request("GET", "/v1/models")[0] == 404
             assert Client(gateway).request("GET", "/api/session")[0] == 404
         if gateway_measurement is not None:
-            gateway_measurement["ready_high_water_bytes"] = peak_rss()
+            gateway_measurement["ready_high_water_bytes"] = snapshot("gateway")["rss_high_water_bytes"]
+        if capacity_measurement is not None:
+            capacity_measurement["ready"] = {kind: snapshot(kind) for kind in processes}
         yield platform, gateway, private
+        if capacity_measurement is not None:
+            capacity_measurement["final"] = {kind: snapshot(kind) for kind in processes}
         if gateway_measurement is not None:
-            gateway_measurement["final_high_water_bytes"] = peak_rss()
+            gateway_measurement["final_high_water_bytes"] = snapshot("gateway")["rss_high_water_bytes"]
 
 
 def seeded(platform, private):

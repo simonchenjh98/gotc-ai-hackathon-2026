@@ -33,7 +33,8 @@ STATUS_KINDS = {400: "invalid", 401: "auth", 403: "forbidden", 404: "not_found",
 class GatewayError(APIError):
     """An error with a sub2api-style classification; plain APIError statuses are classified by STATUS_KINDS."""
 
-    def __init__(self, kind, message, status=None, upstream_status=None, upstream_message="", retry_after=None, detail=""):
+    def __init__(self, kind: str, message: str, status: int | None = None, upstream_status: int | None = None,
+                 upstream_message: str = "", retry_after: int | None = None, detail: str = "") -> None:
         super().__init__(status or ERROR_KINDS[kind][0], message)
         self.kind, self.upstream_status, self.upstream_message = kind, upstream_status, upstream_message
         self.retry_after, self.detail = retry_after, detail  # detail: recorded for admins, never sent to the team

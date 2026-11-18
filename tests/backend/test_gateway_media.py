@@ -10,11 +10,14 @@ import types
 import unittest
 from unittest import mock
 import wave
+import zlib
 
 import httpx
 from starlette.requests import Request
 
 from backend.gotc.errors import APIError
+from backend.gotc.gateway.accounting import compressed_request
+from backend.gotc.gateway.admission import BodyUploads, GatewayCapacity
 from backend.gotc.gateway.asgi_context import GatewayContext
 from backend.gotc.gateway.async_media import serve_media
 from backend.gotc.gateway.memory import BulkMemory
@@ -183,6 +186,8 @@ class Gateway(keys.KeyService):
     def __init__(self):
         self.opener = gateway_transport.make_opener({})
         self.memory = BulkMemory()
+        self.capacity = GatewayCapacity()
+        self.body_uploads = BodyUploads(self.capacity)
         self.records = []
         self.admitted = self.released = self.rechecked = 0
         self.config = {}
@@ -195,12 +200,10 @@ class Gateway(keys.KeyService):
         call["log"] = True
         return call["key"]
 
-    async def admit_async(self, team, rpm, count_tokens=False, bulk_lease=None):
-        if bulk_lease is not None:
-            await bulk_lease.acquire()
+    async def admit_async(self, team, rpm, count_tokens=False, lane="model", wait_for_grant=None):
         self.admitted += 1
 
-    def release(self, team, count_tokens=False):
+    def release(self, team, count_tokens=False, lane="model"):
         self.released += 1
 
     def recheck_access(self, handler, call):
@@ -246,7 +249,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.pricing.start()
         self.addCleanup(self.pricing.stop)
 
-    async def request(self, path="/v1/embeddings", data=None, mime="application/json", raw=None, auth="Bearer client-key", extra_headers=()):
+    async def request(self, path="/v1/embeddings", data=None, mime="application/json", raw=None, auth="Bearer client-key", extra_headers=(), receive=None):
         if raw is None:
             raw = json.dumps(data or {"model": "valid", "input": "hello"}).encode()
         headers = [("Content-Type", mime), ("Content-Length", str(len(raw))), ("Authorization", auth),
@@ -254,7 +257,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         path, _, query = path.partition("?")
         sent, messages = [], iter([{"type": "http.request", "body": raw}])
 
-        async def receive():
+        async def default_receive():
             message = next(messages, None)
             if message is None:
                 await asyncio.Event().wait()  # The client remains connected until delivery.
@@ -265,7 +268,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
         request = Request({"type": "http", "scheme": "http", "server": ("localhost", 80), "method": "POST",
                            "path": path, "query_string": query.encode(), "client": ("127.0.0.1", 12345),
-                           "headers": [(k.lower().encode(), v.encode()) for k, v in headers], "gateway_send": send}, receive)
+                           "headers": [(k.lower().encode(), v.encode()) for k, v in headers], "gateway_send": send}, receive or default_receive)
         ctx = GatewayContext(self.gw, request, path)
         self.last_call = ctx.call
         self.gw.tasks = self.media.tasks
@@ -273,8 +276,91 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             await serve_media(ctx, path)
             await ctx.finish()
         finally:
-            ctx.release_bulk_memory()
+            ctx.close()
         return ctx.call, b"".join(m.get("body", b"") for m in sent), dict(httpx.Headers(sent[0]["headers"]))
+
+    async def test_paused_multipart_receives_under_bulk_lease_before_model_admission(self):
+        mime, raw = self.large_uploads()[1]
+        paused, resume = asyncio.Event(), asyncio.Event()
+        parts = iter((raw[:100], raw[100:]))
+        async def receive():
+            part = next(parts, None)
+            if part is not None:
+                if len(part) == 100:
+                    return {"type": "http.request", "body": part, "more_body": True}
+                paused.set()
+                await resume.wait()
+                return {"type": "http.request", "body": part}
+            await asyncio.Event().wait()
+        job = asyncio.create_task(self.request(raw=raw, mime=mime, receive=receive))
+        try:
+            await asyncio.wait_for(paused.wait(), 3)
+            self.assertEqual(self.gw.admitted, 0)
+            self.assertIsNotNone(self.gw.memory.owner)
+            self.assertEqual(self.gw.body_uploads.running["team-1"], 1)
+        finally:
+            resume.set()
+            await asyncio.wait_for(job, 3)
+        self.assertEqual(Provider.calls[0][2], raw)
+        self.assertIsNone(self.gw.memory.owner)
+
+    async def test_large_form_metadata_leaves_memory_while_queued_and_is_logged_without_file_contents(self):
+        prompt = "x" * 600_000
+        raw = multipart([("model", "valid", None), ("prompt", prompt, None), ("text", prompt, None),
+                         ("file", b"synthetic binary fixture", "clip.wav")])
+        admit = self.gw.admit_async
+        async def inspect_queue(*args, **kwargs):
+            self.assertEqual(self.gw.body_uploads.running.total(), 0)
+            self.assertIsNone(self.gw.memory.owner)
+            self.assertNotIn("pricing_request", self.last_call)
+            self.assertEqual(self.last_call["request"], b"")
+            self.assertFalse(self.last_call["request_file"].closed)
+            await admit(*args, **kwargs)
+
+        def record(handler, call):
+            self.assertIsNotNone(self.gw.memory.owner)
+            with compressed_request(call) as (encoded, size):
+                encoded.seek(0)
+                capture = zlib.decompress(encoded.read())
+            self.assertEqual(size, len(capture))
+            self.assertNotEqual(size, call["request_bytes"])
+            self.assertEqual(json.loads(capture)["text"], prompt)
+            self.assertNotIn(b"synthetic binary fixture", capture)
+            call["recorded"] = True
+
+        with mock.patch.object(self.gw, "admit_async", inspect_queue), mock.patch.object(self.gw, "safe_record", record):
+            call, _, _ = await self.request(raw=raw, mime="multipart/form-data; boundary=test-boundary")
+        self.assertEqual(Provider.calls[0][2], raw)
+        self.assertEqual(call["request_bytes"], len(raw))
+        self.assertEqual(self.quotes[-1][1]["request"]["prompt"], prompt)
+        self.assertIsNone(self.gw.memory.owner)
+
+    async def test_queued_spool_budget_releases_on_completion_and_allows_small_requests(self):
+        mime, raw = self.large_uploads()[0]
+        self.gw.memory.spool_limit = len(raw)
+        queued, resume = asyncio.Event(), asyncio.Event()
+        admit = self.gw.admit_async
+        async def pause_first(*args, **kwargs):
+            if not queued.is_set():
+                queued.set()
+                await resume.wait()
+            await admit(*args, **kwargs)
+
+        with mock.patch.object(self.gw, "admit_async", pause_first):
+            first = asyncio.create_task(self.request(raw=raw, mime=mime))
+            try:
+                await asyncio.wait_for(queued.wait(), 3)
+                with self.assertRaises(gateway_protocol_errors.GatewayError) as error:
+                    await self.request(raw=raw, mime=mime)
+                self.assertEqual(error.exception.status, 429)
+                self.assertGreater(error.exception.retry_after, 0)
+                await self.request()
+                self.assertEqual(len(Provider.calls), 1)
+            finally:
+                resume.set()
+                await asyncio.wait_for(first, 3)
+        await self.request(raw=raw, mime=mime)
+        self.assertEqual(len(Provider.calls), 3)
 
     def local_gitee_connection(self):
         """Use HTTPX against the real loopback fixture while exercising provider-specific limits."""
@@ -415,6 +501,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(APIError):
                 await self.request(**kwargs)
         self.assertEqual(Provider.calls, [])
+        self.assertEqual(self.gw.admitted, 0)
 
     async def test_chat_and_websocket_are_not_media_http_routes(self):
         self.assertFalse(self.media.supports("/v1/chat/completions"))

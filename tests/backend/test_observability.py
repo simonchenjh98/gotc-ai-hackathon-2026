@@ -84,8 +84,7 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.get(path, client=None, server=("/run/gateway.sock", None)))[0], 200)
 
     async def test_active_sse_and_gateway_admission_use_actual_gauges(self):
-        self.service.keys = SimpleNamespace(lock=threading.Lock(), inflight={"one": 2}, waiting={"one": 3},
-                                            counting=defaultdict(int))
+        self.service.keys = SimpleNamespace(admission_snapshot=lambda: ({"one": 2}, {"one": 3}))
         async def stream(scope, receive, send):
             await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/event-stream")]})
             metrics = (await self.get("/metrics"))[2]

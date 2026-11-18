@@ -1,0 +1,58 @@
+{
+  "workload": {
+    "seed": 20261118,
+    "sha256_binary_arrival_team_duration": "f8c89970638e71499b5de12ffd6fd0bd451b1ab25600b21dcc8b34d2e5fe8005",
+    "calls": 69266,
+    "teams": 40,
+    "periods": 24,
+    "peak_global": 78,
+    "peak_one_team": 24,
+    "duration_seconds": {
+      "p50": 15.584,
+      "p90": 44.378,
+      "p99": 149.378
+    }
+  },
+  "baseline": {
+    "limits": {
+      "team_running": 2,
+      "global_running": 4,
+      "team_queue": 20,
+      "global_queue": 4,
+      "round_robin": false,
+      "timeout_seconds": 30
+    },
+    "outcomes": {
+      "served": 9472,
+      "global_queue_full": 58144,
+      "queue_timeout": 1650
+    },
+    "rejected": 59794,
+    "rejected_fraction": 0.8632518118557445,
+    "peak_running": 4,
+    "peak_queued": 4,
+    "waited_then_served": 9374,
+    "queued_served_wait_p95_seconds": 28.34
+  },
+  "candidate": {
+    "limits": {
+      "team_running": 15,
+      "global_running": 64,
+      "team_queue": 16,
+      "global_queue": 64,
+      "round_robin": true,
+      "timeout_seconds": 30
+    },
+    "outcomes": {
+      "served": 69059,
+      "team_queue_full": 187,
+      "queue_timeout": 20
+    },
+    "rejected": 207,
+    "rejected_fraction": 0.0029884791961424075,
+    "peak_running": 64,
+    "peak_queued": 20,
+    "waited_then_served": 874,
+    "queued_served_wait_p95_seconds": 27.399
+  }
+}

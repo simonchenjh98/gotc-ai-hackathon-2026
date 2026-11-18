@@ -121,7 +121,7 @@ def compressed_request(call):
             size += len(block)
             encoded.write(compressor.compress(block))
         encoded.write(compressor.flush())
-        if size != call["request_bytes"]:
+        if size != call.get("request_capture_bytes", call["request_bytes"]):
             raise OSError("Incomplete spooled request capture")
         source.close()
         yield encoded, size

@@ -72,7 +72,7 @@ class GatewayProtocolErrorTests(unittest.TestCase):
                         detail = self.admin.post("/api/admin/keys/log", {"id": item["id"]})[1]["response"]
                         self.assertIn("请求已发出，按估算用量计费", detail)
                         self.assertReleased(team_id)
-                        self.assertEqual(self.service.keys.inflight[team_id], 0)
+                        self.assertEqual(self.service.keys.model_slots.running[team_id], 0)
 
     def test_malformed_count_tokens_reply_remains_free(self):
         team_id, client, key = self.enabled_key()
@@ -88,7 +88,7 @@ class GatewayProtocolErrorTests(unittest.TestCase):
                 self.assertEqual((item["cost"], item["incomplete"], item["estimated"]), (0, 0, 0))
                 self.assertEqual(client.get("/api/team/keys")[1]["usage"]["used24h"], 0)
                 self.assertReleased(team_id)
-                self.assertEqual(self.service.keys.counting[team_id], 0)
+                self.assertEqual(self.service.keys.task_slots.running[team_id], 0)
 
     def test_invalid_upstream_url_is_not_charged_before_any_request_is_sent(self):
         team_id, client, key = self.enabled_key()
@@ -108,7 +108,7 @@ class GatewayProtocolErrorTests(unittest.TestCase):
                 self.assertEqual((status, item["status"], item["errorOwner"]), (500, 500, "platform"))
                 self.assertEqual(client.get("/api/team/keys")[1]["usage"]["used24h"], 0)
                 self.assertReleased(team_id)
-                self.assertEqual(self.service.keys.inflight[team_id], 0)
+                self.assertEqual(self.service.keys.model_slots.running[team_id], 0)
 
 
 if __name__ == "__main__":

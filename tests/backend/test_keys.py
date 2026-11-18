@@ -10,6 +10,7 @@ import ssl
 import subprocess
 import tempfile
 import urllib.request
+from types import SimpleNamespace
 from unittest import mock
 import sqlite3
 import threading
@@ -17,6 +18,7 @@ import unittest
 
 import test_api
 from test_api import Client
+from backend.gotc.gateway.asgi import GatewayEndpoint
 from backend.gotc.gateway import transport as gateway_transport
 from backend.gotc.gateway import async_text as gateway_relay
 from backend.gotc.gateway import usage as gateway_usage
@@ -588,10 +590,10 @@ class GatewayTests(unittest.TestCase):
     def assertReleased(self, team_id, expected=0):
         """The slot is released just after the reply is sent, so allow the server thread to finish."""
         for _ in range(100):
-            if self.service.keys.inflight[team_id] == expected:
+            if self.service.keys.model_slots.running[team_id] == expected:
                 return
             threading.Event().wait(0.02)
-        self.assertEqual(self.service.keys.inflight[team_id], expected)
+        self.assertEqual(self.service.keys.model_slots.running[team_id], expected)
 
     def latest(self):
         return self.admin.post("/api/admin/keys/logs", {})[1]["items"][0]
@@ -638,12 +640,12 @@ class GatewayTests(unittest.TestCase):
     def test_queued_request_is_rechecked_after_the_wait(self):
         team_id, _, key = self.enabled_key()
         service = self.service.keys
-        service.inflight[team_id] = keys.TEAM_CONCURRENCY  # team busy: the next request queues
+        service.model_slots.running[team_id] = service.capacity.team_running  # team busy: the next request queues
         result = {}
         waiter = threading.Thread(target=lambda: result.update(status=self.call("/v1/chat/completions", {"model": "cheap"}, key)[0]))
         waiter.start()
         for _ in range(100):
-            if service.waiting[team_id]:  # the request is now waiting for a slot
+            if service.model_slots.queued(team_id):  # the request is now waiting for a slot
                 break
             threading.Event().wait(0.02)
         self.assertEqual(self.admin.post("/api/admin/keys/revoke", {"teamId": team_id})[0], 200)
@@ -652,8 +654,8 @@ class GatewayTests(unittest.TestCase):
         waiter.join(10)
         self.assertEqual(result["status"], 401)
         self.assertEqual(len(FakeUpstream.calls), before)  # never reached the upstream
-        self.assertEqual(service.inflight[team_id], keys.TEAM_CONCURRENCY - 1)  # its slot was given back
-        self.assertReleased(team_id, keys.TEAM_CONCURRENCY - 1)
+        self.assertEqual(service.model_slots.running[team_id], service.capacity.team_running - 1)  # its slot was given back
+        self.assertReleased(team_id, service.capacity.team_running - 1)
 
     def test_saturated_gateway_still_allows_organizer_revocation(self):
         team, _, credential = self.enabled_key()
@@ -670,7 +672,8 @@ class GatewayTests(unittest.TestCase):
         def call(label):
             results[label] = self.call(path, body, credential)[0]
 
-        with mock.patch.object(keys, "GLOBAL_RUNNING", 1), mock.patch.object(keys, "GLOBAL_QUEUE_CAP", 1), \
+        with mock.patch.object(self.service.keys.model_slots, "global_running", 1), \
+                mock.patch.object(self.service.keys.model_slots, "global_queue", 1), \
                 mock.patch.object(FakeUpstream, "do_POST", paused):
             running = threading.Thread(target=call, args=("running",))
             queued = threading.Thread(target=call, args=("queued",))
@@ -679,11 +682,13 @@ class GatewayTests(unittest.TestCase):
                 self.assertTrue(provider_entered.wait(3))
                 queued.start()
                 for _ in range(150):
-                    if self.service.keys.waiting[team] == 1:
+                    if self.service.keys.model_slots.queued(team) == 1:
                         break
                     threading.Event().wait(0.01)
-                self.assertEqual(self.service.keys.waiting[team], 1)
+                self.assertEqual(self.service.keys.model_slots.queued(team), 1)
                 self.assertEqual(self.call(path, body, credential)[0], 429)
+                self.assertEqual(self.call("/v1/models", None, credential, method="GET")[0], 200)
+                self.assertEqual(self.call("/v1/models", None, method="GET")[0], 401)
                 self.assertEqual(self.admin.post("/api/admin/keys/revoke", {"teamId": team})[0], 200)
             finally:
                 release_provider.set()
@@ -1016,26 +1021,68 @@ class GatewayTests(unittest.TestCase):
     def test_client_that_left_while_queued_is_not_forwarded(self):
         team_id, _, key = self.enabled_key()
         service = self.service.keys
-        service.inflight[team_id] = keys.TEAM_CONCURRENCY
+        service.model_slots.running[team_id] = service.capacity.team_running
         body = json.dumps({"model": "cheap"}).encode()
         sock = socket.create_connection(("127.0.0.1", self.server.server_port))
         sock.sendall(b"POST " + self.service.base_path.encode() + b"/v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
                      b"Authorization: Bearer " + key.encode() + b"\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
         for _ in range(100):
-            if service.waiting[team_id]:
+            if service.model_slots.queued(team_id):
                 break
             threading.Event().wait(0.02)
-        sock.close()  # the student gives up while queued
+        self.assertEqual(service.model_slots.queued(team_id), 1)
+        sock.close()  # The running calls keep their slots after this client leaves.
         before = len(FakeUpstream.calls)
-        service.release(team_id)
+        for _ in range(100):
+            if not service.model_slots.queued(team_id):
+                break
+            threading.Event().wait(0.02)
+        self.assertEqual(service.model_slots.queued(team_id), 0)
         for _ in range(100):
             items = self.admin.post("/api/admin/keys/logs", {})[1]["items"]
             if items:
                 break
-            threading.Event().wait(0.05)
+            threading.Event().wait(0.02)
         self.assertEqual((items[0]["status"], items[0]["errorType"], items[0]["cost"]), (499, "api_error", 0))
-        self.assertEqual(len(FakeUpstream.calls), before)  # never forwarded
-        self.assertReleased(team_id, keys.TEAM_CONCURRENCY - 1)
+        self.assertEqual(len(FakeUpstream.calls), before)
+        self.assertReleased(team_id, service.capacity.team_running)
+
+    def test_native_asgi_cancellation_of_queued_authenticated_call_is_recorded(self):
+        team, _, key = self.enabled_key()
+        gateway = self.service.keys
+        gateway.model_slots.running[team] = gateway.capacity.team_running
+
+        async def interrupt():
+            body = json.dumps({"model": "cheap"}).encode()
+            messages = asyncio.Queue()
+            messages.put_nowait({"type": "http.request", "body": body, "more_body": False})
+            state = SimpleNamespace(ingress=0)
+            scope = {"type": "http", "method": "POST", "scheme": "http",
+                     "path": self.service.base_path + "/v1/chat/completions", "query_string": b"",
+                     "server": ("localhost", 80), "client": ("127.0.0.1", 1), "app": SimpleNamespace(state=state),
+                     "headers": [(b"authorization", ("Bearer " + key).encode()), (b"content-type", b"application/json"),
+                                 (b"content-length", str(len(body)).encode())]}
+
+            async def send(frame):
+                self.fail("A cancelled request must not send response frames")
+
+            endpoint = GatewayEndpoint(self.service, gateway_relay.serve_text)
+            job = asyncio.create_task(endpoint(scope, messages.get, send))
+            try:
+                async with asyncio.timeout(2):
+                    while not gateway.model_slots.queued(team):
+                        await asyncio.sleep(0.001)
+            finally:
+                job.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await job
+            self.assertEqual((state.ingress, scope["state"]["gateway_outcome"]), (0, 499))
+
+        asyncio.run(interrupt())
+        row = self.latest()
+        self.assertEqual((row["status"], row["cost"]), (499, 0))
+        self.assertEqual((gateway.model_slots.queued(team), len(FakeUpstream.calls)), (0, 0))
+        self.assertReleased(team, gateway.capacity.team_running)
 
     def test_count_tokens_mirrors_upstream_errors_and_is_never_charged(self):
         _, _, key = self.enabled_key()
@@ -1153,24 +1200,24 @@ class GatewayTests(unittest.TestCase):
     def test_queue_and_rpm_follow_sub2api(self):
         team_id, _, key = self.enabled_key()
         service = self.service.keys
-        cap, keys.QUEUE_CAP = keys.QUEUE_CAP, 0
+        cap, service.model_slots.team_queue = service.model_slots.team_queue, 0
         try:
-            service.inflight[team_id] = keys.TEAM_CONCURRENCY
+            service.model_slots.running[team_id] = service.capacity.team_running
             status, content, retry = self.raw_call("/v1/chat/completions", {"model": "cheap"}, {"Authorization": "Bearer " + key})
             self.assertEqual((status, retry), (429, "2"))  # queue full: rejected at once, not after 30 s
             self.assertIn("排队请求已满".encode(), content)
-            # count_tokens takes no concurrency slot, so it still works while the team is busy.
+            # count_tokens uses the separate lightweight lane, so it still works while the team is busy.
             self.assertEqual(self.call("/v1/messages/count_tokens", {"model": "claude-x"}, key)[0], 200)
         finally:
-            keys.QUEUE_CAP = cap
-            service.inflight[team_id] = 0
+            service.model_slots.team_queue = cap
+            service.model_slots.running[team_id] = 0
         self.assertEqual(self.admin.post("/api/admin/keys/settings", {"teamRpm": 2})[0], 200)
         service.recent[team_id].clear()
         wait, keys.QUEUE_WAIT = keys.QUEUE_WAIT, 0.2
         try:
-            service.inflight[team_id] = keys.TEAM_CONCURRENCY
+            service.model_slots.running[team_id] = service.capacity.team_running
             self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, key)[0], 429)  # queue timeout
-            service.inflight[team_id] = 0
+            service.model_slots.running[team_id] = 0
             self.assertEqual(len(service.recent[team_id]), 0)  # a request that never ran does not use up the minute
             for _ in range(2):
                 self.assertEqual(self.call("/v1/chat/completions", {"model": "cheap"}, key)[0], 200)
@@ -1395,12 +1442,12 @@ class GatewayTests(unittest.TestCase):
         service = self.service.keys
         delay, keys.QUEUE_WAIT = keys.QUEUE_WAIT, 0.3
         try:
-            service.inflight["T1"] = keys.TEAM_CONCURRENCY
+            service.model_slots.running["T1"] = service.capacity.team_running
             with self.assertRaises(keys.APIError):
                 asyncio.run(service.admit_async("T1", 0))  # times out while the team is full
             threading.Timer(0.1, service.release, ("T1",)).start()
             asyncio.run(service.admit_async("T1", 0))  # a slot frees up during the wait
-            self.assertEqual(service.inflight["T1"], keys.TEAM_CONCURRENCY)
+            self.assertEqual(service.model_slots.running["T1"], service.capacity.team_running)
         finally:
             keys.QUEUE_WAIT = delay
 

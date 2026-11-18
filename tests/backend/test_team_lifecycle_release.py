@@ -7,7 +7,6 @@ import unittest
 from unittest.mock import patch
 
 from backend.gotc import service as service_module
-from backend.gotc.gateway import keys
 from backend.gotc.teams import team_lifecycle
 import test_keys as gateway_helpers
 import test_team_lifecycle as lifecycle_helpers
@@ -140,12 +139,12 @@ class LifecycleGatewayReleaseTests(unittest.TestCase):
 
     def test_actual_queued_http_call_fails_after_recycle_before_fake_provider(self):
         team,_,key=self.enabled_key();service=self.service.keys
-        with service.lock:service.inflight[team]=keys.TEAM_CONCURRENCY
+        with service.lock:service.model_slots.running[team]=service.capacity.team_running
         with ThreadPoolExecutor(max_workers=1) as pool:
             call=pool.submit(self.call,'/v1/chat/completions',{'model':'cheap'},key)
             for _ in range(100):
                 with service.lock:
-                    if service.waiting[team]:
+                    if service.model_slots.queued(team):
                         break
                 threading.Event().wait(0.05)
             else:
@@ -154,7 +153,7 @@ class LifecycleGatewayReleaseTests(unittest.TestCase):
             finally:service.release(team)
             self.assertEqual(call.result(timeout=10)[0],401)
         self.assertEqual(gateway_helpers.FakeUpstream.calls,[])
-        with service.lock:self.assertEqual(service.inflight[team],keys.TEAM_CONCURRENCY-1)
+        with service.lock:self.assertEqual(service.model_slots.running[team],service.capacity.team_running-1)
 
     def test_already_admitted_call_may_finish_and_remains_auditable_after_recycle(self):
         team,_,key=self.enabled_key();service=self.service.keys

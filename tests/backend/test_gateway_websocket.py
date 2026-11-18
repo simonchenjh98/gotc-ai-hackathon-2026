@@ -15,6 +15,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from backend.gotc.errors import APIError
 from backend.gotc.gateway import gateway_websocket as speech
+from backend.gotc.gateway.admission import GatewayCapacity
 from backend.gotc.gateway.asgi import create_gateway_app
 from backend.gotc.gateway.gateway_pricing import Catalog, PricingError
 from backend.gotc.gateway.protocol_errors import error_info
@@ -22,6 +23,7 @@ from backend.gotc.gateway.protocol_errors import error_info
 
 class SpeechGateway:
     def __init__(self):
+        self.capacity = GatewayCapacity()
         self.records = []
         self.refreshed = 0
         self.admitted = self.released = 0
@@ -36,10 +38,12 @@ class SpeechGateway:
         call.update(key={'id': 'key', 'team_id': 'team'}, settings={'teamRpm': 60, 'blockedWords': []})
         return call['key']
 
-    async def admit_async(self, team, rpm, count_tokens=False):
+    async def admit_async(self, team, rpm, count_tokens=False, lane=None):
+        assert lane == "speech"
         self.admitted += 1
 
-    def release(self, team, count_tokens=False):
+    def release(self, team, count_tokens=False, lane=None):
+        assert lane == "speech"
         self.released += 1
 
     def recheck_access(self, handler, call):

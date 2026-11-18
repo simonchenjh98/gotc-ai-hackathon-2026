@@ -9,7 +9,7 @@ import sqlite3
 import threading
 import time
 import logging
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from contextlib import closing
 from urllib.parse import urlsplit
 
@@ -20,6 +20,7 @@ from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
 from backend.gotc.observability import GATEWAY_RUNTIME_PATH
 from . import transport
+from .admission import QUEUE_WAIT, BodyUploads, FairSlots, GatewayCapacity
 from .memory import BulkMemory
 from .accounting import (
     CAPTURE_BLOCK, DAY_MS, RESPONSE_LOG_CAP, UsageLedger, beijing_midnight, initialize_schema, now_ms,
@@ -36,18 +37,10 @@ from .requests import client_ip, gateway_json
 __all__ = ["KeyService", "load_config"]
 
 
-QUEUE_CAP = 20  # waiting requests per team beyond its running ones (sub2api defaultExtraWaitSlots)
 AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW, AUTH_BLOCK = 120, 60, 60  # per client IP, as sub2api's invalid-auth limiter
 
 
 KEY_CREATE_PER_HOUR = 60  # as sub2api; deleting a key does not give the quota back
-QUEUE_WAIT = 30  # seconds a request waits for a free team slot before 429 (agent tools send bursts)
-
-
-COUNT_TOKENS_CONCURRENCY = 15
-TEAM_CONCURRENCY = 2
-GLOBAL_RUNNING = 4
-GLOBAL_QUEUE_CAP = 4
 
 
 KEY_HASH_ITERATIONS = 1000  # keys are 256-bit random, so the server-side pepper, not iterations, carries the strength
@@ -77,23 +70,26 @@ class KeyService:
 
     def __init__(self, service, config, text):
         self.service, self.text = service, text
+        self.capacity = GatewayCapacity.from_env()
         self.pepper = load_pepper(service)
         self.seed = config  # raw gateway.json content, copied into the database once
         self.config = parse_config(config)
         self.lock = threading.Lock()
         self.config_publish_lock = threading.Lock()
-        self.async_waiters = set()
-        self.memory = BulkMemory(self.wake_waiters)
-        # ponytail: in-memory per-team concurrency; correct because the service is a single process.
-        self.inflight = defaultdict(int)
+        capacity = self.capacity
+        self.model_slots = FairSlots(team_running=capacity.team_running, global_running=capacity.global_running,
+                                     team_queue=capacity.team_queue, global_queue=capacity.global_queue)
+        self.task_slots = FairSlots(team_running=capacity.team_tasks, global_running=capacity.global_tasks)
+        self.speech_slots = FairSlots(team_running=capacity.team_speech, global_running=capacity.global_speech)
+        self.body_uploads = BodyUploads(capacity)
+        self.lanes = {"model": self.model_slots, "task": self.task_slots, "speech": self.speech_slots}
+        self.memory = BulkMemory(spool_mib=capacity.spool_mib)
         self.recent = defaultdict(deque)  # team -> monotonic times of requests in the last minute
-        self.waiting = defaultdict(int)  # team -> requests queued for a slot
-        self.counting = defaultdict(int)  # team -> count_tokens calls in flight
         self.ledger = UsageLedger(service, self.currency)
         self.auth_failures, self.auth_blocked = defaultdict(deque), {}
         self.auth_failures_seen = deque(maxlen=100000)  # failed key attempts, for the admin overview
         self.runtime_client = None  # The combined developer app owns the live counters locally.
-        self.opener = transport.make_opener()  # honours HTTPS_PROXY for reaching upstreams
+        self.opener = transport.make_opener(max_connections=capacity.provider_connections)
         self.catalog = Catalog()
         self.tasks = AsyncTasks(self, pricing=self.task_price)
         self.media = MediaGateway(self, self.catalog, self.tasks)
@@ -462,15 +458,22 @@ class KeyService:
             trust_env=False, follow_redirects=False, timeout=httpx.Timeout(0.5, connect=0.2, pool=0.1),
         )
 
+    def admission_snapshot(self):
+        running, waiting = Counter(), Counter()
+        for lane in self.lanes.values():
+            active, queued = lane.snapshot()
+            running.update(active)
+            waiting.update(queued)
+        return running, waiting
+
     def runtime_snapshot(self):
         now = time.monotonic()
+        running, waiting = self.admission_snapshot()
         with self.lock:
-            teams = self.inflight.keys() | self.counting.keys()
             return {
                 "sampledAt": now_ms(),
-                "inflight": {key: self.inflight.get(key, 0) + self.counting.get(key, 0) for key in teams
-                             if self.inflight.get(key, 0) or self.counting.get(key, 0)},
-                "waiting": {key: value for key, value in self.waiting.items() if value},
+                "inflight": dict(running),
+                "waiting": dict(waiting),
                 "authFailuresHour": sum(at > now - 3600 for at in self.auth_failures_seen),
                 "blockedClients": sum(until > now for until in self.auth_blocked.values()),
             }
@@ -522,39 +525,23 @@ class KeyService:
         with self.lock:
             self._window(team, rpm).append(time.monotonic())
 
-    def _has_capacity(self, team, count_tokens):
-        return ((self.counting[team] < COUNT_TOKENS_CONCURRENCY if count_tokens else self.inflight[team] < TEAM_CONCURRENCY)
-                and sum(self.inflight.values()) + sum(self.counting.values()) < GLOBAL_RUNNING)
-
-    async def admit_async(self, team, rpm, *, count_tokens=False, defer_rpm=False, bulk_lease=None):
-        loop = asyncio.get_running_loop()
-        wake = asyncio.Event()
-        waiter = (loop, wake)
-        deadline = loop.time() + QUEUE_WAIT
+    async def admit_async(self, team, rpm, *, count_tokens=False, defer_rpm=False, lane="model", wait_for_grant=None):
+        # Token counting is a lightweight provider operation alongside task polling.
+        slots = self.lanes["task" if count_tokens else lane]
+        with self.lock:
+            self._window(team, rpm)
+        await slots.acquire(team, QUEUE_WAIT, wait_for_grant=wait_for_grant)
         try:
-            while True:
-                with self.lock:
-                    window = self._window(team, rpm)
-                    if self._has_capacity(team, count_tokens) and (bulk_lease is None or bulk_lease.try_acquire()):
-                        if not defer_rpm:
-                            window.append(time.monotonic())
-                        (self.counting if count_tokens else self.inflight)[team] += 1
-                        return
-                    if waiter not in self.async_waiters:
-                        if self.waiting[team] >= QUEUE_CAP or sum(self.waiting.values()) >= GLOBAL_QUEUE_CAP:
-                            raise GatewayError("rate_limit", "排队请求已满，请稍后重试", retry_after=2)
-                        self.async_waiters.add(waiter)
-                        self.waiting[team] += 1
-                    wake.clear()
-                try:
-                    await asyncio.wait_for(wake.wait(), max(0, deadline - loop.time()))
-                except TimeoutError:
-                    raise GatewayError("rate_limit", "中转请求排队超时，请稍后重试", retry_after=2) from None
-        finally:
             with self.lock:
-                if waiter in self.async_waiters:
-                    self.async_waiters.remove(waiter)
-                    self.waiting[team] -= 1
+                window = self._window(team, rpm)
+                if not defer_rpm:
+                    window.append(time.monotonic())
+        except BaseException:
+            slots.release(team)
+            raise
+
+    def release(self, team, *, count_tokens=False, lane="model"):
+        self.lanes["task" if count_tokens else lane].release(team)
 
     def recheck_access(self, handler, call):
         """Re-check key, team and expiry after waiting for a concurrency slot."""
@@ -565,16 +552,6 @@ class KeyService:
             settings = self.settings(db)
             if settings["expiresAt"] is not None and now_ms() >= settings["expiresAt"]:
                 raise GatewayError("billing", "本活动 API 访问权限已到期")
-
-    def wake_waiters(self):
-        with self.lock:
-            for loop, event in self.async_waiters:
-                loop.call_soon_threadsafe(event.set)
-
-    def release(self, team, *, count_tokens=False):
-        with self.lock:
-            (self.counting if count_tokens else self.inflight)[team] -= 1
-        self.wake_waiters()
 
     def note_error(self, call, error):
         """Attach the final status and classification to a call that has not been written yet."""

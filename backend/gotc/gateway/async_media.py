@@ -1,5 +1,7 @@
 """Streaming media requests and provider responses for the ASGI gateway."""
-from contextlib import aclosing, asynccontextmanager
+from contextlib import aclosing, ExitStack
+import json
+import os
 import tempfile
 import time
 
@@ -16,33 +18,63 @@ from .requests import client_ip, gateway_json
 __all__ = ["serve_media", "serve_task", "reconcile_tasks"]
 
 
-@asynccontextmanager
-async def _request_body(ctx, media):
-    from .async_text import read_json, request_chunks
+async def _prepare_request(ctx, media, source, path, files):
+    from .async_text import ReplayableFile, read_json, request_chunks, spool_json
 
     headers = ctx.handler.headers
     mime = headers.get_content_type()
+    metadata_file = None
+    spool_bytes = 0
     if mime == "application/json":
-        body = (await read_json(ctx))[0]
-        raw = await ctx.sync(gateway_json, body)
-        yield body, raw, "application/json", len(raw)
-        return
-    length = _length(ctx.handler)
-    if headers.get("Content-Encoding", "identity").lower() != "identity":
-        raise APIError(415, "媒体表单不支持 Content-Encoding")
-    if mime not in ("multipart/form-data", "application/x-www-form-urlencoded"):
-        raise APIError(415, "请使用 JSON、multipart/form-data 或表单请求")
-    content_type = headers.get("Content-Type", "")
-    with tempfile.SpooledTemporaryFile(max_size=SPOOL_MEMORY, mode="w+b") as spool:
+        body, decoded_size = await read_json(ctx)
+        content_type = "application/json"
+        if decoded_size >= BULK_BYTES:
+            metadata_file, length = await ctx.sync(spool_json, body)
+            files.enter_context(metadata_file)
+            content = ReplayableFile(metadata_file, ctx.sync)
+            metadata_size = length
+            spool_bytes = length
+        else:
+            content = await ctx.sync(gateway_json, body)
+            length = len(content)
+    else:
+        length = _length(ctx.handler)
+        if headers.get("Content-Encoding", "identity").lower() != "identity":
+            raise APIError(415, "媒体表单不支持 Content-Encoding")
+        if mime not in ("multipart/form-data", "application/x-www-form-urlencoded"):
+            raise APIError(415, "请使用 JSON、multipart/form-data 或表单请求")
+        content_type = headers.get("Content-Type", "")
+        spool = files.enter_context(tempfile.SpooledTemporaryFile(max_size=SPOOL_MEMORY, mode="w+b"))
+        if length >= SPOOL_MEMORY:
+            await ctx.sync(spool.rollover)
+            spool_bytes = length
         async for chunk in request_chunks(ctx.request, length):
             await ctx.sync(spool.write, chunk)
             del chunk
-        if length >= BULK_BYTES:
-            await ctx.reserve_bulk_memory()
         body, metadata_bytes = await ctx.sync(media.parse_form, spool, mime, content_type, length)
-        if length >= BULK_BYTES and metadata_bytes < BULK_BYTES:
-            ctx.release_bulk_memory()  # The file stays on disk. Only its metadata survives parsing.
-        yield body, _file_chunks(ctx, spool), content_type, length
+        content = _file_chunks(ctx, spool)
+        if metadata_bytes >= BULK_BYTES:
+            metadata_file, metadata_size = await ctx.sync(spool_json, body)
+            files.enter_context(metadata_file)
+            spool_bytes += metadata_size
+
+    # prepare_request normally captures the validated wire JSON (or form metadata).
+    # Large captures are already on disk. Give the ledger its own handle since
+    # errors are recorded after this function's caller closes its temporary files.
+    encoded = b"" if metadata_file is not None else (content if mime == "application/json" else None)
+    try:
+        await ctx.sync(media.prepare_request, ctx.handler, path, ctx.call, source, body, length, encoded)
+    finally:
+        if metadata_file is not None and ctx.call["log"] and ctx.call["request_bytes"]:
+            metadata_file.flush()
+            ctx.call["request_file"] = os.fdopen(os.dup(metadata_file.fileno()), "rb")
+            ctx.call["request_capture_bytes"] = metadata_size
+    if metadata_file is not None:
+        # The same metadata can be read later for pricing, under the response lease.
+        del ctx.call["pricing_request"]
+    if spool_bytes:
+        ctx.retain_spool(spool_bytes)
+    return content, content_type, length, metadata_file
 
 
 async def _file_chunks(ctx, spool):
@@ -72,11 +104,17 @@ async def _spool_response(ctx, response, output):
     declared = response.headers.get("Content-Length")
     if declared is not None and (not declared.isascii() or not declared.isdigit() or len(declared) > 20 or int(declared) > REPLY_LIMIT):
         raise GatewayError("upstream", "上游媒体响应长度不正确或超过 64MB 限制")
+    bulk = declared is not None and int(declared) >= BULK_BYTES
+    if bulk:
+        await ctx.reserve_bulk_memory()
     total = 0
     async for chunk in response.aiter_raw(chunk_size=CHUNK):
         total += len(chunk)
         if total > REPLY_LIMIT:
             raise GatewayError("upstream", "上游媒体响应超过 64MB 限制")
+        if not bulk and total >= BULK_BYTES:
+            await ctx.reserve_bulk_memory()
+            bulk = True
         await ctx.sync(output.write, chunk)
     if declared is not None and int(declared) != total:
         raise GatewayError("network", "上游媒体响应未完整接收，费用等待核对")
@@ -84,8 +122,8 @@ async def _spool_response(ctx, response, output):
     return total
 
 
-async def _relay(ctx, response, path, source, body):
-    from .async_text import relay_stream
+async def _relay(ctx, response, path, source, metadata_file):
+    from .async_text import _load_file, relay_stream
 
     media, call = ctx.gateway.media, ctx.call
     status = response.status_code
@@ -103,6 +141,9 @@ async def _relay(ctx, response, path, source, body):
     if response.headers.get("Content-Encoding", "identity").lower() != "identity":
         raise GatewayError("upstream", "上游返回了不支持的媒体压缩编码")
     submission = path.startswith("/v1/async/")
+    if metadata_file is not None:
+        await ctx.reserve_bulk_memory()
+        call["pricing_request"] = await ctx.sync(_load_file, metadata_file, json.loads)
     if mime == "text/event-stream":
         if submission:
             raise GatewayError("upstream", "异步任务提交未返回任务 JSON")
@@ -117,12 +158,10 @@ async def _relay(ctx, response, path, source, body):
         size = await _spool_response(ctx, response, output)
         call["reply_bytes"] = size
         if mime == "application/json" or mime.endswith("+json"):
-            if size >= BULK_BYTES:
-                await ctx.reserve_bulk_memory()
             raw = await ctx.sync(output.read)
             data = await ctx.sync(media.response_json, raw, call, status)
             if submission:
-                data = await register_task(ctx, source, data, body, response.headers)
+                data = await register_task(ctx, source, data, call["pricing_request"], response.headers)
                 raw = await ctx.sync(gateway_json, data)
             else:
                 await ctx.sync(media._quote, call, data)
@@ -157,14 +196,12 @@ async def serve_media(ctx, path):
     call["metered_media"], call["requested_at"] = True, time.time()
     call["billing"] = _zero("not_forwarded")
     call["secrets"] += (source["key"],)
-    async with ctx.admitted():
-        call["user_agent"] = (ctx.handler.headers.get("User-Agent") or "")[:300]
-        call["client_ip"] = client_ip(ctx.handler)
-        async with _request_body(ctx, media) as (body, content, content_type, length):
-            await ctx.sync(media.prepare_request, ctx.handler, path, call, source, body, length,
-                           content if content_type == "application/json" else None)
-            if await ctx.disconnected():
-                raise GatewayError("client_closed", "客户端已断开，请求未发出，不计费")
+    with ExitStack() as files:
+        async with ctx.uploading():
+            call["user_agent"] = (ctx.handler.headers.get("User-Agent") or "")[:300]
+            call["client_ip"] = client_ip(ctx.handler)
+            content, content_type, length, metadata_file = await _prepare_request(ctx, media, source, path, files)
+        async with ctx.admitted():
             headers = {"Authorization": "Bearer " + source["key"], "Content-Type": content_type,
                        "Accept-Encoding": "identity", "Content-Length": str(length), "User-Agent": call["user_agent"] or "gotc-gateway/1.0",
                        **call["routing_headers"]}
@@ -181,7 +218,7 @@ async def serve_media(ctx, path):
                                    upstream_message=transport.failure_reason(error)) from None
             async with aclosing(response):
                 try:
-                    await _relay(ctx, response, path, source, body)
+                    await _relay(ctx, response, path, source, metadata_file)
                 except httpx.HTTPError as error:
                     raise GatewayError("network", "上游媒体响应中断，费用等待核对",
                                        upstream_message=transport.failure_reason(error)) from None

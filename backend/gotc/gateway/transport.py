@@ -10,13 +10,14 @@ from weakref import WeakKeyDictionary
 import httpx
 
 from . import gateway_uploads
+from .admission import GatewayCapacity
 from .memory import BULK_BYTES
 from .protocol_errors import GatewayError, safe_header
 
 
 UPSTREAM_TIMEOUT = 1200
 CONNECT_TIMEOUT = 20
-POOL_TIMEOUT = 5
+POOL_TIMEOUT = 0.25  # Admission owns waiting; an exhausted pool is a capacity error.
 RETRY_STATUSES = {429, 503, 529}
 RETRY_DELAYS = (0.3, 0.6, 1.2, 2.4)
 PASSED_HEADERS = ("x-request-id", "request-id", "retry-after", "openai-processing-ms")
@@ -81,9 +82,10 @@ async def _body_chunks(data):
 
 
 class AsyncProvider:
-    def __init__(self, *, proxies=None, transport=None):
+    def __init__(self, *, proxies=None, transport=None, max_connections=None):
         # HTTPX verifies TLS, honors environment proxies/NO_PROXY and has zero transport retries by default.
-        limits = httpx.Limits(max_connections=12, max_keepalive_connections=4)
+        max_connections = max_connections or GatewayCapacity().provider_connections
+        limits = httpx.Limits(max_connections=max_connections, max_keepalive_connections=min(16, max_connections))
         options = {"trust_env": proxies is None, "limits": limits, "follow_redirects": False}
         if transport is not None:
             options["transport"] = transport
@@ -168,6 +170,8 @@ class AsyncProvider:
                     await response.aclose()
                     raise UpstreamNetworkError(httpx.RemoteProtocolError("Upstream header limit"), sent=True)
                 return response
+            except httpx.PoolTimeout:
+                raise GatewayError("overloaded", "中转站上游连接池繁忙，请稍后重试（请求未发出，不计费）", retry_after=2) from None
             except httpx.TransportError as error:
                 raise UpstreamNetworkError(error, sent=sent) from None
         finally:
@@ -177,14 +181,16 @@ class AsyncProvider:
 
 class ProviderClients:
     """One pool per serving event loop. Tests can supply a direct or synthetic transport."""
-    def __init__(self, proxies=None, transport=None):
+    def __init__(self, proxies=None, transport=None, max_connections=None):
         self.proxies, self.transport = proxies, transport
+        self.max_connections = max_connections
         self._providers = WeakKeyDictionary()
 
     def async_provider(self):
         loop = asyncio.get_running_loop()
         if loop not in self._providers:
-            self._providers[loop] = AsyncProvider(proxies=self.proxies, transport=self.transport)
+            self._providers[loop] = AsyncProvider(proxies=self.proxies, transport=self.transport,
+                                                  max_connections=self.max_connections)
         return self._providers[loop]
 
     async def close(self):
@@ -193,8 +199,8 @@ class ProviderClients:
             await provider.aclose()
 
 
-def make_opener(proxies=None, *, transport=None):
-    return ProviderClients(proxies, transport)
+def make_opener(proxies=None, *, transport=None, max_connections=None):
+    return ProviderClients(proxies, transport, max_connections)
 
 
 async def probe(opener, method, url, headers, content):

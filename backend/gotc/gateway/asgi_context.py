@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import anyio
 from starlette.responses import Response
 
+from .admission import QUEUE_WAIT
 from .gateway_cors import response_headers
 from .memory import BULK_BYTES, bulk_input
 from .protocol_errors import ClientGone, GatewayError
@@ -52,6 +53,7 @@ class GatewayContext:
                      "secrets": gateway.error_secrets(), "requested_at": time.time()}
         self.config = gateway.config
         self.bulk_lease = None
+        self.spool_bytes = 0
         self._record_task = None
         self._complete = False
 
@@ -81,12 +83,22 @@ class GatewayContext:
         if self.bulk_lease:
             self.bulk_lease.release()
 
+    def retain_spool(self, size):
+        self.gateway.memory.retain_spool(size)
+        self.spool_bytes += size
+
+    def release_spool(self, size):
+        self.gateway.memory.spooled -= size
+        self.spool_bytes -= size
+
     def close(self):
         try:
             capture = self.call.pop("request_file", None)
             if capture is not None:
                 capture.close()
         finally:
+            if self.spool_bytes:
+                self.release_spool(self.spool_bytes)
             self.release_bulk_memory()
 
     async def recheck(self):
@@ -94,21 +106,62 @@ class GatewayContext:
         if await self.disconnected():
             raise GatewayError("client_closed", "客户端已断开，请求未发出，不计费")
 
+    async def authenticate(self):
+        if self.call["key"] is None:
+            await self.sync(self.gateway.authenticate, self.handler, self.call)
+        return self.call["key"]
+
     @asynccontextmanager
-    async def admitted(self, count_tokens=False, defer_rpm=False):
-        key = await self.sync(self.gateway.authenticate, self.handler, self.call)
+    async def uploading(self):
+        key = await self.authenticate()
+        team = key["team_id"]
+        uploads = self.gateway.body_uploads
+        await uploads.acquire(team, timeout=2)
+        try:
+            headers = self.handler.headers
+            if bulk_input(headers):
+                self.bulk_lease = self.gateway.memory.lease()
+                try:
+                    async with asyncio.timeout(QUEUE_WAIT):
+                        await self.bulk_lease.acquire(upload=True)
+                except TimeoutError:
+                    raise GatewayError("rate_limit", "中转请求排队超时，请稍后重试", retry_after=2) from None
+            yield
+            # Failed parsing/validation can retain large data in a traceback through recording.
+            # On that path close() releases the lease after the error response.
+            self.release_bulk_memory()
+        finally:
+            uploads.release(team)
+
+    async def wait_for_grant(self, granted):
+        # Only called while queued, after the entire HTTP body has been consumed.
+        # This is the sole receive consumer until it is joined before the provider recheck.
+        reader = asyncio.create_task(self.request.receive())
+        try:
+            done, _ = await asyncio.wait((reader, granted), return_when=asyncio.FIRST_COMPLETED)
+            if reader in done and reader.result()["type"] == "http.disconnect":
+                raise ClientGone()
+            await asyncio.shield(granted)
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+
+    @asynccontextmanager
+    async def admitted(self, count_tokens=False, defer_rpm=False, *, lane="model"):
+        key = await self.authenticate()
         team = key["team_id"]
         rpm = self.call["settings"]["teamRpm"]
         options = {"defer_rpm": True} if defer_rpm else {}
-        if self.handler.command == "POST" and bulk_input(self.handler.headers):
-            self.bulk_lease = self.gateway.memory.lease()
-            options["bulk_lease"] = self.bulk_lease
+        if lane != "model":
+            options["lane"] = lane
+        if self.request.scope["type"] == "http" and getattr(self.request, "_stream_consumed", False):
+            options["wait_for_grant"] = self.wait_for_grant
         await self.gateway.admit_async(team, rpm or (120 if count_tokens else 0), count_tokens=count_tokens, **options)
         try:
             await self.recheck()
             yield key
         finally:
-            self.gateway.release(team, count_tokens=count_tokens)
+            self.gateway.release(team, count_tokens=count_tokens, lane=lane)
 
     async def charge_rpm(self):
         self.gateway.charge_rpm(self.call["key"]["team_id"], self.call["settings"]["teamRpm"])

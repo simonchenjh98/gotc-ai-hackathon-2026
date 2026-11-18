@@ -1,15 +1,17 @@
 """Serialize memory-intensive gateway work on the service event loop."""
 import asyncio
 from collections import deque
+from .protocol_errors import GatewayError
 
 BULK_BYTES = 1024 * 1024
 
 
 def bulk_input(headers):
-    """Compressed JSON can expand to the full decoded limit regardless of wire length."""
-    if headers.get_content_type() != "application/json":
+    """Reserve the shared lease before consuming large forms or potentially large JSON."""
+    mime = headers.get_content_type()
+    if mime not in {"application/json", "application/x-www-form-urlencoded", "multipart/form-data"}:
         return False
-    if headers.get("Content-Encoding", "identity").strip().lower() in {"gzip", "deflate"}:
+    if mime == "application/json" and headers.get("Content-Encoding", "identity").strip().lower() in {"gzip", "deflate"}:
         return True
     length = headers.get("Content-Length", "")
     try:
@@ -19,15 +21,19 @@ def bulk_input(headers):
 
 
 class BulkMemory:
-    """A single heavy operation may coexist with the bounded ordinary SDK calls.
-
-    Initial inputs compete for a running slot and this lease together. Already submitted
-    calls requiring a large reply get FIFO priority over new large uploads.
-    """
-    def __init__(self, wake_admission=None):
+    """One heavy operation at a time. Finish provider replies before starting new large uploads."""
+    def __init__(self, *, spool_mib=256):
         self.owner = None
         self.pending = deque()
-        self.wake_admission = wake_admission
+        self.uploads = deque()
+        self.spool_limit = spool_mib * 1024 * 1024
+        self.spooled = 0
+
+    def retain_spool(self, size):
+        """Account for files retained beyond the single active bulk parser."""
+        if self.spooled + size > self.spool_limit:
+            raise GatewayError("rate_limit", "大文件请求正在排队，请稍后重试", retry_after=2)
+        self.spooled += size
 
     def lease(self):
         return BulkLease(self)
@@ -42,17 +48,18 @@ class BulkLease:
             self.pool.owner = self
         return self.pool.owner is self
 
-    async def acquire(self):
+    async def acquire(self, *, upload=False):
         if self.try_acquire():
             return
         ready = asyncio.get_running_loop().create_future()
         entry = (self, ready)
-        self.pool.pending.append(entry)
+        queue = self.pool.uploads if upload else self.pool.pending
+        queue.append(entry)
         try:
             await ready
         except BaseException:
-            if entry in self.pool.pending:
-                self.pool.pending.remove(entry)
+            if entry in queue:
+                queue.remove(entry)
             self.release()  # Cancellation can race a successful handoff.
             raise
 
@@ -60,14 +67,13 @@ class BulkLease:
         if self.pool.owner is not self:
             return
         self.pool.owner = None
-        while self.pool.pending:
-            lease, ready = self.pool.pending.popleft()
-            if not ready.cancelled():
-                self.pool.owner = lease
-                ready.set_result(None)
-                return
-        if self.pool.wake_admission:
-            self.pool.wake_admission()
+        for queue in (self.pool.pending, self.pool.uploads):
+            while queue:
+                lease, ready = queue.popleft()
+                if not ready.cancelled():
+                    self.pool.owner = lease
+                    ready.set_result(None)
+                    return
 
     async def __aenter__(self):
         return self

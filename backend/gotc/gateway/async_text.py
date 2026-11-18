@@ -7,6 +7,7 @@ import json
 import mmap
 import tempfile
 import time
+from contextlib import ExitStack
 
 import httpx
 from starlette.requests import ClientDisconnect
@@ -332,6 +333,35 @@ async def _send_json(ctx, name, response, content_type):
                 await ctx.send(response.status_code, content_type, chunk)
 
 
+async def _prepare_request(ctx, name, path, upstream, counting, files):
+    call = ctx.call
+    if counting:
+        call["log"] = False
+    body, size = await read_json(ctx, capture=call["log"] and not counting)
+    large = size >= BULK_BYTES
+    if counting:
+        model = resolve(upstream, body.get("model"))
+        call["model"] = model or ""
+        if not model:
+            raise GatewayError("not_found", "模型不在本活动开放列表中，可用模型见 /v1/models")
+        body["model"] = model
+        requests.reject_stored_file_references(body)
+    else:
+        call["request_bytes"] = size
+        await ctx.sync(prepare_text, ctx.gateway, name, path, upstream, body, call)
+    if large:
+        file, size = await ctx.sync(spool_json, body)
+        files.enter_context(file)
+        data = ReplayableFile(file, ctx.sync)
+        capture_bytes = call["request_bytes"] if "request_file" in call else 0
+        ctx.retain_spool(size + capture_bytes)
+        files.callback(ctx.release_spool, size)
+    else:
+        data = await ctx.sync(requests.gateway_json, body)
+        size = len(data)
+    return data, size
+
+
 async def serve_text(ctx, path):
     name, suffix = ROUTES.get(path, (None, None))
     config = ctx.config or {}
@@ -341,69 +371,49 @@ async def serve_text(ctx, path):
     call = ctx.call
     call["secrets"] += (upstream["key"],)
     counting = path == "/v1/messages/count_tokens"
-    async with ctx.admitted(count_tokens=counting, defer_rpm=not counting):
-        if counting:
-            call["log"] = False
-        body, size = await read_json(ctx, capture=call["log"] and not counting)
-        large = size >= BULK_BYTES
-        if counting:
-            model = resolve(upstream, body.get("model"))
-            call["model"] = model or ""
-            if not model:
-                raise GatewayError("not_found", "模型不在本活动开放列表中，可用模型见 /v1/models")
-            body["model"] = model
-            requests.reject_stored_file_references(body)
-        else:
-            call["request_bytes"] = size
-            await ctx.sync(prepare_text, ctx.gateway, name, path, upstream, body, call)
-            await ctx.charge_rpm()
-        file = None
-        if large:
-            file, size = await ctx.sync(spool_json, body)
-            data = ReplayableFile(file, ctx.sync)
-        else:
-            data = await ctx.sync(requests.gateway_json, body)
-            size = len(data)
-        del body
-        ctx.release_bulk_memory()
-        headers = _outbound_headers(ctx.handler.headers, name, upstream["key"], call["stream"], counting)
-        try:
+    with ExitStack() as files:
+        async with ctx.uploading():
+            data, size = await _prepare_request(ctx, name, path, upstream, counting, files)
+        async with ctx.admitted(count_tokens=counting, defer_rpm=not counting):
+            if not counting:
+                await ctx.charge_rpm()
+            headers = _outbound_headers(ctx.handler.headers, name, upstream["key"], call["stream"], counting)
             try:
-                headers["Content-Length"] = str(size)
-                response = await ctx.upstream.open("POST", upstream["url"] + suffix, headers=headers, content=data,
-                                                   length=size, retry=True, recheck=ctx.recheck)
-            finally:
-                if file is not None:
-                    file.close()
-                del data
-            try:
-                secrets = ctx.gateway.error_secrets(call)
-                content_type = safe_header(response.headers.get("Content-Type", "application/json"), secrets)
-                status = response.status_code
-                call["status"] = status
-                request_id = response.headers.get("request-id") or response.headers.get("x-request-id") or ""
-                call["upstream_request_id"] = safe_header(request_id, secrets)
-                if not 200 <= status < 300:
-                    return await _send_provider_error(ctx, response, content_type, counting)
+                try:
+                    headers["Content-Length"] = str(size)
+                    response = await ctx.upstream.open("POST", upstream["url"] + suffix, headers=headers, content=data,
+                                                       length=size, retry=True, recheck=ctx.recheck)
+                finally:
+                    files.close()
+                    del data
+                try:
+                    secrets = ctx.gateway.error_secrets(call)
+                    content_type = safe_header(response.headers.get("Content-Type", "application/json"), secrets)
+                    status = response.status_code
+                    call["status"] = status
+                    request_id = response.headers.get("request-id") or response.headers.get("x-request-id") or ""
+                    call["upstream_request_id"] = safe_header(request_id, secrets)
+                    if not 200 <= status < 300:
+                        return await _send_provider_error(ctx, response, content_type, counting)
+                    if counting:
+                        payload = await _read(ctx, response, ERROR_REPLY_CAP, truncate=True)
+                        await ctx.record()
+                        return await ctx.send(status, content_type, payload)
+                    call["forwarded"] = True
+                    call["reply_headers"] = transport.passed_headers(response.headers, secrets)
+                    call["pricing_headers"] = {k: v for k, v in response.headers.items()
+                                               if k.lower() in {"inference-cost", "inference-currency", "inference-cost-currency"}}
+                    call["first_token_ms"] = int((time.monotonic() - call["started"]) * 1000)
+                    if content_type.partition(";")[0].strip().lower() == "text/event-stream":
+                        return await relay_stream(ctx, name, response, content_type)
+                    return await _send_json(ctx, name, response, content_type)
+                finally:
+                    await response.aclose()
+            except OSError as error:
                 if counting:
-                    payload = await _read(ctx, response, ERROR_REPLY_CAP, truncate=True)
-                    await ctx.record()
-                    return await ctx.send(status, content_type, payload)
-                call["forwarded"] = True
-                call["reply_headers"] = transport.passed_headers(response.headers, secrets)
-                call["pricing_headers"] = {k: v for k, v in response.headers.items()
-                                           if k.lower() in {"inference-cost", "inference-currency", "inference-cost-currency"}}
-                call["first_token_ms"] = int((time.monotonic() - call["started"]) * 1000)
-                if content_type.partition(";")[0].strip().lower() == "text/event-stream":
-                    return await relay_stream(ctx, name, response, content_type)
-                return await _send_json(ctx, name, response, content_type)
-            finally:
-                await response.aclose()
-        except OSError as error:
-            if counting:
-                raise GatewayError("network", "上游模型服务暂时不可用，请稍后重试",
-                                   upstream_message=transport.failure_reason(error)) from None
-            _network_failure(call, error)
+                    raise GatewayError("network", "上游模型服务暂时不可用，请稍后重试",
+                                       upstream_message=transport.failure_reason(error)) from None
+                _network_failure(call, error)
 
 
 async def relay_stream(ctx, name, response, content_type):

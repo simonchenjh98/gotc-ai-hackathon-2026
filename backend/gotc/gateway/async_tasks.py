@@ -47,12 +47,13 @@ async def _fetch(tasks, provider, sync, task, method="GET", action="", *, reserv
                 if not 200 <= response.status_code < 300 or response.headers.get("Content-Encoding", "identity").lower() != "identity":
                     raise APIError(502, "上游异步任务查询失败")
                 async for chunk in response.aiter_raw(chunk_size=64 * 1024):
-                    size += len(chunk)
-                    if size > RESPONSE_LIMIT:
+                    end = size + len(chunk)
+                    if end > RESPONSE_LIMIT:
                         raise APIError(502, "异步任务返回内容过大")
+                    if reserve is not None and size < BULK_BYTES <= end:
+                        await reserve()
                     await sync(spool.write, chunk)
-            if reserve is not None and size >= BULK_BYTES:
-                await reserve()
+                    size = end
             await sync(spool.seek, 0)
             try:
                 payload = await sync(json.load, spool)
@@ -104,12 +105,11 @@ async def register_task(ctx, source, payload, request, headers):
 
 async def serve_task(ctx, path):
     tasks = ctx.gateway.tasks
-    async with ctx.admitted():
-        key = ctx.call["key"]
-        task_id, action = tasks.route(ctx.handler.command, path)
-        # A cancel has no consumed input body. All task operations take the task
-        # lock before acquiring memory for a large cached or newly received reply.
-        ctx.release_bulk_memory()
+    key = await ctx.authenticate()
+    task_id, action = tasks.route(ctx.handler.command, path)
+    async with ctx.admitted(lane="task"):
+        # Poll/cancel endpoints have no input body. Serialize access to the task
+        # before acquiring memory for a large cached or newly received reply.
         async with tasks.async_lock(task_id):
             task = await _load(ctx.sync, ctx.reserve_bulk_memory, tasks._owned, key, task_id)
             if action == "/cancel" and task["state"] not in TERMINAL:
