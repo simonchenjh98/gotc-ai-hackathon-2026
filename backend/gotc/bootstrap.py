@@ -45,7 +45,7 @@ def _initialize_settings(db, now):
 
 def _named_admins_enabled(db):
     table = db.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='named_admins'").fetchone()
-    return bool(table and db.execute("SELECT 1 FROM named_admins LIMIT 1").fetchone())
+    return bool(table and db.execute("SELECT 1 FROM named_admins WHERE portal_confirmed=1 LIMIT 1").fetchone())
 
 
 def _initialize_accounts(db, event, hash_code):
@@ -98,6 +98,9 @@ def legacy_schema(event, *, database_existed, hash_code):
 
 
 def initialize_state(event, *, database_existed, previous_version, hash_code):
+    if previous_version >= 2:
+        with event.db() as db:
+            migrations.v002_admin_auth.ensure_portal_confirmation(db)
     if previous_version == 0:
         legacy_schema(event, database_existed=database_existed, hash_code=hash_code)
     else:
@@ -110,8 +113,7 @@ def initialize_state(event, *, database_existed, previous_version, hash_code):
             event.keys.load_runtime(db)
             event.submission_records.seed_current(db)
             _initialize_accounts(db, event, hash_code)
-    if previous_version < migrations.LATEST:
-        migrations.apply(event)
+    migrations.apply(event)
     with event.db() as db:
         write_shared_admin = "admin" in event.shared_login_codes and not _named_admins_enabled(db)
     if write_shared_admin:

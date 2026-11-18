@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 import unittest
+from unittest.mock import patch
 
 from backend.gotc.service import EventService
 from backend.gotc.teams.claims import INVALID
@@ -42,6 +43,38 @@ class ClaimsTests(unittest.TestCase):
 
     def approve(self,claim,team=None,**changes):
         body=self.approval(claim,team,**changes);result=self.admin_call('/review',body);self.assertEqual(result[0],200,result[1]);return body
+
+    def test_redemption_derives_credentials_without_an_open_transaction(self):
+        self.roster()
+        claim = self.claim()
+        self.approve(claim)
+        original = self.service.claims.kdf
+
+        def verify(code, salt):
+            with self.service.db() as db:
+                self.assertFalse(db.in_transaction)
+            return original(code, salt)
+
+        with patch.object(self.service.claims, 'kdf', verify):
+            for _ in range(2):
+                response = self.bearer(claim, 'redeem')
+                self.assertEqual(response[0], 200, response[1])
+                self.assertEqual(response[1]['status'], 'issued')
+
+    def test_revocation_committed_during_redemption_refuses_delivery(self):
+        self.roster()
+        claim = self.claim()
+        self.approve(claim)
+        original = self.service.claims.kdf
+
+        def revoke(code, salt):
+            with self.service.db() as db:
+                db.execute('UPDATE accounts SET active=0 WHERE id=?', (code.split('.')[0],))
+            return original(code, salt)
+
+        with patch.object(self.service.claims, 'kdf', revoke):
+            status, view, _ = self.bearer(claim, 'redeem')
+        self.assertEqual((status, view['status'], view['code']), (200, 'unavailable', None))
 
     def test_private_roster_auth_marker_import_size_and_no_silent_rewrites(self):
         self.assertEqual(self.public.post('/api/claims/request',{'name':'x','school':'y'})[0],200)

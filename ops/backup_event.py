@@ -123,9 +123,16 @@ def copy_database(source, destination):
     reader=None;writer=None
     try:
         reader=sqlite3.connect(source.as_uri()+'?mode=ro',uri=True)
+        reader.execute('BEGIN')
+        if (reader.execute("SELECT 1 FROM pragma_table_info('named_admins') WHERE name='totp_seed'").fetchone()
+                or reader.execute("SELECT 1 FROM sqlite_schema WHERE name='organizer_seed_cleanup_pending'").fetchone()):
+            raise ValueError('Convert the offline development TOTP checkpoint before creating a backup')
+        if reader.execute("SELECT 1 FROM sqlite_schema WHERE name='v003_content_migration'").fetchone():
+            raise ValueError('Resume the interrupted content migration before creating a portable event backup')
         if reader.execute('PRAGMA integrity_check').fetchone()[0]!='ok':raise ValueError('Source integrity check failed')
         writer=sqlite3.connect(destination)
         reader.backup(writer)
+        reader.rollback()  # Release the source snapshot before copying material files.
         if writer.execute('PRAGMA integrity_check').fetchone()[0]!='ok' or writer.execute('PRAGMA foreign_key_check').fetchall():
             raise ValueError('Copied database validation failed')
         tables=[row[0] for row in writer.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]

@@ -2,5 +2,7 @@
 
 
 class APIError(Exception):
-    def __init__(self, status, message, code=None):
-        self.status,self.message,self.code=status,message,code
+    def __init__(self, status: int, message: str, code: str | None = None) -> None:
+        self.status = status
+        self.message = message
+        self.code = code

@@ -1,0 +1,78 @@
+{
+  "date": "2026-11-18",
+  "environment": {
+    "os": "macOS 27.0.1 arm64",
+    "python": "3.14.3",
+    "sqlite": "3.50.4",
+    "record_type": "Synthetic temporary SQLite databases",
+    "filesystem_available_kib_before_test": 147200000
+  },
+  "baseline": {
+    "commit": "3a96a18",
+    "fixture_user_version": 2,
+    "tests": "Archived checkout plus first regression test file, before any migration fix",
+    "result": "9 failing subtests. Missing and invalid choices and simulated zero free space all allowed startup. Discard copied 100 rows.",
+    "content_bytes": 209715400,
+    "initial_bytes": 211435726,
+    "peak_extra_bytes": 421964376,
+    "peak_wal_bytes": 211393112,
+    "peak_rollback_journal_bytes": 17936
+  },
+  "candidate": {
+    "command": ".runtime/venv/bin/python -B -m unittest tests.backend.test_content_migration_disk tests.backend.test_content_retention tests.backend.test_database_runtime tests.operations.test_installer_recovery.InstallerRecoveryTests.test_insufficient_backup_target_space_precedes_bundle_creation tests.operations.test_installer_recovery.InstallerRecoveryTests.test_interrupted_content_migration_refused_before_release_backup",
+    "result": "25 tests passed in 8.473s",
+    "separate_historical_fixture_command": ".runtime/venv/bin/python -B -m unittest discover -s tests/backend -p test_submission_records_release.py",
+    "separate_historical_fixture_result": "6 tests passed in 1.586s",
+    "installer_source_regression_command": ".runtime/venv/bin/python -B -m unittest tests.operations.test_installer_recovery",
+    "installer_source_regression_result": "14 tests passed in 0.870s. The original writable snapshot reader changed the main database and removed an 8 MiB crash-left WAL after free-space refusal. The read-only source preserved both durable file hashes on refusal and successful backup. The snapshot included committed WAL payload, passed integrity_check and had zero foreign key violations.",
+    "space_fixture": "Unnumbered baseline with named_admins removed. 100 distinct 2 MiB stored payloads plus 200 UTF-8 header bytes. Half the historical request IDs are blank. SQLite page size 4096.",
+    "measurement": "Poll regular-file lengths, allocated blocks, combined WAL and rollback journals in a dedicated data directory at 1 ms intervals during actual EventService startup. Lengths and allocated blocks include both databases, WALs, shared-memory files and other private fixture files. Peaks are sampled lower bounds; allocated-block peaks depend on filesystem allocation.",
+    "baseline_and_candidate_gate": "Migrate <= 220 MiB plus 24 MiB journal allowance. Discard <= 24 MiB. Candidate tests assert the limit on both logical and allocated growth when filesystem block counts are available.",
+    "migrate": {
+      "content_bytes": 209715400,
+      "initial_bytes": 211435726,
+      "peak_extra_bytes": 212357296,
+      "allocated_peak_extra_bytes": 221614080,
+      "peak_wal_bytes": 2150672,
+      "peak_rollback_journal_bytes": 4616,
+      "required_free_bytes": 520529116,
+      "copy_budget_bytes": 231122140,
+      "journal_budget_bytes": 20971520,
+      "historical_snapshot_budget_bytes": 0,
+      "existing_wal_checkpoint_growth_bytes": 0,
+      "free_reserve_bytes": 268435456,
+      "retained_rows": 100
+    },
+    "discard": {
+      "content_bytes": 209715400,
+      "initial_bytes": 211435726,
+      "peak_extra_bytes": 2191536,
+      "allocated_peak_extra_bytes": 2195456,
+      "peak_wal_bytes": 2134192,
+      "peak_rollback_journal_bytes": 4616,
+      "required_free_bytes": 289406976,
+      "copy_budget_bytes": 0,
+      "journal_budget_bytes": 20971520,
+      "historical_snapshot_budget_bytes": 0,
+      "existing_wal_checkpoint_growth_bytes": 0,
+      "free_reserve_bytes": 268435456,
+      "retained_rows": 0
+    },
+    "restart_process_exit_points": [
+      "Initial checkpoint after the migration plan commits",
+      "Inside the sidecar copy transaction immediately before commit",
+      "After the sidecar copy commits",
+      "Inside a discard transaction immediately before commit",
+      "After the source batch deletion commits",
+      "After the last source deletion and sidecar pruning, before publishing the schema version"
+    ],
+    "other_checks": [
+      "Retention, quota, byte identities, request-ID backfill, all usage IDs, billing fields, foreign keys and final schema version",
+      "Quota shared with a pre-existing sidecar after rollback-generated legacy rows; restored request IDs cannot address unrelated bodies",
+      "One byte below estimated required space refuses startup; exact budget passes",
+      "Existing committed WAL growth is included for the event database and a pre-existing sidecar, including discard mode",
+      "Missing, invalid and changed policy, insufficient space, missing paired sidecar, interrupted portable backup and interrupted installer snapshot fail closed",
+      "Installer independently checks free space for its snapshot before creating its backup directory"
+    ]
+  }
+}

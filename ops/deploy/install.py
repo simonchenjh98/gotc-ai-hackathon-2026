@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
-from contextlib import closing
+from contextlib import ExitStack, closing
 import hashlib
 import json
 import os
@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import stat
 import sqlite3
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -49,7 +50,7 @@ def unit_text(service, release, origin):
         'Restart=on-failure', 'RestartSec=4',
         'MemoryMax=256M' if role == 'platform' else 'MemoryMax=384M',
         'TimeoutStopSec=35' if role == 'platform' else 'TimeoutStopSec=55',
-        'TasksMax=80' if role == 'platform' else 'TasksMax=48',
+        'TasksMax=80' if role == 'platform' else 'TasksMax=48', 'LimitNOFILE=1024',
         *HARDENING, f'ReadWritePaths={ROOT}/data', '', '[Install]', 'WantedBy=multi-user.target', '',
     ))
 
@@ -82,7 +83,7 @@ FILES = PAGES_FILES | manifest({
     'backend': '__init__.py requirements.txt',
     'backend/gotc': (
         '__init__.py __main__.py admin_auth.py admin_data.py api.py bootstrap.py cli.py constants.py credentials.py '
-        'database.py errors.py listener.py observability.py organizer.py service.py settings.py validation.py write_conflicts.py'
+        'database.py errors.py listener.py observability.py organizer.py password_capacity.py service.py settings.py validation.py write_conflicts.py'
     ),
     'backend/gotc/gateway': (
         '__init__.py accounting.py admission.py asgi.py asgi_context.py async_media.py async_tasks.py async_text.py config.py content_store.py gateway_catalog.json gateway_cors.py '
@@ -412,16 +413,35 @@ def install_release(args, snapshot):
     if data.is_symlink() or not data.is_dir():
         raise RuntimeError('Expected the provisioned private data directory')
     backup = ROOT / 'backups' / args.release
-    backup.mkdir(mode=0o700)
-    (backup / 'nginx.conf').write_text(old_nginx)
-    for name, original in units.items():
-        if original is not None:
-            (backup / f'{name}.service').write_text(original)
-    if (data / 'event.sqlite3').is_file():
-        with closing(sqlite3.connect(data / 'event.sqlite3')) as source, closing(sqlite3.connect(backup / 'event.sqlite3')) as target:
-            source.backup(target)
-            copy_roadshow_claim_key(target, data, backup)
-        os.chmod(backup / 'event.sqlite3', 0o600)
+    with ExitStack() as inputs:
+        source = None
+        event_database = data / 'event.sqlite3'
+        if event_database.is_file():
+            # A writable source can checkpoint a crash-left WAL on last close,
+            # including after the backup-target disk check refused the upgrade.
+            source = inputs.enter_context(closing(sqlite3.connect(event_database.as_uri() + '?mode=ro', uri=True)))
+            source.execute('BEGIN')
+            if (source.execute("SELECT 1 FROM pragma_table_info('named_admins') WHERE name='totp_seed'").fetchone()
+                    or source.execute("SELECT 1 FROM sqlite_schema WHERE name='organizer_seed_cleanup_pending'").fetchone()):
+                raise ValueError('Convert the offline development TOTP checkpoint before creating a backup')
+            if source.execute("SELECT 1 FROM sqlite_schema WHERE name='v003_content_migration'").fetchone():
+                raise ValueError('Resume the interrupted content migration before creating a portable event backup')
+            snapshot_bytes = source.execute("PRAGMA page_count").fetchone()[0] * source.execute("PRAGMA page_size").fetchone()[0]
+            required = snapshot_bytes + 256 * 1024 * 1024
+            free = shutil.disk_usage(backup.parent).free
+            if free < required:
+                raise RuntimeError(f"Insufficient release backup space: free={free} required={required} bytes")
+        backup.mkdir(mode=0o700)
+        (backup / 'nginx.conf').write_text(old_nginx)
+        for name, original in units.items():
+            if original is not None:
+                (backup / f'{name}.service').write_text(original)
+        if source is not None:
+            with closing(sqlite3.connect(backup / 'event.sqlite3')) as target:
+                source.backup(target)
+                source.rollback()
+                copy_roadshow_claim_key(target, data, backup)
+            os.chmod(backup / 'event.sqlite3', 0o600)
     release = ROOT / 'releases' / args.release
     release.mkdir(mode=0o755)
     extract_release(snapshot, release)

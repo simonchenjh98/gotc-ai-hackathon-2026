@@ -33,7 +33,19 @@ New events default to metadata-only gateway logging. Gateway maintenance expires
 
 The organizer dashboard reads event history from SQLite. For live inflight and queued calls it asks the gateway for a bounded snapshot over its private Unix socket after the authenticated database read completes. If the gateway is unavailable, the dashboard labels those counters unavailable. A combined development instance can obtain them from the same process.
 
+## Public credential checks
+
+The platform gives public sign-ins and credential redemption two dedicated workers. Up to 40 requests wait in FIFO order for at most four seconds after their request body arrives. Waiters use the event loop and leave the eight general API workers available. A full or expired queue returns HTTP 429 with `login_busy` and `Retry-After: 1`. Local platform metrics expose current and peak counts for active and waiting password work.
+
+Each rejected credential counts toward a limit of 20 attempts per minute per IP and per account/IP pair. Successful checks refund the reservation. After 20 failures against an identity in one minute, subsequent proofs wait in a separate cooling queue before taking a password worker. Organizer pressure spans all usernames. Shared-code roles aggregate failures across that role and finals uses one invitation identity. Organizer and participant cooling each allow one check per second and at most three queued peers. A full cooling queue returns the same retryable busy response. A correct proof from a fresh IP can still sign in during the delay. These process-local limits cover one platform worker.
+
+Team redemption and roadshow claims derive their credentials between database transactions. Immediately before issuing a code or session, the service checks the current receipt or roster, eligibility and the account's credential again. Automatic team approval reserves an identity whose first usable password is created at redemption.
+
 ## Following a submission
+
+Each team has one contestant account and one active participant code (参赛码). The captain redeems it with the tab's claim receipt after approval, or an organizer issues it directly. The same website session opens the team's registration profile, uploads, submission history, private scores and API key management. Organizers enable gateway access separately. The resulting SDK key authorizes model API requests. Existing legacy registration codes give their holders access only to their original registration record.
+
+An organizer can rotate the participant code while preserving the team's account, materials and profile. Rotation and revocation invalidate the old website sessions. Anyone holding a superseded claim receipt sees the code as unavailable. A browser retries a credential submission only after an explicit `429 login_busy`, up to three times with backoff and jitter. If `Retry-After` exceeds its five-second wait limit, it returns control for a later manual retry.
 
 1. The shared browser shell resolves `#team` against the current identity. The route lists the scripts and styles for that workspace. A navigation generation identifies the currently active view, so a delayed load cannot mount the page the user has left.
 2. The submission controller handles local editing and renders upload and receipt state. It sends authenticated requests using the shared same-origin client. Scripts use classic browser scope for compatibility with the original controllers. Add cross-feature dependencies to the route declaration and exercise a cold entry in the browser tests.

@@ -50,8 +50,8 @@ def preauthorize_write(event, db, command):
             raise APIError(400, "决赛接口不接受查询参数")
         if command.path == "/api/finals/access":
             event.judge_login_schedule.require_open(db, "finals")
-            event.rate_limit(command.ip, "finals-access")
-            event.finals.verify_invitation(command.body)
+            with event.login_attempt(command.ip, "finals", "invitation"):
+                event.finals.verify_invitation(command.body)
             return
         if endpoint.actor == "finals-access":
             event.finals.require_access(db, command.finals_access)

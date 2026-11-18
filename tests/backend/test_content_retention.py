@@ -2,6 +2,7 @@
 import asyncio
 from contextlib import contextmanager, closing
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -81,6 +82,7 @@ class RetentionTests(unittest.TestCase):
         self.event.keys = SimpleNamespace(ledger=self.ledger)
         with self.db() as db:
             db.executescript("""
+                PRAGMA user_version=2;
                 CREATE TABLE settings (key TEXT PRIMARY KEY,value TEXT);
                 CREATE TABLE audit (id INTEGER PRIMARY KEY, action TEXT, metadata TEXT);
                 CREATE TABLE api_usage (id INTEGER PRIMARY KEY, request_id TEXT, at INTEGER);
@@ -182,10 +184,11 @@ class RetentionTests(unittest.TestCase):
             db.execute("UPDATE settings SET value='true' WHERE key='keys.logContent'")
             self.legacy(db, 1, accounting.now_ms())
             self.legacy(db, 2, 1)
-        with self.assertRaises(RuntimeError), self.db() as db:
-            v003_content_store.apply(db, self.event)
-            raise RuntimeError("simulated event commit interruption")
-        with self.db() as db:
+        policy = {"GOTC_LEGACY_GATEWAY_CONTENT": "migrate"}
+        with patch.dict(os.environ, policy), self.db() as db:
+            with patch.object(v003_content_store, "_delete_batch", side_effect=RuntimeError("fixture interruption")):
+                with self.assertRaisesRegex(RuntimeError, "fixture interruption"):
+                    v003_content_store.apply(db, self.event)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM api_logs").fetchone()[0], 2)
             v003_content_store.apply(db, self.event)
             self.assertEqual(db.execute("SELECT value FROM settings WHERE key='keys.logContent'").fetchone()[0], "false")
@@ -193,7 +196,6 @@ class RetentionTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM api_logs").fetchone()[0], 0)
             self.assertEqual(self.ledger.content.detail(db, 1)["response"], b"\x02")
             self.assertIsNone(self.ledger.content.detail(db, 2))
-            self.ledger.content.migrate(db, accounting.now_ms())
         self.assertEqual(self.ledger.content.summary()["rows"], 1)
         self.assertEqual(self.ledger.content.path.stat().st_mode & 0o777, 0o600)
         with self.db() as restored:
@@ -204,6 +206,7 @@ class RetentionTests(unittest.TestCase):
         with self.db() as db:
             db.execute("UPDATE settings SET value='true' WHERE key='keys.logContent'")
             db.execute("INSERT INTO audit VALUES (1,'api-key.settings',?)", (json.dumps({"logContent": [False, True]}),))
+            db.commit()
             v003_content_store.apply(db, self.event)
             self.assertEqual(db.execute("SELECT value FROM settings WHERE key='keys.logContent'").fetchone()[0], "true")
 
@@ -214,9 +217,11 @@ class RetentionTests(unittest.TestCase):
             for identifier in range(1, 5):
                 self.legacy(db, identifier, now + identifier)
             db.execute("UPDATE api_logs SET response=zeroblob(400000)")
-            with patch.object(self.ledger.content, "insert", wraps=self.ledger.content.insert) as insert:
-                self.ledger.content.migrate(db, now)
-            self.assertEqual([call.args[1] for call in insert.call_args_list], [4, 3])
+            db.commit()
+            with patch.dict(os.environ, {"GOTC_LEGACY_GATEWAY_CONTENT": "migrate"}):
+                v003_content_store.apply(db, self.event)
+            with self.ledger.content.connection() as content:
+                self.assertEqual([row[0] for row in content.execute("SELECT usage_id FROM content ORDER BY usage_id")], [3, 4])
             self.assertEqual(self.ledger.content.summary()["rows"], 2)
             self.assertEqual(db.execute("SELECT count(*) FROM api_usage").fetchone()[0], 4)
 

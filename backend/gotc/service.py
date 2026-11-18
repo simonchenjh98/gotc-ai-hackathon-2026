@@ -19,6 +19,7 @@ from . import admin_auth, api, bootstrap, database, migrations
 from .admin_data import AdminDataService
 from .constants import COOKIE_NAME, DIMENSIONS, LOGIN_KDF_CONCURRENCY, SESSION_SECONDS, VOTE_LIMIT
 from .errors import APIError
+from .password_capacity import PASSWORD_PATHS, PasswordChecks
 from .http.routes import resolve_endpoint
 from .credentials import Credentials
 from .gateway.keys import KeyService
@@ -51,7 +52,8 @@ def scrypt_hash(code, salt):
 
 
 class EventService:
-    def __init__(self, data_dir=None, base_path=None, origin=None, static_root=None, *, clock=None):
+    def __init__(self, data_dir=None, base_path=None, origin=None, static_root=None, *, clock=None,
+                 check_organizer_credentials=True):
         project_root = Path(__file__).resolve().parents[2]
         self.root = Path(static_root or project_root / "frontend").resolve()
         self.data_dir = bootstrap.data_directory(data_dir, project_root)
@@ -64,7 +66,6 @@ class EventService:
         self.origin = public_origin(origin)
         self.secure = self.origin.startswith("https://")
         self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.data_dir, 0o700)
         self.credentials = Credentials(self.data_dir)
         self.shared_login_codes = bootstrap.shared_login_codes(self.credentials)
         self.db_path = self.data_dir / "event.sqlite3"
@@ -72,27 +73,34 @@ class EventService:
         self.database_maintenance = database.DatabaseMaintenance(self)
         self.rate_lock = threading.Lock()
         self.login_attempts = OrderedDict()
-        self.login_kdf_slots = threading.BoundedSemaphore(LOGIN_KDF_CONCURRENCY)
+        self.organizer_failures: deque[tuple[float, None]] = deque(maxlen=20)
+        self.password_checks = PasswordChecks(running=LOGIN_KDF_CONCURRENCY)
         self.judging=JudgingService(clock=self.clock,text=text_field,audit=self.audit,touch=self.touch,
             history=lambda *args,**kwargs:self.admin_data.record_review_change(*args,**kwargs),
             enrich_team=lambda db,team:self.admin_data.enrich_team(db,team),
             is_team_recycled=lambda db,team_id:self.team_lifecycle.is_recycled(db,team_id))
-        self.admin_data=AdminDataService(self)
-        self.team_lifecycle=TeamLifecycle(self)
+        self.admin_data: AdminDataService = AdminDataService(self)
+        self.team_lifecycle: TeamLifecycle = TeamLifecycle(self)
         self.admin_team_access=AdminTeamAccess(self,COOKIE_NAME)
         self.claims=Claims(self,self.clock,text_field,scrypt_hash)
         self.registration=TeamRegistration(self,self.clock,text_field)
         self.submission_records=SubmissionRecords(self)
-        self.material_uploads=MaterialUploads(self)
         self.repositories=Repositories(self)
         self.repository_backups=RepositoryBackups(self)
         self.write_conflicts=WriteConflicts(self)
         self.finals=FinalsService(self,self.clock,text_field)
         # Both service processes may boot together. Serialize private-key provisioning,
         # historical snapshots and SQLite schema changes before accepting traffic.
+        if self.db_path.exists() and not (self.data_dir / ".schema.lock").exists():
+            # Fail a first legacy preflight before creating even the startup lock.
+            migrations.inspect_existing(self.db_path, self.credentials if check_organizer_credentials else None)
         with database.startup_lock(self.data_dir):
             database_existed = self.db_path.exists()
-            previous_version = migrations.inspect_existing(self.db_path)
+            previous_version = migrations.inspect_existing(
+                self.db_path, self.credentials if check_organizer_credentials else None
+            )
+            os.chmod(self.data_dir, 0o700)
+            self.material_uploads=MaterialUploads(self)
             self.roadshow_access=RoadshowAccess(self,self.clock,text_field,scrypt_hash)
             self.roadshow_scoring=RoadshowScoring(self,self.clock,text_field)
             self.judge_login_schedule=JudgeLoginSchedule(self,self.clock)
@@ -131,6 +139,8 @@ class EventService:
             raise APIError(400, "JSON内容必须是对象")
         command = api.Command(endpoint, path, body, cookie, ip, query or {}, expected_login_id,
                               server_received_at, finals_judge_id, finals_access_token)
+        if path in PASSWORD_PATHS:
+            return self.password_checks.run_sync(lambda: endpoint.controller(self, command))
         return endpoint.controller(self, command)
 
     def config(self, db):
@@ -173,12 +183,18 @@ class EventService:
                    (self.clock(), actor["id"] if actor else None, 'admin' if operator else actor["role"] if actor else None,
                     action, target, json.dumps(metadata or {}, ensure_ascii=False)))
 
-    def create_account(self, db, role, name):
+    def create_account(self, db, role, name, *, awaiting_claim=False):
         account_id = {"admin": "GA", "judge": "GJ", "audience": "GV", "team": "GT"}[role] + secrets.token_hex(8)
-        code = self.shared_login_codes.get(role) or account_id + "." + secrets.token_urlsafe(32)
         salt = secrets.token_bytes(16)
+        if awaiting_claim:
+            # The auto-review transaction reserves an identity. Only redemption
+            # creates its first usable credential, outside the writer transaction.
+            code, hashed = None, secrets.token_bytes(32)
+        else:
+            code = self.shared_login_codes.get(role) or account_id + "." + secrets.token_urlsafe(32)
+            hashed = scrypt_hash(code, salt)
         db.execute("INSERT INTO accounts(id,role,name,salt,code_hash,created_at) VALUES (?,?,?,?,?,?)",
-                   (account_id, role, name, salt, scrypt_hash(code, salt), self.clock()))
+                   (account_id, role, name, salt, hashed, self.clock()))
         return {"id": account_id, "role": role, "name": name}, code
 
     def reserve_attempts(self, keys):
@@ -195,7 +211,7 @@ class EventService:
                 if len(bucket) >= 20:
                     raise APIError(429, "登录尝试过于频繁，请一分钟后重试")
                 buckets.append(bucket)
-            for key, bucket in zip(keys, buckets):
+            for key, bucket in zip(keys, buckets, strict=True):
                 bucket.append(ticket)
                 self.login_attempts[key] = bucket
                 self.login_attempts.move_to_end(key)
@@ -208,23 +224,36 @@ class EventService:
         self.reserve_attempts([("public", scope, ip)])
 
     @contextmanager
-    def login_attempt(self, ip, role, selector):
-        # Count simultaneous attempts immediately. Only unsuccessful credentials
-        # remain charged, so participants sharing an IP can sign in normally.
+    def login_attempt(self, ip, role, selector, *, failure_statuses=(401,)):
+        # Reserve per-peer attempts before checking, then refund all outcomes except
+        # failed credentials. The role-wide organizer history covers every username.
         digest = hashlib.sha256(selector.encode()).digest()
-        ticket, buckets = self.reserve_attempts([("login-ip", ip), ("login-account", role, digest)])
+        peer_keys = [("login-ip", ip), ("login-peer-account", ip, role, digest)]
+        pressure_key = ("login-account", role, b"shared" if role in self.shared_login_codes else digest)
+        ticket, buckets = self.reserve_attempts(peer_keys)
+        failed = False
         try:
+            with self.rate_lock:
+                history = self.organizer_failures if role == "admin" else self.login_attempts.get(pressure_key)
+                pressured = history and len(history) >= 20 and history[-20][0] > time.monotonic() - 60
+            if pressured:
+                self.password_checks.require_cooling(role)
             yield
         except APIError as error:
-            if error.status == 401:
-                raise
-            self.refund_attempt(ticket, buckets)
+            failed = error.status in failure_statuses
+            if failed:
+                with self.rate_lock:
+                    if role == "admin":
+                        # Other public activity cannot evict this protection through the peer LRU.
+                        history = self.organizer_failures
+                    else:
+                        history = self.login_attempts.setdefault(pressure_key, deque(maxlen=20))
+                        self.login_attempts.move_to_end(pressure_key)
+                    history.append((time.monotonic(), None))
             raise
-        except BaseException:
-            self.refund_attempt(ticket, buckets)
-            raise
-        else:
-            self.refund_attempt(ticket, buckets)
+        finally:
+            if not failed:
+                self.refund_attempt(ticket, buckets)
 
     def refund_attempt(self, ticket, buckets):
         with self.rate_lock:
@@ -297,20 +326,24 @@ class EventService:
         role = body.get("role")
         if not isinstance(role, str) or role not in {"admin", "judge", "audience", "team"}:
             raise APIError(400, "登录身份不正确")
-        code = text_field(body.get("code"), "邀请码", 160, True)
+        code = text_field(body.get("code"), "参赛码" if role == "team" else "邀请码", 160, True)
         selector = body.get("accountId")
         if selector is not None and (not isinstance(selector, str) or len(selector) > 80):
             raise APIError(400, "登录身份不正确")
         named = admin_auth.username(body.get("username")) if role == "admin" else None
         claimed = named or selector or code.split(".", 1)[0]
-        with self.login_attempt(ip, role, claimed):
-            return self.verify_login(role, code, selector, named, body.get("totp"))
+        def check():
+            with self.login_attempt(ip, role, claimed):
+                return self.verify_login(role, code, selector, named, body.get("totp"))
+
+        return self.password_checks.run_sync(check)
 
     def verify_login(self, role, code, selector, named, otp):
         with self.db() as db:
-            named_mode = role == "admin" and db.execute("SELECT 1 FROM named_admins LIMIT 1").fetchone()
+            named_mode = role == "admin" and (named is not None or otp is not None or db.execute(
+                "SELECT 1 FROM named_admins WHERE portal_confirmed=1 LIMIT 1").fetchone())
             if named_mode:
-                account = db.execute("""SELECT a.*, n.totp_seed, n.last_step FROM named_admins n
+                account = db.execute("""SELECT a.*, n.seed_binding, n.last_step FROM named_admins n
                     JOIN accounts a ON a.id=n.account_id
                     WHERE n.username=? AND a.role='admin' AND a.active=1""", (named,)).fetchone()
             else:
@@ -326,31 +359,31 @@ class EventService:
                     if candidates:
                         selector = candidates[0]["id"]
                 selector = selector or code.split(".", 1)[0]
-                account = db.execute("SELECT * FROM accounts WHERE id=? AND role=? AND active=1", (selector, role)).fetchone()
+                account = db.execute("""SELECT * FROM accounts WHERE id=? AND role=? AND active=1
+                                     AND NOT EXISTS (SELECT 1 FROM named_admins n WHERE n.account_id=accounts.id)""",
+                                     (selector, role)).fetchone()
         salt = account["salt"] if account else b"gotc-dummy-salt!"
-        if not self.login_kdf_slots.acquire(blocking=False):
-            raise APIError(429, "登录繁忙，请稍后重试", "login_busy")
-        try:
-            hashed = scrypt_hash(code, salt)
-        finally:
-            self.login_kdf_slots.release()
+        hashed = scrypt_hash(code, salt)
+        invalid_code = "参赛码无效或已停用" if role == "team" else "邀请码无效或已停用"
         if not account or not hmac.compare_digest(hashed, account["code_hash"]):
-            raise APIError(401, "邀请码无效或已停用")
-        if named_mode and admin_auth.verified_step(account['totp_seed'], otp, self.clock(), account['last_step']) is None:
-            raise APIError(401, "管理员账号或验证码无效")
+            raise APIError(401, invalid_code)
+        if named_mode:
+            seed = admin_auth.login_seed(self.credentials, named, account['seed_binding'])
+            if seed is None or admin_auth.verified_step(seed, otp, self.clock(), account['last_step']) is None:
+                raise APIError(401, "管理员账号或验证码无效")
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             current = db.execute("SELECT * FROM accounts WHERE id=? AND role=? AND active=1", (account["id"], role)).fetchone()
             if not current or not hmac.compare_digest(current["salt"], account["salt"]) or not hmac.compare_digest(current["code_hash"], account["code_hash"]):
-                raise APIError(401, "邀请码无效或已停用")
+                raise APIError(401, invalid_code)
             if named_mode:
-                credential = db.execute("SELECT totp_seed,last_step FROM named_admins WHERE account_id=? AND username=?",
+                credential = db.execute("SELECT seed_binding,last_step FROM named_admins WHERE account_id=? AND username=?",
                                         (current['id'], named)).fetchone()
-                step = (admin_auth.verified_step(credential['totp_seed'], otp, self.clock(), credential['last_step'])
-                        if credential else None)
+                seed = admin_auth.login_seed(self.credentials, named, credential['seed_binding']) if credential else None
+                step = admin_auth.verified_step(seed, otp, self.clock(), credential['last_step']) if seed else None
                 if step is None:
                     raise APIError(401, "管理员账号或验证码无效")
-                db.execute("UPDATE named_admins SET last_step=? WHERE account_id=?", (step, current['id']))
+                admin_auth.confirm_portal_login(self, db, current, step)
             return self.issue_session(db, current)
 
     def bound_submission_team(self,db,actor):
@@ -366,9 +399,9 @@ class EventService:
         self.team_lifecycle.require_available(db,team['id'])
         return team
 
-    def team_access(self, db, actor, body: inputs.ManageTeamAccess):
+    def team_access(self, db, actor, body: inputs.ManageTeamAccess, *, awaiting_claim=False):
         if not inputs.accepts_fields(body, inputs.ManageTeamAccess) or (not isinstance(body.get("action"), str) or body["action"] not in {"issue", "rotate", "revoke"}):
-            raise APIError(400, "提交码操作不正确")
+            raise APIError(400, "参赛码操作不正确")
         team_id=self.team_exists(db, body["teamId"])
         action=body["action"]
         if action!='revoke':self.team_lifecycle.require_available(db,team_id)
@@ -376,13 +409,13 @@ class EventService:
         before={'id':account['id'],'active':bool(account['active'])} if account else None
         if action=="issue":
             if account:
-                raise APIError(409, "该队已有提交身份，请重发提交码")
+                raise APIError(409, "该队已有参赛码，请重发参赛码")
             name=db.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()[0]
-            account,code=self.create_account(db, "team", name)
+            account,code=self.create_account(db, "team", name, awaiting_claim=awaiting_claim)
             db.execute("INSERT INTO team_accounts VALUES (?,?)", (account["id"], team_id))
         else:
             if not account:
-                raise APIError(404, "该队尚未创建提交身份")
+                raise APIError(404, "该队尚未发放参赛码")
             db.execute("DELETE FROM sessions WHERE account_id=?", (account["id"],))
             if action=="rotate":
                 code=account["id"]+"."+secrets.token_urlsafe(32)

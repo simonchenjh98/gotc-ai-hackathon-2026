@@ -40,6 +40,31 @@ class CredentialTests(unittest.TestCase):
         self.addCleanup(second.connections.close)
         self.assertEqual(first.keys.pepper, second.keys.pepper)
 
+    def test_mounted_organizer_mapping_never_falls_back_and_rejects_unsafe_files(self):
+        name = 'organizer-totp.json'
+        local = self.event / name
+        local.touch(mode=0o600)
+        local.write_text('{"demo":"' + 'A' * 32 + '"}')
+        mounted = self.mount / name
+        loader = Credentials(self.event)
+        self.assertEqual(loader.organizer_seeds(), {})
+        mounted.touch(mode=0o600)
+        mounted.write_text('{"demo":"' + 'B' * 32 + '"}')
+        self.assertTrue(loader.organizer_seeds()['demo'] == 'B' * 32)
+        if os.name == 'posix':
+            mounted.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, 'private'):
+                loader.organizer_seeds()
+            mounted.chmod(0o600)
+        mounted.write_text('{"demo":"SYNTHETIC-INVALID"}')
+        with self.assertRaises(ValueError) as failure:
+            loader.organizer_seeds()
+        self.assertNotIn('SYNTHETIC', str(failure.exception))
+        mounted.unlink()
+        mounted.symlink_to(local)
+        with self.assertRaisesRegex(RuntimeError, "Cannot open"):
+            loader.organizer_seeds()
+
     def test_mismatched_key_and_invalid_config_do_not_disclose_values(self):
         (self.event / "roadshow-claim-key").write_bytes(b"a" * 32)
         (self.mount / "roadshow-claim-key").write_bytes(b"b" * 32)

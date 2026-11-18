@@ -1,16 +1,15 @@
 """Health and observability contracts, exercised as ASGI requests in memory."""
-from collections import defaultdict
 from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
 import tempfile
-import threading
 from types import SimpleNamespace
 import unittest
 
 from starlette.responses import PlainTextResponse
 
+from backend.gotc.password_capacity import PasswordChecks
 from backend.gotc.observability import ObservabilityMiddleware, record_db_lock_wait
 
 
@@ -24,7 +23,7 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
             db.execute("CREATE TABLE settings(value TEXT)")
             db.execute("INSERT INTO settings VALUES ('ok')")
             db.commit()
-        service = SimpleNamespace(data_dir=root, db_path=db_path, base_path="/gotc")
+        service = SimpleNamespace(data_dir=root, db_path=db_path, base_path="/gotc", password_checks=PasswordChecks())
         self.service = service
         self.app = ObservabilityMiddleware(self.endpoint, service=service, role="platform")
 
@@ -67,7 +66,7 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         record_db_lock_wait(0.01, failed=True)
         _, _, body = await self.get("/metrics")
         for name in (b"request_duration_seconds_bucket", b"db_write_wait_seconds_sum", b"disk_free_bytes",
-                     b"gateway_queue_depth", b"active_streams", b"request_errors_total"):
+                     b"gateway_queue_depth", b"active_streams", b"request_errors_total", b"gotc_password_peak_waiting 0"):
             self.assertIn(name, body)
         self.service.db_path.unlink()
         self.assertEqual((await self.get("/readyz"))[0], 503)

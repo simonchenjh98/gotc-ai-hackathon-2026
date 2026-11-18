@@ -1,9 +1,11 @@
 """Exercise the fixed host installer with synthetic units and a real CI release archive."""
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stdout
 import hashlib
 import io
 import os
 from pathlib import Path
+import sqlite3
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -107,6 +109,58 @@ class InstallerRecoveryTests(unittest.TestCase):
             self.assertEqual((self.units / (service + '.service')).read_text(), 'old unit ' + service)
         self.assertFalse((self.root / 'last-deployment.json').exists())
 
+    def test_seed_checkpoint_refused_before_creating_release_backup(self):
+        with closing(sqlite3.connect(self.root / 'data' / 'event.sqlite3')) as db:
+            db.execute('CREATE TABLE named_admins (totp_seed TEXT)')
+        with self.assertRaisesRegex(ValueError, 'TOTP checkpoint'):
+            self.install()
+        self.assertFalse((self.root / 'backups' / self.release).exists())
+        self.assert_restored()
+
+    def test_interrupted_content_migration_refused_before_release_backup(self):
+        with closing(sqlite3.connect(self.root / 'data' / 'event.sqlite3')) as db:
+            db.execute('CREATE TABLE v003_content_migration (mode TEXT)')
+        with self.assertRaisesRegex(ValueError, 'content migration'):
+            self.install()
+        self.assertFalse((self.root / 'backups' / self.release).exists())
+        self.assert_restored()
+
+    def test_insufficient_backup_target_space_precedes_bundle_creation(self):
+        source = self.root / 'data' / 'event.sqlite3'
+        wal = source.with_name(source.name + '-wal')
+        writer = """
+import os, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("PRAGMA journal_mode=WAL")
+db.execute("PRAGMA wal_autocheckpoint=0")
+db.execute("CREATE TABLE ledger (id INTEGER PRIMARY KEY)")
+db.execute("CREATE TABLE entry (ledger_id INTEGER REFERENCES ledger(id), payload BLOB)")
+db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+db.execute("INSERT INTO ledger VALUES (17)")
+db.execute("INSERT INTO entry VALUES (17, zeroblob(8388608))")
+db.commit()
+os._exit(0)
+"""
+        subprocess.run([sys.executable, '-B', '-c', writer, str(source)], check=True, timeout=10)
+        self.assertGreater(wal.stat().st_size, 8 * 1024 * 1024)
+
+        def durable_files():
+            return {p.name: hashlib.sha256(p.read_bytes()).digest() for p in (source, wal) if p.exists()}
+
+        before = durable_files()
+        with patch('shutil.disk_usage', return_value=shutil._ntuple_diskusage(1, 0, 1)):
+            with self.assertRaisesRegex(RuntimeError, 'backup.*free'):
+                self.install()
+        self.assertFalse((self.root / 'backups' / self.release).exists())
+        self.assert_restored()
+        self.assertEqual(durable_files(), before)
+        self.install()
+        self.assertEqual(durable_files(), before)
+        with closing(sqlite3.connect(self.root / 'backups' / self.release / 'event.sqlite3')) as backup:
+            self.assertEqual(backup.execute('SELECT ledger_id,length(payload) FROM entry').fetchall(), [(17, 8388608)])
+            self.assertEqual(backup.execute('PRAGMA foreign_key_check').fetchall(), [])
+            self.assertEqual(backup.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+
     def test_normal_isolated_install_checks_both_sockets_and_individual_neighbors(self):
         checked = []
         self.health = lambda url, sock=None: checked.append((url, sock))
@@ -120,6 +174,8 @@ class InstallerRecoveryTests(unittest.TestCase):
             sock = f'/run/{service}/http.sock'
             self.assertIn(f'ExecStart={target}/.venv/bin/python -EsBu -m backend.gotc --service {role} --uds {sock}', unit)
             self.assertIn(f'WorkingDirectory={target}', unit)
+            self.assertIn('LimitNOFILE=1024', unit.splitlines())
+            self.assertIn('TasksMax=' + ('80' if role == 'platform' else '48'), unit.splitlines())
             self.assertEqual([line for line in unit.splitlines() if line.startswith('MemoryMax=')],
                              ['MemoryMax=' + memory_limits[service]])
             self.assertIn('http://localhost/readyz', [url for url, endpoint in checked if endpoint == sock])

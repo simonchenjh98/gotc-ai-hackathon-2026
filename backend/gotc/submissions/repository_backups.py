@@ -14,6 +14,7 @@ import threading
 import time
 import zipfile
 from dataclasses import dataclass
+from typing import BinaryIO
 from urllib.parse import quote
 
 from backend.gotc.errors import APIError
@@ -34,7 +35,7 @@ class BackupFailure(Exception):
 
 @dataclass
 class ArchiveDownload:
-    stream: object
+    stream: BinaryIO
     size: int
     filename: str
     content_type: str

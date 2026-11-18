@@ -33,7 +33,7 @@ class Endpoint:
 
 @cache
 def endpoints() -> tuple[Endpoint, ...]:
-    routes = []
+    routes: list[Endpoint] = []
 
     def add(controller: Callable, method: str, actor: Actor, *paths: str, limit: int = 16384,
             model: type | tuple[type, ...] | None = None, snapshot: bool = False, unmodeled: str | None = None):

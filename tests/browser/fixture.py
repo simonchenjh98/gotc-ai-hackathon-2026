@@ -70,6 +70,9 @@ def activate_organizer(service):
     from backend.gotc.admin_auth import activate, prepare_enrollment
 
     organizer = prepare_enrollment("browser-organizer", "Browser Fixture Organizer")
+    credential = service.data_dir / "organizer-totp.json"
+    credential.touch(mode=0o600)
+    credential.write_text(json.dumps({organizer["username"]: organizer["seed"]}))
     # Model an enrollment completed a minute before this real browser login.
     enrolled_ms = service.clock() - 60000
     with patch.object(service, "clock", return_value=enrolled_ms):

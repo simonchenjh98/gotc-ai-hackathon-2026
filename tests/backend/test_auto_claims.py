@@ -26,7 +26,10 @@ class AutoClaimsTests(unittest.TestCase):
         return entries,body
 
     def test_whole_team_automatic_private_redeem_and_no_api(self):
-        self.source();claim=self.application();self.assertEqual(claim['status'],'approved');self.assertIsNone(claim['code'])
+        self.source()
+        with patch('backend.gotc.service.scrypt_hash', side_effect=AssertionError('KDF under approval writer')):
+            claim = self.application()
+        self.assertEqual(claim['status'],'approved');self.assertIsNone(claim['code'])
         first=self.bearer(claim,'redeem')[1];self.assertEqual(first,self.bearer(claim,'redeem')[1])
         client=Client(self.server);self.assertEqual(client.post('/api/login',{'role':'team','code':first['code']})[0],200)
         with self.service.db() as db:

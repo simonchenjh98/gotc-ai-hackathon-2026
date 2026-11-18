@@ -249,8 +249,7 @@ def smoke(browser, service):
         go(page, "team", "#jump-team-project-intro")
         passed.append("team submission workbench, AI panel, team profile and private score refresh")
 
-    # Exercise the pre-enrollment portal first, then activate the named account
-    # in the same disposable event and sign in with a real current TOTP.
+    # Stage a named account in the same disposable event; the browser performs the cutover.
     with visit() as page:
         page.goto(base + "platform.html#team")
         team_login = page.locator("#login-form")
@@ -263,8 +262,13 @@ def smoke(browser, service):
         passed.append("contestant entry links to organizer portal; pre-enrollment organizer signs in explicitly")
     from fixture import activate_organizer
     organizer = activate_organizer(service)
+    with service.db() as db:
+        assert db.execute("SELECT portal_confirmed FROM named_admins WHERE username=?", (organizer["username"],)).fetchone()[0] == 0
     with visit("admin") as page:
         page.locator("#settings-form").wait_for()
+        with service.db() as db:
+            assert db.execute("SELECT portal_confirmed FROM named_admins WHERE username=?", (organizer["username"],)).fetchone()[0] == 1
+            assert not db.execute("SELECT 1 FROM accounts WHERE role='admin' AND active=1 AND id NOT IN (SELECT account_id FROM named_admins)").fetchone()
         go(page, "admin-roadshow", "[data-roadshow-roster]")
         direct_entry(page, "[data-roadshow-roster]")
         go(page, "admin-finals", "[data-finals-roster]")

@@ -20,6 +20,7 @@ from starlette.routing import Route
 
 from ..constants import COOKIE_NAME, SESSION_SECONDS
 from ..errors import APIError
+from ..password_capacity import PASSWORD_PATHS
 from ..submissions.repository_backups import ArchiveDownload
 from ..submissions.submission_records import query_path
 from ..teams.team_registration import PUBLIC_ORIGINS, PUBLIC_PATHS
@@ -143,6 +144,7 @@ def create_platform_app(service, *, trusted_proxy_socket=None):
     from ..observability import ObservabilityMiddleware
 
     limiter = anyio.CapacityLimiter(8)
+    password_workers = anyio.CapacityLimiter(service.password_checks.capacity.running)
     immutable = immutable_assets(service.root)
     prefix = service.base_path
 
@@ -160,14 +162,20 @@ def create_platform_app(service, *, trusted_proxy_socket=None):
             if request.method == "POST":
                 same_origin(request, service, path)
                 length = checked_length(request.headers)
-                await run(check_actor, service, endpoint, identity)
+                if endpoint.actor != "public":
+                    await run(check_actor, service, endpoint, identity)
                 body = await json_body(request, length, endpoint)
                 if path == "/api/submission":
                     received_at = service.clock()
-            value, token, action = await run(service.dispatch_endpoint, endpoint, path, body, identity.cookie,
-                                             client_ip(request.scope, trusted_proxy_socket), query=query,
-                                             expected_login_id=identity.login_id, server_received_at=received_at,
-                                             finals_judge_id=identity.finals_judge, finals_access_token=identity.finals_access)
+            dispatch = partial(service.dispatch_endpoint, endpoint, path, body, identity.cookie,
+                               client_ip(request.scope, trusted_proxy_socket), query=query,
+                               expected_login_id=identity.login_id, server_received_at=received_at,
+                               finals_judge_id=identity.finals_judge, finals_access_token=identity.finals_access)
+            if path in PASSWORD_PATHS:
+                value, token, action = await service.password_checks.run(
+                    lambda: anyio.to_thread.run_sync(dispatch, limiter=password_workers))
+            else:
+                value, token, action = await run(dispatch)
             if isinstance(value, ArchiveDownload):
                 async def chunks():
                     try:
@@ -186,7 +194,9 @@ def create_platform_app(service, *, trusted_proxy_socket=None):
             response = JSONResponse(value, media_type="application/json; charset=utf-8")
             if action:
                 response.set_cookie(COOKIE_NAME, token or "", max_age=SESSION_SECONDS if action == "set" else 0,
-                                    path=prefix or "/", httponly=True, samesite="Strict", secure=service.secure)
+                                    path=prefix or "/", httponly=True, secure=service.secure,
+                                    # Preserve the historical wire casing accepted by Starlette.
+                                    samesite="Strict")  # type: ignore[arg-type]
             return response
 
         return Route(prefix + endpoint.path, handle, methods=[endpoint.method], name=f"{endpoint.method} {endpoint.path}")

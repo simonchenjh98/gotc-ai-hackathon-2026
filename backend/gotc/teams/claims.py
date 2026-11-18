@@ -203,7 +203,7 @@ class Claims:
         self.s.audit(db,None,'claims.update',row['id'],{'requestRevision':row['revision']+1})
         return self.bearer(db,{'requestId':body['requestId'],'secret':body['secret']})
 
-    def bearer(self,db,body: inputs.ReceiptProof,redeem=False):
+    def bearer(self,db,body: inputs.ReceiptProof):
         if not inputs.accepts_fields(body, inputs.ReceiptProof):return dict(INVALID)
         row=self.receipt_row(db,body)
         if not row:return dict(INVALID)
@@ -221,19 +221,49 @@ class Claims:
         if not account or not account['active'] or not hmac.compare_digest(row['account_fingerprint'],fingerprint(account)):
             result['status']='unavailable';return result
         team=db.execute('SELECT id,number,name,track FROM teams WHERE id=?',(row['team_id'],)).fetchone();result['team']=dict(team)
-        if not redeem:return result
-        code=account['id']+'.'+digest('gotc-claim-code-v1',body['secret'])
-        if row['status']=='approved':
-            salt=secrets.token_bytes(16);hashed=self.kdf(code,salt)
-            db.execute('UPDATE accounts SET salt=?,code_hash=? WHERE id=?',(salt,hashed,account['id']))
-            updated=db.execute('SELECT * FROM accounts WHERE id=?',(account['id'],)).fetchone()
-            db.execute("UPDATE claim_requests SET status='issued',issued_at=?,account_fingerprint=?,revision=revision+1 WHERE id=?",(self.clock(),fingerprint(updated),row['id']))
-            self.s.audit(db,None,'claims.redeem',row['id'])
-        elif not hmac.compare_digest(account['code_hash'],self.kdf(code,account['salt'])):
-            result['status']='unavailable';result['team']=None;return result
-        result.update(status='issued',code=code)
-        if row['status']=='approved':result['requestRevision']=row['revision']+1
         return result
+
+    def redeem(self, body):
+        # Pending receipts may be approved by the ordinary atomic review transaction.
+        with self.s.db() as db:
+            if not inputs.accepts_fields(body, inputs.ReceiptProof) or not self.receipt_row(db, body):
+                return dict(INVALID)
+            db.execute('BEGIN IMMEDIATE')
+            result = self.bearer(db, body)
+            if result['status'] not in {'approved', 'issued'}:
+                return result
+            receipt = self.receipt_row(db, body)
+            if receipt is None:
+                return dict(INVALID)
+            account = db.execute('SELECT * FROM accounts WHERE id=?', (receipt['account_id'],)).fetchone()
+        code = account['id'] + '.' + digest('gotc-claim-code-v1', body['secret'])
+        # The random, unique receipt ID gives concurrent first redemptions the
+        # same salt. Already-issued receipts retain their original stored salt.
+        salt = bytes.fromhex(receipt['id']) if receipt['status'] == 'approved' else account['salt']
+        hashed = self.kdf(code, salt)
+        with self.s.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            result = self.bearer(db, body)
+            if result['status'] not in {'approved', 'issued'}:
+                return result
+            current = db.execute('SELECT * FROM accounts WHERE id=?', (account['id'],)).fetchone()
+            row = self.receipt_row(db, body)
+            if row is None:
+                return dict(INVALID)
+            if not current or not current['active'] or row['account_id'] != current['id']:
+                return {**result, 'status':'unavailable', 'team':None}
+            if row['status'] == 'approved':
+                if not hmac.compare_digest(fingerprint(current), receipt['account_fingerprint']):
+                    return {**result, 'status':'unavailable', 'team':None}
+                db.execute('UPDATE accounts SET salt=?,code_hash=? WHERE id=?', (salt, hashed, current['id']))
+                updated = db.execute('SELECT * FROM accounts WHERE id=?', (current['id'],)).fetchone()
+                db.execute("""UPDATE claim_requests SET status='issued',issued_at=?,account_fingerprint=?,
+                              revision=revision+1 WHERE id=?""", (self.clock(), fingerprint(updated), row['id']))
+                self.s.audit(db, None, 'claims.redeem', row['id'])
+                result['requestRevision'] += 1
+            elif current['salt'] != salt or not hmac.compare_digest(current['code_hash'], hashed):
+                return {**result, 'status':'unavailable', 'team':None}
+            return {**result, 'status':'issued', 'code':code}
 
     def listing(self,db):
         requests=[dict(row) for row in db.execute('''SELECT id,name,school,status,revision,created_at AS createdAt,expires_at AS expiresAt,
@@ -296,7 +326,7 @@ class Claims:
         online=set(body) in (online_fields,online_fields|{'teamId','teamContext'},online_fields|{'teamId','teamContext','reissueRevoked'})
         if not online and set(body) not in (onsite_fields,onsite_fields|{'teamId','teamContext'}):raise APIError(400,'开放申请审核字段不正确')
         if reissue:
-            if body['reissueRevoked'] is not True:raise APIError(400,'请明确确认停用提交身份重新发码')
+            if body['reissueRevoked'] is not True:raise APIError(400,'请明确确认为已停用参赛码的队伍重新发码')
             self.s.require(actor,'admin')
         if 'teamId' in body and (not isinstance(body['teamId'],str) or not body['teamId'] or not isinstance(body['teamContext'],str) or not re.fullmatch(r'[a-f0-9]{64}',body['teamContext'])):raise APIError(400,'请选择队伍并提交当前队伍核验上下文')
         if not isinstance(body['requestId'],str) or type(body['expectedRevision']) is not int or not isinstance(body['reviewContext'],str) or not re.fullmatch(r'[a-f0-9]{64}',body['reviewContext']):raise APIError(400,'需要申请修订号及核验上下文')
@@ -357,7 +387,9 @@ class Claims:
                 db.execute('INSERT INTO claim_memberships VALUES (?,?,?)',(person_id,team['id'],row['id']))
                 member_ids.append(person_id)
             self.s.registration.sync_verified_members(db,actor,team['id'],member_ids[0],member_ids)
-            access=self.s.team_access(db,actor,{'teamId':team['id'],'action':'rotate' if reissue else 'issue'})
+            access_body = {'teamId':team['id'], 'action':'rotate' if reissue else 'issue'}
+            access = (self.s.team_access(db, actor, access_body, awaiting_claim=True) if actor is None
+                      else self.s.team_access(db, actor, access_body))
             account=db.execute('SELECT * FROM accounts WHERE id=?',(access['id'],)).fetchone()
             reviewed={**declaration,**metadata}
             self.save_declaration(db,row['id'],row['revision']+1,reviewed)
@@ -445,6 +477,8 @@ class Claims:
         if not admin:
             if method!='POST' or path not in public_scopes:raise APIError(404,'接口不存在')
             self.s.rate_limit(ip,public_scopes[path])
+            if path == '/api/claims/redeem':
+                return self.redeem(body)
         with self.s.db() as db:
             if method == 'POST':
                 if admin:
@@ -472,5 +506,5 @@ class Claims:
             elif method=='POST':
                 if path=='/api/claims/request':return self.request(db,body)
                 if path=='/api/claims/update':return self.update(db,body)
-                if path in {'/api/claims/status','/api/claims/redeem'}:return self.bearer(db,body,path.endswith('/redeem'))
+                if path=='/api/claims/status':return self.bearer(db,body)
             raise APIError(404,'接口不存在')

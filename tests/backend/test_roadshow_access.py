@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import unittest
+from unittest.mock import patch
 
 from backend.gotc.service import EventService
 import test_api as fixtures
@@ -59,6 +60,32 @@ class RoadshowAccessTests(unittest.TestCase):
             'judgeIds': before['roster']['judgeIds']})
         self.assertEqual(status, 200, body)
         return team_id
+
+    def test_claim_derives_credentials_without_an_open_transaction(self):
+        self.configure(['Synthetic judge'])
+        original = self.service.roadshow_access.password_hash
+
+        def verify(code, salt):
+            with self.service.db() as db:
+                self.assertFalse(db.in_transaction)
+            return original(code, salt)
+
+        with patch.object(self.service.roadshow_access, 'password_hash', verify):
+            response = self.public.post('/api/roadshow/claim', {'name':'Synthetic judge'})
+            self.assertEqual(response[0], 200, response[1])
+
+    def test_revocation_committed_during_claim_refuses_delivery(self):
+        self.configure(['Synthetic judge'])
+        original = self.service.roadshow_access.password_hash
+
+        def revoke(code, salt):
+            with self.service.db() as db:
+                db.execute('UPDATE accounts SET active=0 WHERE id=?', (code.split('.')[0],))
+            return original(code, salt)
+
+        with patch.object(self.service.roadshow_access, 'password_hash', revoke):
+            status, error, _ = self.claim('Synthetic judge')
+        self.assertEqual(status, 403, error)
 
     def test_empty_roster_is_explicit_and_never_creates_arbitrary_accounts(self):
         status, public, headers = self.public.get('/api/roadshow/access')

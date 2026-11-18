@@ -30,9 +30,10 @@ def api_error(error: APIError) -> JSONResponse:
     data = {"error": error.message}
     if error.code:
         data["code"] = error.code
-    if getattr(error, "request_id", None):
-        data["requestId"] = error.request_id
-    return JSONResponse(data, status_code=error.status, media_type="application/json; charset=utf-8")
+    if request_id := getattr(error, "request_id", None):
+        data["requestId"] = request_id
+    headers = {"Retry-After": "1"} if error.code == "login_busy" else {}
+    return JSONResponse(data, status_code=error.status, headers=headers, media_type="application/json; charset=utf-8")
 
 
 class HTTPPolicy:

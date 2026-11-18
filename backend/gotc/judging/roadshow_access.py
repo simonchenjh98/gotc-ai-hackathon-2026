@@ -190,13 +190,23 @@ class RoadshowAccess:
         account = db.execute('SELECT * FROM accounts WHERE id=?', (row['judge_id'],)).fetchone()
         return self.s.issue_session(db, account)
 
-    def claim(self, db, state, body):
-        self.s.judge_login_schedule.require_open(db, 'roadshow')
-        row = self.resolve_name(db, state, body)
-        code = self.code(row)
-        if row['claimed_at'] is None:
-            salt = secrets.token_bytes(16)
-            hashed = self.password_hash(code, salt)
+    def claim(self, body):
+        with self.s.db() as db:
+            self.s.judge_login_schedule.require_open(db, 'roadshow')
+            previous = self.resolve_name(db, self.s.judging.state(db, 'roadshow'), body)
+        code = self.code(previous)
+        salt = secrets.token_bytes(16)
+        hashed = self.password_hash(code, salt) if previous['claimed_at'] is None else None
+        with self.s.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self.s.judge_login_schedule.require_open(db, 'roadshow')
+            row = self.resolve_name(db, self.s.judging.state(db, 'roadshow'), body)
+            if previous['judge_id'] != row['judge_id'] or previous['nonce'] != row['nonce']:
+                raise APIError(409, '评委身份已变化，请重新核对')
+            if row['claimed_at'] is not None:
+                return {'name': row['name'], 'code': code}
+            if hashed is None or previous['credential_fingerprint'] != row['credential_fingerprint']:
+                raise APIError(409, '评委凭据已变化，请重新核对')
             db.execute('UPDATE accounts SET salt=?,code_hash=? WHERE id=?', (salt, hashed, row['judge_id']))
             db.execute('DELETE FROM sessions WHERE account_id=?', (row['judge_id'],))
             db.execute('UPDATE roadshow_access_roster SET claimed_at=?,credential_fingerprint=? WHERE judge_id=?',
@@ -207,27 +217,26 @@ class RoadshowAccess:
     def dispatch(self, method, path, body, cookie, ip, expected_login_id, query=None):
         if query:
             raise APIError(400, '路演身份接口不接受查询参数')
-        if method == 'POST' and path == '/api/roadshow/claim':
-            self.s.rate_limit(ip, 'roadshow-claim')
-        if method == 'POST' and path == '/api/roadshow/login':
-            self.s.rate_limit(ip, 'roadshow-name-login')
+        if method == 'POST' and path in {'/api/roadshow/login', '/api/roadshow/claim'}:
+            name = self.normalized(self.clean_name(body.get('name')))
+            with self.s.login_attempt(ip, 'roadshow', name, failure_statuses=(401, 403, 404)):
+                if path == '/api/roadshow/claim':
+                    return self.claim(body)
+                with self.s.db() as db:
+                    self.s.judge_login_schedule.require_open(db, 'roadshow')
+                    self.resolve_name(db, self.s.judging.state(db, 'roadshow'), body)
+                    db.execute('BEGIN IMMEDIATE')
+                    return self.login(db, self.s.judging.state(db, 'roadshow'), body)
         with self.s.db() as db:
             if method == 'POST':
                 if path == '/api/admin/roadshow-access':
                     self.s.write_identity(db, cookie, 'admin', expected_login_id, marker_required=True)
-                elif path in {'/api/roadshow/login', '/api/roadshow/claim'}:
-                    self.s.judge_login_schedule.require_open(db, 'roadshow')
-                    self.resolve_name(db, self.s.judging.state(db, 'roadshow'), body)
                 else:
                     raise APIError(404, '路演领码接口不存在')
             db.execute('BEGIN IMMEDIATE' if method == 'POST' else 'BEGIN')
             state = self.s.judging.state(db, 'roadshow')
             if method == 'GET' and path == '/api/roadshow/access':
                 return self.public_view(db, state)
-            if method == 'POST' and path == '/api/roadshow/login':
-                return self.login(db, state, body)
-            if method == 'POST' and path == '/api/roadshow/claim':
-                return self.claim(db, state, body)
             if path == '/api/admin/roadshow-access':
                 actor = self.s.account(db, cookie)
                 self.s.require(actor, 'admin')

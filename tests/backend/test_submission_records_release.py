@@ -38,12 +38,13 @@ def load_module(name,path):
 def unrelated_numbered_migrations(event):
     # These historical feature fixtures intentionally omit one part of baseline 001.
     # Retain the unrelated current components while presenting an unnumbered store.
-    from backend.gotc.migrations import v002_admin_auth, v003_content_store
+    from backend.gotc.migrations import v002_admin_auth
+    from backend.gotc.gateway.content_store import reset_legacy_capture
 
     with event.db() as db:
         db.execute("BEGIN IMMEDIATE")
         v002_admin_auth.apply(db)
-        v003_content_store.apply(db, event)
+        reset_legacy_capture(db)
 
 
 def snapshot(path):

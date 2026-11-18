@@ -1,0 +1,263 @@
+{
+  "simultaneous_valid_logins": 40,
+  "login_count": 200,
+  "waves": [
+    {
+      "valid_logins": 40,
+      "login": {
+        "p50_ms": 220.654,
+        "p95_ms": 405.486
+      },
+      "idle": {
+        "p50_ms": 0.746,
+        "p95_ms": 1.065
+      },
+      "loaded": {
+        "p50_ms": 0.643,
+        "p95_ms": 1.019
+      }
+    },
+    {
+      "valid_logins": 40,
+      "login": {
+        "p50_ms": 246.975,
+        "p95_ms": 448.017
+      },
+      "idle": {
+        "p50_ms": 0.982,
+        "p95_ms": 2.706
+      },
+      "loaded": {
+        "p50_ms": 0.768,
+        "p95_ms": 2.134
+      }
+    },
+    {
+      "valid_logins": 40,
+      "login": {
+        "p50_ms": 238.661,
+        "p95_ms": 424.384
+      },
+      "idle": {
+        "p50_ms": 1.046,
+        "p95_ms": 2.764
+      },
+      "loaded": {
+        "p50_ms": 0.691,
+        "p95_ms": 1.617
+      }
+    },
+    {
+      "valid_logins": 40,
+      "login": {
+        "p50_ms": 226.241,
+        "p95_ms": 409.865
+      },
+      "idle": {
+        "p50_ms": 1.21,
+        "p95_ms": 2.624
+      },
+      "loaded": {
+        "p50_ms": 0.616,
+        "p95_ms": 0.992
+      }
+    },
+    {
+      "valid_logins": 40,
+      "login": {
+        "p50_ms": 226.029,
+        "p95_ms": 409.184
+      },
+      "idle": {
+        "p50_ms": 1.003,
+        "p95_ms": 2.746
+      },
+      "loaded": {
+        "p50_ms": 0.65,
+        "p95_ms": 0.869
+      }
+    }
+  ],
+  "login": {
+    "p50_ms": 241.06,
+    "p95_ms": 427.384
+  },
+  "authenticated_api": "GET /api/team",
+  "idle": {
+    "p50_ms": 0.928,
+    "p95_ms": 2.658,
+    "n": 400
+  },
+  "loaded": {
+    "p50_ms": 0.664,
+    "p95_ms": 1.654,
+    "n": 381
+  },
+  "loaded_to_idle_p95": 0.622,
+  "password_lane": {
+    "active": 0,
+    "waiting": 0,
+    "peak_active": 2,
+    "peak_waiting": 38
+  },
+  "accepted": true,
+  "environment": "macOS 27.0.1 arm64, Python 3.14.3, two disposable Uvicorn services on private Unix sockets",
+  "command": ".runtime/venv/bin/python -B tests/performance/login_capacity.py",
+  "single_wave_after_cooling_change": {
+    "login_count": 40,
+    "login": {
+      "p50_ms": 246.427,
+      "p95_ms": 487.917
+    },
+    "authenticated_api": "GET /api/team",
+    "idle": {
+      "p50_ms": 0.754,
+      "p95_ms": 1.095,
+      "n": 96
+    },
+    "loaded": {
+      "p50_ms": 1.643,
+      "p95_ms": 2.432,
+      "n": 78
+    },
+    "loaded_to_idle_p95": 2.221,
+    "password_lane": {
+      "active": 0,
+      "waiting": 0,
+      "peak_active": 2,
+      "peak_waiting": 38
+    },
+    "accepted": false
+  },
+  "single_wave_before_cooling_change": {
+    "login_count": 40,
+    "login": {
+      "p50_ms": 225.848,
+      "p95_ms": 421.323
+    },
+    "authenticated_api": "GET /api/team",
+    "idle": {
+      "p50_ms": 0.607,
+      "p95_ms": 0.784,
+      "n": 96
+    },
+    "loaded": {
+      "p50_ms": 0.765,
+      "p95_ms": 1.373,
+      "n": 77
+    },
+    "loaded_to_idle_p95": 1.751,
+    "password_lane": {
+      "active": 0,
+      "waiting": 0,
+      "peak_active": 2,
+      "peak_waiting": 38
+    },
+    "accepted": true
+  },
+  "concurrent_workspace_five_waves": {
+    "simultaneous_valid_logins": 40,
+    "login_count": 200,
+    "waves": [
+      {
+        "valid_logins": 40,
+        "login": {
+          "p50_ms": 237.312,
+          "p95_ms": 437.172
+        },
+        "idle": {
+          "p50_ms": 0.657,
+          "p95_ms": 0.803
+        },
+        "loaded": {
+          "p50_ms": 1.055,
+          "p95_ms": 1.726
+        }
+      },
+      {
+        "valid_logins": 40,
+        "login": {
+          "p50_ms": 226.939,
+          "p95_ms": 427.542
+        },
+        "idle": {
+          "p50_ms": 0.684,
+          "p95_ms": 0.861
+        },
+        "loaded": {
+          "p50_ms": 0.923,
+          "p95_ms": 1.593
+        }
+      },
+      {
+        "valid_logins": 40,
+        "login": {
+          "p50_ms": 220.065,
+          "p95_ms": 419.483
+        },
+        "idle": {
+          "p50_ms": 0.699,
+          "p95_ms": 1.586
+        },
+        "loaded": {
+          "p50_ms": 0.833,
+          "p95_ms": 1.448
+        }
+      },
+      {
+        "valid_logins": 40,
+        "login": {
+          "p50_ms": 424.945,
+          "p95_ms": 628.429
+        },
+        "idle": {
+          "p50_ms": 0.811,
+          "p95_ms": 1.537
+        },
+        "loaded": {
+          "p50_ms": 1.325,
+          "p95_ms": 17.104
+        }
+      },
+      {
+        "valid_logins": 40,
+        "login": {
+          "p50_ms": 222.709,
+          "p95_ms": 421.269
+        },
+        "idle": {
+          "p50_ms": 0.692,
+          "p95_ms": 0.951
+        },
+        "loaded": {
+          "p50_ms": 0.823,
+          "p95_ms": 1.63
+        }
+      }
+    ],
+    "login": {
+      "p50_ms": 260.684,
+      "p95_ms": 537.56
+    },
+    "authenticated_api": "GET /api/team",
+    "idle": {
+      "p50_ms": 0.698,
+      "p95_ms": 1.153,
+      "n": 400
+    },
+    "loaded": {
+      "p50_ms": 0.95,
+      "p95_ms": 1.902,
+      "n": 381
+    },
+    "loaded_to_idle_p95": 1.65,
+    "password_lane": {
+      "active": 0,
+      "waiting": 0,
+      "peak_active": 2,
+      "peak_waiting": 38
+    },
+    "accepted": true
+  },
+  "method": "Five waves of 40 valid synthetic team logins on trusted private Unix sockets. Each wave brackets authenticated GET /api/team probes with 40 pre-wave and 40 post-wave probes, all spaced by 4 ms after the response. Nearest-rank p95 is pooled across all five waves. The final run followed completion of concurrent capacity, memory and integration suites."
+}

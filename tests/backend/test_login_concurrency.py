@@ -1,6 +1,9 @@
 """Login concurrency regressions against isolated real HTTP services."""
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+import hashlib
 import json
+import time
 import threading
 import unittest
 from unittest.mock import patch
@@ -185,7 +188,7 @@ class LoginConcurrencyTests(unittest.TestCase):
                     'role': 'judge', 'code': invitation['code']}) for _ in range(capacity)]
                 try:
                     self.assertTrue(slots_full.wait(3))
-                    with self.assertRaises(service_module.APIError) as busy:
+                    with patch.object(self.service.password_checks.capacity, 'timeout', 0), self.assertRaises(service_module.APIError) as busy:
                         self.service.login({'role': 'judge', 'code': invitation['code']}, 'synthetic-ip')
                     self.assertEqual((busy.exception.status, busy.exception.code), (429, 'login_busy'))
                     self.assertEqual(self.admin.settings({'submissionsOpen': True})[0], 200)
@@ -194,22 +197,71 @@ class LoginConcurrencyTests(unittest.TestCase):
                 self.assertEqual([future.result(5)[0] for future in futures], [200] * capacity)
         self.assertEqual(peak, capacity)
 
-    def test_failed_attempts_limit_one_ip_and_one_account_without_a_role_lock(self):
-        def failure(ip, target):
-            try:
-                with self.service.login_attempt(ip, 'judge', target):
-                    raise service_module.APIError(401, 'synthetic authentication failure')
-            except service_module.APIError as error:
-                return error.status
-        for index in range(20):
-            self.assertEqual(failure(str(index), 'target'), 401)
-            self.assertEqual(failure('one-ip', 'other-' + str(index)), 401)
-        self.assertEqual(failure('new-ip', 'target'), 429)
-        self.assertEqual(failure('one-ip', 'fresh'), 429)
-        for _ in range(25):
-            with self.service.login_attempt('new-ip', 'judge', 'fresh'):
-                pass
+    def test_full_gate_returns_immediate_retry_after_and_preserves_normal_api(self):
+        _, invitation = self.invitation('judge', 'Synthetic queued judge')
+        gate = self.service.password_checks.capacity
+        tickets = [gate.reserve() for _ in range(gate.running + gate.waiting)]
+        try:
+            with patch.object(service_module, 'scrypt_hash', side_effect=AssertionError('unexpected hash')):
+                start = time.monotonic()
+                status, result, headers = self.public.post('/api/login', {'role':'judge','code':invitation['code']})
+                self.assertLess(time.monotonic() - start, 1.0)
+                self.assertEqual((status, result['code'], headers['Retry-After']), (429, 'login_busy', '1'))
+            self.assertEqual(self.admin.get('/api/admin')[0], 200)
+        finally:
+            for ticket in reversed(tickets):
+                gate.release(ticket)
+        self.assertEqual((gate.active, len(gate.queue), gate.peak_waiting), (0, 0, 40))
 
+    def test_account_pressure_accepts_a_valid_login_from_a_fresh_peer(self):
+        _, invitation = self.invitation('judge', 'Synthetic active judge')
+        digest = hashlib.sha256(invitation['id'].encode()).digest()
+        history = deque((time.monotonic(), object()) for _ in range(20))
+        self.service.login_attempts[('login-account', 'judge', digest)] = history
+        with patch('time.sleep') as delay:
+            result = self.service.login({'role': 'judge', 'code': invitation['code']}, 'new-peer')
+        self.assertTrue(result[0]['ok'])
+        delay.assert_called_once()
+        self.assertEqual(len(history), 20)
+
+    def test_pressure_delay_releases_kdf_capacity_for_an_unrelated_valid_user(self):
+        _, pressured = self.invitation('judge', 'Synthetic pressured judge')
+        _, normal = self.invitation('judge', 'Synthetic unrelated judge')
+        target = hashlib.sha256(pressured['id'].encode()).digest()
+        self.service.login_attempts[('login-account', 'judge', target)] = deque(
+            (time.monotonic(), None) for _ in range(20))
+        cooling, resume = threading.Event(), threading.Event()
+        def controlled_delay(_seconds):
+            cooling.set()
+            if not resume.wait(4):
+                raise AssertionError('Synthetic delay timed out')
+        with ThreadPoolExecutor(max_workers=1) as worker, patch('time.sleep', controlled_delay):
+            delayed = worker.submit(self.service.login, {'role':'judge', 'code':pressured['code']}, 'new-peer')
+            try:
+                self.assertTrue(cooling.wait(2))
+                self.assertEqual(self.service.password_checks.capacity.active, 0)
+                self.assertEqual(self.public.post('/api/login', {'role':'judge', 'code':normal['code']})[0], 200)
+            finally:
+                resume.set()
+            self.assertTrue(delayed.result(2)[0]['ok'])
+
+    def test_peer_and_organizer_failure_controls(self):
+        for key in [('login-ip', 'one-peer'),
+                    ('login-peer-account', 'one-peer', 'judge', hashlib.sha256(b'target').digest())]:
+            self.service.login_attempts.clear()
+            self.service.login_attempts[key] = deque((time.monotonic(), object()) for _ in range(20))
+            with self.assertRaises(service_module.APIError) as denied:
+                with self.service.login_attempt('one-peer', 'judge', 'target'):
+                    self.fail('Saturated peer budget admitted a check')
+            self.assertEqual(denied.exception.status, 429)
+        self.service.login_attempts.clear()
+        self.service.organizer_failures.extend((time.monotonic(), None) for _ in range(20))
+        def try_organizer():
+            with self.service.login_attempt('fresh', 'admin', 'another-selector'):
+                return True
+        with patch('time.sleep') as delay:
+            self.assertTrue(self.service.password_checks.run_sync(try_organizer))
+            delay.assert_called_once()
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

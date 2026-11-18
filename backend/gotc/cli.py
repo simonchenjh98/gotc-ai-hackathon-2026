@@ -35,7 +35,7 @@ def main(argv=()):
         except ValueError:
             raise SystemExit("GOTC_HOST must be a loopback IP address") from None
         origin = public_origin()
-    service = EventService(origin=origin)
+    service = EventService(origin=origin, check_organizer_credentials=args.service != "gateway")
     try:
         if gateway_socket is not None:
             service.keys.connect_runtime_socket(gateway_socket)

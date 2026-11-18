@@ -4,8 +4,6 @@ import json
 import os
 import sqlite3
 
-from .config import settings
-
 
 class ContentStore:
     def __init__(self, directory):
@@ -112,30 +110,6 @@ class ContentStore:
         with self.connection() as content:
             return content.execute("SELECT * FROM content WHERE usage_id=? AND request_id=?",
                                    (usage_id, usage[0])).fetchone()
-
-    def migrate(self, db, now):
-        """Commit the sidecar first. An interrupted event transaction can safely replay the copy."""
-        if not db.execute("SELECT 1 FROM api_logs LIMIT 1").fetchone():
-            return
-        db.execute("PRAGMA secure_delete=ON")
-        db.execute("""UPDATE api_usage SET request_id=lower(hex(randomblob(16)))
-                      WHERE request_id='' AND id IN (SELECT usage_id FROM api_logs)""")
-        policy = settings(db)
-        rows = db.execute("""SELECT l.usage_id,u.request_id,u.at,
-                                    length(CAST(l.headers AS blob))+length(l.request)+length(l.response)
-                             FROM api_logs l JOIN api_usage u ON u.id=l.usage_id WHERE u.at>=?
-                             ORDER BY u.at DESC,u.id DESC""", (now - policy["logRetentionHours"] * 3_600_000,))
-        remaining = policy["logMaxMB"] * 1048576
-        with self.connection() as content:
-            for usage_id, request_id, at, size in rows:
-                if size > remaining:
-                    break  # the retention policy removes oldest entries first
-                remaining -= size
-                payload = db.execute("""SELECT headers,request,response,request_bytes,response_bytes
-                                        FROM api_logs WHERE usage_id=?""", (usage_id,)).fetchone()
-                self.insert(content, usage_id, request_id, at, *payload)
-            self.prune(content, policy, now)
-        db.execute("DELETE FROM api_logs")
 
 
 def reset_legacy_capture(db):

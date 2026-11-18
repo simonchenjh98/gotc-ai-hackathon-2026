@@ -114,6 +114,12 @@ class ObservabilityMiddleware:
             f"gotc_disk_free_bytes {shutil.disk_usage(self.service.data_dir).free}",
             "# TYPE gotc_request_duration_seconds histogram",
         ]
+        if self.role == 'platform':
+            capacity = self.service.password_checks.capacity
+            with capacity.lock:
+                lines.extend([f"gotc_password_active {capacity.active}", f"gotc_password_waiting {len(capacity.queue)}",
+                              f"gotc_password_peak_active {capacity.peak_active}",
+                              f"gotc_password_peak_waiting {capacity.peak_waiting}"])
         for bound in BUCKETS:
             lines.append(f'gotc_request_duration_seconds_bucket{{le="{bound}"}} {buckets[bound]}')
         lines.extend([f'gotc_request_duration_seconds_bucket{{le="+Inf"}} {counts["requests"]}',

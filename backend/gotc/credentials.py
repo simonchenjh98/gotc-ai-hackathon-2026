@@ -11,9 +11,13 @@ import stat
 import tempfile
 
 
+ORGANIZER_TOTP = "organizer-totp.json"
+ORGANIZER_USERNAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}", re.ASCII)
+TOTP_SEED = re.compile(r"[A-Z2-7]{32}", re.ASCII)
+
 CREDENTIAL_NAMES = frozenset({
     "api-key-pepper", "roadshow-claim-key", "gateway.json", "repositories.env",
-    "shared-login-codes.json", "finals-access-code.txt",
+    "shared-login-codes.json", "finals-access-code.txt", ORGANIZER_TOTP,
 })
 
 
@@ -39,7 +43,12 @@ class Credentials:
         except OSError:
             raise RuntimeError(f"Cannot open credential {name}") from None
         with os.fdopen(fd, "rb") as stream:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
+            info = os.fstat(fd)
+            if name == ORGANIZER_TOTP and os.name == "posix" and (
+                info.st_mode & 0o077 or info.st_uid not in {0, os.geteuid()}
+            ):
+                raise ValueError("Organizer credential requires a private, operator-owned file")
+            if not stat.S_ISREG(info.st_mode):
                 raise RuntimeError(f"Invalid credential file {name}")
             data = stream.read(1_048_577)
         if len(data) > 1_048_576:
@@ -47,6 +56,8 @@ class Credentials:
         return data
 
     def read(self, name):
+        if name == ORGANIZER_TOTP:
+            return self._read(self.systemd or self.directory, name)
         data = self._read(self.systemd, name)
         return data if data is not None else self._read(self.directory, name)
 
@@ -61,13 +72,22 @@ class Credentials:
             pass
         raise ValueError(f"Invalid JSON in {name}")
 
+    def organizer_seeds(self) -> dict[str, str]:
+        entries = self.read_json(ORGANIZER_TOTP, default={})
+        if not isinstance(entries, dict) or any(
+            not ORGANIZER_USERNAME.fullmatch(login) or not isinstance(seed, str) or not TOTP_SEED.fullmatch(seed)
+            for login, seed in entries.items()
+        ):
+            raise ValueError("Invalid organizer credential mapping")
+        return entries
+
     def repository_settings(self):
         # A credential file overrides explicitly exported local development settings.
         return ChainMap(self._repository_file, os.environ)
 
     @cached_property
     def _repository_file(self):
-        result = {}
+        result: dict[str, str] = {}
         data = self.read("repositories.env")
         if data is None:
             return result

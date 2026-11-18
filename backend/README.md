@@ -33,7 +33,7 @@ Nginx 将平台和网关请求按原路径分别代理到对应的 Unix socket�
 
 组织方可以在私有数据目录放置 `shared-login-codes.json`，用 `admin` 和/或 `judge` 字段配置统一登录码。真实值仅放在该私有文件，不进入 Git 或公开网页。启动时同步仍使用统一码的账号哈希，使已更改密码账号的旧会话失效，保留账号 ID、评分和投票。若配置了评委统一码且还没有任何评委身份，自动创建“评委01”；后续新建评委身份沿用统一码。多位评委共用登录码时，正确输入登录码后选择自己的身份，各自记录分开保存。单独重发的评委会退出统一码，使用自己的新码；启动会保留该独立码，不再恢复统一码，也不出现在统一码的身份选择中。观众邀请码不受统一码影响。
 
-管理员也可在选手入口填写现有统一管理码，服务端仍验证真实管理员账号，登录结果先为 `role: "admin"`。选择有效队伍后进入代管会话，可准备该队材料、申请仓库、查看该队历史及已开通的 API 工具；无需创建学生账号或改变提交码。代管不越过作品提交窗口、模型权限、密钥数量或调用限制。没有学生提交身份的队伍可先准备材料与仓库，但其 API 密钥实际调用仍遵守既有队伍账号启用条件。
+Organizers sign in at `#admin` with their own credentials before selecting a team for delegated work. The team sign-in form accepts only the participant code (参赛码). Delegation grants the selected workspace access to submissions, repositories, history and provisioned AI tools within the existing submission window, model permissions, key count and usage limits. Teams awaiting their participant code can still have an organizer prepare materials and repositories. SDK calls require an active team account.
 
 代管会话的数据库 `sessions.account_id` 始终属于真实管理员，`admin_team_sessions` 将当前令牌关联到唯一队伍。对选手接口仅呈现该队权限；进入、返回和再次选队都旋转令牌，使旧标签的身份标记失效。管理员账号停用、管理码轮换时删除会话、会话到期或退出后，代管也失效。材料、仓库、密钥等审计记录实际管理员 ID、`role: "admin"` 和 `metadata.operator` 中的目标队伍。旧学生账号和会话保持原有规则。
 
@@ -53,7 +53,7 @@ Nginx 将平台和网关请求按原路径分别代理到对应的 Unix socket�
 
 回收站恢复先检查现存队名、原成员身份与占用情况；可以填写空闲新队名，但不能覆盖其他队伍成员。任一明确冲突阻止整个恢复。仅原登记成员学校未知的同名提示不证明同一人，不阻止恢复，也不建立已审核身份绑定。成功恢复沿用原 ID、队号及原参赛状态；原为退出或取消资格时不会自动变成参赛中。
 
-**恢复队伍不等于恢复访问。** 原提交码、会话及 API key 仍失效；需要访问时，使用已有后台流程重发提交码、重新开通 API 并创建新 key。资料管理可使用参赛码；已有未作废管理码仅保留原登记权限，不再发放或重发，回收时已作废的旧码不会因恢复自动复活。相关阶段的已发布结果需核对后主动重新发布。网关在排队后的最终准入检查拒绝已回收队伍；已经通过该检查的请求可以完成并计费，历史用量不会撤销。
+**恢复队伍不等于恢复访问。** 原参赛码、会话及 API key 仍失效；需要访问时，使用已有后台流程重发参赛码、重新开通 API 并创建新 key。资料管理可使用参赛码；已有未作废管理码仅保留原登记权限，不再发放或重发，回收时已作废的旧码不会因恢复自动复活。相关阶段的已发布结果需核对后主动重新发布。网关在排队后的最终准入检查拒绝已回收队伍；已经通过该检查的请求可以完成并计费，历史用量不会撤销。
 
 私有接口为 `GET /api/admin/data/team?teamId=…`、`GET /api/admin/data/recycle-bin`、`POST /api/admin/data/team/recycle` 和 `POST /api/admin/data/team/restore`。仅真实管理员且携带当前 `X-GOTC-Login` 可访问，代管身份不可用。回收提交显示的 `expectedRevision` 和 `recycleContext`；资料变化返回 409 后需刷新、核对并重新确认，不自动重试。恢复同样要求显示版本并在事务内重查冲突。
 
@@ -149,7 +149,7 @@ Nginx 将平台和网关请求按原路径分别代理到对应的 Unix socket�
 | POST `/api/admin/team-access` | 管理员 | `{teamId,action:"issue"\|"rotate"\|"revoke"}` → `{ok,teamId,id,active,code?}`；仅发码与重发返回明文 |
 | GET `/api/admin/submissions/export` | 管理员 | UTF-8 BOM CSV，一队一行，正式与草稿列明确分开，含版本、时间和未提交修改状态，无凭据 |
 
-队伍以 `role:"team"` 使用独立提交码登录，不使用统一评委码。每队绑定一个账号。`issue` 仅首次创建；存在身份返回 409。`rotate` 保留账号 ID、重发随机码并重新启用；`revoke` 停用，可重复调用。二者立即删除旧会话，已保存材料保留。所有写操作先获得 SQLite 写锁再验证会话，排队中的旧会话不能绕过重发或停用。
+队伍以 `role:"team"` 使用独立参赛码登录，不使用统一评委码。每队绑定一个账号。`issue` 仅首次创建；存在身份返回 409。`rotate` 保留账号 ID、重发随机码并重新启用；`revoke` 停用，可重复调用。二者立即删除旧会话，已保存材料保留。所有写操作先获得 SQLite 写锁再验证会话，排队中的旧会话不能绕过重发或停用。
 
 `materials` 只接受下列字段，字符串省略时默认为空并去除首尾空白，`confirmed` 省略为 false：
 
@@ -217,7 +217,7 @@ Claude Code 会按自己的默认模型名请求（如 `claude-opus-…`、`clau
 - 队伍使用：OpenAI 兼容 SDK `base_url=https://<域名>/gotc/v1`；Anthropic SDK `base_url=https://<域名>/gotc`。支持 `Authorization: Bearer` 或 `x-api-key`，支持流式输出。
 - 网页端密钥管理（`/api/team/keys` 及子路由）必须携带页面打开时的 `X-GOTC-Login`，不能从后续登录自动换取新标识继续旧操作。缺失标识返回 428，标识与当前会话不符返回 401；旧标签须刷新并核对登录身份。网页会在切换账号后清除已展示的完整密钥并锁定旧卡片；SDK `/v1/*` 仍仅使用 API Key，无需此请求头。
 - 中转 API 的浏览器来源必须精确匹配 `GOTC_PUBLIC_ORIGIN`；空值、`null`、重复或外站 Origin，以及跨站 `Sec-Fetch-Site` 在读取请求体、转发和计费前返回 403。无 Origin 的 WorkBuddy、SDK 保持支持。预检仅允许明确的方法和请求头，无通配来源或 Cookie credentials；同一规则覆盖 WebSocket 升级。CORS 不能阻止拿到密钥的人通过脚本省略/伪造 Origin，泄露的密钥仍需停用或轮换。
-- 后台设置每队密钥上限、统一到期时间、每队每分钟请求上限（新安装默认为 120，0为不限；已有数据库保留已保存的设置，可在后台调整）、屏蔽词和队伍公告。每队最多 15 个并发请求，超出时排队最多 30 秒再返回 429。
+- Organizers configure the team key limit, shared expiry, RPM limit, blocked words and team announcement. A fresh installation allows 120 requests per team per minute. Zero disables the generation RPM limit. Existing installations retain their saved settings.
 - 每次请求在排队取得并发名额后会再次校验密钥、队伍状态与到期时间。非 Gitee 上游调用按实际 token 用量统计费用，缺少用量时进行估算。Gitee 按上述目录与可信上游证据计价，证据不足时待核价。Anthropic 请求未设置输出上限时补 `max_tokens: 8192`，显式输出上限最多 128000。
 - 后台管理参照 sub2api：
   - 模型上游可“测试已保存的连接”（向第一个模型发送 1 个 token 的请求）与“自动拉取模型列表”。拉取使用当前表单的地址和密钥，无需先保存或填写模型；密钥留空时，只能在地址主机和端口未变化时沿用已保存的密钥。读取上游 `/models` 后可选择模型加入配置，已有模型和价格保留，新模型须补全价格后再保存。拉取不修改配置，也不占用数据库写锁；上游不支持列举模型时仍可手动填写。
@@ -238,7 +238,7 @@ Claude Code 会按自己的默认模型名请求（如 `claude-opus-…`、`clau
 - 鉴权与限流参照 sub2api：
   - `Authorization: Bearer`（大小写不敏感）或 `x-api-key`；网址中携带 `key` / `api_key` 参数直接拒绝（400），避免密钥留在代理日志。
   - 同一来源地址（IPv6 按 /64）每分钟无效密钥超过 120 次即封禁 60 秒，封禁期内该地址的无效密钥返回 429 与 `Retry-After`；有效密钥不受影响（比赛现场所有队伍通常共用一个出口地址）。后台概况显示近1小时无效尝试次数与被封禁地址数。
-  - 每队最多 15 个并发、另可排队 20 个（排队最长 30 秒），超出立即返回 429；生成请求排队超时或因队列已满被拒绝时不计入 RPM；所有 429 都带 `Retry-After`。`count_tokens` 与生成请求共用每队 RPM 计数（RPM 设置为 0 时，计数接口仍按每分钟 120 次限制）但不占用生成请求并发名额，另有每队 15 个的独立并发上限，因计数池已满而被拒绝的请求仍计入 RPM。
+  - Generation defaults to 15 running and 16 queued per team, with 64 running and 64 queued globally. Queued teams take turns, with a 30-second deadline. A full queue or timeout returns `429` with `Retry-After` and consumes no RPM. Token counts and task polling share a separate lightweight provider limit of two per team and eight globally. Token counting shares the generation RPM window and retains a 120 RPM cap when generation RPM is unlimited. [Deployment settings](../ops/deploy/README.md)
   - 每队每小时最多创建 60 个密钥，删除密钥不返还次数。
   - 屏蔽词检查模型会读取的全部文本：所有消息、系统提示、工具定义、工具参数与结果（不检查 JSON 字段名，只跳过真正的图片与文件数据），先做 NFKC 规范化、去除零宽字符、合并空白、不区分大小写，命中的屏蔽词记录在后台；sub2api 只检查最后一条用户消息，但伪造的历史消息可借此绕过，因此这里更严格。
   - 缺少用量时的输入估算：文本按字节/4 计算且不设上限，每张 base64 图片按 1600 token 计（不按其字节数），其他 base64 内容（如 PDF）按字节/4 计。
@@ -440,7 +440,7 @@ python3 -m compileall -q backend
 
 新增请求账本、正式历史、人工检查和迁移元数据表。非空升级先创建私有 `before-submission-records-*.sqlite3` SQLite整库备份；备份失败停止启动。DDL、真实当前正式回填与标记独立原子提交，失败全部回滚，重复启动幂等。旧代码回退期间不维护新记录，再升级只补当时仍保有的当前正式一份并保留缺口，不虚构请求回执、不覆盖已有历史。代码回退不恢复数据库，不自动覆盖现库；整库SQLite备份恢复包含新表。私有临时库演练不代表生产迁移或部署。
 
-队伍使用原提交码进入 `#team-score` 查看本队专业总分、六维均分及匿名逐条评语。`GET /api/team/score` 根据队伍会话绑定确定队伍，要求当前页面的 `X-GOTC-Login`，禁止查询参数指定其他队伍。返回 `{team:{number,name},state,score,dimensions,feedback}`；`state` 为 `published`、`unpublished` 或 `awaiting_scores`。已发布且达到 minJudges 门槛时，score 为百分制专业总均分，dimensions 为六项 `{id,name,max,score}`，每项为同一批全部 status=submitted 记录的该维算术均分，保留两位小数；feedback 为非空、知情确认分享的正式评语字符串数组，按文字稳定排序，保留换行。旧评分数值仍计入各均分，scores_json 本身为原分值，仅 total_tenths 按十分之一存储。是否进入公开前 12 名不影响本队查询。其他状态 score 为 null，dimensions/feedback 均为空数组；不返回个人分数、评委标识、时间或逐评委数值与评语关联。
+队伍使用原参赛码进入 `#team-score` 查看本队专业总分、六维均分及匿名逐条评语。`GET /api/team/score` 根据队伍会话绑定确定队伍，要求当前页面的 `X-GOTC-Login`，禁止查询参数指定其他队伍。返回 `{team:{number,name},state,score,dimensions,feedback}`；`state` 为 `published`、`unpublished` 或 `awaiting_scores`。已发布且达到 minJudges 门槛时，score 为百分制专业总均分，dimensions 为六项 `{id,name,max,score}`，每项为同一批全部 status=submitted 记录的该维算术均分，保留两位小数；feedback 为非空、知情确认分享的正式评语字符串数组，按文字稳定排序，保留换行。旧评分数值仍计入各均分，scores_json 本身为原分值，仅 total_tenths 按十分之一存储。是否进入公开前 12 名不影响本队查询。其他状态 score 为 null，dimensions/feedback 均为空数组；不返回个人分数、评委标识、时间或逐评委数值与评语关联。
 
 专业评分新表单明确告知：本次正式非空评语将在发布且达到门槛后匿名分享给本队，请勿署名或留下联系方式；正式提交非空评语前必须勾选确认，每次提交重新确认。API `POST /api/score` 仅在本次显式附带 `feedbackSharing:"team-anonymous-v1"` 且正式提交非空评语时建立分享授权；省略字段的旧客户端仍可私下保存但不会分享，旧评语不自动公开。无效声明返回 400。授权使用独立 score_feedback_visibility 表绑定本次 score_write_revisions.revision；scores 的插入、更新、删除触发器先清除授权，新服务仅在本次知情提交完成后重新写入。因此旧客户端、旧代码回滚及直接旧格式 SQL 改写不能沿用先前授权。原 scores 七列不变，原评委私有查看、组织方导出不变。
 

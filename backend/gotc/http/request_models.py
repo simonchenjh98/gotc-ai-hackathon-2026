@@ -3,7 +3,7 @@
 Keep these types non-coercing: the original JSON also feeds submission fingerprints.
 Variants represent alternative valid request shapes, not optional authorization fields.
 """
-from typing import Literal, NotRequired, Required, TypedDict
+from typing import Literal, NotRequired, Protocol, Required, TypedDict, cast, is_typeddict
 
 
 class EmptyBody(TypedDict):
@@ -405,9 +405,14 @@ class TeamProfileSave(RevisionBody):
     team: TeamRegistration
 
 
+class _TypedDictFields(Protocol):
+    __required_keys__: frozenset[str]
+    __optional_keys__: frozenset[str]
+
+
 def accepts_fields(value: object, model: type) -> bool:
     """Check keys without coercing values or changing the domain's error handling."""
-    if not isinstance(value, dict):
+    if not isinstance(value, dict) or not is_typeddict(model):
         return False
-    required = model.__required_keys__
-    return required <= value.keys() <= required | model.__optional_keys__
+    fields = cast(_TypedDictFields, model)
+    return fields.__required_keys__ <= value.keys() <= fields.__required_keys__ | fields.__optional_keys__

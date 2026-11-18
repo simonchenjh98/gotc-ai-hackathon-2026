@@ -116,9 +116,6 @@ class KeyService:
     def load_runtime(self, db):
         for key, value in DEFAULTS.items():
             db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, json.dumps(value)))
-        # Replay rows added if this data directory was temporarily served by an older release.
-        if db.execute("PRAGMA user_version").fetchone()[0] >= 3:
-            self.ledger.content.migrate(db, now_ms())
         if self.seed:
             db.execute("INSERT OR IGNORE INTO gateway_config VALUES (1,?,?)", (json.dumps(self.seed, ensure_ascii=False), now_ms()))
         row = db.execute("SELECT data FROM gateway_config WHERE id=1").fetchone()
