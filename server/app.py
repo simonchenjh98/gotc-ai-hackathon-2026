@@ -30,9 +30,9 @@ from repository_backups import RepositoryBackups, ArchiveDownload
 from repositories import Repositories
 from write_conflicts import WriteConflicts
 from judging import JudgingService
-from finals import FinalsService
+from finals import FinalsService, DIMENSIONS as FINALS_DIMENSIONS
 from roadshow_access import RoadshowAccess
-from roadshow_scoring import RoadshowScoring
+from roadshow_scoring import RoadshowScoring, DIMENSIONS as ROADSHOW_DIMENSIONS
 from judge_login_schedule import JudgeLoginSchedule
 from admin_data import AdminDataService, TRACK_OPTIONS
 from admin_team_access import AdminTeamAccess, PATHS as ADMIN_TEAM_PATHS, operator_for
@@ -207,7 +207,7 @@ def repository_parts(value, commit=False):
         return None
 
 
-def normalize_code_version(repository, version):
+def normalize_code_version(repository, version, allow_empty=False):
     try:
         url=urlsplit(repository)
         valid=(url.scheme=='https' and valid_material_host(url.hostname) and url.username is None and url.password is None
@@ -219,6 +219,8 @@ def normalize_code_version(repository, version):
     repo=repository_parts(repository)
     if not valid or (url.hostname in COMMIT_LINK_HOSTS and not repo):
         raise APIError(400,'仓库请填写完整 HTTPS 仓库主页链接，不是本地路径或文件页面；GitHub、Gitee、GitCode、GitLab 请使用仓库根地址')
+    if allow_empty and not version:
+        return ''
     if re.fullmatch(r'(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})',version):
         return version.lower()
     commit=repository_parts(version,commit=True)
@@ -521,7 +523,51 @@ class EventService:
             # Text-only ordering cannot associate comments with judge order or scores.
             feedback = sorted(record["feedback"] for record in comments if record["feedback"].strip())
         return {"team": {"name": team["name"], "number": team["number"]}, "state": state,
-                "score": score, "dimensions": dimensions, "feedback": feedback}
+                "score": score, "dimensions": dimensions, "feedback": feedback,
+                "stages": self.own_stage_scores(db, team["id"])}
+
+    def own_stage_scores(self, db, team_id):
+        """Return only the logged-in team's published roadshow/finals results."""
+        stages = []
+        roadshow = self.judging.state(db, "roadshow")
+        if db.execute("SELECT 1 FROM judging_roster WHERE run_id=? AND team_id=?",
+                      (roadshow["run_id"], team_id)).fetchone():
+            item = {"id": "roadshow", "name": "路演", "state": "unpublished", "score": None,
+                    "dimensions": [], "scoreCount": 0, "minimumScores": 3, "awards": []}
+            if self.roadshow_scoring.published(db, roadshow):
+                saved = self.roadshow_scoring.publication_state(db)
+                summary = json.loads(saved["publication_json"])
+                row = next((value for value in summary.get("teams", []) if value.get("id") == team_id), None)
+                if row is not None:
+                    item["scoreCount"] = int(row.get("scoreCount") or 0)
+                    if row.get("score") is not None:
+                        item.update(state="published", score=row["score"], dimensions=[
+                            {**dimension, "score": value}
+                            for dimension, value in zip(ROADSHOW_DIMENSIONS, row.get("dimensions") or [])])
+                    else:
+                        item["state"] = "awaiting_scores"
+            stages.append(item)
+
+        finals = self.finals.state(db)
+        if db.execute("SELECT 1 FROM finals_teams WHERE run_id=? AND team_id=?",
+                      (finals["run_id"], team_id)).fetchone():
+            item = {"id": "finals", "name": "决赛", "state": "unpublished", "score": None,
+                    "dimensions": [], "scoreCount": 0, "minimumScores": 1, "awards": []}
+            if self.finals.published(db, finals):
+                summary = json.loads(finals["publication_json"])
+                row = next((value for value in summary.get("teams", []) if value.get("id") == team_id), None)
+                if row is not None:
+                    item["scoreCount"] = int(row.get("scoreCount") or 0)
+                    if row.get("score") is not None:
+                        item.update(state="published", score=row["score"], dimensions=[
+                            {"id": dimension["id"], "name": dimension["name"], "max": dimension["max"], "score": value}
+                            for dimension, value in zip(FINALS_DIMENSIONS, row.get("dimensions") or [])])
+                    else:
+                        item["state"] = "awaiting_scores"
+                item["awards"] = [award["name"] for award in summary.get("awards", [])
+                                  if team_id in (award.get("winners") or [])]
+            stages.append(item)
+        return stages
 
     def teams(self, db, public=True):
         config = self.config(db)
@@ -715,6 +761,7 @@ class EventService:
             if method == "GET" and path == "/api/session":
                 return self.admin_team_access.session_view(actor,cookie), None, None
             if method == "GET" and path == "/api/board":
+                self.require(actor, "admin")
                 config = self.config(db)
                 teams = sorted((team for team in self.teams(db) if team["rank"] is not None), key=lambda team: team["rank"])
                 stats = {"teamCount": db.execute("""SELECT COUNT(*) FROM teams t WHERE NOT EXISTS
@@ -971,34 +1018,32 @@ class EventService:
         if len(result['codeVersion'].encode('utf-8'))>1024:
             raise APIError(400,'代码版本最多1024字节')
         for key in urls:
-            value=text_field(materials.get(key, ""), key, 1024)
+            limit=8192 if key=='demoUrl' else 1024
+            schemes=('http','https') if key=='demoUrl' else ('https',)
+            value=text_field(materials.get(key, ""), key, limit)
             if value:
                 try:
                     parsed=urlsplit(value)
-                    valid=(parsed.scheme=="https" and valid_material_host(parsed.hostname) and parsed.username is None and parsed.password is None
-                           and parsed.port!=0 and len(value.encode("utf-8"))<=1024
+                    valid=(parsed.scheme in schemes and valid_material_host(parsed.hostname) and parsed.username is None and parsed.password is None
+                           and parsed.port!=0 and len(value.encode("utf-8"))<=limit
                            and not any(c.isspace() or ord(c)<32 or ord(c)==127 or c=="\\" for c in value)
                            and not re.search(r"%(?:0[0-9a-f]|1[0-9a-f]|7f)", value, re.I))
                 except ValueError:
                     valid=False
                 if not valid:
-                    raise APIError(400, key+"必须是无凭据、无空白的完整 HTTPS 链接（最多1024字节）")
+                    protocol='HTTP 或 HTTPS' if key=='demoUrl' else 'HTTPS'
+                    raise APIError(400, f"{key}必须是无凭据、无空白的完整 {protocol} 链接（最多{limit}字节）")
             result[key]=value
         confirmed=materials.get("confirmed", False)
         if type(confirmed) is not bool:
             raise APIError(400, "提交确认必须为布尔值")
         result["confirmed"]=confirmed
         if submitted:
-            required=("projectName", "summary", "codeUrl", "readmeUrl", "license", "slidesUrl", "sourcesAndLimitations")
-            if lean_gitee:
-                required=tuple(key for key in required if key not in {'readmeUrl','license','sourcesAndLimitations'})
+            required=("slidesUrl", "filesUrl")
             if any(not result[key] for key in required):
-                raise APIError(400, "正式提交请填写全部必填项目材料")
-            if not result["demoUrl"]:
-                raise APIError(400, "请上传HTML作品展示，或填写可以直接打开的HTTPS分享链接")
-            if not confirmed:
-                raise APIError(400, "正式提交前请完成材料自查确认")
-            result['codeVersion']=normalize_code_version(result['codeUrl'],result['codeVersion'])
+                raise APIError(400, "正式提交只需提供PPT和作品压缩包，请补齐这两项")
+            if result['codeUrl'] or result['codeVersion']:
+                result['codeVersion']=normalize_code_version(result['codeUrl'],result['codeVersion'],allow_empty=True)
         return result
 
     def save_submission(self, db, actor, team, body, accepted_at=None):
@@ -1025,7 +1070,7 @@ class EventService:
         if lean_gitee:
             for key in ('readmeUrl','license','licenseUrl','sourcesAndLimitations'):
                 materials[key]=''
-            if submitted:
+            if submitted and materials['codeVersion']:
                 materials['repositoryMaterialsUrl']=self.repositories.public(binding)['codeUrl']+'/tree/'+materials['codeVersion']
         current=now_ms()
         if not self.submission_window(db, current if accepted_at is None else accepted_at)["canEdit"]:
@@ -1043,7 +1088,7 @@ class EventService:
            version if submitted else previous["submittedVersion"], (previous["firstSubmittedAt"] or current) if submitted else previous["firstSubmittedAt"],
            current if submitted else previous["submittedAt"], current))
         if submitted:
-            db.execute("UPDATE teams SET project=?,updated_at=? WHERE id=?", (materials["projectName"], current, team["id"]))
+            db.execute("UPDATE teams SET project=?,updated_at=? WHERE id=?", (materials["projectName"] or team["project"], current, team["id"]))
             db.execute('UPDATE team_details SET revision=revision+1 WHERE team_id=?',(team['id'],))
             self.touch(db)
         self.audit(db, actor, "submission."+body["status"], team["id"], {"version": version})

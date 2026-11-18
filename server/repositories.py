@@ -617,6 +617,9 @@ class Repositories:
             self.s.require(actor, 'team')
             team = self.s.bound_submission_team(db, actor)
             self.s.submission_records.validate_envelope(body)
+            if body.get('repoPreviewId') is None and not body['materials'].get('codeVersion'):
+                # File-only submissions do not opt into the optional repository flow.
+                return None
             if isinstance(body.get('requestId'), str) and db.execute('SELECT 1 FROM submission_requests WHERE team_id=? AND request_id=?', (team['id'], body['requestId'])).fetchone():
                 return None
             row = self.binding(db, team['id'])
@@ -654,6 +657,8 @@ class Repositories:
         if not row:
             if preview_id is not None:
                 raise APIError(400, '未绑定仓库不能使用 SHA 预览编号')
+            return payload
+        if preview_id is None and not payload['materials'].get('codeVersion'):
             return payload
         if not proof or proof.get('previewId') != preview_id:
             raise APIError(409, '仓库绑定已变化，请重新检查材料', 'repository_preview_required')

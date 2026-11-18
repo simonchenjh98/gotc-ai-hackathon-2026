@@ -1,4 +1,4 @@
-"""Independent eight-seat finals: invitation access, seat selection and publication."""
+"""Independent finals: invitation access, seat selection and publication."""
 from contextlib import closing
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
@@ -14,6 +14,7 @@ import re
 from errors import APIError
 
 MAX_REVISION = 9007199254740991
+EXPECTED_JUDGE_COUNT = 7
 FINALS_ACCESS_TTL_MS = 12 * 3600 * 1000
 FINALS_ACCESS_PATHS = {'/api/finals/entry', '/api/finals/judge', '/api/finals/score', '/api/finals/nominations'}
 DIMENSIONS = [
@@ -122,8 +123,12 @@ class FinalsService:
         return db.execute('SELECT * FROM finals_config WHERE id=1').fetchone()
 
     def access_code(self):
-        code = self.s.shared_login_codes.get('admin')
-        if not isinstance(code, str) or not code:
+        path = Path(self.s.data_dir) / 'finals-access-code.txt'
+        try:
+            code = path.read_text(encoding='utf-8').rstrip('\r\n')
+        except OSError:
+            raise APIError(503, '决赛邀请入口尚未配置，请联系组织方', 'finals_access_unavailable')
+        if not re.fullmatch(r'[0-9]{6,32}', code):
             raise APIError(503, '决赛邀请入口尚未配置，请联系组织方', 'finals_access_unavailable')
         return code
 
@@ -156,6 +161,88 @@ class FinalsService:
         if row is None or row['expires_at'] <= self.clock() or not hmac.compare_digest(row['code_tag'], self.access_tag(code, token)):
             raise APIError(401, '决赛邀请验证已失效，请重新输入邀请码', 'finals_access_required')
 
+    @staticmethod
+    def roadshow_source_fingerprint(db):
+        stage = db.execute("SELECT run_id FROM judging_stages WHERE stage='roadshow'").fetchone()
+        if stage is None:
+            raise ValueError('Roadshow stage is unavailable')
+        run_id = stage['run_id']
+        value = {
+            'runId': run_id,
+            'scores': [dict(row) for row in db.execute(
+                'SELECT * FROM roadshow_scores WHERE run_id=? ORDER BY run_id,judge_id,team_id', (run_id,))],
+            'teams': [tuple(row) for row in db.execute('''SELECT t.id,t.number,t.name,t.project,
+                COALESCE(d.status,'active'),EXISTS(SELECT 1 FROM team_recycle_events e
+                    WHERE e.team_id=t.id AND e.restored_at IS NULL)
+                FROM judging_roster r JOIN teams t ON t.id=r.team_id
+                LEFT JOIN team_details d ON d.team_id=t.id WHERE r.run_id=? ORDER BY t.id''', (run_id,))],
+            'judges': [tuple(row) for row in db.execute('''SELECT g.judge_id,a.role,a.active
+                FROM judging_grants g JOIN accounts a ON a.id=g.judge_id
+                WHERE g.run_id=? ORDER BY g.judge_id''', (run_id,))],
+        }
+        return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                         separators=(',', ':')).encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def confirmed_roadshow_team_ids(db, strict=False):
+        row = db.execute("SELECT value FROM settings WHERE key='finalsConfirmedRoadshowRoster'").fetchone()
+        if row is None:
+            return None
+        try:
+            saved = json.loads(row['value'])
+            if not isinstance(saved, dict):
+                raise ValueError('Invalid confirmed roster')
+            ids = saved.get('teamIds')
+            if (not isinstance(ids, list) or not 1 <= len(ids) <= 999
+                    or any(not isinstance(team_id, str) or not 1 <= len(team_id) <= 80 for team_id in ids)
+                    or len(ids) != len(set(ids))):
+                raise ValueError('Invalid team identifiers')
+            fingerprint, reason = saved.get('sourceFingerprint'), saved.get('reason')
+            if (not isinstance(fingerprint, str) or not re.fullmatch(r'[a-f0-9]{64}', fingerprint)
+                    or not isinstance(reason, str) or not reason.strip() or len(reason) > 2000):
+                raise ValueError('Missing source confirmation')
+            final = db.execute('SELECT run_id FROM finals_config WHERE id=1').fetchone()
+            stage = db.execute("SELECT run_id,open FROM judging_stages WHERE stage='roadshow'").fetchone()
+            if (final is None or stage is None or stage['open']
+                    or saved.get('finalsRunId') != final['run_id']
+                    or saved.get('roadshowRunId') != stage['run_id']
+                    or not hmac.compare_digest(fingerprint, FinalsService.roadshow_source_fingerprint(db))):
+                raise ValueError('Source competition state changed')
+            eligible = {team[0] for team in db.execute('''SELECT t.id FROM judging_roster r
+                JOIN teams t ON t.id=r.team_id LEFT JOIN team_details d ON d.team_id=t.id
+                WHERE r.run_id=? AND COALESCE(d.status,'active')='active'
+                AND NOT EXISTS(SELECT 1 FROM team_recycle_events e
+                    WHERE e.team_id=t.id AND e.restored_at IS NULL)''', (stage['run_id'],))}
+            if not set(ids) <= eligible:
+                raise ValueError('Confirmed team is unavailable')
+            return ids
+        except (ValueError, TypeError, KeyError):
+            if strict:
+                raise APIError(409, '组织方确认的决赛名单已失效，请重新核对并确认入围名单',
+                               'finals_confirmed_roster_stale')
+            return None
+
+    @staticmethod
+    def roadshow_seed_order(db):
+        confirmed = FinalsService.confirmed_roadshow_team_ids(db)
+        if confirmed is not None:
+            return {team_id: index for index, team_id in enumerate(confirmed)}
+        row = db.execute('SELECT publication_json FROM roadshow_scoring_config WHERE id=1').fetchone()
+        if row is None or not row['publication_json']:
+            return {}
+        try:
+            teams = json.loads(row['publication_json']).get('teams', [])
+        except (TypeError, ValueError):
+            return {}
+        ordered = []
+        for team in teams:
+            team_id = team.get('id') if isinstance(team, dict) and team.get('valid') is True else None
+            if isinstance(team_id, str) and team_id not in ordered:
+                ordered.append(team_id)
+                if len(ordered) == 12:
+                    break
+        return {team_id: index for index, team_id in enumerate(ordered)}
+
     def teams(self, db, run_id=None):
         sql = """SELECT t.id,t.number,t.name,t.project,COALESCE(d.status,'active') AS status
                  FROM teams t LEFT JOIN team_details d ON d.team_id=t.id"""
@@ -163,8 +250,11 @@ class FinalsService:
         if run_id is not None:
             sql += ' WHERE t.id IN (SELECT team_id FROM finals_teams WHERE run_id=?)'
             params = (run_id,)
-        return [{"id": r['id'], "number": r['number'], "name": r['name'], "project": r['project'],
-                 "eligible": r['status'] == 'active'} for r in db.execute(sql + ' ORDER BY t.number,t.id', params)]
+        result = [{"id": r['id'], "number": r['number'], "name": r['name'], "project": r['project'],
+                   "eligible": r['status'] == 'active'} for r in db.execute(sql, params)]
+        seeds = self.roadshow_seed_order(db) if run_id is not None else {}
+        result.sort(key=lambda team: (seeds.get(team['id'], 1000000), team['number'], team['id']))
+        return result
 
     def judges(self, db, run_id=None):
         sql = "SELECT id,name,active FROM accounts WHERE role='judge'"
@@ -189,13 +279,16 @@ class FinalsService:
                     and state['publication_fingerprint'] == self.fingerprint(db, state))
 
     def config(self, db, state, public=False):
-        result = {'open': bool(state['open']), 'published': self.published(db, state), 'judgeCount': 8,
+        result = {'open': bool(state['open']), 'published': self.published(db, state), 'judgeCount': EXPECTED_JUDGE_COUNT,
                   'publishedAt': state['published_at'] if self.published(db, state) else None, 'awardLimit': 1}
         if not public:
+            confirmed = self.confirmed_roadshow_team_ids(db)
             result.update(runId=state['run_id'], revision=state['revision'], rosterLocked=bool(state['roster_locked']),
                           publicationStale=bool(state['publication_json']) and not self.published(db, state),
                           teamIds=[t['id'] for t in self.teams(db, state['run_id'])],
-                          judgeIds=[j['id'] for j in self.judges(db, state['run_id'])])
+                          judgeIds=[j['id'] for j in self.judges(db, state['run_id'])],
+                          confirmedFinalistCount=len(confirmed) if confirmed is not None else None,
+                          selectionSource='organizer-confirmed' if confirmed is not None else 'roadshow-top12')
         return result
 
     @staticmethod
@@ -232,12 +325,32 @@ class FinalsService:
         if writing and not state['open']:
             raise APIError(409, '决赛评分和提名尚未开放或已关闭', 'finals_closed')
 
+    def current_roadshow_finalists(self, db):
+        confirmed = self.confirmed_roadshow_team_ids(db, strict=True)
+        if confirmed is not None:
+            return confirmed
+        stage = self.s.judging.state(db, 'roadshow')
+        roster = [team for team in self.s.roadshow_scoring.teams(db, stage)
+                  if team['eligible'] and not self.s.team_lifecycle.is_recycled(db, team['id'])]
+        if len(roster) < 12:
+            return None
+        if not self.s.roadshow_scoring.published(db, stage):
+            raise APIError(409, '路演前12名尚未有效发布，不能开放决赛', 'roadshow_finalists_unavailable')
+        seeds = self.roadshow_seed_order(db)
+        ordered = [team_id for team_id, _ in sorted(seeds.items(), key=lambda item: item[1])]
+        if len(ordered) != 12:
+            raise APIError(409, '路演有效成绩不足12队，不能开放决赛', 'roadshow_finalists_incomplete')
+        return ordered
+
     def validate_roster(self, db, state):
         judges, teams = self.judges(db, state['run_id']), self.teams(db, state['run_id'])
-        if len(judges) != 8 or any(not j['active'] for j in judges):
-            raise APIError(409, '决赛必须配置8位不同且有效的评委')
+        if len(judges) != EXPECTED_JUDGE_COUNT or any(not j['active'] for j in judges):
+            raise APIError(409, f'决赛必须配置{EXPECTED_JUDGE_COUNT}位不同且有效的评委')
         if not teams or not any(t['eligible'] for t in teams):
             raise APIError(409, '请先配置有效的决赛队伍')
+        expected = self.current_roadshow_finalists(db)
+        if expected is not None and {team['id'] for team in teams} != set(expected):
+            raise APIError(409, '决赛名单与当前路演前12名不一致，请重新确认路演成绩', 'roadshow_finalists_stale')
         return teams, judges
 
     def summary(self, db, state):
@@ -246,8 +359,8 @@ class FinalsService:
         eligible = {t['id'] for t in teams if t['eligible']}
         scores = [r for r in db.execute('SELECT * FROM finals_scores WHERE run_id=?', (state['run_id'],)) if r['judge_id'] in active_judges]
         blockers = []
-        if len(judges) != 8 or len(active_judges) != 8:
-            blockers.append('需要8位有效决赛评委')
+        if len(judges) != EXPECTED_JUDGE_COUNT or len(active_judges) != EXPECTED_JUDGE_COUNT:
+            blockers.append(f'需要{EXPECTED_JUDGE_COUNT}位有效决赛评委')
         if not eligible:
             blockers.append('尚无有效决赛队伍')
         rows, exact_scores = [], {}
@@ -255,7 +368,7 @@ class FinalsService:
             team_scores = [r for r in scores if r['team_id'] == team['id'] and r['status'] == 'submitted'] if team['eligible'] else []
             recused = sum(r['team_id'] == team['id'] and r['status'] == 'recused' for r in scores) if team['eligible'] else 0
             count = len(team_scores)
-            complete = team['eligible'] and len(active_judges) == 8 and count + recused == 8 and count > 0
+            complete = team['eligible'] and len(active_judges) == EXPECTED_JUDGE_COUNT and count + recused == EXPECTED_JUDGE_COUNT and count > 0
             exact = Fraction(sum(r['total_tenths'] for r in team_scores), 10 * count) if count else None
             dims = [round(sum(json.loads(r['scores_json'])[i] for r in team_scores) / count, 2) if count else None for i in range(6)]
             rows.append({**team, 'score': round(float(exact), 2) if exact is not None else None, 'scoreCount': count,
@@ -263,7 +376,7 @@ class FinalsService:
             if exact is not None:
                 exact_scores[team['id']] = exact
             if team['eligible'] and not complete:
-                blockers.append(f"队伍{team['number']}的评分尚未完成（评分{count}，回避{recused}，需合计8位且至少1份评分）")
+                blockers.append(f"队伍{team['number']}的评分尚未完成（评分{count}，回避{recused}，需合计{EXPECTED_JUDGE_COUNT}位且至少1份评分）")
         ranked = sorted((r for r in rows if r['id'] in exact_scores), key=lambda r: (-exact_scores[r['id']], r['number']))
         previous, rank = None, 0
         for position, row in enumerate(ranked, 1):
@@ -272,8 +385,8 @@ class FinalsService:
                 rank = position
             row['rank'], previous = rank, value
         ballots = [r for r in db.execute("SELECT * FROM finals_nominations WHERE run_id=? AND status='submitted'", (state['run_id'],)) if r['judge_id'] in active_judges]
-        if len(ballots) != 8:
-            blockers.append(f'专项奖提名已提交{len(ballots)}/8位评委（可明确全部弃权）')
+        if len(ballots) != EXPECTED_JUDGE_COUNT:
+            blockers.append(f'专项奖提名已提交{len(ballots)}/{EXPECTED_JUDGE_COUNT}位评委（可明确全部弃权）')
         awards, invalid_ballots, allocated = [], set(), set()
         awards_confirmed = bool(state['awards_json'] and not state['open']
                                 and state['awards_fingerprint'] == self.fingerprint(db, state))
@@ -303,7 +416,7 @@ class FinalsService:
             blockers.append('有提名指向已失去资格的队伍，请评委重新确认提名')
         complete = not blockers
         return {'teams': sorted(rows, key=lambda t: (t['rank'] is None, t['rank'] or 0, t['number'])), 'awards': awards,
-                'submittedBallots': len(ballots), 'expectedJudges': 8, 'complete': complete,
+                'submittedBallots': len(ballots), 'expectedJudges': EXPECTED_JUDGE_COUNT, 'complete': complete,
                 'final': complete and not state['open'] and awards_confirmed, 'blockers': blockers,
                 'awardsConfirmed': awards_confirmed}
 
@@ -311,6 +424,60 @@ class FinalsService:
         return {'config': self.config(db, state), 'dimensions': DIMENSIONS,
                 'teams': self.teams(db, state['run_id']), 'judges': self.judges(db, state['run_id']),
                 'availableTeams': [team for team in self.teams(db) if not self.s.team_lifecycle.is_recycled(db,team['id'])], 'availableJudges': self.judges(db), 'summary': self.summary(db, state)}
+
+    def sync_roadshow_teams(self, db, actor, ordered_team_ids, source_run_id):
+        state = self.state(db)
+        confirmed = self.confirmed_roadshow_team_ids(db, strict=True)
+        if (not isinstance(ordered_team_ids, list) or any(not isinstance(team_id, str) for team_id in ordered_team_ids)
+                or len(ordered_team_ids) != len(set(ordered_team_ids))
+                or len(ordered_team_ids) > (999 if confirmed is not None else 12)):
+            raise APIError(400, '路演自动入围名单格式不正确')
+        if confirmed is not None:
+            source = db.execute("SELECT run_id FROM judging_stages WHERE stage='roadshow'").fetchone()
+            if source is None or source['run_id'] != source_run_id:
+                raise APIError(409, '路演轮次已变化，请重新核对确认名单', 'finals_confirmed_roster_stale')
+            # An automatic publication or withdrawal cannot replace the organizer's explicit selection.
+            ordered_team_ids = confirmed
+        available = {team['id'] for team in self.teams(db) if team['eligible'] and not self.s.team_lifecycle.is_recycled(db, team['id'])}
+        if not set(ordered_team_ids) <= available:
+            raise APIError(409, '路演前12名包含已失去资格或已回收的队伍')
+        if state['revision'] >= MAX_REVISION:
+            raise APIError(409, '决赛配置版本已达上限', 'revision_exhausted')
+        existing = {row[0] for row in db.execute('SELECT team_id FROM finals_teams WHERE run_id=?', (state['run_id'],))}
+        has_records = bool(db.execute('SELECT 1 FROM finals_scores WHERE run_id=? LIMIT 1', (state['run_id'],)).fetchone() or db.execute(
+            'SELECT 1 FROM finals_nominations WHERE run_id=? LIMIT 1', (state['run_id'],)).fetchone())
+        if state['open'] or state['roster_locked'] or has_records:
+            if confirmed is not None and existing == set(confirmed):
+                self.s.audit(db, actor, 'finals.roster.confirmed-sync-idempotent', state['run_id'],
+                             {'sourceRunId': source_run_id, 'teamCount': len(confirmed)})
+                return len(confirmed)
+            saved = db.execute('''SELECT publication_run_id,publication_json
+                                  FROM roadshow_scoring_config WHERE id=1''').fetchone()
+            saved_order = []
+            if saved is not None and saved['publication_json']:
+                try:
+                    saved_teams = json.loads(saved['publication_json']).get('teams', [])
+                except (TypeError, ValueError):
+                    saved_teams = []
+                saved_order = [team.get('id') for team in saved_teams
+                               if isinstance(team, dict) and team.get('valid') is True][:12]
+            if (ordered_team_ids and existing == set(ordered_team_ids)
+                    and saved is not None and saved['publication_run_id'] == source_run_id
+                    and saved_order == ordered_team_ids):
+                self.s.audit(db, actor, 'finals.roster.roadshow-sync-idempotent', state['run_id'],
+                             {'sourceRunId': source_run_id, 'teamCount': len(ordered_team_ids)})
+                return len(ordered_team_ids)
+            raise APIError(409, '决赛已开放、名单已锁定或已有记录，不能覆盖路演自动入围名单', 'finals_roster_locked')
+        if existing != set(ordered_team_ids):
+            db.execute('DELETE FROM finals_teams WHERE run_id=?', (state['run_id'],))
+            db.executemany('INSERT INTO finals_teams(run_id,team_id) VALUES (?,?)',
+                           [(state['run_id'], team_id) for team_id in ordered_team_ids])
+            db.execute('''UPDATE finals_config SET revision=?,publication_json=NULL,publication_fingerprint=NULL,
+                          published_at=NULL,awards_json=NULL,awards_fingerprint=NULL WHERE id=1''',
+                       (state['revision'] + 1,))
+        self.s.audit(db, actor, 'finals.roster.roadshow-sync', state['run_id'],
+                     {'sourceRunId': source_run_id, 'teamIds': ordered_team_ids, 'teamCount': len(ordered_team_ids)})
+        return len(ordered_team_ids)
 
     def save_roster(self, db, actor, state, body):
         self.fields(body, {'expectedRevision', 'teamIds', 'judgeIds'})
@@ -321,8 +488,8 @@ class FinalsService:
         for value in (team_ids, judge_ids):
             if not isinstance(value, list) or any(not isinstance(v, str) for v in value) or len(value) != len(set(value)):
                 raise APIError(400, '名单必须是无重复的身份列表')
-        if not team_ids or len(team_ids) > 999 or len(judge_ids) != 8:
-            raise APIError(400, '请选择至少一支队伍和恰好8位不同评委')
+        if not team_ids or len(team_ids) > 999 or len(judge_ids) != EXPECTED_JUDGE_COUNT:
+            raise APIError(400, f'请选择至少一支队伍和恰好{EXPECTED_JUDGE_COUNT}位不同评委')
         for team_id in team_ids:
             self.s.team_lifecycle.require_available(db,team_id)
         valid_teams = {t['id'] for t in self.teams(db) if t['eligible']}
@@ -334,7 +501,7 @@ class FinalsService:
         db.executemany('INSERT INTO finals_teams VALUES (?,?)', [(state['run_id'], t) for t in team_ids])
         db.executemany('INSERT INTO finals_judges VALUES (?,?)', [(state['run_id'], j) for j in judge_ids])
         db.execute('UPDATE finals_config SET revision=? WHERE id=1', (revision,))
-        self.s.audit(db, actor, 'finals.roster', state['run_id'], {'teamCount': len(team_ids), 'judgeCount': 8})
+        self.s.audit(db, actor, 'finals.roster', state['run_id'], {'teamCount': len(team_ids), 'judgeCount': EXPECTED_JUDGE_COUNT})
         return self.admin_view(db, self.state(db))
 
     def create_judges(self, db, actor, state, body):
@@ -343,12 +510,12 @@ class FinalsService:
         if state['roster_locked'] or state['judges_created'] or self.judges(db, state['run_id']):
             raise APIError(409, '决赛评委已配置，不能重复批量创建')
         judges = []
-        for number in range(1, 9):
+        for number in range(1, EXPECTED_JUDGE_COUNT + 1):
             judge, _ = self.s.create_account(db, 'judge', f'决赛评委 {number:02}')
             db.execute('INSERT INTO finals_judges VALUES (?,?)', (state['run_id'], judge['id']))
             judges.append({'id': judge['id'], 'name': judge['name'], 'active': True})
         db.execute('UPDATE finals_config SET revision=?,judges_created=1 WHERE id=1', (revision,))
-        self.s.audit(db, actor, 'finals.judges-created', state['run_id'], {'count': 8})
+        self.s.audit(db, actor, 'finals.judges-created', state['run_id'], {'count': EXPECTED_JUDGE_COUNT})
         return {'config': self.config(db, self.state(db)), 'judges': judges}
 
     def save_settings(self, db, actor, state, body):
@@ -385,8 +552,8 @@ class FinalsService:
             raise APIError(409, '请先关闭决赛评分和提名，再确认专项奖')
         self.validate_roster(db, state)
         summary = self.summary(db, state)
-        if summary['submittedBallots'] != 8:
-            raise APIError(409, '须收齐8位评委的正式提名（含明确弃权）后确认专项奖')
+        if summary['submittedBallots'] != EXPECTED_JUDGE_COUNT:
+            raise APIError(409, f'须收齐{EXPECTED_JUDGE_COUNT}位评委的正式提名（含明确弃权）后确认专项奖')
         if any('提名指向' in reason for reason in summary['blockers']):
             raise APIError(409, '存在失去资格队伍的提名，请重新开放并由评委核对提名')
         selections = body['selections']
@@ -493,10 +660,11 @@ class FinalsService:
             judges = [j for j in self.judges(db, state['run_id']) if j['active']]
             teams = self.teams(db, state['run_id'])
             return {'config': {'runId': state['run_id'], 'open': bool(state['open']),
-                               'published': self.published(db, state), 'judgeCount': 8,
-                               'rosterReady': len(judges) == 8 and any(t['eligible'] for t in teams)},
+                               'published': self.published(db, state), 'judgeCount': EXPECTED_JUDGE_COUNT,
+                               'rosterReady': len(judges) == EXPECTED_JUDGE_COUNT and any(t['eligible'] for t in teams)},
                     'judges': [{'id': j['id'], 'name': j['name']} for j in judges]}
         if path == '/api/finals/board' and method == 'GET':
+            self.s.require(actor, 'admin')
             return {'config': self.config(db, state, public=True), 'dimensions': DIMENSIONS,
                     'summary': json.loads(state['publication_json']) if self.published(db, state) else None}
         if path.startswith('/api/admin/finals'):

@@ -187,8 +187,8 @@ function finalsSummaryMarkup(data,{publicView=false}={}){
   const teams=summary.teams || [],byId=new Map(teams.map(team=>[team.id,team]));
   const final=data.config?.published===true && summary.final===true;
   const state=final?'已发布 · 最终结果':'暂定结果 · 尚未发布';
-  const stats=metrics([[teams.filter(t=>t.eligible!==false).length,'决赛队伍'],[`${Number(summary.submittedBallots || 0)} / ${Number(summary.expectedJudges || 8)}`,'已正式提交提名的评委'],[teams.filter(t=>t.complete && t.eligible!==false).length,'评分已收齐的队伍'],[final?'已发布':'暂定','当前结果']]);
-  const scoreRows=[...teams].sort((a,b)=>(a.eligible===false)-(b.eligible===false)||(a.rank??9999)-(b.rank??9999)||a.number-b.number).map(team=>`<tr><td>${team.eligible===false?'—':esc(team.rank??'待定')}</td><td><strong>${esc(finalsName(team))}</strong><small>${esc(team.project || '作品名称待完善')}${team.eligible===false?' · 已不具备参赛资格':''}</small></td><td class="board-score">${team.eligible===false?'—':finalsScore(team.score)}</td><td>${Number(team.scoreCount || 0)} / ${Number(summary.expectedJudges || 8)}<small>${Number(team.recusedCount || 0)} 人回避 · ${team.complete?'已收齐':'尚未收齐'}</small></td></tr>`).join('');
+  const stats=metrics([[teams.filter(t=>t.eligible!==false).length,'决赛队伍'],[`${Number(summary.submittedBallots || 0)} / ${Number(summary.expectedJudges || 7)}`,'已正式提交提名的评委'],[teams.filter(t=>t.complete && t.eligible!==false).length,'评分已收齐的队伍'],[final?'已发布':'暂定','当前结果']]);
+  const scoreRows=[...teams].sort((a,b)=>(a.eligible===false)-(b.eligible===false)||(a.rank??9999)-(b.rank??9999)||a.number-b.number).map(team=>`<tr><td>${team.eligible===false?'—':esc(team.rank??'待定')}</td><td><strong>${esc(finalsName(team))}</strong><small>${esc(team.project || '作品名称待完善')}${team.eligible===false?' · 已不具备参赛资格':''}</small></td><td class="board-score">${team.eligible===false?'—':finalsScore(team.score)}</td><td>${Number(team.scoreCount || 0)} / ${Number(summary.expectedJudges || 7)}<small>${Number(team.recusedCount || 0)} 人回避 · ${team.complete?'已收齐':'尚未收齐'}</small></td></tr>`).join('');
   const awards=(summary.awards || []).map(award=>{
     const winnerIds=final?(award.confirmedWinners || award.winners || []):(award.suggestedWinners || []);
     const winners=winnerIds.map(id=>byId.get(id)).filter(Boolean);
@@ -196,9 +196,9 @@ function finalsSummaryMarkup(data,{publicView=false}={}){
     const votes=(award.votes || []).filter(v=>Number(v.count)>0).sort((a,b)=>b.count-a.count||(byId.get(a.teamId)?.number||0)-(byId.get(b.teamId)?.number||0));
     const winnerVotes=id=>Number(votes.find(v=>v.teamId===id)?.count || 0);
     const confirmed=Array.isArray(award.confirmedWinners);
-    return `<section class="surface finals-award"><h3>${esc(award.name)}</h3><p class="finals-award-state">${final?'获奖队伍':confirmed?'已确认归属 · 尚未发布':'建议获奖队伍'}${winners.length>1?' · 并列':''}</p>${winners.length?`<ul class="finals-winners">${winners.map(team=>`<li>${esc(finalsName(team))}<b>${winnerVotes(team.id)} 票</b></li>`).join('')}</ul>`:`<p class="finals-no-vote">${final?'本奖项无人获奖':maxVotes>0?'候选队伍已获前序奖项':'暂无提名票'}</p>`}<p class="small-note">共 ${Number(award.totalVotes || 0)} 票，最多 ${Number(summary.expectedJudges || 8)} 票。每队最多1奖；已获前序奖项的队伍顺延。</p>${votes.length?`<details data-finals-award="${esc(award.id)}"><summary>展开候选名单与票数 ▾</summary><ul class="finals-votes">${votes.map(v=>`<li><span>${esc(byId.has(v.teamId)?finalsName(byId.get(v.teamId)):'已退出名单的队伍')}<small>${winnerIds.includes(v.teamId)?(final?'获奖队伍':'建议获奖'):(award.rawLeaders || []).includes(v.teamId)?'原始最高票 · 已获前序奖项，顺延':'候选队伍'}</small></span><b>${Number(v.count)} 票</b></li>`).join('')}</ul></details>`:''}</section>`;
+    return `<section class="surface finals-award"><h3>${esc(award.name)}</h3><p class="finals-award-state">${final?'获奖队伍':confirmed?'已确认归属 · 尚未发布':'建议获奖队伍'}${winners.length>1?' · 并列':''}</p>${winners.length?`<ul class="finals-winners">${winners.map(team=>`<li>${esc(finalsName(team))}<b>${winnerVotes(team.id)} 票</b></li>`).join('')}</ul>`:`<p class="finals-no-vote">${final?'本奖项无人获奖':maxVotes>0?'候选队伍已获前序奖项':'暂无提名票'}</p>`}<p class="small-note">共 ${Number(award.totalVotes || 0)} 票，最多 ${Number(summary.expectedJudges || 7)} 票。每队最多1奖；已获前序奖项的队伍顺延。</p>${votes.length?`<details data-finals-award="${esc(award.id)}"><summary>展开候选名单与票数 ▾</summary><ul class="finals-votes">${votes.map(v=>`<li><span>${esc(byId.has(v.teamId)?finalsName(byId.get(v.teamId)):'已退出名单的队伍')}<small>${winnerIds.includes(v.teamId)?(final?'获奖队伍':'建议获奖'):(award.rawLeaders || []).includes(v.teamId)?'原始最高票 · 已获前序奖项，顺延':'候选队伍'}</small></span><b>${Number(v.count)} 票</b></li>`).join('')}</ul></details>`:''}</section>`;
   }).join('');
-  const confirmAwards=!publicView?`<section class="surface"><h2>确认专项奖归属</h2><p class="small-note">按创意 → 社会关怀 → 技术呈现 → 应用潜力 → AI跨界探索 → 开源贡献的顺序分配。每奖排除已获前序奖项的队伍，再取最高正票；并列共同获奖，每队最多1奖。</p><p class="small-note">可展开上方每个奖项核对队伍编号、队名、票数及顺延结果。确认只保存系统按票数与顺序得出的建议名单。</p><button class="btn" type="button" data-finals-confirm-awards ${data.config?.open || Number(summary.submittedBallots)!==8 || summary.awardsConfirmed?'disabled':''}>${summary.awardsConfirmed?'专项奖归属已确认':'确认六项专项奖归属'}</button><p class="form-error" data-finals-awards-message role="status"></p></section>`:'';
+  const confirmAwards=!publicView?`<section class="surface"><h2>确认专项奖归属</h2><p class="small-note">按创意 → 社会关怀 → 技术呈现 → 应用潜力 → AI跨界探索 → 开源贡献的顺序分配。每奖排除已获前序奖项的队伍，再取最高正票；并列共同获奖，每队最多1奖。</p><p class="small-note">可展开上方每个奖项核对队伍编号、队名、票数及顺延结果。确认只保存系统按票数与顺序得出的建议名单。</p><button class="btn" type="button" data-finals-confirm-awards ${data.config?.open || Number(summary.submittedBallots)!==Number(summary.expectedJudges || 7) || summary.awardsConfirmed?'disabled':''}>${summary.awardsConfirmed?'专项奖归属已确认':'确认六项专项奖归属'}</button><p class="form-error" data-finals-awards-message role="status"></p></section>`:'';
   return `<div class="info-banner ${final?'':'warning'}"><strong>${state}</strong><br>总分为有效正式评分的平均值；提名票独立统计，不加进100分。${final?'同票队伍共同获奖，由各队队长上台领奖；每队最多1个专项奖。':'未提交不作0分；请核对评分人数、回避和提名提交进度。'}</div>${stats}<section class="surface"><h2>决赛总分 · 满分100分</h2><div class="table-wrap"><table class="board-table finals-results"><thead><tr><th>排名</th><th>队伍 / 作品</th><th>平均分</th><th>有效评分人数</th></tr></thead><tbody>${scoreRows || '<tr><td colspan="4">尚未配置决赛队伍。</td></tr>'}</tbody></table></div></section><div class="finals-awards">${awards}</div>${confirmAwards}${!publicView && summary.blockers?.length?`<section class="info-banner warning"><strong>发布前还需处理</strong><ul>${summary.blockers.map(text=>`<li>${esc(text)}</li>`).join('')}</ul></section>`:''}`;
 }
 
@@ -217,7 +217,7 @@ function finalsPatchSummary(view,data,publicView=false){
   }
   if(publicView)return;
   const button=host.querySelector('[data-finals-confirm-awards]');if(!button)return;
-  button.disabled=!!view.awardBusy || !!data.config.open || Number(data.summary?.submittedBallots)!==8 || !!data.summary?.awardsConfirmed;
+  button.disabled=!!view.awardBusy || !!data.config.open || Number(data.summary?.submittedBallots)!==Number(data.summary?.expectedJudges || 7) || !!data.summary?.awardsConfirmed;
   const message=host.querySelector('[data-finals-awards-message]');message.textContent=view.awardMessage || '';
   button.onclick=async()=>{
     if(!view.valid() || button.disabled || view.awardBusy)return;
@@ -247,13 +247,13 @@ function finalsStartPolling(view,path,apply){
 
 async function renderFinalsBoard(version){
   const view=createFinalsView(version,null),data=await finalsRequest(view,'finals/board');if(!view.valid())return;
-  finalsShell(view,'FINALS / 决赛结果','决赛成绩与六项专项奖','8位评委 · 六维100分 · 每奖最多8票，最高票并列共同获奖。','<p class="small-note" data-finals-sync role="status">每2秒同步</p><div data-finals-summary></div>');
+  finalsShell(view,'FINALS / 决赛结果','决赛成绩与六项专项奖','7位评委 · 六维100分 · 每奖最多7票，最高票并列共同获奖。','<p class="small-note" data-finals-sync role="status">每2秒同步</p><div data-finals-summary></div>');
   const update=latest=>finalsPatchSummary(view,latest,true);update(data);finalsStartPolling(view,'finals/board',update);
 }
 
 async function renderFinalsAccess(version){
   const view=createFinalsView(version,'access');let available=false,busy=false;
-  finalsShell(view,'FINALS / 决赛评委','决赛评分与奖项提名','登录开放后输入主办方提供的邀请码，验证后选择自己的姓名或评委席位。',`<section class="surface finals-entry"><h2>决赛评委验证</h2><p class="info-banner" data-finals-login-status role="status">正在读取登录开放状态…</p><form data-finals-access><label class="field">决赛邀请码<input name="code" type="password" autocomplete="one-time-code" required maxlength="160" placeholder="输入主办方提供的邀请码" disabled></label><button class="btn" type="submit" disabled>验证并选择评委席位</button><p class="form-error" role="alert"></p></form><button class="btn secondary small" type="button" data-finals-login-refresh>重新读取登录状态</button><p class="small-note">每2秒自动核对开放状态。每位评委的评分和提名单独保存。</p><a href="#board-finals">查看公开决赛结果 →</a></section>`);
+  finalsShell(view,'FINALS / 决赛评委','决赛评分与奖项提名','登录开放后输入主办方提供的邀请码，验证后选择自己的姓名或评委席位。',`<section class="surface finals-entry"><h2>决赛评委验证</h2><p class="info-banner" data-finals-login-status role="status">正在读取登录开放状态…</p><form data-finals-access><label class="field">决赛邀请码<input name="code" type="password" autocomplete="one-time-code" required maxlength="160" placeholder="输入主办方提供的邀请码" disabled></label><button class="btn" type="submit" disabled>验证并选择评委席位</button><p class="form-error" role="alert"></p></form><button class="btn secondary small" type="button" data-finals-login-refresh>重新读取登录状态</button><p class="small-note">每2秒自动核对开放状态。每位评委的评分和提名单独保存。</p></section>`);
   const form=view.container.querySelector('[data-finals-access]'),button=form.querySelector('button'),notice=view.container.querySelector('[data-finals-login-status]');
   const buttons=()=>{button.disabled=form.elements.code.disabled=busy || !available;};
   view.poller=makeFinalsPoller({
@@ -295,7 +295,7 @@ async function renderFinalsJudge(version,judge=null){
   const view=createFinalsView(version,judge?'seat':'entry',judge);
   if(!judge){
     let judges=[],available=false,choices='';
-    finalsShell(view,'FINALS / 决赛评委','决赛评分与奖项提名','邀请码已验证。登录开放后选择自己的姓名或评委席位，即可查看队伍并评分。',`<section class="surface finals-entry"><h2>选择本次评分归属</h2><p>请按主办方分配的姓名或席位选择。每位评委的评分和提名单独保存。</p><p class="info-banner" data-finals-login-status role="status">正在读取登录开放状态…</p><form data-finals-entry><label class="field">评委姓名 / 席位<select name="judgeId" required disabled><option value="">请选择自己的姓名或席位</option></select></label><button class="btn" type="submit" disabled>进入评分与提名</button><p class="form-error" role="status"></p></form><p class="small-note" data-finals-entry-state></p><button class="btn secondary small" type="button" data-finals-login-refresh>重新读取登录状态</button><p class="small-note">每2秒自动核对开放状态。</p><button class="btn secondary small" type="button" data-finals-access-exit>退出决赛验证</button><a href="#board-finals">查看公开决赛结果 →</a></section>`);
+    finalsShell(view,'FINALS / 决赛评委','决赛评分与奖项提名','邀请码已验证。登录开放后选择自己的姓名或评委席位，即可查看队伍并评分。',`<section class="surface finals-entry"><h2>选择本次评分归属</h2><p>请按主办方分配的姓名或席位选择。每位评委的评分和提名单独保存。</p><p class="info-banner" data-finals-login-status role="status">正在读取登录开放状态…</p><form data-finals-entry><label class="field">评委姓名 / 席位<select name="judgeId" required disabled><option value="">请选择自己的姓名或席位</option></select></label><button class="btn" type="submit" disabled>进入评分与提名</button><p class="form-error" role="status"></p></form><p class="small-note" data-finals-entry-state></p><button class="btn secondary small" type="button" data-finals-login-refresh>重新读取登录状态</button><p class="small-note">每2秒自动核对开放状态。</p><button class="btn secondary small" type="button" data-finals-access-exit>退出决赛验证</button></section>`);
     finalsInstallAccessExit(view,version);
     const form=view.container.querySelector('[data-finals-entry]'),select=form.elements.judgeId,submit=form.querySelector('[type=submit]');
     const notice=view.container.querySelector('[data-finals-login-status]'),state=view.container.querySelector('[data-finals-entry-state]');
@@ -315,7 +315,7 @@ async function renderFinalsJudge(version,judge=null){
         if(entry){
           judges=entry.judges || [];const next=judges.map(item=>`<option value="${esc(item.id)}">${esc(item.name)}</option>`).join('');
           if(next!==choices){const selected=select.value;select.innerHTML='<option value="">请选择自己的姓名或席位</option>'+next;select.value=judges.some(item=>item.id===selected)?selected:'';choices=next;}
-          state.textContent=!entry.config.rosterReady?'组织方正在准备决赛名单与8个评委席位。':entry.config.open?'决赛评分与提名已开放。':'当前尚未开放或已关闭，可进入查看已保存记录。';
+          state.textContent=!entry.config.rosterReady?'组织方正在准备决赛名单与7个评委席位。':entry.config.open?'决赛评分与提名已开放。':'当前尚未开放或已关闭，可进入查看已保存记录。';
         }else state.textContent='';
         buttons();
       },
@@ -405,7 +405,7 @@ async function renderFinalsAdmin(version){
   const view=createFinalsView(version,'admin'),data=await finalsRequest(view,'admin/finals');if(!view.valid())return;
   view.data=data;view.config=data.config;
   const cfg=data.config;
-  finalsShell(view,'FINALS / 组织方控制台','决赛控制台','独立管理8位决赛评委、决赛队伍、六维评分和六项奖项提名。',`<div class="finals-admin-tools"><a class="btn secondary small" href="#board-finals">公开决赛看板 ↗</a><button class="btn secondary small" data-finals-reload>重新载入设置</button><span class="small-note" data-finals-sync role="status">每2秒同步统计</span></div><p class="info-banner warning" data-finals-config-notice hidden></p><div class="finals-admin-layout"><section class="surface"><h2>01 / 决赛名单</h2><p class="small-note">候选直接来自队伍信息。主办方勾选入围队伍并保存后，才会进入决赛评分与提名选项；新增登记队伍不会自动入围。首次开放后名单锁定，评委须恰好8位。</p><form data-finals-roster><fieldset class="finals-fieldset" ${cfg.rosterLocked?'disabled':''}><h3>主办方选定的决赛入围队伍</h3><div class="finals-roster" data-finals-team-list>${scoringTeamChoicesMarkup(data.availableTeams || [],cfg.teamIds || [])}</div><h3>决赛评委 · 必须恰好8位</h3><div class="finals-roster" data-finals-judge-list>${finalsJudgeChecks(data.availableJudges || [],cfg.judgeIds || [])}</div><button class="btn" type="submit" data-finals-save>保存决赛入围名单</button></fieldset><button class="btn secondary small" type="button" data-finals-refresh-teams>刷新队伍信息（保留勾选）</button><p class="form-error" role="status"></p><div data-finals-recovery></div></form><form data-finals-create-judges><p class="small-note">尚未配置决赛评委时，可建立8个评委席位。评委打开决赛入口，选择自己的姓名或席位即可评分。</p><button class="btn secondary" type="submit" data-finals-save ${cfg.rosterLocked || cfg.judgeIds?.length?'disabled':''}>建立8个决赛评委席位</button><p class="form-error" role="status"></p><div data-finals-recovery></div></form></section><section class="surface"><h2>02 / 开放与发布</h2><form data-finals-settings><label class="toggle-line"><input type="checkbox" name="open" ${cfg.open?'checked':''}>开放决赛评分与提名</label><label class="toggle-line"><input type="checkbox" name="published" ${cfg.published?'checked':''}>发布最终成绩和获奖队伍</label><p class="small-note">发布前必须关闭评分、收齐8位评委的提名表，并完成所有队伍的评分或回避。重新开放会取消发布。后台未发布时始终显示“暂定结果”。</p><button class="btn" type="submit" data-finals-save>保存开放与发布设置</button><p class="form-error" role="status"></p><div data-finals-recovery></div></form><h3>六维评分参考</h3><dl class="finals-rubrics">${data.dimensions.map(d=>`<div><dt>${esc(d.name)} · ${Number(d.max)}分</dt><dd>${esc(finalsGuidance[d.id] || '')}</dd></div>`).join('')}</dl><p class="small-note">提名票不影响100分总分；每位评委每奖最多1票，每奖最多8票，六奖合计最多48票。按固定奖项顺序排除已获奖队伍后，最高正票同票共同获奖；每队最多1奖，无有效候选则无人获奖。</p></section></div><div data-finals-summary></div>`);
+  finalsShell(view,'FINALS / 组织方控制台','决赛控制台','独立管理7位决赛评委、决赛队伍、六维评分和六项奖项提名。',`<div class="finals-admin-tools"><button class="btn secondary small" data-finals-reload>重新载入设置</button><span class="small-note" data-finals-sync role="status">每2秒同步统计</span></div><p class="info-banner warning" data-finals-config-notice hidden></p><div class="finals-admin-layout"><section class="surface"><h2>01 / 决赛名单</h2><p class="small-note">${cfg.confirmedFinalistCount?`组织方已确认 ${Number(cfg.confirmedFinalistCount)} 支决赛队伍，按已确认的路演成绩顺序展示。`:'默认在确认路演成绩后自动同步前12名；已由组织方单独确认的入围名单优先。'}首次开放决赛前请核对名单，开放后名单锁定；评委须恰好7位。</p><form data-finals-roster><fieldset class="finals-fieldset" ${cfg.rosterLocked?'disabled':''}><h3>路演成绩自动同步的决赛入围队伍</h3><div class="finals-roster" data-finals-team-list>${scoringTeamChoicesMarkup(data.availableTeams || [],cfg.teamIds || [])}</div><h3>决赛评委 · 必须恰好7位</h3><div class="finals-roster" data-finals-judge-list>${finalsJudgeChecks(data.availableJudges || [],cfg.judgeIds || [])}</div><button class="btn" type="submit" data-finals-save>保存决赛入围名单</button></fieldset><button class="btn secondary small" type="button" data-finals-refresh-teams>刷新队伍信息（保留勾选）</button><p class="form-error" role="status"></p><div data-finals-recovery></div></form><form data-finals-create-judges><p class="small-note">尚未配置决赛评委时，可建立7个评委席位。评委打开决赛入口，选择自己的姓名或席位即可评分。</p><button class="btn secondary" type="submit" data-finals-save ${cfg.rosterLocked || cfg.judgeIds?.length?'disabled':''}>建立7个决赛评委席位</button><p class="form-error" role="status"></p><div data-finals-recovery></div></form></section><section class="surface"><h2>02 / 开放与发布</h2><form data-finals-settings><label class="toggle-line"><input type="checkbox" name="open" ${cfg.open?'checked':''}>开放决赛评分与提名</label><label class="toggle-line"><input type="checkbox" name="published" ${cfg.published?'checked':''}>确认最终成绩和获奖队伍</label><p class="small-note">发布前必须关闭评分、收齐7位评委的提名表，并完成所有队伍的评分或回避。重新开放会取消确认。全队汇总与排名仅在组织方后台显示；确认发布后，选手只可查看本队结果。</p><button class="btn" type="submit" data-finals-save>保存开放与确认设置</button><p class="form-error" role="status"></p><div data-finals-recovery></div></form><h3>六维评分参考</h3><dl class="finals-rubrics">${data.dimensions.map(d=>`<div><dt>${esc(d.name)} · ${Number(d.max)}分</dt><dd>${esc(finalsGuidance[d.id] || '')}</dd></div>`).join('')}</dl><p class="small-note">提名票不影响100分总分；每位评委每奖最多1票，每奖最多7票，六奖合计最多42票。按固定奖项顺序排除已获奖队伍后，最高正票同票共同获奖；每队最多1奖，无有效候选则无人获奖。</p></section></div><div data-finals-summary></div>`);
   view.container.querySelector('[data-finals-reload]').onclick=()=>finalsConfirmReload(view);
   finalsInstallAdmin(view);
   const update=latest=>{
@@ -418,7 +418,7 @@ async function renderFinalsAdmin(version){
   update(data);finalsStartPolling(view,'admin/finals',update);
 }
 
-function finalsJudgeChecks(judges,selected){return judges.map(judge=>`<label class="finals-check"><input type="checkbox" name="judgeIds" value="${esc(judge.id)}" ${selected.includes(judge.id)?'checked':''} ${judge.active===false?'disabled':''}><span>${esc(judge.name)}${judge.active===false?'（已停用）':''}</span></label>`).join('') || '<p>暂无评委席位，可在下方建立8个决赛评委席位。</p>';}
+function finalsJudgeChecks(judges,selected){return judges.map(judge=>`<label class="finals-check"><input type="checkbox" name="judgeIds" value="${esc(judge.id)}" ${selected.includes(judge.id)?'checked':''} ${judge.active===false?'disabled':''}><span>${esc(judge.name)}${judge.active===false?'（已停用）':''}</span></label>`).join('') || '<p>暂无评委席位，可在下方建立7个决赛评委席位。</p>';}
 
 function finalsInstallAdmin(view){
   const roster=view.container.querySelector('[data-finals-roster]'),settings=view.container.querySelector('[data-finals-settings]'),create=view.container.querySelector('[data-finals-create-judges]');
@@ -438,7 +438,7 @@ function finalsInstallAdmin(view){
   roster.onsubmit=event=>{
     event.preventDefault();if(!view.valid() || (view.latestRosterLocked ?? view.config.rosterLocked) || view.candidateLoading)return;
     const teamIds=[...roster.querySelectorAll('input[name=teamIds]:checked')].map(input=>input.value),judgeIds=[...roster.querySelectorAll('input[name=judgeIds]:checked')].map(input=>input.value);
-    if(!teamIds.length || judgeIds.length!==8){finalsMessage(roster,'请选择至少1支决赛队伍，以及恰好8位不同评委。');return;}
+    if(!teamIds.length || judgeIds.length!==Number(cfg.judgeCount || 7)){finalsMessage(roster,'请选择至少1支决赛队伍，以及恰好7位不同评委。');return;}
     return finalsSave(view,roster,'admin/finals/roster',{expectedRevision:roster.finalsRevision,teamIds,judgeIds},result=>saved(roster,result));
   };
   settings.onsubmit=event=>{
@@ -482,4 +482,150 @@ function finalsInstallAdmin(view){
     finally{view.candidateLoading=false;if(view.valid()){candidateRefresh.disabled=false;buttons();}}
   };
   buttons();
+}
+
+;
+// Organizer finals dashboard bundle.
+'use strict';
+
+// Read-only finals overview. The server owns ranking, ties and award allocation.
+let activeAdminFinalsDashboard=null;
+const adminFinalsAwardDefaults=[
+  {id:'creativity',name:'最佳创意奖'},
+  {id:'social',name:'最具社会关怀奖'},
+  {id:'technical',name:'最佳技术呈现奖'},
+  {id:'application',name:'最具应用潜力奖'},
+  {id:'crossdisciplinary',name:'最佳 AI 跨界探索奖'},
+  {id:'opensource',name:'最佳开源贡献奖'}
+];
+const adminFinalsCount=value=>Number.isSafeInteger(value) && value>=0?value:0;
+function adminFinalsTeamName(team){return `${String(team.number).padStart(2,'0')} · ${team.name || '未命名队伍'}`;}
+
+function adminFinalsDashboardModel(data){
+  if(!data || !data.config || !data.summary || !Array.isArray(data.summary.teams) || !Array.isArray(data.summary.awards))throw new Error('决赛统计格式不正确');
+  const {config,summary}=data,teams=summary.teams,byId=new Map(teams.map(team=>[team.id,team]));
+  const expectedJudges=Number.isSafeInteger(summary.expectedJudges) && summary.expectedJudges>0?summary.expectedJudges:7;
+  const stateFinal=config.published===true && summary.final===true && config.publicationStale!==true;
+  const confirmed=summary.awardsConfirmed===true && config.open!==true;
+  const name=id=>byId.has(id)?adminFinalsTeamName(byId.get(id)):'队伍信息待核对';
+  // Keep the exact order/rank returned by the server: two displayed rounded
+  // averages may differ before rounding and must not be re-ranked here.
+  const teamsHTML=teams.map(team=>{
+    const scored=typeof team.score==='number' && Number.isFinite(team.score);
+    const rank=Number.isSafeInteger(team.rank) && team.rank>0?team.rank:null;
+    const count=adminFinalsCount(team.scoreCount),recused=adminFinalsCount(team.recusedCount);
+    return `<li class="afd-team${rank===1?' afd-team-first':''}"><span class="afd-rank" aria-label="${rank?'排名 '+rank:'暂无排名'}">${rank ?? '—'}</span><div class="afd-team-detail"><strong>${esc(adminFinalsTeamName(team))}</strong>${team.project?`<span class="afd-project">${esc(team.project)}</span>`:''}<small>${count} / ${expectedJudges} 位已评分${recused?` · ${recused} 位回避`:''}</small><small class="${team.complete?'afd-complete':'afd-pending'}">${team.eligible===false?'已失去决赛资格':team.complete?'评分已收齐':'评分尚未收齐'}</small></div><span class="afd-score${scored?'':' afd-unscored'}">${scored?team.score.toFixed(2):'待评分'}</span></li>`;
+  }).join('') || '<li class="afd-empty">尚未配置决赛入围队伍。请在决赛控制台选择本次入围队伍。</li>';
+  const dimensions=Array.isArray(data.dimensions)?data.dimensions:[];
+  const awards=adminFinalsAwardDefaults.map((fallback,index)=>{
+    const dimension=dimensions.find(item=>item.id===fallback.id) || dimensions[index];
+    const award=summary.awards.find(item=>item.id===fallback.id) || {};
+    const votes=Array.isArray(award.votes)?award.votes.filter(item=>adminFinalsCount(item.count)>0):[];
+    const winners=confirmed && Array.isArray(award.confirmedWinners)?award.confirmedWinners:(Array.isArray(award.suggestedWinners)?award.suggestedWinners:[]);
+    const resultLabel=stateFinal?'最终获奖':confirmed?'已确认 · 尚未发布':'暂定获奖建议';
+    const resultHTML=`<span class="afd-result-label">${resultLabel}</span>${winners.length?`<ul>${winners.map(id=>`<li>${esc(name(id))}</li>`).join('')}</ul>${winners.length>1?'<small>同票共同获奖</small>':''}`:`<span class="afd-result-empty">${stateFinal?'本奖项空缺':'暂无有效获奖候选'}</span>`}`;
+    const votesHTML=votes.map(vote=>`<li><span>${esc(name(vote.teamId))}</span><strong>${adminFinalsCount(vote.count)}<small>票</small></strong></li>`).join('') || '<li class="afd-empty">尚无正式提名票</li>';
+    return {id:fallback.id,name:award.name || dimension?.award || fallback.name,votesHTML,resultHTML,totalVotes:adminFinalsCount(award.totalVotes)};
+  });
+  const dimensionText=dimensions.length===6?dimensions.map(item=>`${item.name} ${item.max} 分`).join('、'):'创意 20 分、社会关怀 15 分、技术呈现 20 分、应用潜力 20 分、AI 跨界探索 15 分、开源贡献 10 分';
+  const rulesHTML=`<ol><li><strong>成绩排名：</strong>${esc(dimensionText)}，总分 100 分。按有效正式评分的平均分从高到低排列；同分并列，后续名次跳号。草稿、回避和未提交不计分，未提交不作 0 分。</li><li><strong>评分收齐：</strong>每队须完成 ${expectedJudges} 位评委的评分或回避记录，且至少有 1 份正式评分。未收齐时显示已有正式评分的暂定均分。</li><li><strong>专项提名：</strong>提名票与总分独立；每位评委每奖最多提名 1 队，也可弃权。每奖最多 ${expectedJudges} 票，六奖最多 ${expectedJudges*6} 票；只统计正式提交的提名表。</li><li><strong>奖项归属：</strong>按右侧六奖顺序分配，排除已获前序奖项的队伍，再取其余队伍最高正票；同票共同获奖，每队最多 1 个专项奖，无有效候选则空缺。原始提名票始终保留展示。</li><li><strong>最终发布：</strong>关闭评分、收齐评分及 ${expectedJudges} 份提名表，并由组织方确认奖项后才能发布。发布前显示暂定结果；评分或名单变化后的失效发布须重新核对。</li></ol>`;
+  return {teamsHTML,awards,rulesHTML,stateLabel:stateFinal?'已发布 · 最终结果':'暂定结果 · 仅组织方可见',stateFinal,teamCount:teams.length,completedTeams:teams.filter(team=>team.complete===true).length,submittedBallots:adminFinalsCount(summary.submittedBallots),expectedJudges,notice:config.publicationStale===true?'评分或名单已变化，原发布结果已失效。请到决赛控制台核对并重新发布。':''};
+}
+
+function adminFinalsDashboardMarkup(){
+  return `<section id="admin-finals-dashboard" class="admin-finals-dashboard" aria-labelledby="afd-heading"><div class="afd-heading"><div><p class="afd-eyebrow">FINALS / 决赛实时总览</p><h2 id="afd-heading">决赛成绩与专项奖提名</h2><p class="afd-counts" data-afd-counts>正在读取决赛统计…</p></div><div class="afd-tools"><span class="afd-state" data-afd-state>等待同步</span><button type="button" class="btn secondary small" data-afd-refresh>刷新统计</button><a href="#admin-finals" class="afd-console-link">决赛控制台 ↗</a></div></div><p class="afd-notice" data-afd-notice role="alert" hidden></p><div class="afd-grid"><section class="afd-ranking" aria-labelledby="afd-ranking-heading"><div class="afd-column-heading"><h3 id="afd-ranking-heading">全场排名</h3><span>均分 / 100</span></div><ol class="afd-teams afd-scroll" data-afd-teams tabindex="0" aria-label="决赛队伍排名，可上下滚动"><li class="afd-empty">正在读取成绩…</li></ol></section><section class="afd-awards" aria-label="六项专项奖提名"><div class="afd-awards-heading"><h3>专项奖提名</h3><span>按正式提名票展示 · 六奖依次分配</span></div><div class="afd-awards-scroll" tabindex="0" aria-label="六项专项奖，可左右滚动"><div class="afd-award-grid">${adminFinalsAwardDefaults.map((award,index)=>`<article class="afd-award" data-afd-award-index="${index}"><div class="afd-award-heading"><span class="afd-award-number">0${index+1}</span><h4 data-afd-award-name>${esc(award.name)}</h4><p data-afd-total-votes>等待提名统计</p></div><ul class="afd-votes afd-scroll" data-afd-votes tabindex="0" aria-label="${esc(award.name)}提名队伍，可上下滚动"><li class="afd-empty">正在读取提名…</li></ul><div class="afd-result" data-afd-result></div></article>`).join('')}</div></div></section></div><div class="afd-footer"><span class="afd-sync" data-afd-sync role="status" aria-live="polite">正在连接 · 每 2 秒自动同步</span><details class="afd-rules"><summary>查看计分与提名规则</summary><div data-afd-rules></div></details></div></section>`;
+}
+
+function patchAdminFinalsDashboard(panel,data){
+  const model=adminFinalsDashboardModel(data);
+  const html=(node,value)=>{
+    if(!node || node.afdMarkup===value)return;
+    const top=node.scrollTop,left=node.scrollLeft;
+    node.innerHTML=value;node.afdMarkup=value;node.scrollTop=top;node.scrollLeft=left;
+  };
+  const text=(selector,value)=>{const node=panel.querySelector(selector);if(node && node.textContent!==value)node.textContent=value;};
+  html(panel.querySelector('[data-afd-teams]'),model.teamsHTML);
+  model.awards.forEach((award,index)=>{
+    const card=panel.querySelector(`[data-afd-award-index="${index}"]`);if(!card)return;
+    const title=card.querySelector('[data-afd-award-name]');if(title && title.textContent!==award.name)title.textContent=award.name;
+    const total=card.querySelector('[data-afd-total-votes]'),totalLabel=`正式提名 ${award.totalVotes} 票`;if(total && total.textContent!==totalLabel)total.textContent=totalLabel;
+    html(card.querySelector('[data-afd-votes]'),award.votesHTML);
+    html(card.querySelector('[data-afd-result]'),award.resultHTML);
+  });
+  html(panel.querySelector('[data-afd-rules]'),model.rulesHTML);
+  text('[data-afd-state]',model.stateLabel);
+  panel.querySelector('[data-afd-state]')?.classList.toggle('afd-final',model.stateFinal);
+  text('[data-afd-counts]',`${model.teamCount} 支决赛队伍 · 评分收齐 ${model.completedTeams}/${model.teamCount} 队 · 提名表 ${model.submittedBallots}/${model.expectedJudges} 份`);
+  const notice=panel.querySelector('[data-afd-notice]');if(notice){notice.hidden=!model.notice;if(notice.textContent!==model.notice)notice.textContent=model.notice;}
+  return model;
+}
+
+function disposeAdminFinalsDashboard(){activeAdminFinalsDashboard?.dispose();}
+
+function mountAdminFinalsDashboard(version){
+  disposeAdminFinalsDashboard();
+  const owner=session,loginId=owner.loginId,headingNode=root.querySelector('.page-heading');
+  const loggedOut=()=>typeof browserLogoutOwner==='function' && browserLogoutOwner()===loginId;
+  if(route!=='admin' || version!==routeVersion || owner.role!=='admin' || !owner.loginId || !ownsBrowserLogin(owner) || loggedOut() || !headingNode)return null;
+  headingNode.insertAdjacentHTML('afterend',adminFinalsDashboardMarkup());
+  const panel=root.querySelector('#admin-finals-dashboard');if(!panel)return null;
+  const view={owner,version,panel,poller:null,disposed:false,suspended:false,lastSync:null};
+  activeAdminFinalsDashboard=view;
+  const clear=message=>{panel.innerHTML=message?`<p class="afd-auth" role="alert">${esc(message)}</p>`:'';};
+  view.dispose=message=>{
+    if(view.disposed)return;view.disposed=true;view.poller?.stop();clear(message);
+    if(activeAdminFinalsDashboard===view)activeAdminFinalsDashboard=null;
+  };
+  view.valid=()=>{
+    if(view.disposed)return false;
+    if(activeAdminFinalsDashboard!==view || !panel.isConnected || route!=='admin' || routeVersion!==version){view.dispose();return false;}
+    if(session!==owner || owner.role!=='admin' || !loginId || owner.loginId!==loginId || !ownsBrowserLogin(owner) || loggedOut()){
+      view.dispose('登录身份已变化，决赛统计已清除。请重新登录组织方后台。');return false;
+    }
+    return true;
+  };
+  const status=kind=>{
+    if(!view.valid())return;
+    if(kind==='auth'){view.dispose('登录已失效或无权访问，决赛统计已清除。请重新登录组织方后台。');return;}
+    if(view.suspended)return;
+    const node=panel.querySelector('[data-afd-sync]');if(!node)return;
+    if(kind==='updated')view.lastSync=new Date();
+    const time=view.lastSync?.toLocaleTimeString('zh-CN',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    node.textContent=kind==='error'?(time?`同步暂不可用 · 显示 ${time} 的结果，正在重试`:'尚未取得决赛数据 · 正在重试'):`最近同步 ${time} · 每 2 秒自动同步`;
+    node.classList.toggle('afd-sync-error',kind==='error');
+  };
+  const clearForCache=()=>{
+    // Do not keep private scores in a page restored from the browser cache.
+    for(const node of panel.querySelectorAll('[data-afd-teams], [data-afd-votes], [data-afd-result]')){node.innerHTML='';node.afdMarkup='';}
+    for(const selector of ['[data-afd-counts]','[data-afd-total-votes]','[data-afd-state]','[data-afd-sync]'])for(const node of panel.querySelectorAll(selector))node.textContent='等待重新同步';
+    panel.querySelector('[data-afd-state]')?.classList.toggle('afd-final',false);
+    const notice=panel.querySelector('[data-afd-notice]');if(notice){notice.textContent='';notice.hidden=true;}
+    view.lastSync=null;
+  };
+  view.poller=makeFinalsPoller({
+    read:async signal=>{
+      if(!view.valid() || signal.aborted)throw new Error('当前组织方页面已失效');
+      const result=await api('admin/finals',undefined,{signal,loginId});
+      if(!view.valid() || signal.aborted)throw new Error('当前组织方页面已失效');
+      return result;
+    },
+    apply:data=>{if(view.valid())patchAdminFinalsDashboard(panel,data);},status,
+    alive:()=>view.valid(),isHidden:()=>document.hidden || view.suspended,
+    subscribe:kick=>{
+      const check=()=>{if(view.valid())kick();};
+      const pagehide=()=>{if(!view.valid())return;view.suspended=true;clearForCache();kick();};
+      const pageshow=()=>{if(!view.valid())return;view.suspended=false;kick();};
+      document.addEventListener('visibilitychange',check);
+      window.addEventListener('storage',check);window.addEventListener('focus',check);
+      window.addEventListener('pagehide',pagehide);window.addEventListener('pageshow',pageshow);
+      return ()=>{
+        document.removeEventListener('visibilitychange',check);
+        window.removeEventListener('storage',check);window.removeEventListener('focus',check);
+        window.removeEventListener('pagehide',pagehide);window.removeEventListener('pageshow',pageshow);
+      };
+    }
+  });
+  panel.querySelector('[data-afd-refresh]').onclick=()=>{if(view.valid())view.poller.kick();};
+  view.poller.start();view.poller.refresh();
+  return view;
 }
