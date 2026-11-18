@@ -3,7 +3,7 @@ name: Pull request checks
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, codex/platform-rebuild]
   workflow_dispatch:
 
 permissions:
@@ -101,9 +101,31 @@ jobs:
         with:
           extra_args: --all-files
 
+  systemd:
+    name: Isolated services and Git under systemd
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Prepare a synthetic event on this disposable runner
+        run: |
+          sudo groupadd --system gotc-proxy
+          sudo useradd --system --gid gotc-proxy --no-create-home --shell /usr/sbin/nologin gotc-hackathon
+          sudo install -d -o "$(id -un)" /opt/gotc-ci
+          git archive HEAD | tar -C /opt/gotc-ci -xf -
+          make -C /opt/gotc-ci deps VENV=.venv
+          sudo install -d -o gotc-hackathon -g gotc-proxy -m 0700 /opt/gotc-hackathon/data
+      - name: Start both generated units and exercise Git with the platform restrictions
+        run: python /opt/gotc-ci/tests/operations/rehearse_systemd_git.py
+
   release:
     name: Build offline server artifact
-    needs: [frontend, browser, backend, hygiene]
+    needs: [frontend, browser, backend, hygiene, systemd]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -113,12 +135,6 @@ jobs:
         with:
           python-version: '3.12'
       - run: make wheels
-      - name: Rehearse Git backups under production systemd restrictions
-        run: |
-          sudo install -d -o "$(id -un)" /opt/gotc-ci
-          git archive HEAD | tar -C /opt/gotc-ci -xf -
-          make -C /opt/gotc-ci deps WHEELHOUSE="$PWD/.runtime/wheels"
-          python /opt/gotc-ci/tests/operations/rehearse_systemd_git.py
       - name: Build release and record its digest
         run: |
           mkdir -p "$RUNNER_TEMP/gotc-artifact"

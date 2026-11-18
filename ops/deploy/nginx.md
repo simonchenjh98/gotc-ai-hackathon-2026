@@ -31,3 +31,10 @@ Nginx must be able to traverse the runtime socket directories and connect to the
 The edge generates the request ID and replaces the forwarded client address and scheme. Neighboring sites do not use GOTC's per-IP rate zones. Static files are restricted to their documented paths and file types. Symlink traversal under the frontend directory is disabled. The configured document root may itself traverse the root-owned `current` release pointer.
 
 The CI edge check validates a temporary Nginx configuration, negotiates HTTP/2 using a disposable certificate, calls synthetic socket upstreams, and exercises HTML caching, gzip, immutable assets, private paths and neighboring routes.
+
+
+## Shared worker capacity
+
+The event brief records 768 `worker_connections` per worker on the shared Nginx. Each ordinary HTTP/1 client with a proxied stream uses one downstream and one upstream Unix-socket connection. Budget 160 connections for 80 such clients on a single worker, leaving at most 608 for other traffic. At the default gateway admission ceiling of 272 simultaneous requests, the same estimate is 544 connections, leaving at most 224. These figures exclude platform traffic, idle clients, listeners, readiness checks, neighboring sites and work still entering the gateway. HTTP/2 may share downstream sockets across requests. Connection distribution across workers and shared-site occupancy must be measured on the rehearsal host.
+
+The SDK location permits 30 requests per second per client IP with a burst allowance of 80. Distinct teams behind a campus NAT can share this allowance. The synthetic 80-stream test reached the gateway's Unix socket directly. The separate TLS fixture exercises routing and HTTP/2 negotiation. Before rollout, measure each worker's file descriptor count and active connections during representative traffic from shared IPs, including neighboring sites. Check the worker's effective descriptor limit and error log for connection exhaustion. Any change to the shared listener, limits or worker configuration belongs to the host operator.
