@@ -155,7 +155,7 @@ test('team score login refuses a shared cookie replaced between code entry and s
   await form.onsubmit({preventDefault(){}});
   assert.deepEqual(requests,['/api/login','/api/session']);
   assert.deepEqual(published,[]);
-  assert.match(error.textContent,/重新输入本队提交码/);
+  assert.match(error.textContent,/重新输入本队参赛码/);
   assert.equal(vm.runInContext('session.role',ctx),null);
 });
 

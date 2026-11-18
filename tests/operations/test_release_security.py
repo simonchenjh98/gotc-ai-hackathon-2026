@@ -1,6 +1,7 @@
 """Deployment entrypoint rehearsals: temporary paths and fake SSH only."""
 from contextlib import ExitStack
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,8 @@ import unittest
 import subprocess
 import tarfile
 import time
+import zipfile
+from urllib.parse import quote, urlsplit
 import shutil
 import signal
 import httpx
@@ -273,19 +276,44 @@ print(json.dumps([team_id, team_code, judge_code]))
         self.assertEqual(request('api/board').status_code, 401)
         self.assertEqual(request('api/team').status_code, 401)
 
-        _, login = api('api/login', {'role': 'team', 'code': team_code})
-        cookie = login['Set-Cookie']
+        identity, login = api('api/login', {'role': 'team', 'code': team_code})
+        cookie = login['Set-Cookie'].split(';', 1)[0]
         team, _ = api('api/team', cookie=cookie)
         self.assertEqual(team['submission']['version'], 0)
+        project = 'Tar Synthetic'
+        def upload(kind, original, contents):
+            response = client.post(f'/gotc/api/team/uploads/{kind}', content=contents, headers={
+                'Origin': origin, 'Cookie': cookie, 'X-GOTC-Login': identity['loginId'],
+                'Content-Type': 'application/octet-stream',
+                'X-GOTC-Filename': quote(original), 'X-GOTC-Project': quote(project),
+            })
+            response.raise_for_status()
+            item = response.json()
+            self.assertEqual(item['filename'], f'Synthetic Team+{project}{Path(original).suffix}')
+            self.assertEqual(item['size'], len(contents))
+            self.assertEqual(item['kind'], kind)
+            self.assertTrue(item['url'].startswith(origin + '/gotc/materials/'))
+            download = client.get(urlsplit(item['url']).path)
+            self.assertEqual(download.status_code, 200)
+            self.assertEqual(download.content, contents)
+            return item['url']
+
+        bundle = io.BytesIO()
+        with zipfile.ZipFile(bundle, 'w', zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr('README.md', '# Packaged contestant upload\n')
+        slides = upload('slides', 'presentation.pdf', b'%PDF-1.7\nSynthetic release fixture\n%%EOF')
+        files = upload('files', 'project.zip', bundle.getvalue())
         materials = {'projectName': 'Tar Synthetic', 'summary': 'Tar test', 'codeUrl': 'https://example.test/code',
                      'readmeUrl': 'https://example.test/readme', 'license': 'MIT', 'licenseUrl': '',
                      'demoUrl': 'https://example.test/demo', 'demoInstructions': 'Run',
-                     'slidesUrl': 'https://example.test/slides', 'filesUrl': 'https://example.test/files.zip',
+                     'slidesUrl': slides, 'filesUrl': files,
                      'videoUrl': 'https://example.test/video',
                      'sourcesAndLimitations': 'Synthetic', 'codeVersion': 'a' * 40, 'confirmed': True}
         saved, _ = api('api/submission', {'expectedVersion': 0, 'status': 'submitted', 'materials': materials}, cookie)
         self.assertEqual(saved['submission']['submitted']['projectName'], materials['projectName'])
         self.assertEqual(saved['submission']['submitted']['codeVersion'], materials['codeVersion'])
+        self.assertEqual(saved['submission']['submitted']['slidesUrl'], slides)
+        self.assertEqual(saved['submission']['submitted']['filesUrl'], files)
         team, _ = api('api/team', cookie=cookie)
         self.assertEqual(team['submission']['submittedVersion'], 1)
 

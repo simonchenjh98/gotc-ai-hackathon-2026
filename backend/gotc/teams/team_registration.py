@@ -306,7 +306,7 @@ class TeamRegistration:
         if not admin and path not in PUBLIC_PATHS|RETIRED_PATHS:
             raise APIError(404, '接口不存在')
         if method=='POST' and path in RETIRED_PATHS:
-            raise APIError(410,'队伍管理码功能已停用。请使用原参赛码登录选手工作台；尚无参赛码请前往队伍申请入口','registration_code_retired')
+            raise APIError(410,'已停止发放新的队伍管理码。请使用本队参赛码登录选手工作台；尚无参赛码请前往队伍申请入口','registration_code_retired')
         if method == 'POST' and not admin:
             self.s.rate_limit(ip, 'registration')
         with self.s.db() as db:
@@ -329,7 +329,7 @@ class TeamRegistration:
                 if method == 'POST' and path == '/api/admin/registration/import' and inputs.accepts_fields(body, inputs.RegistrationImport):
                     return self.import_rows(db, actor, body['rows'])
                 if method == 'POST' and path == '/api/admin/registration/rotate':
-                    raise APIError(410,'队伍管理码已停用，不再重发；队伍资料使用原参赛码登录选手工作台管理','registration_code_retired')
+                    raise APIError(410,'已停止重发队伍管理码；队伍资料使用本队参赛码登录选手工作台管理','registration_code_retired')
             else:
                 if method == 'GET' and path == '/api/registration':
                     return self.listing(db)

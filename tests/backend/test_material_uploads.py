@@ -175,6 +175,30 @@ class MaterialUploadTests(unittest.TestCase):
         self.assertEqual(self.client.get('/api/team')[1]['submission']['version'], 0)
         self.assertEqual(len(self.rows()), 1)
 
+    def test_plain_http_event_accepts_only_its_own_verified_slide_and_zip_uploads(self):
+        self.service.origin = f'http://127.0.0.1:{self.server.server_port}'
+        slides = self.uploaded()
+        files = self.uploaded(kind='files', data=archive(), filename='project.zip')
+        materials = self.materials(slidesUrl=slides['url'], filesUrl=files['url'])
+        other, _ = self.access(self.team(2, 'Other team'))
+        self.assertEqual(self.submit(materials, client=other)[0], 403)
+        for number, (key, value, code) in enumerate([
+            ('slidesUrl', 'http://example.test/slides.pdf', 'materials_invalid'),
+            ('slidesUrl', self.service.origin + '/sample.pdf', 'materials_invalid'),
+            ('slidesUrl', slides['url'] + '?other', 'upload_reference'),
+            ('slidesUrl', slides['url'].rsplit('/', 1)[0] + '/..%2F..%2Ftest.pdf', 'upload_reference'),
+            ('filesUrl', slides['url'], 'upload_kind'),
+            ('readmeUrl', slides['url'], 'materials_invalid'),
+        ]):
+            with self.subTest(key=key, value=value):
+                status, error, _ = self.submit({**materials, key: value}, status='draft',
+                                               request_id=f'rejected-http-file-{number}')
+                self.assertEqual((status, error['code']), (400, code))
+        self.assertEqual(self.submit(materials, status='draft')[0], 200)
+        status, submitted, _ = self.submit(materials, version=1, request_id='http-materials-formal')
+        self.assertEqual(status, 200)
+        self.assertEqual(submitted['receipt']['materials']['filesUrl'], files['url'])
+
     def test_internal_link_aliases_cannot_bypass_ownership_and_zip64_is_bounded(self):
         other, _ = self.access(self.team(2, 'Other'))
         slides = self.uploaded()

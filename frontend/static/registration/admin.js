@@ -4,7 +4,7 @@ let currentRegistrationAdmin=null;
 function installRegistrationAdmin(version){
   currentRegistrationAdmin?.dispose();
   const owner=session,loginId=owner.loginId,marker=browserLoginOwner();
-  root.insertAdjacentHTML('beforeend','<section class="surface" id="registration-admin"><h2>队伍登记资料</h2><p>查看联系方式及待核对项目；队伍成员资料通过原参赛码在选手工作台维护，已审核成员变更请联系组织方。</p><button class="btn secondary small" data-registration-load>读取 / 刷新登记名单</button><p data-registration-message role="status"></p><div data-registration-content></div></section>');
+  root.insertAdjacentHTML('beforeend','<section class="surface" id="registration-admin"><h2>队伍登记资料</h2><p>查看联系方式及待核对项目；队伍成员资料通过本队参赛码在选手工作台维护，已审核成员变更请联系组织方。</p><button class="btn secondary small" data-registration-load>读取 / 刷新登记名单</button><p data-registration-message role="status"></p><div data-registration-content></div></section>');
   const box=document.getElementById('registration-admin'),content=box.querySelector('[data-registration-content]'),message=box.querySelector('[data-registration-message]'),button=box.querySelector('[data-registration-load]');
   const state={loginId,active:true,sequence:0,
     lock(){

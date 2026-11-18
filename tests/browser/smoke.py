@@ -12,6 +12,7 @@ from threading import Thread
 from urllib.parse import urlsplit
 
 from playwright.sync_api import sync_playwright
+from contestant_upload import contestant_upload
 from fixture import participants
 
 
@@ -47,7 +48,7 @@ def local_event(source):
                 worker.join()
 
 
-def page_context(browser, service, **options):
+def page_context(browser, service, *, allowed_errors=(), **options):
     context = browser.new_context(service_workers="block", **options)
     failures = []
     def guard(route):
@@ -61,8 +62,19 @@ def page_context(browser, service, **options):
     page = context.new_page()
     page.set_default_timeout(8000)
     page.on("pageerror", lambda error: failures.append(f"JavaScript: {error.name}: {error.message}"))
-    page.on("response", lambda r: failures.append(f"HTTP {r.status}: {urlsplit(r.url).path}") if r.status >= 400 else None)
-    page.on("console", lambda msg: failures.append("console: " + msg.text) if msg.type == "error" else None)
+    def check_response(response):
+        path = urlsplit(response.url).path
+        if response.status >= 400 and (path, response.status) not in allowed_errors:
+            failures.append(f"HTTP {response.status}: {path}")
+    def check_console(message):
+        if message.type == "error":
+            path = urlsplit(message.location["url"]).path
+            if any(path == url and message.text.startswith(f"Failed to load resource: the server responded with a status of {status} ")
+                   for url, status in allowed_errors):
+                return
+            failures.append("console: " + message.text)
+    page.on("response", check_response)
+    page.on("console", check_console)
     page.on("requestfailed", lambda r: failures.append(f"{r.failure}: {urlsplit(r.url).path}")
             if r.failure != "net::ERR_ABORTED" or r.resource_type not in {"fetch", "xhr"} else None)
     return context, page, failures
@@ -276,6 +288,8 @@ def smoke(browser, service):
         page.locator("#admin-team-workbench").wait_for()
         go(page, "admin", "#settings-form")
         passed.append("organizer dashboard, roadshow roster, finals roster, 7 AI console sections and delegated team round-trip")
+        contestant_upload(visit, service, page)
+        passed.append("team code, file picker, PPTX/PDF/ZIP downloads and integrity, size/type/window errors and retry, draft refresh, preview, formal receipt and judge access")
 
     # Force a stale route to finish loading after the new route has rendered.
     with visit() as page:

@@ -36,7 +36,7 @@ async function api(path, data, options={}) {
   let body; try { body = await res.json(); } catch { throw new Error('服务暂时不可用，请稍后重试。'); }
   const confirmingLogin = path === 'session' && options.recordVerifiedLogin === false;
   if (!res.ok) {
-    if (!confirmingLogin) {
+    if (!confirmingLogin && path !== 'login') {
       if (path === 'admin' && [401,403,428].includes(res.status) && session === sessionAtStart
           && currentAdminTeamLifecycle === adminLifecycleAtStart) adminLifecycleAtStart?.lock();
       if ([401,403].includes(res.status) && currentTeamRecovery === recoveryAtStart) recoveryAtStart?.lock();
@@ -45,10 +45,7 @@ async function api(path, data, options={}) {
         currentAdminTeamLifecycle?.valid();
       }
     }
-    const error = new Error(body.error || '操作未成功，请重试。');
-    error.status = res.status;
-    error.code = body.code;
-    throw error;
+    throw platformRequestError(res, body, '操作未成功，请重试。');
   }
   if(path==='session' && !confirmingLogin)verifiedBrowserLogin={loginId:body.loginId,owner:ownerAtStart};
   return body;
@@ -83,7 +80,7 @@ async function logoutAccount(event,{preserveClaim=false}={}){
       }
       if(session.role==='team'){teamAtExit=await api('team');if(!owned())return;if(currentTeamRecovery && currentTeamRecovery.teamId!==teamAtExit.team.id)currentTeamRecovery.lock('当前登录队伍已变化，本地副本需重新授权后查看。');const store=teamDraftStore(teamAtExit,undefined,teamAtExit.loginId ?? operation.owner.loginId ?? '');const captured=store?.capturePurge();local={purge:()=>store?.purge(captured) ?? false};}
       if(teamAtExit?!confirm(`退出当前登录的${teamAtExit.team.name}会清除本浏览器内本队当前及历史恢复副本，并停止旧标签编辑；退出期间重新登录后新建的副本会保留；服务器材料不受影响。${claimNavigationState().dirty?'本页尚未提交的队伍申请输入也会丢弃。':''}${profileNavigationState().dirty?'本页尚未保存的资料输入也会丢弃。':''}确认退出？`):!confirmLeave())return;
-      if(!preserveClaim && typeof hasClaimReceipt==='function' && hasClaimReceipt() && !confirm('退出会清除此标签页的队伍申请凭据。请先返回申请页领取并复制提交码；尚未批准的申请将无法继续领取。确认清除并退出？'))return false;
+      if(!preserveClaim && typeof hasClaimReceipt==='function' && hasClaimReceipt() && !confirm('退出会清除此标签页的队伍申请凭据。请先返回申请页领取并复制参赛码；尚未批准的申请将无法继续领取。确认清除并退出？'))return false;
       await api('logout',{}, {loginId:teamAtExit?.loginId ?? operation.owner.loginId});
       const claimClearError=!preserveClaim && typeof clearClaimReceipt==='function'?clearClaimReceipt():'';if(claimClearError)toast(claimClearError);
       if(['team','admin'].includes(operation.owner.role) && operation.owner.loginId){
@@ -127,20 +124,20 @@ function renderLogin(role) {
   if (!Object.hasOwn(roleName,role)) throw new Error('无效登录入口');
   const stage=stageForRoute();
   const loginRoleName=route==='admin-finals'?'决赛管理员':route==='admin-roadshow'?'路演管理员':roleName[role];
-  const copy = {team:route==='team-profile'?['本队资料与成员','使用现有参赛码（原提交码）登录，查看本队成员和学校、补充队伍资料。作品提交和查分继续使用同一个账号。']:route==='team-score'?['本队查分','输入主办方发给本队的提交码，查看本队已发布的总分、六维均分及评委同意分享的匿名评语。']:['选手工作台<br>AI 工具 · 作品提交','用本队提交码登录，在同一工作台查看 AI 工具、准备代码仓库和提交作品。没有提交码，请先提交队伍申请。'],judge:route==='judge'?['专业评分<br>六维 100 分','使用主办方提供的评委码，选择自己的身份。评分可保存草稿，正式提交后计入专业均分。']:route==='judge-roadshow'?['路演评分<br>六维 100 分','邀请码就是你的真实姓名，输入名单中的完整姓名即可验证登录。问题价值20、方案与 AI 使用20、原型完成度20、测试与改进15、社会关怀与责任10、团队协作与表达15分；路演期间不显示汇总分数。']:[`${stageName(stage)}记录`,'使用主办方提供的评委码，选择自己的身份。可查看本轮队伍、保存草稿、提交评语或回避；本阶段记录暂不计分。'],audience:['选出让你<br>眼前一亮的作品。','观众选择票独立于专业成绩。使用观众邀请码登录，每个邀请码最多支持 3 支不同队伍。'],admin:route==='admin-finals'?['决赛管理<br>评分 · 提名 · 颁奖','管理7位决赛评委和决赛队伍，实时核对六维评分与提名票数，确认专项奖归属后发布结果。请用个人组织方账号登录。']:route==='admin-roadshow'?['路演管理<br>名单 · 实时成绩','配置路演评委名单，查看姓名登录资格与实时六维评分，核对后发布路演成绩。请用个人组织方账号登录。']:['组织方<br>活动管理','管理队伍、评委、评审窗口和作品材料。请用个人组织方账号登录。']}[role];
+  const copy = {team:route==='team-profile'?['本队资料与成员','使用现有参赛码登录，查看本队成员和学校、补充队伍资料。作品提交和查分继续使用同一个账号。']:route==='team-score'?['本队查分','输入本队参赛码，查看本队已发布的总分、六维均分及评委同意分享的匿名评语。']:['选手工作台<br>AI 工具 · 作品提交','队长在申请获批后领取本队参赛码，也可由主办方发放。全队使用同一码登录，维护资料、提交作品、查看本队成绩。主办方开通 AI 权限后，可在工作台创建 API 密钥。'],judge:route==='judge'?['专业评分<br>六维 100 分','使用主办方提供的评委码，选择自己的身份。评分可保存草稿，正式提交后计入专业均分。']:route==='judge-roadshow'?['路演评分<br>六维 100 分','邀请码就是你的真实姓名，输入名单中的完整姓名即可验证登录。问题价值20、方案与 AI 使用20、原型完成度20、测试与改进15、社会关怀与责任10、团队协作与表达15分；路演期间不显示汇总分数。']:[`${stageName(stage)}记录`,'使用主办方提供的评委码，选择自己的身份。可查看本轮队伍、保存草稿、提交评语或回避；本阶段记录暂不计分。'],audience:['选出让你<br>眼前一亮的作品。','观众选择票独立于专业成绩。使用观众邀请码登录，每个邀请码最多支持 3 支不同队伍。'],admin:route==='admin-finals'?['决赛管理<br>评分 · 提名 · 颁奖','管理7位决赛评委和决赛队伍，实时核对六维评分与提名票数，确认专项奖归属后发布结果。请用个人组织方账号登录。']:route==='admin-roadshow'?['路演管理<br>名单 · 实时成绩','配置路演评委名单，查看姓名登录资格与实时六维评分，核对后发布路演成绩。请用个人组织方账号登录。']:['组织方<br>活动管理','管理队伍、评委、评审窗口和作品材料。请用个人组织方账号登录。']}[role];
   const organizer = role === 'admin';
   const organizerFields = organizer ? `
     <label class="field">组织方用户名<input name="username" autocomplete="username" maxlength="80" required></label>
     <label class="field">验证器动态码<input name="totp" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" required></label>
     <label><input type="checkbox" name="legacyAdmin"> 迁移期间使用原管理码</label>
     <p class="small-note">首个实名组织方账号启用后，原管理码入口关闭。</p>` : '';
-  root.innerHTML = `<div class="login-layout"><div class="login-story"><p class="eyebrow">GOTC 2026 / ${roleLabel}</p><h1>${copy[0].split('<br>').map(esc).join('<br>')}</h1><p>${esc(copy[1])}</p><span class="login-pixel" aria-hidden="true"></span></div><form class="login-card" id="login-form"><h2>${esc(loginRoleName)}登录</h2>${role==='team'?'<p><a href="#claim">尚无提交码？提交队伍申请并领取 ↗</a></p>'+(route==='team-profile'?'':'<p class="small-note">组织方请从<a href="#admin">组织方登录</a>进入，再选择需要代管的队伍。</p>'):''}<p>邀请码仅用于本届活动，请妥善保管。<br>如无法登录，请核对审核状态或联系主办方。</p>${organizerFields}<label class="field">${role === 'admin' ? '个人凭据或原管理码' : (role === 'judge' ? '评委登录码' : role === 'team' ? '本队参赛码（原提交码）' : '观众邀请码')}<input name="code" type="password" autocomplete="${organizer ? 'current-password' : 'one-time-code'}" required maxlength="160" placeholder="输入你的${role === 'admin' ? '管理码' : '邀请码'}"></label><p class="form-error" role="alert"></p><button type="submit" class="btn">${route==='team-score'?'查看本队成绩':route==='team-profile'?'进入本队资料与成员':'进入'+esc(loginRoleName)+'工作台 ↗'}</button><p class="form-footnote">本队查分仅显示当前登录队伍；全部队伍成绩看板仅组织方可见。</p></form></div>`;
+  root.innerHTML = `<div class="login-layout"><div class="login-story"><p class="eyebrow">GOTC 2026 / ${roleLabel}</p><h1>${copy[0].split('<br>').map(esc).join('<br>')}</h1><p>${esc(copy[1])}</p><span class="login-pixel" aria-hidden="true"></span></div><form class="login-card" id="login-form"><h2>${esc(loginRoleName)}登录</h2>${role==='team'?'<p><a href="#claim">尚无参赛码？提交队伍申请并领取 ↗</a></p>'+(route==='team-profile'?'':'<p class="small-note">组织方请从<a href="#admin">组织方登录</a>进入，再选择需要代管的队伍。</p>'):''}<p>${role === 'team' ? '参赛码' : '登录凭据'}仅用于本届活动，请妥善保管。<br>如无法登录，请核对审核状态或联系主办方。</p>${organizerFields}<label class="field">${role === 'admin' ? '个人凭据或原管理码' : (role === 'judge' ? '评委登录码' : role === 'team' ? '本队参赛码（原提交码）' : '观众邀请码')}<input name="code" type="password" autocomplete="${organizer ? 'current-password' : 'one-time-code'}" required maxlength="160" placeholder="${role === 'team' ? '输入本队参赛码' : '输入你的' + (role === 'admin' ? '管理凭据' : '邀请码')}"></label><p class="form-error" role="alert"></p><button type="submit" class="btn">${route==='team-score'?'查看本队成绩':route==='team-profile'?'进入本队资料与成员':'进入'+esc(loginRoleName)+'工作台 ↗'}</button><p class="form-footnote">本队查分仅显示当前登录队伍；全部队伍成绩看板仅组织方可见。</p></form></div>`;
   const form=document.getElementById('login-form');
   const page = route, version = routeVersion;
   const mounted = () => route === page && routeVersion === version && form.isConnected
     && document.getElementById('login-form') === form;
   const changedMessage = role === 'team'
-    ? '浏览器的登录身份已切换，请重新输入本队提交码。'
+    ? '浏览器的登录身份已切换，请重新输入本队参赛码。'
     : '浏览器的登录身份已切换，请核对身份并重新输入邀请码。';
   const identityField=document.createElement('label');
   identityField.className='field';identityField.hidden=true;
@@ -148,6 +145,8 @@ function renderLogin(role) {
   identityField.innerHTML=`选择自己的${identityName}身份<select name="accountId"><option value="">请选择主办方分配的身份</option></select>`;
   form.querySelector('.form-error').before(identityField);
   const identity=form.elements.accountId;
+  let inputRevision = 0;
+  form.oninput = () => { inputRevision++; formError(form, ''); };
   const {username, totp, legacyAdmin} = form.elements;
   if (organizer) {
     legacyAdmin.addEventListener('change', () => {
@@ -169,7 +168,7 @@ function renderLogin(role) {
     if (button.disabled || !mounted()) return;
     button.disabled = true;
     formError(form, '');
-    const owner = session, marker = browserLoginOwner();
+    const owner = session, marker = browserLoginOwner(), revision = inputRevision;
     const code = form.elements.code.value.trim();
     const named = organizer && !legacyAdmin.checked;
     const credentials = named ? {username:username.value.trim(), totp:totp.value.trim()} : {};
@@ -179,13 +178,15 @@ function renderLogin(role) {
       return;
     }
     const accountId = identityField.hidden ? '' : identity.value;
-    const currentInput = () => mounted() && session === owner
+    const currentInput = () => mounted() && session === owner && revision === inputRevision
       && form.elements.code.value.trim() === code
       && (!organizer || named === !legacyAdmin.checked)
       && (!named || (username.value.trim() === credentials.username && totp.value.trim() === credentials.totp))
       && (identityField.hidden ? '' : identity.value) === accountId;
     try {
-      const result = await api('login', {role, code, ...credentials, ...(accountId && !named ? {accountId} : {})});
+      const payload = {role, code, ...credentials, ...(accountId && !named ? {accountId} : {})};
+      const result = await withLoginRetry(() => api('login', payload),
+        () => currentInput() && browserLoginOwner() === marker, message => formError(form, message));
       if (!currentInput()) return;
       if (browserLoginOwner() !== marker) { formError(form, changedMessage); return; }
       if (result.selectAccount) {
@@ -208,13 +209,17 @@ function renderLogin(role) {
       acceptVerifiedLogin(confirmed, marker);
       await renderRoute();
     } catch (error) {
-      if (mounted()) formError(form, error.message);
+      if (mounted()) {
+        const message = browserLoginOwner() !== marker || session !== owner ? changedMessage
+          : currentInput() ? error.message : '输入已变化，请核对当前信息后重试。';
+        formError(form, message);
+      }
     } finally {
       if (form.isConnected) button.disabled = false;
     }
   };
 }
-function renderWrongRole(role) { root.innerHTML = heading('ACCESS / 登录身份','请使用对应的邀请码',`当前身份为${esc(roleName[session.role] || session.role)}，此入口需要${roleName[role]}身份。`) + empty('切换登录身份','切换后使用此入口的专属邀请码登录；独立的队伍申请凭据会保留，可返回申请页领取提交码。','<button class="btn" id="switch-role">切换身份（保留申请）</button>');document.getElementById('switch-role').onclick=event=>logoutAccount(event,{preserveClaim:true}); }
+function renderWrongRole(role) { root.innerHTML = heading('ACCESS / 登录身份','请使用对应的登录凭据',`当前身份为${esc(roleName[session.role] || session.role)}，此入口需要${roleName[role]}身份。`) + empty('切换登录身份','切换后使用此入口的登录凭据登录；独立的队伍申请凭据会保留，可返回申请页领取参赛码。','<button class="btn" id="switch-role">切换身份（保留申请）</button>');document.getElementById('switch-role').onclick=event=>logoutAccount(event,{preserveClaim:true}); }
 
 function beijingTime(value){return value===null || value===undefined?'—':new Date(value).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false});}
 function beijingInput(value){if(value===null || value===undefined)return '';const parts=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date(value));const part=k=>parts.find(p=>p.type===k).value;return `${part('year')}-${part('month')}-${part('day')}T${part('hour')}:${part('minute')}`;}

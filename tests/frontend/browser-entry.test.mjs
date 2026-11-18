@@ -113,10 +113,107 @@ async function openPage(hash, {beforeAsset, session = {role:null}, replies = {},
 test('the signed-out team entry renders its login before loading any team or organizer controllers',async()=>{
   const browser=await openPage('#team');
   assert.match(browser.main.innerHTML,/选手工作台/);
+  assert.match(browser.main.innerHTML,/本队参赛码/);
+  assert.match(browser.main.innerHTML,/参赛码（原提交码）/);
+  assert.equal(browser.main.innerHTML.split('提交码').length - 1, 1);
+  assert.match(browser.main.innerHTML,/placeholder="输入本队参赛码"/);
   assert.match(browser.main.innerHTML,/id="login-form"/);
   assert.deepEqual(browser.requests,['/gotc/api/session']);
   assert.ok(browser.assets.every(path=>!/(?:\/team\/|\/admin\/|\/gateway\/)/.test(path)));
   assert.equal(vm.runInContext('typeof renderTeam',browser.context),'undefined');
+});
+
+function loginReply(status, body, retryAfter=null) {
+  return {ok:status<400, status, headers:{get:name=>name==='Retry-After'?retryAfter:null}, json:async()=>body};
+}
+
+async function busyLoginPage(replies) {
+  let calls=0;
+  const login={role:'team',loginId:'fixture-team'};
+  const browser=await openPage('#team-score',{respond:path=>{
+    if(path==='login') return replies[calls++];
+    if(path==='session' && calls) return loginReply(200,login);
+    if(path==='team/score') return loginReply(200,{team:{number:2,name:'Fixture'},state:'unpublished'});
+  }});
+  const timers=[];
+  browser.context.setTimeout=(run,ms)=>{timers.push({run,ms});return timers.length;};
+  const form=browser.nodes['login-form'];
+  form.elements.code.value='fixture-code';
+  const submit=()=>form.onsubmit({preventDefault(){}});
+  return {browser,form,submit,timers,calls:()=>calls};
+}
+
+test('participant login waits for Retry-After and jitter, ignores duplicates, and confirms the retried login',async()=>{
+  const h=await busyLoginPage([loginReply(429,{code:'login_busy',error:'Busy'},'2'),
+    loginReply(200,{role:'team',loginId:'fixture-team'})]);
+  const pending=h.submit();
+  await settle();
+  assert.equal(h.form.querySelector('button').disabled,true);
+  assert.match(h.form.querySelector('.form-error').textContent,/等待.*自动重试/);
+  assert.equal(h.timers.length,1);
+  assert.ok(h.timers[0].ms>=2000 && h.timers[0].ms<=2500);
+  await h.submit();
+  assert.equal(h.calls(),1);
+  h.timers[0].run();
+  await pending;
+  assert.equal(h.calls(),2);
+  assert.match(h.browser.main.innerHTML,/成绩尚未发布/);
+});
+
+test('sign-in stops after three busy retries and leaves the code ready for a manual retry',async()=>{
+  const h=await busyLoginPage(Array(4).fill(loginReply(429,{code:'login_busy'},'1')));
+  const pending=h.submit();
+  for(let attempt=0;attempt<3;attempt++) {
+    await settle();
+    assert.equal(h.timers.length,attempt+1);
+    assert.ok(h.timers[attempt].ms>=Math.max(1000,500*2**attempt));
+    h.timers[attempt].run();
+  }
+  await pending;
+  assert.equal(h.calls(),4);
+  assert.equal(h.timers.length,3);
+  assert.match(h.form.querySelector('.form-error').textContent,/手动重试/);
+  assert.equal(h.form.querySelector('button').disabled,false);
+  assert.equal(h.form.elements.code.value,'fixture-code');
+});
+
+test('sign-in never resubmits rejected credentials or a generic rate limit',async()=>{
+  for(const [status,code] of [[401,'login_busy'],[403,'login_busy'],[429,'rate_limit']]) {
+    const h=await busyLoginPage([loginReply(status,{code,error:'Fixture rejection'},'2')]);
+    await h.submit();
+    assert.equal(h.calls(),1);
+    assert.equal(h.timers.length,0);
+    assert.match(h.form.querySelector('.form-error').textContent,/Fixture rejection/);
+  }
+});
+
+test('a long Retry-After leaves sign-in available for a later manual attempt',async()=>{
+  const h=await busyLoginPage([loginReply(429,{code:'login_busy'},'60')]);
+  await h.submit();
+  assert.equal(h.calls(),1);
+  assert.equal(h.timers.length,0);
+  assert.match(h.form.querySelector('.form-error').textContent,/手动重试/);
+});
+
+test('changing input, browser identity, or route during backoff cancels the pending login',async()=>{
+  for(const change of ['input','identity','route']) {
+    const h=await busyLoginPage([loginReply(429,{code:'login_busy'},'1')]);
+    const pending=h.submit();
+    await settle();
+    if(change==='input'){
+      h.form.elements.code.value='different';
+      h.form.oninput();
+      h.form.elements.code.value='fixture-code';
+      h.form.oninput();
+    }
+    if(change==='identity') vm.runInContext("publishLogin({loginId:'other-tab'})",h.browser.context);
+    if(change==='route') await h.browser.go('#board-finals');
+    h.timers[0].run();
+    await pending;
+    assert.equal(h.calls(),1);
+    if(change==='route') assert.match(h.browser.main.innerHTML,/全部队伍成绩看板已关闭/);
+    else assert.match(h.form.querySelector('.form-error').textContent,/变化|切换/);
+  }
 });
 
 test('opening the public claim route loads its real form on demand and reuses its scripts on return',async()=>{
@@ -322,4 +419,14 @@ test('a changed code and double click while team login is pending cannot adopt t
   assert.equal(f.storage.get(ownerKey),undefined);
   assert.equal(vm.runInContext('session.role',f.browser.context),null);
   assert.equal(f.form.elements.code.value,'replacement-code');
+});
+
+test('a late wrong-code response does not label a newly entered code as wrong',async()=>{
+  const f=await loginFixture('team','team','post');
+  f.form.elements.code.value='new-code';
+  f.form.oninput();
+  f.pending.resolve(loginReply(401,{error:'Wrong old code'}));
+  await f.submitted;
+  assert.doesNotMatch(f.form.querySelector('.form-error').textContent,/Wrong old code/);
+  assert.equal(f.form.querySelector('button').disabled,false);
 });

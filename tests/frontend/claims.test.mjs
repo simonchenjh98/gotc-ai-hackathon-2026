@@ -31,6 +31,33 @@ test('approved and issued states can redeem repeatable code, status never retain
   assert.ok(calls.every(call=>!call.path.includes(receipt.secret)));assert.ok(![...storage.map.values()].join('').includes('GT_FIXTURE'));
 });
 
+test('a busy redemption waits with its original receipt and clearing it cancels the retry',async()=>{
+  const timers=[];
+  context.setTimeout=(run,ms)=>timers.push({run,ms});
+  for(const clear of [false,true]){
+    const storage=new Storage();
+    store(storage).write(receipt);
+    let calls=0;
+    const {client,states}=controller(storage,async(path,body)=>{
+      assert.equal(path,'claims/redeem');
+      assert.equal(body.secret,receipt.secret);
+      if(++calls===1) throw Object.assign(new Error('Busy'),{status:429,code:'login_busy',retryAfterMs:1000});
+      return {status:'issued',code:'fixture-code'};
+    });
+    const pending=client.redeem();
+    await flush();
+    assert.match(states.at(-1).error,/等待自动重试/);
+    assert.equal(states.at(-1).busy,true);
+    if(clear) client.clear();
+    const timer=timers.shift();
+    assert.ok(timer.ms>=1000);
+    timer.run();
+    await pending;
+    assert.equal(calls,clear?1:2);
+    assert.equal(states.at(-1).code,clear?null:'fixture-code');
+  }
+});
+
 test('storage failures are visible and in-memory receipt still permits status/redeem',async()=>{
   const storage={getItem(){throw new Error('blocked');},setItem(){throw new Error('blocked');},removeItem(){throw new Error('blocked');}};
   const {client,states}=controller(storage,async path=>path.endsWith('request')?receipt:{status:'approved',code:null});client.start();assert.match(states.at(-1).error,/无法读取/);

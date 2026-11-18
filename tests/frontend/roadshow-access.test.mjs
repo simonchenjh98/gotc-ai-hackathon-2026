@@ -62,6 +62,30 @@ test('unknown or disabled names retain input and never retry automatically',asyn
   for(const status of [404,403,429]){let writes=0;const h=loginHarness({login:async()=>{writes++;throw Object.assign(new Error('请核对名单'),{status});}});await h.controller.reload();h.name.value='Judge One';await h.controller.login();assert.equal(writes,1);assert.equal(h.name.value,'Judge One');assert.match(h.error.textContent,/请核对名单/);assert.equal(h.button.disabled,false);h.controller.dispose();}
 });
 
+test('roadshow sign-in waits once after a capacity refusal and confirms the same judge',async()=>{
+  let calls=0, accepted=0;
+  const waits=[];
+  const h=loginHarness({login:async()=>{
+    if(++calls===1) throw Object.assign(new Error('Busy'),{status:429,code:'login_busy',retryAfterMs:1200});
+    return {role:'judge',loginId:'judge-epoch'};
+  },accept:async()=>accepted++},{setTimeout:(run,ms)=>{
+    if(ms<8000) waits.push({run,ms});
+    return 1;
+  },clearTimeout(){}});
+  await h.controller.reload();
+  h.name.value='Fixture Judge';
+  const pending=h.controller.login();
+  await flush();
+  assert.match(h.error.textContent,/等待自动重试/);
+  assert.equal(waits.length,1);
+  assert.ok(waits[0].ms>=1200);
+  waits[0].run();
+  await pending;
+  assert.equal(calls,2);
+  assert.equal(accepted,1);
+  h.controller.dispose();
+});
+
 test('name login has an eight-second abort deadline and does not automatically resend',async()=>{
   const tasks=new Map();let seq=0,writes=0;const h=loginHarness({login:(_body,signal)=>{writes++;return new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>reject(Object.assign(new Error('abort'),{name:'AbortError'}))));}},{setTimeout:(fn,ms)=>{tasks.set(++seq,{fn,ms});return seq;},clearTimeout:id=>tasks.delete(id)});
   await h.controller.reload();h.name.value='Judge One';const pending=h.controller.login();assert.equal([...tasks.values()][0].ms,8000);[...tasks.values()][0].fn();await pending;

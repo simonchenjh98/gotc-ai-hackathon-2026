@@ -36,6 +36,12 @@ def participants(service):
         })
         team_id = service.registration.insert(db, profile, None)["team_id"]
     team = api("admin/team-access", {"action": "issue", "teamId": team_id})
+    # Key management requires a configured provider. The browser only reads the
+    # model list and team controls, so a local, unused fixture URL is sufficient.
+    api("admin/keys/upstreams", {"upstreams": {
+        "openai": {"url": service.origin + "/browser-fixture/v1", "key": "fixture-only", "models": {"fixture": [0, 0]}},
+    }})
+    api("admin/keys/provision", {"teamId": team_id})
     judge = api("admin/invitations", {"role": "judge", "name": "Browser Fixture Judge"})
     audience = api("admin/invitations", {"role": "audience", "name": "Browser Fixture Audience"})
     for stage in ["exhibition", "roadshow"]:

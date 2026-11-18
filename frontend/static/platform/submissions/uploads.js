@@ -6,13 +6,12 @@ const submissionUploadKinds={
   demo:{field:'demoUrl',label:'HTML 作品',accept:'.html,.htm',max:10*1024*1024,hint:'上传单文件 HTML / HTM，最大 10 MiB，图片和脚本请内嵌或使用 HTTPS 地址。多文件网站请部署后填写公开分享链接；评委应能直接打开查看。'}
 };
 function submissionUploadMarkup(kind){const spec=submissionUploadKinds[kind];return `<div class="submission-upload"><p class="small-note" id="upload-${kind}-help">${spec.hint}</p><label class="field" for="upload-${kind}-file">选择${kind==='files'?'作品压缩包 ZIP':spec.label+'文件'}<input type="file" id="upload-${kind}-file" accept="${spec.accept}" aria-describedby="upload-${kind}-help upload-${kind}-name"></label><p class="small-note upload-filename" id="upload-${kind}-name">可直接选择文件；未填作品名称时，文件按“队名+作品.扩展名”命名。</p><button type="button" class="btn secondary" id="upload-${kind}-button">上传${spec.label}</button><p class="upload-status" id="upload-${kind}-status" role="status" aria-live="polite"></p><p class="upload-result" id="upload-${kind}-result"></p></div>`;}
-function siteUploadedMaterial(value){try{const url=new URL(value),prefix=new URL('materials/',base);return url.origin===prefix.origin && !url.search && !url.hash && url.pathname.startsWith(prefix.pathname) && /^[A-Za-z0-9_-]{43}\/[^/]+$/.test(url.pathname.slice(prefix.pathname.length));}catch{return false;}}
 function submissionUploadProblem(kind,file,project){const spec=submissionUploadKinds[kind];if(Array.from(project).length>140)return '作品名称不能超过 140 字，请修改后再上传。';if(!file)return '请先选择一个文件。';const ext='.'+file.name.split('.').at(-1).toLowerCase();if(!spec.accept.split(',').includes(ext))return `文件格式不支持，请选择 ${spec.accept} 文件。`;if(!file.size)return '文件为空，请重新选择。';if(file.size>spec.max)return `文件超过 ${spec.max/1024/1024} MiB，请压缩或填写公开 HTTPS 链接。`;return '';}
 async function uploadSubmissionFile(kind,file,project,owner,signal){
   const response=await fetch(new URL(`api/team/uploads/${kind}`,base),{method:'POST',credentials:'same-origin',cache:'no-store',headers:{'Content-Type':'application/octet-stream','X-GOTC-Login':owner.loginId,'X-GOTC-Project':encodeURIComponent(project),'X-GOTC-Filename':encodeURIComponent(file.name)},body:file,signal});
   let result;try{result=await response.json();}catch{throw new Error('未收到有效上传结果；原链接和其他输入已保留，请重试。');}
   if(!response.ok){const error=new Error(result.error || '上传未成功，请重试。');error.status=response.status;throw error;}
-  if(result.kind!==kind || !safeMaterialUrl(result.url) || !siteUploadedMaterial(result.url) || typeof result.filename!=='string' || !result.filename || result.size!==file.size)throw new Error('上传回执不完整；原链接已保留，请重试。');
+  if(result.kind!==kind || !safeMaterialFieldUrl(submissionUploadKinds[kind].field,result.url) || !siteUploadedMaterial(result.url) || typeof result.filename!=='string' || !result.filename || result.size!==file.size)throw new Error('上传回执不完整；原链接已保留，请重试。');
   return result;
 }
 function installSubmissionUploads(data,form,{isCurrent,canUpload,onChange,onBusy,onUnauthorized}){

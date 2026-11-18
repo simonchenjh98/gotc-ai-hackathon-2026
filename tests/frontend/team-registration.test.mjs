@@ -49,7 +49,7 @@ test('out-of-order public refresh cannot replace a newer directory',async()=>{
 });
 test('public pages expose existing-code profile and pending application links',()=>{
   for(const path of ['index.html','teams.html']){
-    const html=readSource(path);assert.match(html,/platform.html#team-profile/);assert.match(html,/platform.html#claim/);assert.match(html,/原提交码/);assert.match(html,/未作废的队伍管理码/);
+    const html=readSource(path);assert.match(html,/platform.html#team-profile/);assert.match(html,/platform.html#claim/);assert.match(html,/参赛码/);assert.match(html,/未作废的队伍管理码/);
   }
 });
 test('organizer registration UI keeps contact/history reads and removes credential issuance controls',async()=>{

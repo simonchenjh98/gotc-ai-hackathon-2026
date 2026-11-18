@@ -21,7 +21,7 @@
       ${link('活动首页', home(''), 'home')}
       ${link('组队登记', new URL('teams.html', platform).href, 'teams')}
       ${link('选手工作台', entry('team'), 'team', 'team')}
-      ${link('领取提交码', entry('claim'), 'claim', 'claim')}
+      ${link('领取参赛码', entry('claim'), 'claim', 'claim')}
       ${link('本队查分', entry('team-score'), 'team-score', 'team-score')}
       <details class="gotc-more"><summary>更多入口</summary><div class="gotc-more-links">
         ${link('关于活动', home('about'), 'about')}

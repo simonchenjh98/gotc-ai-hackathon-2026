@@ -8,7 +8,7 @@ async function roadshowNameRequest(path,payload,signal){
   if(!['roadshow/access','roadshow/login'].includes(path))throw new Error('姓名登录入口不正确。');
   const response=await fetch(new URL(`api/${path}`,base),{method:payload===undefined?'GET':'POST',credentials:path==='roadshow/login'?'same-origin':'omit',cache:'no-store',headers:payload===undefined?{}:{'Content-Type':'application/json'},body:payload===undefined?undefined:JSON.stringify(payload),signal});
   let data;try{data=await response.json();}catch{throw new Error('服务暂时不可用，请稍后重试。');}
-  if(!response.ok){const error=new Error(data.error || '登录未完成，请核对真实姓名后重试。');error.status=response.status;error.code=data.code;throw error;}
+  if(!response.ok)throw platformRequestError(response,data,'登录未完成，请核对真实姓名后重试。');
   return data;
 }
 
@@ -39,10 +39,12 @@ function makeRoadshowNameLoginController({form,isCurrent,load,login,accept}){
     const requested=name.value.trim(),epoch=edit;if(!requested){error.textContent='请输入名单中的完整真实姓名。';return;}
     clearRefresh();busy=true;buttons();error.textContent='正在验证姓名并登录…';
     try{
-      const result=await request(signal=>login({name:requested},signal));if(!current())return;
+      const unchanged=()=>current() && epoch===edit && name.value.trim()===requested;
+      const result=await withLoginRetry(()=>request(signal=>login({name:requested},signal)), unchanged,
+        message=>{error.textContent=message;});if(!current())return;
       if(epoch!==edit || name.value.trim()!==requested){error.textContent='姓名已变化，请核对当前姓名后重新登录。';return;}
       if(result.role!=='judge' || typeof result.loginId!=='string' || !result.loginId)throw new Error('登录返回的评委身份不正确，请重试或联系主办方。');
-      await request(signal=>accept(result,signal,()=>current() && epoch===edit && name.value.trim()===requested));
+      await request(signal=>accept(result,signal,unchanged));
     }catch(failure){if(current()){if(failure.code==='judge_login_not_open'){allowed=false;availability.textContent=failure.message;}error.textContent=failure.name==='AbortError'?'登录请求超时，未确认登录身份。请核对姓名后手动重试，没有自动重发。':failure.message;}}
     finally{if(current()){busy=false;buttons();retryStatus();}}
   }

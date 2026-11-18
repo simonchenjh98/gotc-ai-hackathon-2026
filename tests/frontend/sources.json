@@ -58,22 +58,26 @@
     "frontend/static/registration/profile.js"
   ],
   "platform-claims.js": [
+    "frontend/static/platform/login-retry.js",
     "frontend/static/platform/claims/receipt.js",
     "frontend/static/platform/claims/form.js",
     "frontend/static/platform/claims/application.js",
     "frontend/static/platform/claims/review.js"
   ],
   "platform-finals.js": [
+    "frontend/static/platform/login-retry.js",
     "frontend/static/platform/finals/shared.js",
     "frontend/static/platform/finals/judges.js",
     "frontend/static/platform/finals/organizer.js",
     "frontend/static/platform/finals/dashboard.js"
   ],
   "platform-roadshow-access.js": [
+    "frontend/static/platform/login-retry.js",
     "frontend/static/platform/roadshow/login.js",
     "frontend/static/platform/roadshow/roster.js"
   ],
   "platform.js": [
+    "frontend/static/platform/login-retry.js",
     "frontend/static/platform/shell.js",
     "frontend/static/platform/team/delegation.js",
     "frontend/static/platform/judging/rules.js",

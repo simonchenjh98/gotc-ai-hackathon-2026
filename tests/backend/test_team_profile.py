@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from test_api import Client
 import test_api
+import test_material_uploads
 import test_online_claims
 import test_submissions
 from registration_fixtures import registration_fixture_create
@@ -79,6 +80,82 @@ class TeamProfileTests(unittest.TestCase):
         with self.service.db() as db:
             audit=db.execute("SELECT actor_id,role,metadata FROM audit WHERE action='team.profile.save'").fetchone()
             self.assertEqual(tuple(audit)[:2],(access['id'],'team'));self.assertNotIn(access['code'],audit['metadata'])
+
+    def test_claim_code_and_organizer_reissue_cover_the_whole_contestant_workbench(self):
+        self.service.origin = 'https://event.example.test'
+        self.assertEqual(self.admin.settings({'submissionsOpen': True})[0], 200)
+        upstream = {'url': 'http://127.0.0.1:1/v1', 'key': 'synthetic', 'models': {'fixture': [0, 0]}}
+        self.assertEqual(self.admin.post('/api/admin/keys/upstreams', {'upstreams': {'openai': upstream}})[0], 200)
+        claim = self.application()
+        self.assertEqual(self.admin_call('/approve', self.approval(claim))[0], 200)
+        issued = self.bearer(claim, 'redeem')[1]
+        team_id, code = issued['team']['id'], issued['code']
+        self.assertEqual(self.bearer(claim, 'redeem')[1]['code'], code)
+        self.assertEqual(self.public.post('/api/login', {'role': 'team', 'code': claim['secret']})[0], 401)
+
+        def sign_in(code):
+            client = Client(self.server)
+            self.assertEqual(client.post('/api/login', {'role': 'team', 'code': code})[0], 200)
+            return client
+
+        def team_request(client, path, body=None):
+            return client.request('GET' if body is None else 'POST', '/api/' + path, body,
+                                  headers={'X-GOTC-Login': client.login_id})
+
+        def upload(client, kind='slides', **kwargs):
+            return test_material_uploads.MaterialUploadTests.upload(self, kind, client=client, **kwargs)
+
+        original = sign_in(code)
+        cookie = original.cookie
+        current = self.profile(original)[1]
+        self.assertEqual(current['team']['id'], team_id)
+        self.assertEqual(self.profile(original, self.body(current, summary='Saved by the team'))[0], 200)
+        self.assertFalse(team_request(original, 'team/keys')[1]['enabled'])
+        self.assertEqual(self.admin.post('/api/admin/keys/provision', {'teamId': team_id})[0], 200)
+        created = team_request(original, 'team/keys', {'name': 'Synthetic client'})
+        self.assertEqual(created[0], 200, created[1])
+        self.assertNotEqual(created[1]['key'], code)
+        self.assertEqual(self.public.request('GET', '/v1/models', headers={'Authorization': 'Bearer '+created[1]['key']})[0], 200)
+        self.assertEqual(original.request('GET', '/v1/models', headers={'Authorization': 'Bearer '+code})[0], 401)
+        self.assertEqual(self.public.post('/api/login', {'role': 'team', 'code': created[1]['key']})[0], 401)
+
+        slides = upload(original)
+        files = upload(original, 'files', data=test_material_uploads.archive(), filename='work.zip')
+        self.assertEqual((slides[0], files[0]), (200, 200))
+        materials = test_submissions.SubmissionAPITests.materials(self, slidesUrl=slides[1]['url'], filesUrl=files[1]['url'])
+        for version, state in enumerate(['draft', 'submitted']):
+            result = team_request(original, 'submission', {'expectedVersion': version, 'status': state,
+                                  'requestId': f'synthetic-submit-{version}', 'materials': materials})
+            self.assertEqual(result[0], 200, result[1])
+        self.assertEqual(team_request(original, 'team/score')[1]['team']['number'], issued['team']['number'])
+        self.assertEqual(original.cookie, cookie)
+        self.assertEqual(original.get('/api/session')[1]['loginId'], original.login_id)
+
+        def assert_revoked(client):
+            for path in ['team', 'team/profile', 'team/score', 'team/keys', 'submission/history']:
+                self.assertEqual(team_request(client, path)[0], 401, path)
+            self.assertEqual(upload(client)[0], 401)
+            self.assertEqual(team_request(client, 'team/keys', {'name': 'Revoked session'})[0], 401)
+            self.assertEqual(team_request(client, 'submission', {'expectedVersion': 2, 'status': 'draft',
+                                  'materials': materials})[0], 401)
+
+        rotated = self.admin.post('/api/admin/team-access', {'teamId': team_id, 'action': 'rotate'})[1]
+        self.assertEqual(rotated['id'], code.split('.')[0])
+        self.assertNotEqual(rotated['code'], code)
+        assert_revoked(original)
+        failed = self.public.post('/api/login', {'role': 'team', 'code': code})
+        self.assertEqual(failed[0], 401)
+        self.assertIn('参赛码', failed[1]['error'])
+        self.assertEqual(self.bearer(claim, 'redeem')[1]['status'], 'unavailable')
+        replacement = sign_in(rotated['code'])
+        self.assertEqual(team_request(replacement, 'team')[1]['team']['id'], team_id)
+        self.assertEqual(self.profile(replacement)[1]['profile']['summary'], 'Saved by the team')
+        self.assertEqual(team_request(replacement, 'submission/history/2')[1]['materials']['filesUrl'], files[1]['url'])
+        self.assertEqual(team_request(replacement, 'team/score')[1]['team']['number'], issued['team']['number'])
+        self.assertEqual(team_request(replacement, 'team/keys')[1]['keys'][0]['id'], created[1]['item']['id'])
+        self.assertEqual(self.admin.post('/api/admin/team-access', {'teamId': team_id, 'action': 'revoke'})[0], 200)
+        assert_revoked(replacement)
+        self.assertEqual(self.public.post('/api/login', {'role': 'team', 'code': rotated['code']})[0], 401)
 
     def test_missing_profile_get_is_read_only_and_first_save_only_creates_original_team_profile(self):
         team_id,client,_,_=self.owned();before=self.snapshot(['accounts','sessions','team_accounts','teams','team_details','team_registrations','claim_people','claim_memberships','audit'])

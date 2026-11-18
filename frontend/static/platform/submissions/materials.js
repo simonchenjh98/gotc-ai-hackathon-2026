@@ -20,10 +20,30 @@ function repositoryMaterialsUrl(materials){
 function repositoryMaterialsText(materials){const url=repositoryMaterialsUrl(materials);return url?'仓库内材料（请在此固定版本查看 README、许可证、第三方来源与已知局限；文件内容未由平台检查）：'+url:'';}
 
 function submissionState(s){return s?.submitted?(s.hasUnsubmittedChanges?'已提交且有草稿修改':'已正式提交'):s?.draft?'草稿':'未保存';}
-function safeSubmissionUrl(value,demo=false){if(typeof value!=='string')return '';const trimmed=value.trim();if(!trimmed || demo && !/^https?:\/\//i.test(trimmed) || /[\s\\\u0000-\u001f\u007f]/.test(trimmed) || /%(?:0[0-9a-f]|1[0-9a-f]|7f)/i.test(trimmed) || new TextEncoder().encode(trimmed).length>(demo?8192:1024))return '';try{const url=new URL(trimmed);return (url.protocol==='https:' || demo && url.protocol==='http:') && url.hostname && !trimmed.match(/^https?:\/\/[^/?#]*@/i) && !url.username && !url.password && url.port!=='0' && (url.hostname.startsWith('[') || url.hostname.replace(/\.$/,'').split('.').every(label=>/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label)))?trimmed:'';}catch{return '';}}
-function safeMaterialUrl(value){return safeSubmissionUrl(value);}
-function safeDemoUrl(value){return safeSubmissionUrl(value,true);}
-function safeMaterialFieldUrl(key,value){return key==='demoUrl'?safeDemoUrl(value):safeMaterialUrl(value);}
+function siteUploadedMaterial(value){
+  try {
+    const url = new URL(value), prefix = new URL('materials/', base);
+    return url.origin === prefix.origin && !url.username && !url.password && !url.search && !url.hash
+      && url.pathname.startsWith(prefix.pathname) && /^[A-Za-z0-9_-]{43}\/[^/]+$/.test(url.pathname.slice(prefix.pathname.length));
+  } catch { return false; }
+}
+function safeMaterialFieldUrl(key, value){
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim(), demo = key === 'demoUrl';
+  if (!trimmed || (demo && !/^https?:\/\//i.test(trimmed)) || /[\s\\\u0000-\u001f\u007f]/.test(trimmed)
+      || /%(?:0[0-9a-f]|1[0-9a-f]|7f)/i.test(trimmed) || new TextEncoder().encode(trimmed).length > (demo ? 8192 : 1024)) return '';
+  try {
+    const url = new URL(trimmed);
+    const eventFile = (key === 'slidesUrl' || key === 'filesUrl') && siteUploadedMaterial(trimmed);
+    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && (demo || eventFile))) return '';
+    if (!url.hostname || /^https?:\/\/[^/?#]*@/i.test(trimmed) || url.username || url.password || url.port === '0') return '';
+    const validHost = url.hostname.startsWith('[') || url.hostname.replace(/\.$/, '').split('.')
+      .every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label));
+    return validHost ? trimmed : '';
+  } catch { return ''; }
+}
+function safeMaterialUrl(value){return safeMaterialFieldUrl('', value);}
+function safeDemoUrl(value){return safeMaterialFieldUrl('demoUrl', value);}
 function fullCommit(value){return /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value);}
 const commitLinkHosts=new Set(['github.com','gitee.com','gitcode.com','gitlab.com']);
 function repositoryParts(value,commit=false){

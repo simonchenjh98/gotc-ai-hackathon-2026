@@ -111,8 +111,12 @@ class MaterialUploads:
         if size + length > self.TEAM_QUOTA or count >= self.TEAM_COUNT:
             raise APIError(413, '本队上传总量已达上限，请联系组织方（每队500 MiB）', 'upload_quota')
 
+    @property
+    def url_prefix(self):
+        return self.s.origin + self.s.base_path + '/materials/'
+
     def url(self, row):
-        return self.s.origin + self.s.base_path + '/materials/' + row['id'] + '/' + quote(row['filename'], safe='')
+        return self.url_prefix + row['id'] + '/' + quote(row['filename'], safe='')
 
     def upload(self, headers, read_chunk, kind, length):
         if length <= 0 or length > LIMITS[kind]:
@@ -242,7 +246,9 @@ class MaterialUploads:
             if parsed_key != own_key and not http_alias:
                 continue
             path = posixpath.normpath(unquote(parsed.path))
-            if not path.startswith(prefix):
+            # A noncanonical URL that names our upload endpoint must still pass
+            # the exact row comparison below, even if its decoded path escapes it.
+            if not path.startswith(prefix) and not value.startswith(self.url_prefix):
                 continue
             match = re.fullmatch(re.escape(prefix) + r'([A-Za-z0-9_-]{43})/([^/]+)', path)
             row = db.execute('SELECT * FROM material_uploads WHERE id=?', (match[1],)).fetchone() if match else None

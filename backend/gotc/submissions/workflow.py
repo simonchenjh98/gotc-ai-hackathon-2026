@@ -94,11 +94,14 @@ class SubmissionWorkflow:
             raise APIError(400,'代码版本最多1024字节')
         for key in urls:
             limit=8192 if key=='demoUrl' else 1024
-            schemes=('http','https') if key=='demoUrl' else ('https',)
             value=text_field(materials.get(key, ""), key, limit)
             if value:
                 try:
                     parsed=urlsplit(value)
+                    # The development listener generates HTTP links for files it owns.
+                    # The upload store verifies each internal reference before saving.
+                    event_file = key in ('slidesUrl', 'filesUrl') and value.startswith(self.event.material_uploads.url_prefix)
+                    schemes = ('http', 'https') if key == 'demoUrl' or event_file else ('https',)
                     valid=(parsed.scheme in schemes and valid_material_host(parsed.hostname) and parsed.username is None and parsed.password is None
                            and parsed.port!=0 and len(value.encode("utf-8"))<=limit
                            and not any(c.isspace() or ord(c)<32 or ord(c)==127 or c=="\\" for c in value)

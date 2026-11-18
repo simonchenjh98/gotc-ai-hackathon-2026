@@ -19,7 +19,7 @@ function submissionEntryMarkup(data){
   return `<section class="surface submission-entry" aria-labelledby="submission-entry-title"><div class="submission-entry-heading"><div><p class="eyebrow">作品提交</p><h2 id="submission-entry-title">提交 PPT 和作品压缩包</h2><p>只需这两项即可正式提交；其余信息均为选填。</p></div><button type="button" class="btn" id="jump-submit-work">提交作品 ↓</button></div><div class="submission-entry-parts">${[['slides','01','PPT 展示材料'],['files','02','作品压缩包 ZIP · 必填'],['demo','03','作品展示 · 选填']].map(([kind,number,label])=>`<button type="button" id="jump-submit-${kind}"><span>${number} · ${label}</span><small id="submission-${kind}-state">${kind==='demo'?'可稍后补充':'待准备'}</small></button>`).join('')}</div><p class="small-note">以上为当前填写状态，文件上传和保存草稿都不等于正式提交。以“正式版 v… 已收到”的回执为准。</p></section>`;
 }
 function updateSubmissionEntry(data,form){
-  const value=key=>form.elements[key]?.value.trim(),states={slides:safeMaterialUrl(value('slidesUrl'))?'已填写链接 · 待正式检查':'待上传 PPT 或填写链接',files:safeMaterialUrl(value('filesUrl'))?'已填作品压缩包链接 · 待正式检查':'待上传作品压缩包或填写 ZIP 链接',demo:safeDemoUrl(value('demoUrl'))?'已填写展示链接（选填）':'选填，可稍后补充'};
+  const value=key=>form.elements[key]?.value.trim(),states={slides:safeMaterialFieldUrl('slidesUrl',value('slidesUrl'))?'已填写链接 · 待正式检查':'待上传 PPT 或填写链接',files:safeMaterialFieldUrl('filesUrl',value('filesUrl'))?'已填作品压缩包链接 · 待正式检查':'待上传作品压缩包或填写 ZIP 链接',demo:safeDemoUrl(value('demoUrl'))?'已填写展示链接（选填）':'选填，可稍后补充'};
   for(const [kind,label] of Object.entries(states)){const target=document.getElementById(`submission-${kind}-state`);if(target)target.textContent=label;}
 }
 function participantGuideMarkup(window={}){

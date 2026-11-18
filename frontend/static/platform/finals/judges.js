@@ -21,9 +21,12 @@ async function renderFinalsAccess(version){
   form.onsubmit=async event=>{
     event.preventDefault();if(busy || !available || !view.valid() || !form.isConnected)return;
     busy=true;buttons();finalsMessage(form,'');
+    const code=form.elements.code.value;
+    const unchanged=()=>view.valid() && form.isConnected && available && form.elements.code.value===code;
     try{
-      const result=await finalsRequest(view,'finals/access',{code:form.elements.code.value});
-      if(!view.valid() || !form.isConnected)return;
+      const result=await withLoginRetry(()=>finalsRequest(view,'finals/access',{code}), unchanged,
+        message=>finalsMessage(form,message));
+      if(!unchanged())return;
       if(typeof result.accessToken!=='string' || result.accessToken.length<32 || !Number.isFinite(result.expiresAt) || result.expiresAt<=Date.now())throw new Error('验证结果无效，请重新输入邀请码。');
       finalsSetAccess({accessToken:result.accessToken,expiresAt:result.expiresAt});
       await renderFinalsJudge(version);
@@ -32,7 +35,7 @@ async function renderFinalsAccess(version){
         if(error.code==='judge_login_not_open'){available=false;notice.textContent=error.message;view.poller.kick();}
         finalsMessage(form,error.name==='AbortError'?'验证超时，请重试。':error.message);
       }
-    }finally{form.elements.code.value='';busy=false;if(form.isConnected)buttons();}
+    }finally{if(form.elements.code.value===code)form.elements.code.value='';busy=false;if(form.isConnected)buttons();}
   };
   await view.poller.refresh();
 }

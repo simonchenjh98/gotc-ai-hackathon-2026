@@ -342,6 +342,30 @@ function invitePage(api,extra={},schedule=()=>openLogin){
 }
 const grant=()=>({accessToken:'new-synthetic-finals-token-0123456789',expiresAt:Date.now()+3600000});
 
+test('finals invitation retries capacity once without adopting or sending the ordinary cookie',async()=>{
+  let attempts=0;
+  const waits=[];
+  const p=invitePage(path=>{
+    if(path==='finals/entry') return seats();
+    if(++attempts===1) throw Object.assign(new Error('Busy'),{status:429,code:'login_busy'});
+    return grant();
+  },{setTimeout:(run,ms)=>{
+    if(ms<2000) waits.push(run);
+    return 1;
+  },clearTimeout(){}});
+  await p.ctx.testHelpers.renderFinalsJudge(1);
+  const pending=p.submit();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.match(p.error.textContent,/等待自动重试/);
+  assert.equal(waits.length,1);
+  waits[0]();
+  await pending;
+  assert.equal(attempts,2);
+  assert.ok(p.calls.every(call=>call.options.credentials==='omit'));
+  assert.equal(p.ctx.testHelpers.finalsHasAccess(),true);
+  p.ctx.testHelpers.disposeFinalsView();
+});
+
 test('unverified entry reads only public login status before showing invitation verification',async()=>{
   const p=invitePage(()=>assert.fail('seat or score data must remain protected'));
   await p.ctx.testHelpers.renderFinalsJudge(1);

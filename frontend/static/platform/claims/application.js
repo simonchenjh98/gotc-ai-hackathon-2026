@@ -9,7 +9,10 @@ function makeClaimController({store,request,isCurrent,onChange}){
   async function run(action,body,reviewLatest=false){
     if(busy || !isCurrent())return;const operation=++generation;busy=true;state.error='';publish();
     try{
-      const result=await request('claims/'+action,body);
+      const send=()=>request('claims/'+action,body);
+      const result=action==='redeem'
+        ? await withLoginRetry(send,()=>operation===generation && isCurrent(),message=>{state.error=message;publish();})
+        : await send();
       if(operation!==generation || !isCurrent())return;
       if(action==='request'){
         receipt={requestId:result.requestId,secret:result.secret,pin:result.pin,expiresAt:result.expiresAt};storageError=store.write(receipt);
@@ -76,7 +79,7 @@ async function renderClaim(version){
     const cancel=document.getElementById('claim-edit-cancel');if(cancel)cancel.onclick=()=>controller.cancelEdit();
     const refresh=document.getElementById('claim-status');if(refresh)refresh.onclick=()=>controller.status();
     const redeem=document.getElementById('claim-redeem');if(redeem)redeem.onclick=()=>controller.redeem();
-    const clear=document.getElementById('claim-clear');if(clear)clear.onclick=()=>{if(confirm('清除后本标签页无法继续领取。已领取的提交码请先自行保存。确认清除？'))controller.clear();};
+    const clear=document.getElementById('claim-clear');if(clear)clear.onclick=()=>{if(confirm('清除后本标签页无法继续领取。已领取的参赛码请先自行保存。确认清除？'))controller.clear();};
   }});
   currentClaimController=controller;await controller.start();
 }

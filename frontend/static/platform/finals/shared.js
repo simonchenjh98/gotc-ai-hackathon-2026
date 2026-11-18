@@ -77,7 +77,7 @@ async function finalsRequest(view,path,payload,signal){
       // Finals authorization and attribution are independent of ordinary account cookies.
       const response=await fetch(new URL(`api/${path}`,base),{method:payload===undefined?'GET':'POST',credentials:'omit',cache:'no-store',headers:{...(view.grant?{'X-GOTC-Finals-Access':view.grant.accessToken}:{}),...(view.role==='seat'?{'X-GOTC-Finals-Judge':view.judgeId}:{}),...(payload===undefined?{}:{'Content-Type':'application/json'})},body:payload===undefined?undefined:JSON.stringify(payload),signal:signal || controller.signal});
       let body;try{body=await response.json();}catch{throw new Error('服务暂时不可用，请稍后重试。');}
-      if(!response.ok){const error=new Error(body.error || '操作未成功，请核对当前评委席位。');error.status=response.status;error.code=body.code;throw error;}
+      if(!response.ok)throw platformRequestError(response,body,'操作未成功，请核对当前评委席位。');
       return body;
     }
     return await api(path,payload,{loginId:view.owner?.loginId,signal:signal || controller.signal});
