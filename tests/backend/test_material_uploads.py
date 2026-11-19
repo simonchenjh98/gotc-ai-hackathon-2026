@@ -14,7 +14,7 @@ from unittest.mock import patch
 from urllib.parse import quote, urlsplit
 import zipfile
 
-from backend.gotc.submissions.material_uploads import HTML_CSP, LIMITS
+from backend.gotc.submissions.material_uploads import HTML_CSP, LIMITS, enters_material_namespace
 import test_submissions
 
 
@@ -28,6 +28,18 @@ def archive(pptx=False):
         for name in (('[Content_Types].xml', 'ppt/presentation.xml') if pptx else ('main.py', 'README.md')):
             target.writestr(name, 'synthetic')
     return stream.getvalue()
+
+
+class MaterialNamespaceTests(unittest.TestCase):
+    def test_entering_the_namespace_is_independent_of_the_remaining_path(self):
+        for mount in ('', '/gotc', '/events/gotc'):
+            namespace = (mount + '/materials').strip('/').split('/')
+            for spelling in ('/materials', '/./materials', '/%6Daterials'):
+                for suffix in ('', '/', '/slide.pdf', '/..'):
+                    with self.subTest(mount=mount, spelling=spelling, suffix=suffix):
+                        self.assertTrue(enters_material_namespace(mount + spelling + suffix, namespace))
+            for sibling in ('/materials-guide/slide.pdf', '/other/materials/slide.pdf'):
+                self.assertFalse(enters_material_namespace(mount + sibling, namespace))
 
 
 class MaterialUploadTests(unittest.TestCase):
@@ -311,6 +323,19 @@ class MaterialUploadTests(unittest.TestCase):
         # A blank optional title also accepts previously named uploads without renaming bytes.
         named = self.uploaded(project='Named project')
         self.assertEqual(self.submit({'slidesUrl': named['url'], 'filesUrl': files['url']}, 1, 'named-upload-blank-title')[0], 200)
+
+    def test_namespace_directory_requires_a_registered_file_for_drafts_and_formal_submissions(self):
+        before = self.client.get('/api/team')[1]['submission']
+        for status in ('draft', 'submitted'):
+            for field in ('slidesUrl', 'filesUrl', 'demoUrl'):
+                with self.subTest(status=status, field=field):
+                    materials = {'slidesUrl': 'https://example.test/slides.pdf',
+                                 'filesUrl': 'https://example.test/project.zip',
+                                 field: 'https://EVENT.example.test:443/gotc/materials'}
+                    code, body, _ = self.submit(materials, request_id=f'namespace-directory-{status}-{field}',
+                                                status=status)
+                    self.assertEqual((code, body.get('code')), (400, 'upload_reference'))
+        self.assertEqual(self.client.get('/api/team')[1]['submission'], before)
 
     def test_optional_filled_invalid_fields_still_reject_formal_submission(self):
         base = {'slidesUrl': 'https://example.test/slides', 'filesUrl': 'https://example.test/work.zip'}
