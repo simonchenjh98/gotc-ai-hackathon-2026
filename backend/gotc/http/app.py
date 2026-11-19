@@ -145,6 +145,8 @@ def create_platform_app(service, *, trusted_proxy_socket=None):
 
     limiter = anyio.CapacityLimiter(8)
     password_workers = anyio.CapacityLimiter(service.password_checks.capacity.running)
+    # Long uploads wait on client bytes. Spare workers return upload_busy promptly.
+    upload_workers = anyio.CapacityLimiter(service.material_uploads.CONCURRENCY + 2)
     immutable = immutable_assets(service.root)
     prefix = service.base_path
 
@@ -214,7 +216,8 @@ def create_platform_app(service, *, trusted_proxy_socket=None):
         def read(size):
             return anyio.from_thread.run(stream.read, size)
 
-        result = await run(service.material_uploads.upload, request.headers, read, kind, length)
+        result = await anyio.to_thread.run_sync(
+            partial(service.material_uploads.upload, request.headers, read, kind, length), limiter=upload_workers)
         return JSONResponse(result, media_type="application/json; charset=utf-8")
 
     async def material(request):

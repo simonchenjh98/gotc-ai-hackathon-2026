@@ -47,10 +47,13 @@ class ProviderOperations:
     LIMITS = {'preview': 10, 'confirmation': 20, 'refresh': 6}
     WINDOW_SECONDS = 60
     MAX_BUCKETS = 4096
+    PROVIDER_RUNNING = 4
+    TOTAL_RUNNING = 6  # One slow provider cannot block the other, and API workers remain available.
 
     def __init__(self, clock=time.monotonic):
         self.clock = clock
-        self.permits = {name: threading.BoundedSemaphore(4) for name in ('github', 'gitee')}
+        self.permits = {name: threading.BoundedSemaphore(self.PROVIDER_RUNNING) for name in ('github', 'gitee')}
+        self.running = threading.BoundedSemaphore(self.TOTAL_RUNNING)
         self.lock = threading.Lock()
         self.buckets = {}
 
@@ -80,9 +83,14 @@ class ProviderOperations:
         if not permit.acquire(blocking=False):
             raise APIError(503, '仓库服务繁忙，本次尚未执行远端操作；请稍后刷新状态再重试', 'repository_busy')
         try:
-            if kind is not None:
-                self.spend(provider, team_id, kind)
-            yield
+            if not self.running.acquire(blocking=False):
+                raise APIError(503, '仓库服务繁忙，本次尚未执行远端操作；请稍后刷新状态再重试', 'repository_busy')
+            try:
+                if kind is not None:
+                    self.spend(provider, team_id, kind)
+                yield
+            finally:
+                self.running.release()
         finally:
             permit.release()
 

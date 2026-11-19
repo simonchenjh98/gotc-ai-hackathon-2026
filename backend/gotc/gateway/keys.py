@@ -268,28 +268,29 @@ class KeyService:
               COALESCE(SUM(input_tokens),0) AS input, COALESCE(SUM(output_tokens),0) AS output,
               COALESCE(SUM(cache_write_tokens),0) AS cacheWrite, COALESCE(SUM(cache_read_tokens),0) AS cacheRead,
               COALESCE(SUM(status>=400 OR incomplete=1),0) AS errors,
-              COUNT(DISTINCT team_id) AS teams, CAST(AVG(CASE WHEN status<400 THEN duration_ms END) AS INTEGER) AS avgMs
+              COUNT(DISTINCT team_id) AS teams, CAST(AVG(CASE WHEN status<400 THEN duration_ms END) AS INTEGER) AS avgMs,
+              COALESCE(SUM(status<400 AND incomplete=0),0) AS successful,
+              CAST(AVG(first_token_ms) AS INTEGER) AS avgFirstTokenMs
               FROM api_usage WHERE at>=?""", (today,)).fetchone())
             recent = db.execute("SELECT COUNT(*), COALESCE(SUM(input_tokens+output_tokens+cache_write_tokens+cache_read_tokens),0) FROM api_usage WHERE at>=?",
                                 (now_ms() - 300_000,)).fetchone()
             overview["rpm"], overview["tpm"] = round(recent[0] / 5, 1), round(recent[1] / 5)  # last 5 minutes, as sub2api
-            ok = db.execute("SELECT COUNT(*) FROM api_usage WHERE at>=? AND status<400 AND incomplete=0", (today,)).fetchone()[0]
+            ok = overview.pop("successful")
             overview["p95Ms"] = db.execute("""SELECT duration_ms FROM api_usage WHERE at>=? AND status<400 AND incomplete=0
               ORDER BY duration_ms LIMIT 1 OFFSET ?""", (today, max(0, int(ok * 0.95) - 1))).fetchone()[0] if ok else None
-            overview["avgFirstTokenMs"] = db.execute("SELECT CAST(AVG(first_token_ms) AS INTEGER) FROM api_usage WHERE at>=?", (today,)).fetchone()[0]
             storage = self.ledger.content.summary()
             changes = [{"at": r["at"], "action": r["action"], "target": r["target"], "metadata": json.loads(r["metadata"])}
-                       for r in db.execute("SELECT at,action,target,metadata FROM audit WHERE action LIKE 'api-%' ORDER BY id DESC LIMIT 50")]
+                       for r in db.execute("SELECT at,action,target,metadata FROM audit WHERE action GLOB 'api-*' ORDER BY id DESC LIMIT 50")]
             overview["billing"] = self.ledger.billing_summary(db, since=today)
             overview["cost"] = self.ledger.billing_total(overview["billing"])
+            billing24h, billing = self.ledger.billing_by_team(db, since), self.ledger.billing_by_team(db)
             return {"enabled": self.config is not None, "settings": settings, "models": self.models(), "overview": overview, "currency": self.currency(),
                     "upstreams": self.public_config(db), "storage": storage,
                     "changes": changes,
                     "teams": [{"teamId": r["team_id"], "active": bool(r["active"]), "keyCount": r["key_count"],
                                "used24h": self.ledger.billing_total(day), "usedTotal": self.ledger.billing_total(total),
                                "billing24h": day, "billing": total} for r in rows
-                              for day, total in [(self.ledger.billing_summary(db, r["team_id"], since),
-                                                  self.ledger.billing_summary(db, r["team_id"]))]]}
+                              for day, total in [(billing24h.get(r["team_id"], []), billing.get(r["team_id"], []))]]}
         if method == "GET" and path == "/api/admin/keys/export":
             self.service.audit(db, actor, "api-usage.export")
             return self.ledger.export(db)

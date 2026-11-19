@@ -3,7 +3,6 @@ import hashlib
 import ipaddress
 import os
 from pathlib import Path
-import posixpath
 import re
 import secrets
 import shutil
@@ -70,7 +69,22 @@ def origin_key(url):
     return host, url.port or (443 if url.scheme == 'https' else 80)
 
 
+def enters_material_namespace(path: str, namespace: list[str]) -> bool:
+    """Recognize a local upload directory before later path segments can leave it."""
+    components = []
+    for part in unquote(path).split('/'):
+        if part == '..':
+            if components:
+                components.pop()
+        elif part and part != '.':
+            components.append(part)
+            if components == namespace:
+                return True
+    return False
+
+
 class MaterialUploads:
+    CONCURRENCY = 4
     TEAM_QUOTA = 500 * 1024 * 1024
     TEAM_COUNT = 250
     MIN_FREE_BYTES = 1024 * 1024 * 1024
@@ -84,7 +98,7 @@ class MaterialUploads:
         os.chmod(self.root, 0o700)
         self.lock = threading.Lock()
         self.active_teams = set()
-        self.slots = threading.BoundedSemaphore(4)
+        self.slots = threading.BoundedSemaphore(self.CONCURRENCY)
 
     def initialize(self, db):
         db.executescript(SCHEMA)
@@ -234,6 +248,7 @@ class MaterialUploads:
         own = urlsplit(self.s.origin)
         own_key = origin_key(own)
         prefix = self.s.base_path + '/materials/'
+        namespace = prefix.strip('/').split('/')
         team_name = db.execute('SELECT name FROM teams WHERE id=?', (team_id,)).fetchone()['name']
         for field, value in materials.items():
             if not field.endswith('Url') or not value:
@@ -245,12 +260,10 @@ class MaterialUploads:
             http_alias = parsed.scheme == 'http' and own.scheme == 'https' and parsed_key[0] == own_key[0]
             if parsed_key != own_key and not http_alias:
                 continue
-            path = posixpath.normpath(unquote(parsed.path))
-            # A noncanonical URL that names our upload endpoint must still pass
-            # the exact row comparison below, even if its decoded path escapes it.
-            if not path.startswith(prefix) and not value.startswith(self.url_prefix):
+            if not enters_material_namespace(parsed.path, namespace):
                 continue
-            match = re.fullmatch(re.escape(prefix) + r'([A-Za-z0-9_-]{43})/([^/]+)', path)
+            # Only the original server-issued URL can identify an immutable upload.
+            match = re.fullmatch(re.escape(prefix) + r'([A-Za-z0-9_-]{43})/[^/]+', parsed.path)
             row = db.execute('SELECT * FROM material_uploads WHERE id=?', (match[1],)).fetchone() if match else None
             if not row or value != self.url(row) or not (self.root / row['id']).is_file():
                 raise APIError(400, '上传文件不存在或链接不完整，请重新上传', 'upload_reference')

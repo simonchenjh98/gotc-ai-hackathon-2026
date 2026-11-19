@@ -1,5 +1,6 @@
 """Contestant upload HTTP tests use only local servers and disposable synthetic data."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import hashlib
 import http.client
 import io
@@ -14,7 +15,7 @@ from unittest.mock import patch
 from urllib.parse import quote, urlsplit
 import zipfile
 
-from backend.gotc.submissions.material_uploads import HTML_CSP, LIMITS
+from backend.gotc.submissions.material_uploads import HTML_CSP, LIMITS, enters_material_namespace
 import test_submissions
 
 
@@ -28,6 +29,18 @@ def archive(pptx=False):
         for name in (('[Content_Types].xml', 'ppt/presentation.xml') if pptx else ('main.py', 'README.md')):
             target.writestr(name, 'synthetic')
     return stream.getvalue()
+
+
+class MaterialNamespaceTests(unittest.TestCase):
+    def test_entering_the_namespace_is_independent_of_the_remaining_path(self):
+        for mount in ('', '/gotc', '/events/gotc'):
+            namespace = (mount + '/materials').strip('/').split('/')
+            for spelling in ('/materials', '/./materials', '/%6Daterials'):
+                for suffix in ('', '/', '/slide.pdf', '/..'):
+                    with self.subTest(mount=mount, spelling=spelling, suffix=suffix):
+                        self.assertTrue(enters_material_namespace(mount + spelling + suffix, namespace))
+            for sibling in ('/materials-guide/slide.pdf', '/other/materials/slide.pdf'):
+                self.assertFalse(enters_material_namespace(mount + sibling, namespace))
 
 
 class MaterialUploadTests(unittest.TestCase):
@@ -312,6 +325,19 @@ class MaterialUploadTests(unittest.TestCase):
         named = self.uploaded(project='Named project')
         self.assertEqual(self.submit({'slidesUrl': named['url'], 'filesUrl': files['url']}, 1, 'named-upload-blank-title')[0], 200)
 
+    def test_namespace_directory_requires_a_registered_file_for_drafts_and_formal_submissions(self):
+        before = self.client.get('/api/team')[1]['submission']
+        for status in ('draft', 'submitted'):
+            for field in ('slidesUrl', 'filesUrl', 'demoUrl'):
+                with self.subTest(status=status, field=field):
+                    materials = {'slidesUrl': 'https://example.test/slides.pdf',
+                                 'filesUrl': 'https://example.test/project.zip',
+                                 field: 'https://EVENT.example.test:443/gotc/materials'}
+                    code, body, _ = self.submit(materials, request_id=f'namespace-directory-{status}-{field}',
+                                                status=status)
+                    self.assertEqual((code, body.get('code')), (400, 'upload_reference'))
+        self.assertEqual(self.client.get('/api/team')[1]['submission'], before)
+
     def test_optional_filled_invalid_fields_still_reject_formal_submission(self):
         base = {'slidesUrl': 'https://example.test/slides', 'filesUrl': 'https://example.test/work.zip'}
         for number, change in enumerate([{'demoUrl': 'javascript:alert(1)'}, {'codeUrl': 'https://github.com/team/repo/blob/main/x'},
@@ -418,12 +444,17 @@ class MaterialUploadTests(unittest.TestCase):
             self.assertTrue(finished.wait(3))
         self.assertEqual(self.rows(), [])
         self.assertEqual(list(self.service.material_uploads.root.iterdir()), [])
-        connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port)
-        connection.putrequest('POST', self.service.base_path + '/api/team/uploads/slides')
-        for name, value in headers.items(): connection.putheader(name, value)
-        connection.putheader('Content-Length', str(len(PDF))); connection.endheaders(PDF)
-        response = connection.getresponse(); self.assertEqual(response.status, 400)
-        response.read(); connection.close()
+        with closing(http.client.HTTPConnection('127.0.0.1', self.server.server_port)) as connection:
+            connection.putrequest('POST', self.service.base_path + '/api/team/uploads/slides')
+            for name, value in headers.items():
+                connection.putheader(name, value)
+            connection.putheader('Content-Length', str(len(PDF)))
+            connection.endheaders(PDF)
+            # Early rejection can reset the connection after sending the status.
+            with connection.getresponse() as response:
+                self.assertEqual(response.status, 400)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(list(self.service.material_uploads.root.iterdir()), [])
 
 
 if __name__ == '__main__':
