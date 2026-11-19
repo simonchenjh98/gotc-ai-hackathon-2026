@@ -84,6 +84,7 @@ def enters_material_namespace(path: str, namespace: list[str]) -> bool:
 
 
 class MaterialUploads:
+    CONCURRENCY = 4
     TEAM_QUOTA = 500 * 1024 * 1024
     TEAM_COUNT = 250
     MIN_FREE_BYTES = 1024 * 1024 * 1024
@@ -97,7 +98,7 @@ class MaterialUploads:
         os.chmod(self.root, 0o700)
         self.lock = threading.Lock()
         self.active_teams = set()
-        self.slots = threading.BoundedSemaphore(4)
+        self.slots = threading.BoundedSemaphore(self.CONCURRENCY)
 
     def initialize(self, db):
         db.executescript(SCHEMA)

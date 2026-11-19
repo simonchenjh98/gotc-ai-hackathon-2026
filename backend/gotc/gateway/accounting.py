@@ -1,5 +1,6 @@
 """SQLite usage ledger, billing reports and bounded request content logs."""
 
+from collections import defaultdict
 import csv
 from contextlib import contextmanager
 import io
@@ -76,6 +77,9 @@ def initialize_schema(db):
     for column, kind in added.items():  # databases created before these columns existed
         if column not in columns:
             db.execute(f"ALTER TABLE api_usage ADD COLUMN {column} {kind}")
+    # Dashboard totals stay index-only as the permanent usage ledger grows.
+    db.execute("""CREATE INDEX IF NOT EXISTS api_usage_team_billing
+                  ON api_usage(team_id, currency, at, billing_status, cost_micro)""")
 
 
 def now_ms():
@@ -192,6 +196,13 @@ class UsageLedger:
         rows = db.execute("SELECT currency,SUM(cost_micro)/1e6 AS cost,SUM(billing_status='pending') AS pending "
                           "FROM api_usage WHERE at>=?" + clause + " GROUP BY currency ORDER BY currency", values)
         return [dict(r) for r in rows]
+
+    def billing_by_team(self, db, since=0):
+        result = defaultdict(list)
+        for row in db.execute("""SELECT team_id,currency,SUM(cost_micro)/1e6 AS cost,SUM(billing_status='pending') AS pending
+                                 FROM api_usage WHERE at>=? GROUP BY team_id,currency ORDER BY team_id,currency""", (since,)):
+            result[row["team_id"]].append({"currency": row["currency"], "cost": row["cost"], "pending": row["pending"]})
+        return result
 
     @staticmethod
     def billing_total(rows):

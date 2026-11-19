@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS audit (
  id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, actor_id TEXT, role TEXT,
  action TEXT NOT NULL, target TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}'
 );
+CREATE INDEX IF NOT EXISTS audit_gateway_changes ON audit(id) WHERE action GLOB 'api-*';
 """
 
 
