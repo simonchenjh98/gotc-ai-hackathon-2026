@@ -1,5 +1,6 @@
 """Contestant upload HTTP tests use only local servers and disposable synthetic data."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import hashlib
 import http.client
 import io
@@ -443,12 +444,17 @@ class MaterialUploadTests(unittest.TestCase):
             self.assertTrue(finished.wait(3))
         self.assertEqual(self.rows(), [])
         self.assertEqual(list(self.service.material_uploads.root.iterdir()), [])
-        connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port)
-        connection.putrequest('POST', self.service.base_path + '/api/team/uploads/slides')
-        for name, value in headers.items(): connection.putheader(name, value)
-        connection.putheader('Content-Length', str(len(PDF))); connection.endheaders(PDF)
-        response = connection.getresponse(); self.assertEqual(response.status, 400)
-        response.read(); connection.close()
+        with closing(http.client.HTTPConnection('127.0.0.1', self.server.server_port)) as connection:
+            connection.putrequest('POST', self.service.base_path + '/api/team/uploads/slides')
+            for name, value in headers.items():
+                connection.putheader(name, value)
+            connection.putheader('Content-Length', str(len(PDF)))
+            connection.endheaders(PDF)
+            # Early rejection can reset the connection after sending the status.
+            with connection.getresponse() as response:
+                self.assertEqual(response.status, 400)
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(list(self.service.material_uploads.root.iterdir()), [])
 
 
 if __name__ == '__main__':
