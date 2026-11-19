@@ -69,7 +69,8 @@ def activate_organizer(service):
     from unittest.mock import patch
     from backend.gotc.admin_auth import activate, prepare_enrollment
 
-    organizer = prepare_enrollment("browser-organizer", "Browser Fixture Organizer")
+    # Exercise the official username with fresh credentials unique to this temporary event.
+    organizer = prepare_enrollment("organizer", "Browser Fixture Organizer")
     credential = service.data_dir / "organizer-totp.json"
     credential.touch(mode=0o600)
     credential.write_text(json.dumps({organizer["username"]: organizer["seed"]}))
