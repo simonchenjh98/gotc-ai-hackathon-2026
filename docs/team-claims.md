@@ -57,3 +57,21 @@ Use the protected `POST /api/admin/claims/roster` ingress with this alternate co
 New applications, pending edits and valid pending bearer status/redemption checks may attempt automatic approval. Rejected, expired and processed receipts are unchanged. Approval uses the existing atomic team/membership/account pipeline and frozen declaration; ordinary conflicts roll back to pending manual review. Snapshot revision, source digest and matched source IDs are recorded in a distinct `claims.approve-auto` audit event. The ordinary bearer redemption and credential fingerprint checks still govern delivery. Automatic approval does not provision API access.
 
 An existing name collision is reusable only for one active, unissued eligible registered team with the exact normalized team name, captain name/school and full member-name multiset. Registration collects only the captain school; teammate schools are established by the trusted snapshot. A name spanning different schools in the trusted snapshot leaves existing-registration reuse manual because the registration cannot distinguish those identities. Reuse preserves the team ID, project and original records, and applies authoritative membership/contact/target-size synchronization. Existing valid registration credentials retain only their original profile-edit capability. Other collisions remain manual.
+
+## Application email and school choices
+
+The public application asks for the captain's email address. New applications receive a confirmation while pending. An approval or rejection sends the matching status email. A team approved immediately receives only the approval email. Email text contains fixed copy, the application ID and, for received and approved messages, a private recovery link. It never includes team, member or organizer-note text.
+
+The recovery link restores the application receipt in another browser tab until the application expires. Treat it like the receipt: anyone holding it can check the application and claim the team code. Receipts are derived with the private `roadshow-claim-key`, so the database and outbox do not store the link secret. Keep that key with event backups.
+
+Mail is queued in SQLite and sent by the platform service at up to three messages per five-second cycle. Temporary SMTP failures retry up to five times. One address receives messages for at most six other applications per rolling day. Organizers see the address and delivery state in application review. Contact and outbox rows are removed 30 days after the application expires.
+
+Provide `smtp.json` in the private data directory or as a systemd credential:
+
+```json
+{"host":"smtpdm.aliyun.com","port":465,"security":"tls","username":"noreply@example.org","password":"store-privately","from":"noreply@example.org","fromName":"GOTC 2026"}
+```
+
+`security` accepts `tls` or `starttls`. Certificates and hostnames are verified. Without valid settings, applications continue and messages wait until they send or expire.
+
+`GET /api/claims/schools` returns school names from the enabled trusted auto-review list, without people or notes. The form offers those schools and an "other school" manual entry. When auto-review is off, the form uses free text.

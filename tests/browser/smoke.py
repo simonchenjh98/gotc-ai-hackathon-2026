@@ -200,7 +200,7 @@ def smoke(browser, service):
         passed.append("signed-out contestant, exhibition board, closed finals board, roadshow entry, finals invitation and judge seat")
         go(page, "claim", "#claim-request-form")
         form = page.locator("#claim-request-form")
-        for name, value in {"name": "Fixture Applicant", "school": "Fixture School", "teamName": "Fixture New Team"}.items():
+        for name, value in {"name": "Fixture Applicant", "school": "Fixture School", "email": "applicant@example.test", "teamName": "Fixture New Team"}.items():
             form.locator(f"[name={name}]").fill(value)
         for row, name in zip(form.locator("[data-claim-member-row]").all(), ["New One", "New Two"]):
             row.locator("[name=memberName]").fill(name)

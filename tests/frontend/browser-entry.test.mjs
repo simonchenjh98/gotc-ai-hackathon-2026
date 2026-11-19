@@ -229,7 +229,7 @@ test('opening the public claim route loads its real form on demand and reuses it
   await browser.go('#board-roadshow');
   await browser.go('#claim');
   assert.deepEqual(browser.assets,loaded);
-  assert.deepEqual(browser.requests,['/gotc/api/session']);
+  assert.deepEqual(browser.requests,['/gotc/api/session','/gotc/api/claims/schools','/gotc/api/claims/schools']);
   assert.match(browser.main.innerHTML,/id="claim-request-form"/);
 });
 

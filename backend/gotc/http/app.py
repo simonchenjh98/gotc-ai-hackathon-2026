@@ -263,9 +263,11 @@ def create_platform_app(service, *, trusted_proxy_socket=None):
         service.repository_backups.start()
         try:
             service.database_maintenance.start()
+            service.claims.mail.start()
             try:
                 yield
             finally:
+                service.claims.mail.stop()
                 service.database_maintenance.stop()
         finally:
             service.repository_backups.stop()

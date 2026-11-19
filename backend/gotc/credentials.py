@@ -17,7 +17,7 @@ TOTP_SEED = re.compile(r"[A-Z2-7]{32}", re.ASCII)
 
 CREDENTIAL_NAMES = frozenset({
     "api-key-pepper", "roadshow-claim-key", "gateway.json", "repositories.env",
-    "shared-login-codes.json", "finals-access-code.txt", ORGANIZER_TOTP,
+    "shared-login-codes.json", "finals-access-code.txt", "smtp.json", ORGANIZER_TOTP,
 })
 
 

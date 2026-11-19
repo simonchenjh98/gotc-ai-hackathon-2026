@@ -1,7 +1,7 @@
 """Monotonic SQLite event schema versions. The event database owns its version."""
-from . import v001_baseline, v002_admin_auth, v003_content_store
+from . import v001_baseline, v002_admin_auth, v003_content_store, v004_claim_email
 
-LATEST = 3
+LATEST = 4
 
 
 def current(db):
@@ -52,3 +52,11 @@ def apply(event):
         if (current(db) == 2 or db.execute("SELECT 1 FROM api_logs LIMIT 1").fetchone()
                 or v003_content_store.table(db, v003_content_store.STATE)):
             v003_content_store.apply(db, event)
+    with event.db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        previous = current(db)
+        if previous < 4:
+            if previous != 3:
+                raise RuntimeError("Missing predecessor for event schema migration")
+            v004_claim_email.apply(db)
+            db.execute("PRAGMA user_version=4")

@@ -1,11 +1,11 @@
 'use strict';
 
-function makeClaimController({store,request,isCurrent,onChange}){
+function makeClaimController({store,request,isCurrent,onChange,schools=[]}){
   const saved=store.read();let storageError=saved.error,receipt=saved.receipt,generation=0,busy=false;
-  let draft={name:'',school:'',teamName:'',track:'',members:emptyClaimMembers()},editRevision=null;
+  let draft={name:'',school:'',email:'',teamName:'',track:'',members:emptyClaimMembers()},editRevision=null;
   let state={status:receipt?'pending':'new',team:null,code:null,error:saved.error,declaration:null,captain:null,requestRevision:null,editing:false,needsReview:false,reviewRevision:null};
-  const publish=()=>{if(isCurrent())onChange({...state,draft,error:[storageError,state.error].filter((value,index,array)=>value && array.indexOf(value)===index).join(' '),receipt,busy});};
-  const copyDraft=value=>({name:value.name,school:value.school,teamName:value.teamName??'',track:value.track??'',members:value.members.map(p=>({...p}))});
+  const publish=()=>{if(isCurrent())onChange({...state,schools,draft,error:[storageError,state.error].filter((value,index,array)=>value && array.indexOf(value)===index).join(' '),receipt,busy});};
+  const copyDraft=value=>({name:value.name,school:value.school,email:value.email??'',teamName:value.teamName??'',track:value.track??'',members:value.members.map(p=>({...p}))});
   async function run(action,body,reviewLatest=false){
     if(busy || !isCurrent())return;const operation=++generation;busy=true;state.error='';publish();
     try{
@@ -34,7 +34,7 @@ function makeClaimController({store,request,isCurrent,onChange}){
     navigationState(){
       if(!isCurrent())return {pendingInitial:false,dirty:false};
       const saved=copyDraft({...state.captain,teamName:state.declaration?.teamName,track:state.declaration?.track,members:state.declaration?.members??emptyClaimMembers()});
-      return {pendingInitial:busy && !receipt,dirty:receipt?state.editing && JSON.stringify(draft)!==JSON.stringify(saved):[draft.name,draft.school,draft.teamName,draft.track,...draft.members.flatMap(p=>[p.name,p.school])].some(value=>value.trim())};
+      return {pendingInitial:busy && !receipt,dirty:receipt?state.editing && JSON.stringify(draft)!==JSON.stringify(saved):[draft.name,draft.school,draft.email,draft.teamName,draft.track,...draft.members.flatMap(p=>[p.name,p.school])].some(value=>value.trim())};
     },
     start(){publish();if(receipt)return this.status();},
     setDraft(value){if(!isCurrent() || (busy && !receipt))return;draft=copyDraft(value);},
@@ -55,20 +55,35 @@ function makeClaimController({store,request,isCurrent,onChange}){
     cancelEdit(){generation++;busy=false;state.editing=false;state.error='';state.needsReview=false;state.reviewRevision=null;publish();return this.status();},
     status(){if(receipt)return run('status',{requestId:receipt.requestId,secret:receipt.secret});},
     redeem(){if(receipt)return run('redeem',{requestId:receipt.requestId,secret:receipt.secret});},
-    clear(){generation++;busy=false;receipt=null;storageError=store.clear();draft={name:'',school:'',teamName:'',track:'',members:emptyClaimMembers()};state={status:'new',team:null,code:null,error:'',declaration:null,captain:null,requestRevision:null,editing:false,needsReview:false,reviewRevision:null};publish();},
+    clear(){generation++;busy=false;receipt=null;storageError=store.clear();draft={name:'',school:'',email:'',teamName:'',track:'',members:emptyClaimMembers()};state={status:'new',team:null,code:null,error:'',declaration:null,captain:null,requestRevision:null,editing:false,needsReview:false,reviewRevision:null};publish();},
     dispose(){generation++;busy=false;state.code=null;}
   };
 }
 
+function acceptClaimRecoveryLink(store,hash,replaceHash,confirmReplace=()=>true){
+  const match=/^#claim\/recover\/([a-f0-9]{32})\.([A-Za-z0-9_-]{43})\.(\d{6})\.(\d{1,16})$/.exec(hash);
+  if(!match){if(hash.startsWith('#claim/recover/'))replaceHash();return '';}
+  const receipt={requestId:match[1],secret:match[2],pin:match[3],expiresAt:Number(match[4])},saved=store.read().receipt;
+  replaceHash();
+  if(saved && saved.requestId!==receipt.requestId && !confirmReplace())return '';
+  return store.write(receipt);
+}
+
 async function renderClaim(version){
   currentClaimController?.dispose();
-  const controller=makeClaimController({store:claimReceiptStore(),request:api,isCurrent:()=>route==='claim' && version===routeVersion && currentClaimController===controller,onChange:state=>{
-    root.innerHTML=claimStateMarkup(state);
+  const store=claimReceiptStore();
+  const recoveryError=acceptClaimRecoveryLink(store,location.hash,()=>history.replaceState(null,'',location.pathname+location.search+'#claim'),
+    ()=>confirm('此标签页已有另一份领取凭据。是否改用邮件中的申请？'));
+  let schools=[];
+  try{const result=await api('claims/schools');if(Array.isArray(result?.schools))schools=result.schools.filter(school=>typeof school==='string');}catch{}
+  if(route!=='claim' || version!==routeVersion)return;
+  const controller=makeClaimController({store,schools,request:api,isCurrent:()=>route==='claim' && version===routeVersion && currentClaimController===controller,onChange:state=>{
+    root.innerHTML=claimStateMarkup(recoveryError && !state.error?{...state,error:recoveryError}:state);
     const form=document.getElementById('claim-request-form')??document.getElementById('claim-update-form');
     if(form){
-      const read=()=>({name:form.elements.name?.value??state.captain.name,school:form.elements.school?.value??state.captain.school,members:claimFormMembers(form),teamName:form.elements.teamName.value,track:form.elements.track.value});
-      form.oninput=()=>controller.setDraft(read());
-      form.onsubmit=e=>{e.preventDefault();const value=read();if(state.receipt)controller.update(value.members,{teamName:value.teamName,track:value.track});else controller.apply(value.name,value.school,value.members,{teamName:value.teamName,track:value.track});};
+      const read=()=>({name:form.elements.name?.value??state.captain.name,school:form.elements.school?.value??state.captain.school,email:form.elements.email?.value??'',members:claimFormMembers(form),teamName:form.elements.teamName.value,track:form.elements.track.value});
+      form.oninput=event=>{syncClaimSchoolChoice(event?.target);controller.setDraft(read());};
+      form.onsubmit=e=>{e.preventDefault();const value=read();if(state.receipt)controller.update(value.members,{teamName:value.teamName,track:value.track});else controller.apply(value.name,value.school,value.members,{email:value.email,teamName:value.teamName,track:value.track});};
       const add=document.getElementById('claim-member-add');if(add)add.onclick=()=>{controller.setDraft(read());controller.addMember();};
       form.querySelectorAll('[data-claim-remove]').forEach(button=>button.onclick=()=>{controller.setDraft(read());controller.removeMember(Number(button.dataset.claimRemove));});
     }

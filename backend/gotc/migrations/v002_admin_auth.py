@@ -43,7 +43,7 @@ def require_clean_schema(db):
 
 
 def checkpoint_rows(db):
-    if db.execute('PRAGMA user_version').fetchone()[0] not in {2, 3} or not has_old_seeds(db):
+    if db.execute('PRAGMA user_version').fetchone()[0] not in {2, 3, 4} or not has_old_seeds(db):
         raise ValueError('Expected an old development database containing named_admins.totp_seed')
     rows = db.execute('SELECT account_id,username,totp_seed,last_step FROM named_admins').fetchall()
     for _, login, seed, _ in rows:
