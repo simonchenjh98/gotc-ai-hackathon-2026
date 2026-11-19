@@ -58,7 +58,7 @@ class LifecycleMigrationReleaseTests(unittest.TestCase):
         old,before=self.legacy()
         self.assertTrue(TABLES.isdisjoint(before['tables']))
         upgraded=self.service();after=snapshot(upgraded.db_path)
-        self.assertEqual(set(after['tables'])-set(before['tables']),TABLES)
+        self.assertEqual(set(after['tables'])-set(before['tables']),TABLES|{'claim_contacts','claim_email_outbox'})
         for name,rows in before['tables'].items():self.assertEqual(after['tables'][name],rows,name)
         self.assertEqual([row for row in after['schema'] if row[2] in before['tables']],before['schema'])
         for _ in range(2):self.assertEqual(snapshot(self.service().db_path),after)

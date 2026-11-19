@@ -3,6 +3,7 @@
 Receipts are bearer credentials. Only their hashes and credential fingerprints
 persist; organizer reads deliberately never include receipt/PIN/code material.
 """
+import base64
 import hashlib
 import hmac
 import json
@@ -13,6 +14,7 @@ import unicodedata
 
 from backend.gotc.http import request_models as inputs
 from backend.gotc.errors import APIError
+from backend.gotc.teams.claim_email import ClaimMail
 from backend.gotc.teams.claims_auto import AutoReview
 from backend.gotc.admin_data import TRACK_OPTIONS
 
@@ -73,6 +75,7 @@ class Claims:
         self.text=text
         self.kdf=kdf
         self.auto=AutoReview(self,normalize)
+        self.mail=ClaimMail(self)
 
     def initialize(self,db):
         db.executescript(SCHEMA)
@@ -137,19 +140,35 @@ class Claims:
         declaration=self.validate_declaration(name,school,body['members']) if 'members' in body else None
         metadata=self.team_metadata(body)
         if metadata and not declaration:raise APIError(400,'请填写队长及全体组员')
+        if 'email' in body:self.mail.clean(body['email'])
         if declaration:declaration.update(metadata)
         return name, school, declaration
+
+    def receipt_material(self,request_id):
+        # Deriving the receipt lets a queued email carry a recovery link without storing the bearer secret.
+        mac=lambda domain:hmac.new(self.s.roadshow_access.key,domain+b'\0'+request_id.encode('ascii'),hashlib.sha256).digest()
+        secret=base64.urlsafe_b64encode(mac(b'gotc-claim-receipt-v1')).rstrip(b'=').decode('ascii')
+        return secret,f"{int.from_bytes(mac(b'gotc-claim-pin-v1')[:8],'big')%1000000:06d}"
+
+    def schools(self,db):
+        if not self.auto.summary(db)['enabled']:return {'schools':[]}
+        unique={}
+        for row in db.execute("SELECT school,normalized_school FROM claim_auto_people WHERE eligible=1 AND normalized_name<>'' AND normalized_school<>'' ORDER BY normalized_school,school"):
+            unique.setdefault(row['normalized_school'],row['school'])
+        return {'schools':list(unique.values())}
 
     def request(self,db,body):
         name, school, declaration = self.request_fields(body)
         now=self.clock()
         db.execute("UPDATE claim_requests SET status='expired',revision=revision+1 WHERE status='pending' AND expires_at<=?",(now,))
         if db.execute("SELECT COUNT(*) FROM claim_requests WHERE status='pending'").fetchone()[0]>=1000:raise APIError(429,'申请较多，请稍后重试')
-        request_id=secrets.token_hex(16);secret=secrets.token_urlsafe(32);pin=f'{secrets.randbelow(1000000):06d}';expires=now+24*3600*1000
+        request_id=secrets.token_hex(16);secret,pin=self.receipt_material(request_id);expires=now+24*3600*1000
         db.execute('''INSERT INTO claim_requests(id,secret_hash,pin_hash,name,school,normalized_name,normalized_school,created_at,expires_at)
             VALUES (?,?,?,?,?,?,?,?,?)''',(request_id,digest('receipt',secret),digest('pin:'+request_id,pin),name,school,normalize(name),normalize(school),now,expires))
         if declaration:self.save_declaration(db,request_id,1,declaration)
+        if 'email' in body:self.mail.save_contact(db,request_id,self.mail.clean(body['email']))
         result=self.bearer(db,{'requestId':request_id,'secret':secret})
+        if result['status']=='pending':self.mail.notify(db,request_id,'received')
         return {**result,'requestId':request_id,'secret':secret,'pin':pin}
 
     def team_metadata(self,body):
@@ -268,13 +287,15 @@ class Claims:
     def listing(self,db):
         requests=[dict(row) for row in db.execute('''SELECT id,name,school,status,revision,created_at AS createdAt,expires_at AS expiresAt,
             team_id AS teamId,captain_id AS captainId,review_note AS reviewNote,pin_attempts AS pinAttempts FROM claim_requests ORDER BY created_at DESC''')]
+        contacts,delivery=self.mail.delivery(db)
         for row in requests:
+            row['email']=contacts.get(row['id'],'');row['emailDelivery']=delivery.get(row['id'],[])
             row['declaration']=self.declaration(db,row['id'])
             row['reviewContext'],row['references']=self.review_context(db,row['id'],row['revision'],row['declaration'])
             if row['status']=='pending' and row['expiresAt']<=self.clock():row['status']='expired'
         teams=[team for row in db.execute('SELECT id FROM teams ORDER BY number') if (team:=self.eligible_team(db,row['id']))]
         revoked=[team for row in db.execute('SELECT id FROM teams ORDER BY number') if (team:=self.eligible_team(db,row['id'],reissue_revoked=True))]
-        return {'requests':requests,'people':self.roster(db),'teams':teams,'revokedTeams':revoked,'trackOptions':TRACK_OPTIONS,'autoReview':self.auto.summary(db)}
+        return {'emailConfigured':self.mail.configured,'requests':requests,'people':self.roster(db),'teams':teams,'revokedTeams':revoked,'trackOptions':TRACK_OPTIONS,'autoReview':self.auto.summary(db)}
 
     def eligible_team(self,db,team_id,*,reissue_revoked=False):
         team=self.s.admin_data.team(db,team_id)
@@ -395,6 +416,7 @@ class Claims:
             self.save_declaration(db,row['id'],row['revision']+1,reviewed)
             db.execute("""UPDATE claim_requests SET status='approved',revision=revision+1,team_id=?,captain_id=?,approval_digest=?,review_note=?,
                 account_id=?,account_fingerprint=? WHERE id=?""",(team['id'],member_ids[0],approval,note,account['id'],fingerprint(account),row['id']))
+            self.mail.notify(db,row['id'],'approved')
         except sqlite3.IntegrityError:raise APIError(409,'成员或队伍已经分配，请重新读取并核对')
         self.s.audit(db,actor,'claims.approve-open',row['id'],{'teamId':team['id'],'memberIds':member_ids,'declaration':reviewed,
             'requestRevision':body['expectedRevision'],'reviewContext':body['reviewContext'],'resolvedIdentity':body['resolvedIdentity'],'note':note,
@@ -437,6 +459,7 @@ class Claims:
         if row['status']!='pending' or row['expires_at']<=self.clock():raise APIError(409,'申请已处理或过期')
         if body['action']=='reject':
             db.execute("UPDATE claim_requests SET status='rejected',revision=revision+1,review_note=? WHERE id=?",(note,row['id']))
+            self.mail.notify(db,row['id'],'rejected')
             self.s.audit(db,actor,'claims.reject',row['id'],{'note':note})
             return {'ok':True,'status':'rejected','revision':row['revision']+1}
         people={p['id']:p for p in self.roster(db)}
@@ -462,6 +485,7 @@ class Claims:
             access=self.s.team_access(db,actor,{'teamId':body['teamId'],'action':'issue'})
             account=db.execute('SELECT * FROM accounts WHERE id=?',(access['id'],)).fetchone()
             db.execute('UPDATE claim_requests SET account_id=?,account_fingerprint=? WHERE id=?',(account['id'],fingerprint(account),row['id']))
+            self.mail.notify(db,row['id'],'approved')
             ordered_ids=mapping if declaration else [body['captainId']]+[person for person in members if person!=body['captainId']]
             self.s.registration.sync_verified_members(db,actor,body['teamId'],body['captainId'],ordered_ids)
         except sqlite3.IntegrityError:raise APIError(409,'成员或队伍已经分配，请重新读取并核对')
@@ -474,6 +498,8 @@ class Claims:
         admin=path.startswith('/api/admin/claims')
         if query:raise APIError(400,'此接口不接受查询参数')
         public_scopes={'/api/claims/request':'claims-request','/api/claims/status':'claims-status','/api/claims/redeem':'claims-redeem','/api/claims/update':'claims-update'}
+        if not admin and method=='GET' and path=='/api/claims/schools':
+            with self.s.db() as db:return self.schools(db)
         if not admin:
             if method!='POST' or path not in public_scopes:raise APIError(404,'接口不存在')
             self.s.rate_limit(ip,public_scopes[path])

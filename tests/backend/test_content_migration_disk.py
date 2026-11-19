@@ -14,6 +14,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from backend.gotc import migrations
 from backend.gotc.migrations import v003_content_store as migration
 from backend.gotc.service import EventService
 from ops.backup_event import copy_database
@@ -64,7 +65,7 @@ def assert_result(test, event, count, mode, digest):
         test.assertEqual(tuple(db.execute("SELECT count(*),sum(cost_micro),sum(input_tokens),sum(output_tokens) FROM api_usage").fetchone()),
                          (count, 23 * count, 11 * count, 7 * count))
         test.assertEqual(db.execute("SELECT count(*) FROM api_logs").fetchone()[0], 0)
-        test.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+        test.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], migrations.LATEST)
         test.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
         ids = dict(db.execute("SELECT id,request_id FROM api_usage"))
         test.assertEqual(db.execute("SELECT value FROM settings WHERE key='keys.logContent'").fetchone()[0], 'false')

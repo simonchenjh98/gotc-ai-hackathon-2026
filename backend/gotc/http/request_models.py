@@ -96,6 +96,7 @@ class ClaimMember(TypedDict):
 
 
 class ClaimRequest(ClaimMember):
+    email: NotRequired[str]
     members: NotRequired[list[ClaimMember]]
     teamName: NotRequired[str]
     track: NotRequired[str]

@@ -92,7 +92,7 @@ FILES = PAGES_FILES | manifest({
         'stream_events.py text_policy.py transport.py usage.py'
     ),
     'backend/gotc/http': '__init__.py app.py policy.py request_models.py routes.py server.py static.py',
-    'backend/gotc/migrations': '__init__.py v001_baseline.py v002_admin_auth.py v003_content_store.py',
+    'backend/gotc/migrations': '__init__.py v001_baseline.py v002_admin_auth.py v003_content_store.py v004_claim_email.py',
     'backend/gotc/judging': (
         '__init__.py finals.py judge_login_schedule.py judging.py professional.py '
         'roadshow_access.py roadshow_progress.py roadshow_scoring.py standings.py'
@@ -102,7 +102,7 @@ FILES = PAGES_FILES | manifest({
         'repository_seals.py submission_records.py workflow.py'
     ),
     'backend/gotc/teams': (
-        '__init__.py admin_team_access.py claims.py claims_auto.py team_lifecycle.py '
+        '__init__.py admin_team_access.py claim_email.py claims.py claims_auto.py team_lifecycle.py '
         'team_registration.py'
     ),
     'ops': 'backup_event.py',

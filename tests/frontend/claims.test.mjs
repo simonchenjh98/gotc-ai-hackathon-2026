@@ -187,7 +187,7 @@ function claimPageFixture(transport){
     form.querySelectorAll=selector=>selector==='[data-claim-member-row]'?rows:selector==='[data-claim-remove]'?remove:[];
     form.rows=rows;form.remove=remove;
   }});
-  const scope=vm.createContext({JSON,Number,Error,Set,encodeURIComponent,esc,heading:()=>'',beijingTime:String,teamLabel:t=>t.name,base:{pathname:'/test/'},sessionStorage:storage,root,document:{getElementById:id=>nodes.get(id)??null},api:transport,route:'claim',routeVersion:1,confirm:()=>true});vm.runInContext(source,scope);
+  const scope=vm.createContext({JSON,Number,Error,Set,encodeURIComponent,esc,heading:()=>'',beijingTime:String,teamLabel:t=>t.name,base:{pathname:'/test/'},sessionStorage:storage,root,document:{getElementById:id=>nodes.get(id)??null},api:(path,body)=>path==='claims/schools'?Promise.resolve({schools:[]}):transport(path,body),location:{hash:'#claim',pathname:'/test/platform.html',search:''},history:{replaceState(){}},route:'claim',routeVersion:1,confirm:()=>true});vm.runInContext(source,scope);
   return {scope,root,storage,nodes,render:()=>vm.runInContext('renderClaim(1)',scope),form:()=>nodes.get('claim-request-form')??nodes.get('claim-update-form'),fill(){const f=this.form();if(f.elements.name)f.elements.name.value=declaredCaptain.name;if(f.elements.school)f.elements.school.value=declaredCaptain.school;if(f.elements.teamName)f.elements.teamName.value='Fixture Team';f.rows.forEach((row,i)=>{row.querySelector('[name="memberName"]').value='Teammate '+i;row.querySelector('[name="memberSchool"]').value='School '+i;});f.oninput();}};
 }
 
@@ -423,4 +423,37 @@ test('trusted import discards detached, refreshed, replaced-model, edited, busy 
     resolve(JSON.stringify({autoReview:{expectedRevision:0,sourceName:'Synthetic',sourceSha256:'a'.repeat(64),entries:[]}}));await pending;
     assert.equal(sent.length,0,change);assert.deepEqual(errors,[],change);
   }
+});
+
+test('school selector offers imported schools and keeps manual entry in the submitted field',()=>{
+  const markup=context.claimSchoolMarkup('school','Manual <School>',['Listed "A"'],'队长学校');
+  assert.match(markup,/data-claim-school-choice/);assert.match(markup,/value="Listed &quot;A&quot;"/);
+  assert.match(markup,/value="__other_school__" selected/);assert.match(markup,/value="Manual &lt;School&gt;"/);assert.doesNotMatch(markup,/data-claim-school-other hidden/);
+  assert.match(context.claimSchoolMarkup('memberSchool','Listed',['Listed']),/data-claim-school-other hidden/);
+  assert.doesNotMatch(context.claimSchoolMarkup('school','Any',[]),/<select/);
+  const input={value:'old',focused:false,focus(){this.focused=true;}},other={hidden:true,querySelector:()=>input},wrapper={querySelector:()=>other};
+  const choice={value:'Listed',matches:()=>true,closest:()=>wrapper};context.syncClaimSchoolChoice(choice);assert.equal(input.value,'Listed');assert.equal(other.hidden,true);
+  choice.value='__other_school__';context.syncClaimSchoolChoice(choice);assert.equal(input.value,'');assert.equal(other.hidden,false);assert.equal(input.focused,true);
+});
+
+test('application form sends the contact email and shows imported school choices',async()=>{
+  const storage=new Storage(),calls=[],states=[];
+  const client=context.makeClaimController({store:store(storage),schools:['Listed School'],request:async(path,body)=>{calls.push({path,body});return {...receipt,status:'pending'};},isCurrent:()=>true,onChange:state=>states.push(state)});
+  client.start();assert.match(context.claimStateMarkup(states.at(-1)),/name="email" type="email" required/);assert.match(context.claimStateMarkup(states.at(-1)),/Listed School/);
+  await client.apply('Captain','Listed School',undefined,{email:'captain@example.test',teamName:'',track:''});assert.equal(calls[0].body.email,'captain@example.test');
+});
+
+test('email recovery link restores the receipt and removes the secret from the address bar',()=>{
+  const value=`#claim/recover/${receipt.requestId}.${receipt.secret}.${receipt.pin}.${receipt.expiresAt}`;
+  const storage=new Storage(),target=store(storage);let replaced=0;
+  assert.equal(context.acceptClaimRecoveryLink(target,value,()=>replaced++),'');assert.equal(replaced,1);assert.equal(target.read().receipt.secret,receipt.secret);
+  const other={...receipt,requestId:'c'.repeat(32)};target.write(other);
+  context.acceptClaimRecoveryLink(target,value,()=>replaced++,()=>false);assert.equal(target.read().receipt.requestId,other.requestId);assert.equal(replaced,2);
+  context.acceptClaimRecoveryLink(target,'#claim/recover/not-valid',()=>replaced++);assert.equal(replaced,3);assert.equal(target.read().receipt.requestId,other.requestId);
+  context.acceptClaimRecoveryLink(target,'#claim',()=>replaced++);assert.equal(replaced,3);
+});
+
+test('organizer review shows the contact email and delivery state with escaping',()=>{
+  const markup=context.claimEmailStatusMarkup({email:'<team>@example.test',emailDelivery:[{kind:'received',status:'failed'}]});
+  assert.match(markup,/&lt;team&gt;@example\.test/);assert.match(markup,/收件确认：发送失败/);assert.equal(context.claimEmailStatusMarkup({email:''}),'');
 });

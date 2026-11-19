@@ -52,6 +52,7 @@ def endpoints() -> tuple[Endpoint, ...]:
     add(api.backups, "GET", "team-or-admin", "submission/backups/{team}/{version}/{filename}")
     add(api.board, "GET", "admin", "board", snapshot=True)
     add(api.claims, "GET", "admin", "admin/claims")
+    add(api.claims, "GET", "public", "claims/schools")
     add(api.claims, "POST", "public", "claims/request", model=models.ClaimRequest)
     add(api.claims, "POST", "public", "claims/status", "claims/redeem", model=models.ReceiptProof)
     add(api.claims, "POST", "public", "claims/update", model=models.ClaimUpdate)
