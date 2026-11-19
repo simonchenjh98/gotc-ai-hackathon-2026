@@ -9,3 +9,6 @@ node_modules/
 *.log
 .DS_Store
 .serena/
+/_site/
+# Upgrades may retain the previous private event directory.
+/server/data/

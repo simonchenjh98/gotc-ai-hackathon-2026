@@ -3,7 +3,7 @@ name: Pull request checks
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, codex/platform-rebuild]
   workflow_dispatch:
 
 permissions:
@@ -14,6 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  security:
+    uses: ./.github/workflows/security.yml
+
   frontend:
     name: Frontend checks
     runs-on: ubuntu-latest
@@ -31,12 +34,30 @@ jobs:
           python-version: '3.12'
       - name: Check JavaScript syntax
         run: |
-          node --check app.js
-          node --check platform.js
+          find frontend/static -name '*.js' -print0 | xargs -0 -n 1 node --check
       - name: Run browser-side tests
-        run: node --test tests/*.test.mjs
+        run: node --test tests/frontend/*.test.mjs
       - name: Validate public site references
-        run: python -B scripts/check_site.py
+        run: python -B tools/check_site.py
+
+  browser:
+    name: Chromium participant and organizer workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install runtime dependencies and test-only Chromium and Playwright
+        run: |
+          python -m pip install --only-binary=:all: --require-hashes -r backend/requirements.txt
+          python -m pip install -r tests/browser/requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Exercise the local platform with synthetic accounts
+        run: python -B tests/browser/smoke.py --smoke-only
 
   backend:
     name: Backend checks (Python ${{ matrix.python-version }})
@@ -54,9 +75,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Run API tests
-        run: python -B -m unittest discover -s server -p 'test_*.py' -v
+        run: make backend-test
       - name: Compile Python sources
-        run: python -B -m py_compile server/app.py server/test_api.py server/test_shared_login.py scripts/check_site.py deploy/deploy.py deploy/install.py
+        run: python -m compileall -q backend tools ops
+      - name: Install Nginx for the TLS and Unix-socket rehearsal
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nginx openssl
+      - name: Rehearse packaged startup and installation
+        run: make operations-test
 
   hygiene:
     name: Repository hygiene
@@ -69,7 +94,88 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: '3.12'
+      - name: Validate repository layout
+        run: python -B tools/check_layout.py
       - name: Run pre-commit checks
         uses: pre-commit/action@v3.0.1
         with:
           extra_args: --all-files
+
+  systemd:
+    name: Isolated services and Git under systemd
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Prepare a synthetic event on this disposable runner
+        run: |
+          sudo groupadd --system gotc-proxy
+          sudo useradd --system --gid gotc-proxy --no-create-home --shell /usr/sbin/nologin gotc-hackathon
+          sudo install -d -o "$(id -un)" /opt/gotc-ci
+          git archive HEAD | tar -C /opt/gotc-ci -xf -
+          make -C /opt/gotc-ci deps VENV=.venv
+          sudo install -d -o gotc-hackathon -g gotc-proxy -m 0700 /opt/gotc-hackathon/data
+      - name: Start both generated units and exercise Git with the platform restrictions
+        run: python /opt/gotc-ci/tests/operations/rehearse_systemd_git.py
+
+  release:
+    name: Build offline server artifact
+    needs: [frontend, browser, backend, hygiene, systemd]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: make wheels
+      - name: Build release and record its digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/gotc-artifact"
+          python -m ops.deploy.deploy --source-sha "$GITHUB_SHA" --package "$RUNNER_TEMP/gotc-artifact/release.tar.gz" > "$RUNNER_TEMP/gotc-artifact/release.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gotc-release-${{ github.sha }}
+          path: ${{ runner.temp }}/gotc-artifact
+          if-no-files-found: error
+
+  sign:
+    name: Sign the reviewed main release
+    needs: [release, security]
+    if: github.ref == 'refs/heads/main' && github.ref_protected && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    environment: server-release-signing
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: gotc-release-${{ github.sha }}
+          path: ${{ runner.temp }}/signed
+      - name: Sign the exact archive and commit using the environment key
+        env:
+          CI_RELEASE_SIGNING_KEY: ${{ secrets.GOTC_RELEASE_SIGNING_KEY }}
+        run: |
+          set -eu
+          umask 077
+          cd "$RUNNER_TEMP/signed"
+          digest=$(sha256sum release.tar.gz | cut -d ' ' -f 1)
+          printf 'gotc-ci-release-v1\nref refs/heads/main\nsource-sha %s\narchive-sha256 %s\n' "$GITHUB_SHA" "$digest" > release.statement
+          key=$(mktemp "$RUNNER_TEMP/gotc-signing-XXXXXX")
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$CI_RELEASE_SIGNING_KEY" > "$key"
+          unset CI_RELEASE_SIGNING_KEY
+          ssh-keygen -q -Y sign -f "$key" -n gotc-ci-release-v1 release.statement
+          mv release.statement.sig release.tar.gz.sig
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gotc-signed-release-${{ github.sha }}
+          path: ${{ runner.temp }}/signed
+          if-no-files-found: error

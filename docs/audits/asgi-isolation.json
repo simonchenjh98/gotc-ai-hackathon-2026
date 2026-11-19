@@ -1,0 +1,340 @@
+{
+  "layout": "uds",
+  "admitted_provider_calls": 2,
+  "queue_waiters": 0,
+  "samples_per_condition": 24,
+  "observed_gateway": [
+    {
+      "gotc_gateway_running": 2,
+      "gotc_gateway_queue_depth": 0
+    },
+    {
+      "gotc_gateway_running": 2,
+      "gotc_gateway_queue_depth": 0
+    },
+    {
+      "gotc_gateway_running": 2,
+      "gotc_gateway_queue_depth": 0
+    },
+    {
+      "gotc_gateway_running": 2,
+      "gotc_gateway_queue_depth": 0
+    }
+  ],
+  "summary": {
+    "idle": {
+      "login_ms": {
+        "p50": 20.218,
+        "p95": 21.057
+      },
+      "submission_ms": {
+        "p50": 1.238,
+        "p95": 1.407
+      }
+    },
+    "occupied": {
+      "login_ms": {
+        "p50": 20.689,
+        "p95": 21.679
+      },
+      "submission_ms": {
+        "p50": 1.303,
+        "p95": 1.585
+      }
+    },
+    "occupied_to_idle_p95": {
+      "login_ms": 1.03,
+      "submission_ms": 1.127
+    }
+  },
+  "samples": [
+    {
+      "batch": 1,
+      "scenario": "idle",
+      "login_ms": 19.696,
+      "submission_ms": 1.253
+    },
+    {
+      "batch": 1,
+      "scenario": "idle",
+      "login_ms": 19.283,
+      "submission_ms": 1.203
+    },
+    {
+      "batch": 1,
+      "scenario": "idle",
+      "login_ms": 19.307,
+      "submission_ms": 1.167
+    },
+    {
+      "batch": 1,
+      "scenario": "idle",
+      "login_ms": 19.048,
+      "submission_ms": 1.075
+    },
+    {
+      "batch": 1,
+      "scenario": "idle",
+      "login_ms": 19.494,
+      "submission_ms": 1.11
+    },
+    {
+      "batch": 1,
+      "scenario": "idle",
+      "login_ms": 19.221,
+      "submission_ms": 1.112
+    },
+    {
+      "batch": 1,
+      "scenario": "occupied",
+      "login_ms": 19.48,
+      "submission_ms": 1.205
+    },
+    {
+      "batch": 1,
+      "scenario": "occupied",
+      "login_ms": 19.001,
+      "submission_ms": 1.145
+    },
+    {
+      "batch": 1,
+      "scenario": "occupied",
+      "login_ms": 19.433,
+      "submission_ms": 1.193
+    },
+    {
+      "batch": 1,
+      "scenario": "occupied",
+      "login_ms": 19.439,
+      "submission_ms": 1.122
+    },
+    {
+      "batch": 1,
+      "scenario": "occupied",
+      "login_ms": 19.01,
+      "submission_ms": 1.141
+    },
+    {
+      "batch": 1,
+      "scenario": "occupied",
+      "login_ms": 19.137,
+      "submission_ms": 1.097
+    },
+    {
+      "batch": 2,
+      "scenario": "occupied",
+      "login_ms": 21.023,
+      "submission_ms": 1.524
+    },
+    {
+      "batch": 2,
+      "scenario": "occupied",
+      "login_ms": 21.679,
+      "submission_ms": 1.559
+    },
+    {
+      "batch": 2,
+      "scenario": "occupied",
+      "login_ms": 21.796,
+      "submission_ms": 1.585
+    },
+    {
+      "batch": 2,
+      "scenario": "occupied",
+      "login_ms": 21.118,
+      "submission_ms": 1.779
+    },
+    {
+      "batch": 2,
+      "scenario": "occupied",
+      "login_ms": 21.523,
+      "submission_ms": 1.222
+    },
+    {
+      "batch": 2,
+      "scenario": "occupied",
+      "login_ms": 20.987,
+      "submission_ms": 1.396
+    },
+    {
+      "batch": 2,
+      "scenario": "idle",
+      "login_ms": 20.64,
+      "submission_ms": 1.298
+    },
+    {
+      "batch": 2,
+      "scenario": "idle",
+      "login_ms": 20.45,
+      "submission_ms": 1.246
+    },
+    {
+      "batch": 2,
+      "scenario": "idle",
+      "login_ms": 20.245,
+      "submission_ms": 1.247
+    },
+    {
+      "batch": 2,
+      "scenario": "idle",
+      "login_ms": 20.498,
+      "submission_ms": 1.407
+    },
+    {
+      "batch": 2,
+      "scenario": "idle",
+      "login_ms": 20.764,
+      "submission_ms": 1.243
+    },
+    {
+      "batch": 2,
+      "scenario": "idle",
+      "login_ms": 20.545,
+      "submission_ms": 1.226
+    },
+    {
+      "batch": 3,
+      "scenario": "idle",
+      "login_ms": 20.935,
+      "submission_ms": 1.335
+    },
+    {
+      "batch": 3,
+      "scenario": "idle",
+      "login_ms": 20.896,
+      "submission_ms": 1.358
+    },
+    {
+      "batch": 3,
+      "scenario": "idle",
+      "login_ms": 20.192,
+      "submission_ms": 1.226
+    },
+    {
+      "batch": 3,
+      "scenario": "idle",
+      "login_ms": 21.057,
+      "submission_ms": 1.325
+    },
+    {
+      "batch": 3,
+      "scenario": "idle",
+      "login_ms": 21.347,
+      "submission_ms": 1.351
+    },
+    {
+      "batch": 3,
+      "scenario": "idle",
+      "login_ms": 20.506,
+      "submission_ms": 1.459
+    },
+    {
+      "batch": 3,
+      "scenario": "occupied",
+      "login_ms": 21.345,
+      "submission_ms": 1.403
+    },
+    {
+      "batch": 3,
+      "scenario": "occupied",
+      "login_ms": 20.867,
+      "submission_ms": 1.412
+    },
+    {
+      "batch": 3,
+      "scenario": "occupied",
+      "login_ms": 20.97,
+      "submission_ms": 1.332
+    },
+    {
+      "batch": 3,
+      "scenario": "occupied",
+      "login_ms": 21.083,
+      "submission_ms": 1.332
+    },
+    {
+      "batch": 3,
+      "scenario": "occupied",
+      "login_ms": 21.303,
+      "submission_ms": 1.381
+    },
+    {
+      "batch": 3,
+      "scenario": "occupied",
+      "login_ms": 20.825,
+      "submission_ms": 1.324
+    },
+    {
+      "batch": 4,
+      "scenario": "occupied",
+      "login_ms": 20.554,
+      "submission_ms": 1.284
+    },
+    {
+      "batch": 4,
+      "scenario": "occupied",
+      "login_ms": 20.422,
+      "submission_ms": 1.322
+    },
+    {
+      "batch": 4,
+      "scenario": "occupied",
+      "login_ms": 20.508,
+      "submission_ms": 1.261
+    },
+    {
+      "batch": 4,
+      "scenario": "occupied",
+      "login_ms": 19.982,
+      "submission_ms": 1.144
+    },
+    {
+      "batch": 4,
+      "scenario": "occupied",
+      "login_ms": 20.43,
+      "submission_ms": 1.183
+    },
+    {
+      "batch": 4,
+      "scenario": "occupied",
+      "login_ms": 19.692,
+      "submission_ms": 1.195
+    },
+    {
+      "batch": 4,
+      "scenario": "idle",
+      "login_ms": 20.342,
+      "submission_ms": 1.237
+    },
+    {
+      "batch": 4,
+      "scenario": "idle",
+      "login_ms": 20.039,
+      "submission_ms": 1.095
+    },
+    {
+      "batch": 4,
+      "scenario": "idle",
+      "login_ms": 19.403,
+      "submission_ms": 1.239
+    },
+    {
+      "batch": 4,
+      "scenario": "idle",
+      "login_ms": 19.274,
+      "submission_ms": 1.028
+    },
+    {
+      "batch": 4,
+      "scenario": "idle",
+      "login_ms": 19.752,
+      "submission_ms": 1.06
+    },
+    {
+      "batch": 4,
+      "scenario": "idle",
+      "login_ms": 19.292,
+      "submission_ms": 1.154
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "baseline": "d0b6042",
+  "baselineRun": {
+    "os": "Darwin",
+    "machine": "arm64",
+    "python": "3.12.12",
+    "sqlite": "3.50.4",
+    "profiles": {
+      "defaults": {
+        "pragmas": {
+          "synchronous": 2,
+          "cache_size": -2000,
+          "mmap_size": 0
+        },
+        "read": {
+          "count": 450,
+          "p50_us": 309.6,
+          "p95_us": 424.3
+        },
+        "write": {
+          "count": 150,
+          "p50_us": 373.8,
+          "p95_us": 557.6
+        }
+      }
+    }
+  },
+  "candidateRun": {
+    "os": "Darwin",
+    "machine": "arm64",
+    "python": "3.12.12",
+    "sqlite": "3.50.4",
+    "profiles": {
+      "defaults": {
+        "pragmas": {
+          "synchronous": 2,
+          "cache_size": -2000,
+          "mmap_size": 0
+        },
+        "read": {
+          "count": 450,
+          "p50_us": 39.4,
+          "p95_us": 49.6
+        },
+        "write": {
+          "count": 150,
+          "p50_us": 44.4,
+          "p95_us": 62.2
+        }
+      },
+      "normal": {
+        "pragmas": {
+          "synchronous": 1,
+          "cache_size": -2000,
+          "mmap_size": 0
+        },
+        "read": {
+          "count": 450,
+          "p50_us": 39.0,
+          "p95_us": 44.5
+        },
+        "write": {
+          "count": 150,
+          "p50_us": 16.1,
+          "p95_us": 19.8
+        }
+      },
+      "larger-cache": {
+        "pragmas": {
+          "synchronous": 2,
+          "cache_size": -4096,
+          "mmap_size": 0
+        },
+        "read": {
+          "count": 450,
+          "p50_us": 39.6,
+          "p95_us": 46.8
+        },
+        "write": {
+          "count": 150,
+          "p50_us": 43.8,
+          "p95_us": 52.5
+        }
+      },
+      "mmap": {
+        "pragmas": {
+          "synchronous": 2,
+          "cache_size": -2000,
+          "mmap_size": 33554432
+        },
+        "read": {
+          "count": 450,
+          "p50_us": 31.3,
+          "p95_us": 37.3
+        },
+        "write": {
+          "count": 150,
+          "p50_us": 44.1,
+          "p95_us": 52.0
+        }
+      }
+    }
+  }
+}

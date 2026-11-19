@@ -1,0 +1,20 @@
+'use strict';
+
+// Cheap models cost fractions of a cent per call, so small amounts keep 4 decimals.
+let apiCurrency='USD';
+const usd=(v,currency=apiCurrency)=>currency==='MIXED'?'多币种（见调用明细）':v===null || v===undefined?'—':`${currency==='CNY'?'¥':currency==='USD'?'$':''}${Number(v).toFixed(Number(v)!==0 && Math.abs(v)<1?4:2)}${currency==='legacy'?'（原计价）':''}`;
+function billingAmount(rows,fallback,currency=apiCurrency){return Array.isArray(rows)?(rows.map(r=>usd(r.cost,r.currency)).join(' + ') || '0.00'):usd(fallback,currency);}
+function billingNote(rows=[]){const pending=rows.reduce((n,r)=>n+Number(r.pending || 0),0);return `<p class="small-note">${rows.map(r=>`${esc(r.currency==='legacy'?'历史原计价':r.currency)} ${usd(r.cost,r.currency)}`).join(' · ')}${pending?` · ${pending} 笔待核价，尚未计入已结算费用`:''}</p>`;}
+
+const changeName={'api-key.create':'创建密钥','api-key.delete':'删除密钥','api-key.provision':'开通 API','api-key.revoke':'停用 API','api-key.settings':'修改 API 设置','api-log.view':'查看调用内容','api-log.clear':'清空调用内容','api-usage.export':'导出用量','api-upstreams.save':'保存模型账号','api-upstreams.test':'测试账号连接'};
+// Failure classification copied from sub2api's ops error log: owner = whose fault, phase = where it failed.
+const ownerName={client:'学生请求',provider:'上游',platform:'平台'};
+const phaseName={request:'请求校验',auth:'鉴权',upstream:'上游',network:'网络',internal:'内部'};
+function failureNote(i){if(!i.errorType)return '';const title=[i.errorPhase && `阶段：${phaseName[i.errorPhase] || i.errorPhase}`,i.upstreamStatus!==null && i.upstreamStatus!==undefined && `上游状态：${Number(i.upstreamStatus)}`,i.errorMessage].filter(Boolean).join('\n');
+  return `<br><small class="failure-note" title="${esc(title)}">${esc(ownerName[i.errorOwner] || i.errorOwner || '')} · ${esc(i.errorType)}${i.upstreamStatus!==null && i.upstreamStatus!==undefined?` · 上游 ${Number(i.upstreamStatus)}`:''}</small>${i.errorMessage?`<br><small class="failure-message">${esc(String(i.errorMessage).slice(0,120))}</small>`:''}`;}
+function callTable(items,admin){return `<div class="table-wrap"><table class="board-table usage-table"><thead><tr><th>时间（北京）</th>${admin?'<th>队伍 / 密钥</th>':'<th>密钥</th>'}<th>模型</th><th>状态</th><th>输入 / 输出 tokens</th><th>费用</th><th>耗时</th><th>客户端</th>${admin?'<th></th>':''}</tr></thead><tbody>${items.map(i=>`<tr><td>${esc(beijingTime(i.at))}</td><td>${admin?`${esc(String(i.teamNumber).padStart(2,'0'))} · ${esc(i.teamName)}<br><small>${esc(i.keyName)}</small>`:esc(i.keyName)}</td><td>${esc(i.model || '—')}<br><small>${esc(i.path)}${i.stream?' · 流式':''}</small></td><td class="${i.status>=400 || i.incomplete?'status-error':''}">${Number(i.status)}${i.incomplete?'<br><small>流中断</small>':''}${i.estimated?'<br><small title="根据可核实的请求参数或已收到用量估算，详见计费记录">估算计费</small>':''}${failureNote(i)}</td><td>${tokens(i.input)} / ${tokens(i.output)}${i.cacheRead?`<br><small>缓存读取 ${tokens(i.cacheRead)}</small>`:''}</td><td>${i.billingStatus==='pending'?'待核价':usd(i.cost,i.currency || 'legacy')}</td><td>${Number(i.durationMs)}ms</td><td class="ua-cell">${esc(i.userAgent || '—')}</td>${admin?`<td>${i.hasContent?`<button type="button" class="link-button" data-log-id="${Number(i.id)}">查看上下文</button><br><small>${kb(i.requestBytes || 0)}</small>`:'<small>未记录</small>'}</td>`:''}</tr>${admin?`<tr class="log-row" hidden id="log-${Number(i.id)}"><td colspan="9"></td></tr>`:''}`).join('') || `<tr><td colspan="${admin?9:8}">暂无调用记录</td></tr>`}</tbody></table></div>`;}
+
+const kb=n=>n>=1048576?`${(n/1048576).toFixed(1)} MB`:`${Math.max(1,Math.round(n/1024))} KB`;
+
+const tokens=n=>Number(n || 0).toLocaleString('en-US');
+function usageTable(title,head,rows,cells){return `<h3>${title}</h3><div class="table-wrap"><table class="board-table usage-table"><thead><tr>${head.map(h=>`<th>${h}</th>`).join('')}<th>请求</th><th>输入 / 输出 tokens</th><th>费用</th></tr></thead><tbody>${rows.map(r=>`<tr>${cells(r).join('')}<td>${Number(r.requests)}</td><td>${tokens(r.input)} / ${tokens(r.output)}</td><td>${usd(r.cost,r.currency || 'legacy')}</td></tr>`).join('') || `<tr><td colspan="${head.length+3}">暂无数据</td></tr>`}</tbody></table></div>`;}

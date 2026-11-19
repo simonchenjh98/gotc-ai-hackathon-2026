@@ -1,0 +1,27 @@
+{
+  "host": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "python": "3.14.3",
+  "method": "getrusage(RUSAGE_SELF).ru_maxrss",
+  "gateway_global_running": 4,
+  "teams": 2,
+  "batches": 1,
+  "verified_content_rows": 4,
+  "concurrent_calls": 4,
+  "identity_calls": 2,
+  "gzip_calls": 2,
+  "json_request_bytes": 33554432,
+  "gzip_request_bytes": 146503,
+  "json_reply_bytes": 50000000,
+  "log_content": true,
+  "usage_rows": 4,
+  "statuses": [
+    200,
+    200,
+    200,
+    200
+  ],
+  "elapsed_seconds": 2.94,
+  "provider_peak_inflight": 4,
+  "ready_high_water_bytes": 66273280,
+  "final_high_water_bytes": 308527104
+}

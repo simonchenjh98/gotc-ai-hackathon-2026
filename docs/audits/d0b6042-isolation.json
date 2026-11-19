@@ -1,0 +1,323 @@
+{
+  "layout": "baseline",
+  "admitted_provider_calls": 2,
+  "queue_waiters": 0,
+  "samples_per_condition": 24,
+  "observed_gateway": [],
+  "summary": {
+    "idle": {
+      "login_ms": {
+        "p50": 21.6,
+        "p95": 22.581
+      },
+      "submission_ms": {
+        "p50": 2.667,
+        "p95": 3.031
+      }
+    },
+    "occupied": {
+      "login_ms": {
+        "p50": 21.781,
+        "p95": 23.829
+      },
+      "submission_ms": {
+        "p50": 2.603,
+        "p95": 3.061
+      }
+    },
+    "occupied_to_idle_p95": {
+      "login_ms": 1.055,
+      "submission_ms": 1.01
+    }
+  },
+  "samples": [
+    {
+      "batch": 1,
+      "scenario": "idle",
+      "login_ms": 22.205,
+      "submission_ms": 2.578
+    },
+    {
+      "batch": 1,
+      "scenario": "idle",
+      "login_ms": 22.581,
+      "submission_ms": 2.744
+    },
+    {
+      "batch": 1,
+      "scenario": "idle",
+      "login_ms": 22.332,
+      "submission_ms": 2.82
+    },
+    {
+      "batch": 1,
+      "scenario": "idle",
+      "login_ms": 21.811,
+      "submission_ms": 2.562
+    },
+    {
+      "batch": 1,
+      "scenario": "idle",
+      "login_ms": 21.599,
+      "submission_ms": 2.873
+    },
+    {
+      "batch": 1,
+      "scenario": "idle",
+      "login_ms": 21.356,
+      "submission_ms": 2.637
+    },
+    {
+      "batch": 1,
+      "scenario": "occupied",
+      "login_ms": 22.095,
+      "submission_ms": 1.563
+    },
+    {
+      "batch": 1,
+      "scenario": "occupied",
+      "login_ms": 21.54,
+      "submission_ms": 2.624
+    },
+    {
+      "batch": 1,
+      "scenario": "occupied",
+      "login_ms": 22.174,
+      "submission_ms": 1.393
+    },
+    {
+      "batch": 1,
+      "scenario": "occupied",
+      "login_ms": 22.453,
+      "submission_ms": 2.997
+    },
+    {
+      "batch": 1,
+      "scenario": "occupied",
+      "login_ms": 21.953,
+      "submission_ms": 2.99
+    },
+    {
+      "batch": 1,
+      "scenario": "occupied",
+      "login_ms": 21.572,
+      "submission_ms": 2.619
+    },
+    {
+      "batch": 2,
+      "scenario": "occupied",
+      "login_ms": 21.543,
+      "submission_ms": 2.718
+    },
+    {
+      "batch": 2,
+      "scenario": "occupied",
+      "login_ms": 21.031,
+      "submission_ms": 2.494
+    },
+    {
+      "batch": 2,
+      "scenario": "occupied",
+      "login_ms": 23.829,
+      "submission_ms": 2.502
+    },
+    {
+      "batch": 2,
+      "scenario": "occupied",
+      "login_ms": 24.095,
+      "submission_ms": 3.061
+    },
+    {
+      "batch": 2,
+      "scenario": "occupied",
+      "login_ms": 22.622,
+      "submission_ms": 3.009
+    },
+    {
+      "batch": 2,
+      "scenario": "occupied",
+      "login_ms": 22.583,
+      "submission_ms": 2.946
+    },
+    {
+      "batch": 2,
+      "scenario": "idle",
+      "login_ms": 21.668,
+      "submission_ms": 2.696
+    },
+    {
+      "batch": 2,
+      "scenario": "idle",
+      "login_ms": 21.311,
+      "submission_ms": 3.031
+    },
+    {
+      "batch": 2,
+      "scenario": "idle",
+      "login_ms": 21.846,
+      "submission_ms": 2.723
+    },
+    {
+      "batch": 2,
+      "scenario": "idle",
+      "login_ms": 21.405,
+      "submission_ms": 2.571
+    },
+    {
+      "batch": 2,
+      "scenario": "idle",
+      "login_ms": 22.869,
+      "submission_ms": 3.007
+    },
+    {
+      "batch": 2,
+      "scenario": "idle",
+      "login_ms": 21.958,
+      "submission_ms": 2.897
+    },
+    {
+      "batch": 3,
+      "scenario": "idle",
+      "login_ms": 21.4,
+      "submission_ms": 2.785
+    },
+    {
+      "batch": 3,
+      "scenario": "idle",
+      "login_ms": 21.523,
+      "submission_ms": 2.519
+    },
+    {
+      "batch": 3,
+      "scenario": "idle",
+      "login_ms": 21.601,
+      "submission_ms": 2.501
+    },
+    {
+      "batch": 3,
+      "scenario": "idle",
+      "login_ms": 21.395,
+      "submission_ms": 2.616
+    },
+    {
+      "batch": 3,
+      "scenario": "idle",
+      "login_ms": 21.475,
+      "submission_ms": 2.628
+    },
+    {
+      "batch": 3,
+      "scenario": "idle",
+      "login_ms": 21.184,
+      "submission_ms": 2.612
+    },
+    {
+      "batch": 3,
+      "scenario": "occupied",
+      "login_ms": 22.537,
+      "submission_ms": 2.542
+    },
+    {
+      "batch": 3,
+      "scenario": "occupied",
+      "login_ms": 21.257,
+      "submission_ms": 3.097
+    },
+    {
+      "batch": 3,
+      "scenario": "occupied",
+      "login_ms": 21.857,
+      "submission_ms": 1.535
+    },
+    {
+      "batch": 3,
+      "scenario": "occupied",
+      "login_ms": 21.606,
+      "submission_ms": 2.683
+    },
+    {
+      "batch": 3,
+      "scenario": "occupied",
+      "login_ms": 21.188,
+      "submission_ms": 2.471
+    },
+    {
+      "batch": 3,
+      "scenario": "occupied",
+      "login_ms": 21.749,
+      "submission_ms": 2.576
+    },
+    {
+      "batch": 4,
+      "scenario": "occupied",
+      "login_ms": 21.44,
+      "submission_ms": 2.586
+    },
+    {
+      "batch": 4,
+      "scenario": "occupied",
+      "login_ms": 21.611,
+      "submission_ms": 2.374
+    },
+    {
+      "batch": 4,
+      "scenario": "occupied",
+      "login_ms": 21.834,
+      "submission_ms": 2.479
+    },
+    {
+      "batch": 4,
+      "scenario": "occupied",
+      "login_ms": 21.805,
+      "submission_ms": 2.73
+    },
+    {
+      "batch": 4,
+      "scenario": "occupied",
+      "login_ms": 21.415,
+      "submission_ms": 2.511
+    },
+    {
+      "batch": 4,
+      "scenario": "occupied",
+      "login_ms": 21.757,
+      "submission_ms": 2.759
+    },
+    {
+      "batch": 4,
+      "scenario": "idle",
+      "login_ms": 21.144,
+      "submission_ms": 2.956
+    },
+    {
+      "batch": 4,
+      "scenario": "idle",
+      "login_ms": 21.85,
+      "submission_ms": 3.074
+    },
+    {
+      "batch": 4,
+      "scenario": "idle",
+      "login_ms": 21.879,
+      "submission_ms": 2.466
+    },
+    {
+      "batch": 4,
+      "scenario": "idle",
+      "login_ms": 21.682,
+      "submission_ms": 2.418
+    },
+    {
+      "batch": 4,
+      "scenario": "idle",
+      "login_ms": 20.745,
+      "submission_ms": 2.968
+    },
+    {
+      "batch": 4,
+      "scenario": "idle",
+      "login_ms": 21.351,
+      "submission_ms": 2.541
+    }
+  ]
+}

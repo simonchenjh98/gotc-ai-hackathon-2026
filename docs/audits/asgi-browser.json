@@ -1,0 +1,36 @@
+{
+  "chromium": "151.0.7922.34",
+  "coldLogin": {
+    "loginVisibleMs": [
+      520.4,
+      517.6,
+      502.4,
+      506.5,
+      500.1
+    ],
+    "medianMs": 506.5,
+    "decodedJavaScriptBytes": 40267,
+    "scripts": {
+      "/gotc/static/platform/claims/receipt.22f7ec6c87321300.js": 1521,
+      "/gotc/static/platform/navigation.e065914a9ae064a9.js": 5444,
+      "/gotc/static/platform/routes.a6b080e1799ce2c6.js": 6177,
+      "/gotc/static/platform/shell.4981ae8d5ee920e5.js": 22877,
+      "/gotc/static/site/header.76fce04c8667137a.js": 4248
+    },
+    "downloadBytesPerSecond": 200000,
+    "latencyMs": 40,
+    "coldContexts": 5
+  },
+  "smoke": [
+    "mobile homepage checklist, directory search, public directory, claim link, browser Back",
+    "signed-out contestant, exhibition board, closed finals board, roadshow entry, finals invitation and judge seat",
+    "contestant claim submission and receipt lookup",
+    "roadshow roster name login and direct score-page refresh",
+    "judge professional scoring, exhibition review and roadshow scoring",
+    "audience invitation and vote persisted to the local API",
+    "team submission workbench, AI panel, team profile and private score refresh",
+    "contestant entry links to organizer portal; pre-enrollment organizer signs in explicitly",
+    "organizer dashboard, roadshow roster, finals roster, 7 AI console sections and delegated team round-trip",
+    "delayed claim module cannot replace newer judge login; returning to claim succeeds"
+  ]
+}

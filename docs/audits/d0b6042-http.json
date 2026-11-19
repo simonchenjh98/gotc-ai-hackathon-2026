@@ -1,0 +1,87 @@
+{
+  "anonymous_session": {
+    "cache-control": "no-store",
+    "content-type": "application/json; charset=utf-8",
+    "status": 200,
+    "x-content-type-options": "nosniff"
+  },
+  "conditional_html": {
+    "status": 304
+  },
+  "cross_site_vote": {
+    "status": 403
+  },
+  "demo_download": {
+    "content-disposition": "inline; filename=\"gotc-material.html\"; filename*=UTF-8''Fixture%20team%2BFixture.html",
+    "content-security-policy": "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' https:; style-src 'unsafe-inline' https:; img-src https: data: blob:; font-src https: data:; media-src https: data: blob:; connect-src https:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    "content-type": "text/html; charset=utf-8",
+    "status": 200,
+    "x-content-type-options": "nosniff"
+  },
+  "demo_head": {
+    "status": 200
+  },
+  "demo_upload": {
+    "filename": "Fixture team+Fixture.html",
+    "status": 200
+  },
+  "files_download": {
+    "content-disposition": "attachment; filename=\"gotc-material.zip\"; filename*=UTF-8''Fixture%20team%2BFixture.zip",
+    "content-type": "application/zip",
+    "status": 200,
+    "x-content-type-options": "nosniff"
+  },
+  "files_head": {
+    "status": 200
+  },
+  "files_upload": {
+    "filename": "Fixture team+Fixture.zip",
+    "status": 200
+  },
+  "finals_entry_requires_token": {
+    "status": 401
+  },
+  "gateway_preflight": {
+    "access-control-allow-methods": "GET, HEAD, POST, OPTIONS",
+    "access-control-allow-origin": "https://synthetic-event.invalid",
+    "status": 204
+  },
+  "missing_identity": {
+    "status": 428
+  },
+  "organizer_csv": {
+    "content-disposition": "attachment; filename=\"gotc-scores.csv\"",
+    "content-type": "text/csv; charset=utf-8",
+    "status": 200
+  },
+  "organizer_only": {
+    "status": 401
+  },
+  "own_draft": {
+    "status": 200
+  },
+  "private_profile": {
+    "status": 200
+  },
+  "public_html": {
+    "content-type": "text/html; charset=utf-8",
+    "status": 200,
+    "x-content-type-options": "nosniff"
+  },
+  "public_registration_preflight": {
+    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-origin": "https://simonchenjh98.github.io",
+    "status": 204
+  },
+  "stale_revision": {
+    "status": 409
+  },
+  "team_cookie": {
+    "http_only": true,
+    "name": "gotc_session",
+    "path": "/gotc",
+    "same_site": "Strict",
+    "secure": true,
+    "status": 200
+  }
+}
