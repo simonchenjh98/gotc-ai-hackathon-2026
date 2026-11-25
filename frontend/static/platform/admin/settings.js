@@ -20,7 +20,7 @@ function installSettingsForm(form,group,config){
     if(!form.querySelector('[data-settings-conflict]'))form.insertAdjacentHTML('beforeend','<div data-settings-conflict aria-live="polite"></div>');
     const panel=form.querySelector('[data-settings-conflict]');
     panel.innerHTML='<div class="info-banner warning"><strong>当前输入已保留</strong><p>服务端设置已更新。请先查看最新值并与上方输入核对，复制需要保留的内容，再载入最新值重新填写。</p><button class="btn secondary small" type="button" data-settings-preview>查看服务器最新设置</button></div>';
-    form.querySelector('[data-settings-preview]').onclick=async()=>{
+    form.querySelector('[data-settings-preview]').onclick=buttonAction(async()=>{
       if(!alive({notify:true}))return;
       const request=++previewRequest;
       try{
@@ -34,9 +34,9 @@ function installSettingsForm(form,group,config){
           revision=latest.writeRevisions[group];blocked=false;button.disabled=false;form.editRevision=(form.editRevision || 0)+1;dirtyAdminForms.delete(form);panel.innerHTML='';formError(form,'');
         };
       }catch(error){if(request===previewRequest && alive({error}))formError(form,error.message);}
-    };
+    });
   }
-  form.onsubmit=async event=>{
+  form.onsubmit=buttonAction(async event=>{
     event.preventDefault();if(!alive({notify:true}) || saving || blocked)return;
     button=form.querySelector('[type=submit]') || form.querySelector('button');
     if(!validRevision(revision)){formError(form,'缺少设置版本，请刷新页面升级后再保存。当前输入已保留。');return;}
@@ -62,5 +62,5 @@ function installSettingsForm(form,group,config){
       if(error.status===428)blocked=true;
     }finally{saving=false;if(alive())button.disabled=blocked;}
 
-  };
+  });
 }
