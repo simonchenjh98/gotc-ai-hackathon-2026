@@ -26,7 +26,7 @@
 .api-tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:16px}
 .api-tabs button{border:0;background:none;padding:10px 14px;font-size:14px;color:var(--muted);border-bottom:2px solid transparent;margin-bottom:-1px}
 .api-tabs button[aria-selected=true]{color:var(--blue);border-color:var(--blue);font-weight:600}
-.api-tabs.half{border:0;gap:8px}.api-tabs.half button{flex:1;border:0;border-radius:4px;background:#eef1f5;margin:0}.api-tabs.half button[aria-selected=true]{background:#eaf1ff}
+.api-tabs.half{border:0;gap:8px}.api-tabs.half button{flex:1;border:0;border-radius:4px;background:#eef1f5;margin:0}.api-tabs.half button[aria-pressed=true]{background:#eaf1ff}
 .api-dialog{border:1px solid var(--line);padding:0;width:min(760px,94vw);max-height:90vh;color:var(--navy)}.api-dialog::backdrop{background:rgb(11 33 72/.5);backdrop-filter:blur(3px)}
 .api-dialog-form{display:flex;flex-direction:column;max-height:90vh}
 .api-dialog header,.api-dialog footer{display:flex;align-items:center;gap:12px;padding:14px 22px}.api-dialog header{border-bottom:1px solid var(--line);justify-content:space-between}.api-dialog header h2{margin:0;font-size:17px}

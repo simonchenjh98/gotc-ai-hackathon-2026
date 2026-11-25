@@ -53,5 +53,5 @@ function installTeamRepository(data,version,isCurrent,onUpdate=()=>{}){
   const refresh=document.getElementById('refresh-team-repository');
   if(refresh)refresh.onclick=e=>withBusy(e.currentTarget,async()=>{try{await update(await api('team/repository/refresh',{},{loginId}));}catch(error){if(live())document.getElementById('repository-message').textContent=error.message;}});
   const submit=document.getElementById('repository-submit');
-  if(submit)submit.onclick=()=>{const target=document.getElementById('submission-form');if(!target || !live())return;target.scrollIntoView({behavior:'smooth',block:'start'});if(typeof target.requestSubmit==='function')target.requestSubmit();else target.onsubmit?.({preventDefault(){}});};
+  if(submit)submit.onclick=()=>{const target=document.getElementById('submission-form');if(!target || !live())return;target.scrollIntoView({behavior:'smooth',block:'start'});if(typeof target.requestSubmit==='function')target.requestSubmit(target.querySelector('button[type=submit]') || undefined);else target.onsubmit?.({preventDefault(){}});};
 }

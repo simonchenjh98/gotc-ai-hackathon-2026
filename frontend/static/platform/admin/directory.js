@@ -104,10 +104,10 @@ function adminRecordStatus(record){
 function adminCodeOutput(container,credentials){
   const markup=credentials.map(item=>`<div class="code-output"><strong>${esc(item.name || item.id)}</strong><code>${esc(item.code)}</code><p>仅显示本次，请立即复制并单独发放。</p><button type="button" class="btn secondary small" data-copy-secret>复制登录码</button></div>`).join('');
   if(markup)container.insertAdjacentHTML('beforeend',markup);
-  container.querySelectorAll('[data-copy-secret]').forEach(button=>button.onclick=async()=>{
+  container.querySelectorAll('[data-copy-secret]').forEach(button=>button.onclick=buttonAction(async()=>{
     try{await navigator.clipboard.writeText(button.parentElement.querySelector('code').textContent);toast('登录码已复制。');}
     catch{toast('请选中登录码手动复制。');}
-  });
+  }));
 }
 async function adminSaveForm(form,path,payload,onSaved){
   const version=routeVersion,owner=session,editRevision=form.editRevision || 0;
@@ -320,7 +320,7 @@ function installAdminTeamLifecycle({form,alive,refreshDirectory,clearDirectoryMe
       detail={capture,value:result};roster.innerHTML=adminTeamRosterMarkup(result);node('recycle-open').hidden=!!result.recycle;node('recycle-open').disabled=!ready();
     }catch(error){if(seq===readSeq && same(capture)){roster.innerHTML='<p class="small-note">成员明细读取失败；请刷新后核对。</p>';node('lifecycle-error').textContent=error.message;}}
   }
-  node('detail-refresh').onclick=()=>select();
+  node('detail-refresh').onclick=buttonAction(()=>select());
   node('recycle-open').onclick=()=>{
     if(!valid() || !ready() || recycling)return;
     if(dirtyAdminForms.has(form) && !confirm('队伍表单有未保存的输入。删除针对下方已读取的队伍记录；确认继续查看删除确认？'))return;
@@ -360,11 +360,11 @@ function installAdminTeamLifecycle({form,alive,refreshDirectory,clearDirectoryMe
       const result=await request('admin/data/recycle-bin');if(!valid() || seq!==listSeq)return;
       updateCount(result.teams.length);
       node('recycle-list').innerHTML=`<div class="table-wrap"><table class="board-table"><thead><tr><th>编号 / 队名</th><th>删除时间（北京时间）</th><th>原因</th><th>操作</th></tr></thead><tbody>${result.teams.map(team=>`<tr><td>${esc(team.number)} · ${esc(team.name)}</td><td>${esc(beijingTime(team.recycle.deletedAt))}</td><td>${esc(team.recycle.reason)}</td><td><button type="button" class="btn secondary small" data-restore-team="${esc(team.id)}">查看并恢复</button></td></tr>`).join('') || '<tr><td colspan="4">回收站为空。</td></tr>'}</tbody></table></div>`;
-      node('recycle-list').querySelectorAll('[data-restore-team]').forEach(button=>button.onclick=()=>openRestore(button.dataset.restoreTeam));
+      node('recycle-list').querySelectorAll('[data-restore-team]').forEach(button=>button.onclick=buttonAction(()=>openRestore(button.dataset.restoreTeam)));
     }catch(error){if(valid() && seq===listSeq)node('recycle-list').innerHTML=`<p class="form-error">${esc(error.message)}</p>`;}
   }
-  node('recycle-toggle').onclick=()=>{if(!valid())return;node('recycle-bin').hidden=!node('recycle-bin').hidden;if(!node('recycle-bin').hidden)return loadList();};
-  node('recycle-refresh').onclick=()=>{if(!valid())return;const pending=[loadList()];if(restoringId && !restored)pending.push(loadRestore(true));return Promise.all(pending);};
+  node('recycle-toggle').onclick=buttonAction(()=>{if(!valid())return;node('recycle-bin').hidden=!node('recycle-bin').hidden;if(!node('recycle-bin').hidden)return loadList();});
+  node('recycle-refresh').onclick=buttonAction(()=>{if(!valid())return;const pending=[loadList()];if(restoringId && !restored)pending.push(loadRestore(true));return Promise.all(pending);});
   trackAdminForm(restoreForm);
   function conflicts(){
     if(!restoreDetail)return;
@@ -517,7 +517,7 @@ function installRecordTools(ctx,{alive,next,fresh,track}){
       });
     }catch(error){if(fresh('records',id,results))formError(filter,error.message);}
   }
-  filter.onsubmit=event=>{event.preventDefault();if(hasRecordEdits() && !confirm('有未保存的作废或恢复原因，确认重新查询并放弃输入？'))return;discardRecordEdits();readRecords();};
+  filter.onsubmit=buttonAction(event=>{event.preventDefault();if(hasRecordEdits() && !confirm('有未保存的作废或恢复原因，确认重新查询并放弃输入？'))return;discardRecordEdits();return readRecords();});
   elements.stage.onchange=async()=>{if(hasRecordEdits() && !confirm('有未保存的原因，确认切换阶段并放弃输入？')){elements.stage.value=ctx.reviewQuery?.stage || 'exhibition';return;}discardRecordEdits();if(await loadRuns())readRecords();};
   elements.runId.onchange=()=>{elements.teamId.value='';elements.judgeId.value='';elements.track.value='';};
   loadRuns().then(loaded=>{if(loaded && alive())readRecords();});
@@ -540,6 +540,6 @@ function installAuditTools(ctx,{alive,next,fresh}){
       document.getElementById('audit-export').href='api/'+adminQuery('admin/data/export',{kind:'audit',...values});
     }catch(error){if(fresh('audit',id,output))formError(form,error.message);}
   }
-  form.onsubmit=event=>{event.preventDefault();cursor=null;read();};
+  form.onsubmit=buttonAction(event=>{event.preventDefault();cursor=null;return read();});
   more.onclick=()=>withBusy(more,()=>read(true));read();
 }

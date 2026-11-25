@@ -145,7 +145,8 @@ class ReleaseArtifactAndInstallerTests(unittest.TestCase):
         names = {path.relative_to(staged).as_posix() for path in staged.rglob('*') if path.is_file()}
         expected = {name.removeprefix('frontend/') for name in install.PAGES_FILES}
         manifest = json.loads((staged / 'asset-manifest.json').read_text())['assets']
-        self.assertEqual(names, (expected - manifest.keys()) | {item['path'] for item in manifest.values()} | {'.nojekyll', 'asset-manifest.json'})
+        artwork = {name for name in expected if name.startswith('assets/')}
+        self.assertEqual(names, (expected - manifest.keys()) | artwork | {item['path'] for item in manifest.values()} | {'.nojekyll', 'asset-manifest.json'})
         self.assertIn('index.html', names)
         self.assertIn('static/registration/directory.js', manifest)
         html = (staged / 'index.html').read_text()

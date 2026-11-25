@@ -33,5 +33,5 @@ function installRegistrationAdmin(version){
       if(state.valid() && serial===state.sequence)message.textContent=error.message;
     }finally{if(state.valid() && serial===state.sequence)button.disabled=false;}
   }
-  button.onclick=load;
+  button.onclick=buttonAction(load);
 }

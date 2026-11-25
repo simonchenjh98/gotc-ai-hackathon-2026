@@ -1,13 +1,13 @@
 'use strict';
 
 function makeClaimController({store,request,isCurrent,onChange,schools=[]}){
-  const saved=store.read();let storageError=saved.error,receipt=saved.receipt,generation=0,busy=false;
+  const saved=store.read();let storageError=saved.error,receipt=saved.receipt,generation=0,pendingAction=null;
   let draft={name:'',school:'',email:'',teamName:'',track:'',members:emptyClaimMembers()},editRevision=null;
   let state={status:receipt?'pending':'new',team:null,code:null,error:saved.error,declaration:null,captain:null,requestRevision:null,editing:false,needsReview:false,reviewRevision:null};
-  const publish=()=>{if(isCurrent())onChange({...state,schools,draft,error:[storageError,state.error].filter((value,index,array)=>value && array.indexOf(value)===index).join(' '),receipt,busy});};
+  const publish=()=>{if(isCurrent())onChange({...state,schools,draft,error:[storageError,state.error].filter((value,index,array)=>value && array.indexOf(value)===index).join(' '),receipt,busy:!!pendingAction,pendingAction});};
   const copyDraft=value=>({name:value.name,school:value.school,email:value.email??'',teamName:value.teamName??'',track:value.track??'',members:value.members.map(p=>({...p}))});
   async function run(action,body,reviewLatest=false){
-    if(busy || !isCurrent())return;const operation=++generation;busy=true;state.error='';publish();
+    if(pendingAction || !isCurrent())return;const operation=++generation;pendingAction=reviewLatest?'review':action;state.error='';publish();
     try{
       const send=()=>request('claims/'+action,body);
       const result=action==='redeem'
@@ -28,35 +28,35 @@ function makeClaimController({store,request,isCurrent,onChange,schools=[]}){
       state.error=error.message;
       if(action==='update' || reviewLatest){state.needsReview=true;state.reviewRevision=null;}
     }}
-    finally{if(operation===generation){busy=false;publish();}}
+    finally{if(operation===generation){pendingAction=null;publish();}}
   }
   return {
     navigationState(){
       if(!isCurrent())return {pendingInitial:false,dirty:false};
       const saved=copyDraft({...state.captain,teamName:state.declaration?.teamName,track:state.declaration?.track,members:state.declaration?.members??emptyClaimMembers()});
-      return {pendingInitial:busy && !receipt,dirty:receipt?state.editing && JSON.stringify(draft)!==JSON.stringify(saved):[draft.name,draft.school,draft.email,draft.teamName,draft.track,...draft.members.flatMap(p=>[p.name,p.school])].some(value=>value.trim())};
+      return {pendingInitial:!!pendingAction && !receipt,dirty:receipt?state.editing && JSON.stringify(draft)!==JSON.stringify(saved):[draft.name,draft.school,draft.email,draft.teamName,draft.track,...draft.members.flatMap(p=>[p.name,p.school])].some(value=>value.trim())};
     },
     start(){publish();if(receipt)return this.status();},
-    setDraft(value){if(!isCurrent() || (busy && !receipt))return;draft=copyDraft(value);},
-    addMember(){if(!isCurrent() || (busy && !receipt))return;if(draft.members.length<4){draft={...draft,members:[...draft.members,{name:'',school:''}]};publish();}},
-    removeMember(index){if(!isCurrent() || (busy && !receipt))return;if(draft.members.length>2){draft={...draft,members:draft.members.filter((_,i)=>i!==index)};publish();}},
-    apply(name,school,members,team){if(busy || !isCurrent())return;draft=copyDraft({name,school,...team,members:members??emptyClaimMembers()});return run('request',{name,school,...(members===undefined?{}:{members:draft.members}),...team});},
-    edit(){if(busy || !isCurrent() || state.status!=='pending' || !state.captain || !Number.isSafeInteger(state.requestRevision))return;draft=copyDraft({...state.captain,teamName:state.declaration?.teamName,track:state.declaration?.track,members:state.declaration?.members??emptyClaimMembers()});editRevision=state.requestRevision;state.editing=true;state.error='';state.needsReview=false;state.reviewRevision=null;publish();},
+    setDraft(value){if(!isCurrent() || (pendingAction && !receipt))return;draft=copyDraft(value);},
+    addMember(){if(!isCurrent() || (pendingAction && !receipt))return;if(draft.members.length<4){draft={...draft,members:[...draft.members,{name:'',school:''}]};publish();}},
+    removeMember(index){if(!isCurrent() || (pendingAction && !receipt))return;if(draft.members.length>2){draft={...draft,members:draft.members.filter((_,i)=>i!==index)};publish();}},
+    apply(name,school,members,team){if(pendingAction || !isCurrent())return;draft=copyDraft({name,school,...team,members:members??emptyClaimMembers()});return run('request',{name,school,...(members===undefined?{}:{members:draft.members}),...team});},
+    edit(){if(pendingAction || !isCurrent() || state.status!=='pending' || !state.captain || !Number.isSafeInteger(state.requestRevision))return;draft=copyDraft({...state.captain,teamName:state.declaration?.teamName,track:state.declaration?.track,members:state.declaration?.members??emptyClaimMembers()});editRevision=state.requestRevision;state.editing=true;state.error='';state.needsReview=false;state.reviewRevision=null;publish();},
     update(members,team){
-      if(busy || !isCurrent() || !state.editing)return;draft=copyDraft({...draft,members,...team});
+      if(pendingAction || !isCurrent() || !state.editing)return;draft=copyDraft({...draft,members,...team});
       if(state.needsReview){state.error='草稿已保留，请先读取最新已保存名单并逐人核对，再继续保存。';publish();return;}
       if(receipt)return run('update',{requestId:receipt.requestId,secret:receipt.secret,expectedRevision:editRevision,members:draft.members,...team});
     },
     reviewLatest(){if(receipt && state.editing)return run('status',{requestId:receipt.requestId,secret:receipt.secret},true);},
     confirmReview(){
-      if(busy || !isCurrent() || !state.editing || state.status!=='pending' || !Number.isSafeInteger(state.reviewRevision) || state.reviewRevision!==state.requestRevision)return;
+      if(pendingAction || !isCurrent() || !state.editing || state.status!=='pending' || !Number.isSafeInteger(state.reviewRevision) || state.reviewRevision!==state.requestRevision)return;
       editRevision=state.reviewRevision;state.needsReview=false;state.reviewRevision=null;state.error='';publish();
     },
-    cancelEdit(){generation++;busy=false;state.editing=false;state.error='';state.needsReview=false;state.reviewRevision=null;publish();return this.status();},
+    cancelEdit(){generation++;pendingAction=null;state.editing=false;state.error='';state.needsReview=false;state.reviewRevision=null;publish();return this.status();},
     status(){if(receipt)return run('status',{requestId:receipt.requestId,secret:receipt.secret});},
     redeem(){if(receipt)return run('redeem',{requestId:receipt.requestId,secret:receipt.secret});},
-    clear(){generation++;busy=false;receipt=null;storageError=store.clear();draft={name:'',school:'',email:'',teamName:'',track:'',members:emptyClaimMembers()};state={status:'new',team:null,code:null,error:'',declaration:null,captain:null,requestRevision:null,editing:false,needsReview:false,reviewRevision:null};publish();},
-    dispose(){generation++;busy=false;state.code=null;}
+    clear(){generation++;pendingAction=null;receipt=null;storageError=store.clear();draft={name:'',school:'',email:'',teamName:'',track:'',members:emptyClaimMembers()};state={status:'new',team:null,code:null,error:'',declaration:null,captain:null,requestRevision:null,editing:false,needsReview:false,reviewRevision:null};publish();},
+    dispose(){generation++;pendingAction=null;state.code=null;}
   };
 }
 
@@ -87,7 +87,7 @@ async function renderClaim(version){
       const add=document.getElementById('claim-member-add');if(add)add.onclick=()=>{controller.setDraft(read());controller.addMember();};
       form.querySelectorAll('[data-claim-remove]').forEach(button=>button.onclick=()=>{controller.setDraft(read());controller.removeMember(Number(button.dataset.claimRemove));});
     }
-    const workbench=document.getElementById('claim-workbench');if(workbench)workbench.onclick=event=>openClaimWorkbench(event);
+    const workbench=document.getElementById('claim-workbench');if(workbench)workbench.onclick=buttonAction(event=>openClaimWorkbench(event));
     const edit=document.getElementById('claim-edit');if(edit)edit.onclick=()=>controller.edit();
     const reload=document.getElementById('claim-edit-reload');if(reload)reload.onclick=()=>controller.reviewLatest();
     const confirmEdit=document.getElementById('claim-edit-confirm');if(confirmEdit)confirmEdit.onclick=()=>controller.confirmReview();

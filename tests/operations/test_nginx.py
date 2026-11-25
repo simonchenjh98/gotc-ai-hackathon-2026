@@ -177,7 +177,7 @@ class LiveNginxTests(unittest.TestCase):
         return get
 
     def test_https_negotiation_static_headers_and_shared_host_isolation(self):
-        with self.running() as (get, _, filename, js):
+        with self.running() as (get, current, filename, js):
             for path, service in [("/gotc/api/session", "platform"), ("/gotc/v1/models", "gateway")]:
                 with self.subTest(path=path):
                     status, _, response = get(path, {"X-Forwarded-For": "203.0.113.99", "X-Request-ID": "untrusted"})
@@ -207,6 +207,14 @@ class LiveNginxTests(unittest.TestCase):
             for path in ("private.env", "static/site/legacy.js", "metrics", "readyz", "livez", "backend/gotc/service.py"):
                 with self.subTest(path=path):
                     self.assertEqual(get("/gotc/" + path)[0], 404)
+            assets = current / "frontend" / "assets"
+            for name, cache in [("poster.jpg", "public, no-cache"),
+                                ("poster.1234567890abcdef.jpg", "public, max-age=31536000, immutable")]:
+                (assets / name).write_bytes(b"image fixture")
+                status, headers, body = get("/gotc/assets/" + name)
+                self.assertEqual((status, headers["Cache-Control"], body), (200, cache, b"image fixture"))
+                if "immutable" in cache:
+                    self.assertEqual(get("/gotc/assets/" + name, {"If-None-Match": headers["ETag"]})[0], 304)
             self.assertIn(get("/gotc/assets/link.jpg")[0], (403, 404))
 
 

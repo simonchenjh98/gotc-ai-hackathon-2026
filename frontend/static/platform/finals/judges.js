@@ -11,14 +11,14 @@ async function renderFinalsAccess(version){
   finalsShell(view,'FINALS / 决赛评委','决赛评分与奖项提名','登录开放后输入主办方提供的邀请码，验证后选择自己的姓名或评委席位。',`<section class="surface finals-entry"><h2>决赛评委验证</h2><p class="info-banner" data-finals-login-status role="status">正在读取登录开放状态…</p><form data-finals-access><label class="field">决赛邀请码<input name="code" type="password" autocomplete="one-time-code" required maxlength="160" placeholder="输入主办方提供的邀请码" disabled></label><button class="btn" type="submit" disabled>验证并选择评委席位</button><p class="form-error" role="alert"></p></form><button class="btn secondary small" type="button" data-finals-login-refresh>重新读取登录状态</button><p class="small-note">每2秒自动核对开放状态。每位评委的评分和提名单独保存。</p></section>`);
   const form=view.container.querySelector('[data-finals-access]'),button=form.querySelector('button'),notice=view.container.querySelector('[data-finals-login-status]');
   const buttons=()=>{button.disabled=form.elements.code.disabled=busy || !available;};
-  view.poller=makeFinalsPoller({
+  view.poller=makeLivePoller({
     read:signal=>finalsRequest(view,'finals/login-status',undefined,signal),
     apply:schedule=>{if(!view.valid())return;available=schedule.loginAvailable===true;notice.textContent=schedule.message || (available?'评委登录已开放，请输入决赛邀请码。':'评委登录尚未开放，请等待主办方通知。');buttons();},
     status:kind=>{if(view.current() && kind!=='updated'){available=false;buttons();notice.textContent='暂时无法读取登录开放状态，正在重试；也可点击重新读取。';}},
     alive:()=>view.valid(),isHidden:()=>document.hidden,subscribe:listener=>{document.addEventListener('visibilitychange',listener);return ()=>document.removeEventListener('visibilitychange',listener);}
   });
-  view.container.querySelector('[data-finals-login-refresh]').onclick=()=>view.poller.kick();
-  form.onsubmit=async event=>{
+  view.container.querySelector('[data-finals-login-refresh]').onclick=buttonAction(()=>view.poller.refresh());
+  form.onsubmit=buttonAction(async event=>{
     event.preventDefault();if(busy || !available || !view.valid() || !form.isConnected)return;
     busy=true;buttons();finalsMessage(form,'');
     const code=form.elements.code.value;
@@ -36,17 +36,17 @@ async function renderFinalsAccess(version){
         finalsMessage(form,error.name==='AbortError'?'验证超时，请重试。':error.message);
       }
     }finally{if(form.elements.code.value===code)form.elements.code.value='';busy=false;if(form.isConnected)buttons();}
-  };
+  });
   await view.poller.refresh();
 }
 function finalsInstallAccessExit(view,version){
   const button=view.container.querySelector('[data-finals-access-exit]');if(!button)return;
-  button.onclick=()=>{
+  button.onclick=buttonAction(()=>{
     if(!view.valid())return;
     if([...view.forms].some(form=>form.finalsBusy)){toast('正在保存，请等待结果返回后再退出。');return;}
     if([...view.forms].some(form=>dirtyAdminForms.has(form)) && !confirm('退出会放弃未保存的评分或提名，请先保存或复制输入。确认退出？'))return;
     finalsSetAccess(null);return renderFinalsAccess(version);
-  };
+  });
 }
 async function renderFinalsJudge(version,judge=null){
   if(!finalsHasAccess())return renderFinalsAccess(version);
@@ -58,7 +58,7 @@ async function renderFinalsJudge(version,judge=null){
     const form=view.container.querySelector('[data-finals-entry]'),select=form.elements.judgeId,submit=form.querySelector('[type=submit]');
     const notice=view.container.querySelector('[data-finals-login-status]'),state=view.container.querySelector('[data-finals-entry-state]');
     const buttons=()=>{select.disabled=submit.disabled=!available || !judges.length;};
-    view.poller=makeFinalsPoller({
+    view.poller=makeLivePoller({
       read:async signal=>{
         try{const schedule=await finalsRequest(view,'finals/login-status',undefined,signal);return {schedule,entry:schedule.loginAvailable===true?await finalsRequest(view,'finals/entry',undefined,signal):null};}
         catch(error){
@@ -80,13 +80,13 @@ async function renderFinalsJudge(version,judge=null){
       status:kind=>{if(view.current() && kind!=='updated'){available=false;buttons();if(!finalsHasAccess()){void renderFinalsAccess(version);return;}notice.textContent='暂时无法读取登录开放状态，正在重试；也可点击重新读取。';}},
       alive:()=>view.valid(),isHidden:()=>document.hidden,subscribe:listener=>{document.addEventListener('visibilitychange',listener);return ()=>document.removeEventListener('visibilitychange',listener);}
     });
-    view.container.querySelector('[data-finals-login-refresh]').onclick=()=>view.poller.kick();
-    form.onsubmit=async event=>{
+    view.container.querySelector('[data-finals-login-refresh]').onclick=buttonAction(()=>view.poller.refresh());
+    form.onsubmit=buttonAction(async event=>{
       event.preventDefault();if(!view.valid() || !available)return;
       const selected=judges.find(item=>item.id===select.value);
       if(!selected){finalsMessage(form,'请选择自己的姓名或评委席位。');return;}
       await renderFinalsJudge(version,{id:selected.id,name:selected.name});
-    };
+    });
     await view.poller.refresh();
     return;
   }
@@ -96,12 +96,12 @@ async function renderFinalsJudge(version,judge=null){
   if(!view.valid())return;
   view.data=data;view.config=data.config;view.scores=new Map((data.myScores || []).map(score=>[score.teamId,score]));
   finalsShell(view,'FINALS / 决赛评委','决赛评分与奖项提名','六个方向合计100分。每个奖项可提名1支队伍，也可以不提名；分数和提名分别提交。',`<div class="info-banner ${data.config.open?'':'warning'}" data-finals-window><span data-finals-window-state>${data.config.open?'决赛评分与提名开放中。':'决赛评分与提名已关闭，当前只读。'}</span> <strong>当前评分归属：${esc(view.judgeName)}</strong>。<button class="btn secondary small" type="button" data-finals-switch-judge>切换评委</button></div><div class="finals-admin-tools"><button class="btn secondary small" type="button" data-finals-refresh-judge>重新读取名单与评分</button><span class="small-note" data-finals-sync role="status">每2秒同步已确认名单</span></div><p class="info-banner warning" data-finals-roster-notice hidden></p><div class="finals-judge-layout"><section class="surface"><h2>01 / 按队伍评分</h2><label class="field">选择决赛队伍<select data-finals-team>${data.teams.map(team=>`<option value="${esc(team.id)}" ${team.eligible===false?'disabled':''}>${esc(finalsName(team))} · ${esc(finalsStatus(view.scores.get(team.id)))}</option>`).join('')}</select></label><div data-finals-score-editor></div></section><section class="surface"><h2>02 / 六项专项奖提名</h2><p class="small-note">每项最多提名1队，也可弃权。同一队可以被你提名多个奖项，但最终每队最多获得1个专项奖。最多提名6项；正式提交后才计票。</p><div data-finals-nominations></div></section></div>`);
-  view.container.querySelector('[data-finals-switch-judge]').onclick=()=>{
+  view.container.querySelector('[data-finals-switch-judge]').onclick=buttonAction(()=>{
     if(!view.valid())return;
     if([...view.forms].some(form=>form.finalsBusy)){toast('正在保存，请等待结果返回后再切换评委。');return;}
     if([...view.forms].some(form=>dirtyAdminForms.has(form)) && !confirm('切换评委会放弃当前未保存的评分或提名。请先保存或复制输入，确认切换？'))return;
-    renderFinalsJudge(version);
-  };
+    return renderFinalsJudge(version);
+  });
   const select=view.container.querySelector('[data-finals-team]');view.selected=data.teams.find(team=>team.eligible!==false)?.id || '';
   select.value=view.selected;
   select.onchange=()=>{
@@ -111,7 +111,7 @@ async function renderFinalsJudge(version,judge=null){
     if(old)finalsDiscard(view,old);view.selected=select.value;finalsRenderScore(view);
   };
   finalsRenderScore(view);finalsRenderNominations(view,data.myNominations);
-  view.container.querySelector('[data-finals-refresh-judge]').onclick=()=>finalsConfirmReload(view);
+  view.container.querySelector('[data-finals-refresh-judge]').onclick=buttonAction(()=>finalsConfirmReload(view));
   finalsStartPolling(view,'finals/judge',latest=>syncScoringJudge(view,latest));
 }
 
@@ -120,7 +120,7 @@ function finalsJudgeUnavailable(view,version,error){
   if(error.code==='finals_access_required')return renderFinalsAccess(version);
   if(error.code==='judge_login_not_open')return renderFinalsJudge(version);
   finalsShell(view,'FINALS / 决赛评委','暂时无法读取当前席位','',`<section class="surface"><p role="alert">${esc(error.name==='AbortError'?'读取超时，请重试。':error.message)}</p><button class="btn secondary" type="button" data-finals-reselect>重新读取评委名单</button></section>`);
-  view.container.querySelector('[data-finals-reselect]').onclick=()=>renderFinalsJudge(version);
+  view.container.querySelector('[data-finals-reselect]').onclick=buttonAction(()=>renderFinalsJudge(version));
 }
 
 function finalsRenderScore(view){
@@ -145,7 +145,7 @@ function finalsRenderScore(view){
       if(unchanged && record.status==='recused'){for(const dimension of dimensions)form.elements['score-'+dimension.id].value='';preview();}view.poller?.kick();
     });
   }
-  form.onsubmit=event=>{event.preventDefault();save('submitted');};draft.onclick=()=>save('draft');recuse.onclick=()=>save('recused');form.finalsRefreshButtons();
+  form.onsubmit=buttonAction(event=>{event.preventDefault();return save('submitted');});draft.onclick=buttonAction(()=>save('draft'));recuse.onclick=buttonAction(()=>save('recused'));form.finalsRefreshButtons();
 }
 
 function finalsRenderNominations(view,initial){
@@ -156,5 +156,5 @@ function finalsRenderNominations(view,initial){
   const updateCount=()=>{form.querySelector('[data-finals-nomination-count]').textContent=`当前选择 ${Object.values(values()).filter(Boolean).length} / 6 项提名；尚需点击保存或正式提交。`;};form.addEventListener('change',updateCount);updateCount();
   form.finalsRefreshButtons=()=>{const disabled=!view.config.open || form.finalsBlocked || form.finalsBusy;submit.disabled=disabled;draft.disabled=disabled || record?.status==='submitted';};
   const save=status=>{if(!view.valid() || !view.config.open)return;const nominations=values();if(view.eligibleTeamIds && Object.values(nominations).some(id=>id && !view.eligibleTeamIds.has(id))){finalsMessage(form,'已选队伍不在当前有效入围名单，请改选或选择不提名。');return;}return finalsSave(view,form,'finals/nominations',{runId:view.config.runId,expectedRevision:record?.revision || 0,status,nominations},(result,unchanged)=>{record=result.nominations;view.nominationRecord=record;view.poller?.kick();form.querySelector('[data-finals-saved]').textContent=finalsStatus(record)+(record.status==='submitted'?'；已计入提名统计。':'；草稿不计票。');if(unchanged)form.querySelector('[data-finals-nomination-count]').textContent=`已保存 ${Object.values(record.nominations).filter(Boolean).length} / 6 项提名，其余为弃权。`;});};
-  form.onsubmit=event=>{event.preventDefault();save('submitted');};draft.onclick=()=>save('draft');form.finalsRefreshButtons();
+  form.onsubmit=buttonAction(event=>{event.preventDefault();return save('submitted');});draft.onclick=buttonAction(()=>save('draft'));form.finalsRefreshButtons();
 }

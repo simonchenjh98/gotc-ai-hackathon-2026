@@ -50,19 +50,19 @@ function installClaimsAdmin(version){
     content.innerHTML=`<label class="field">搜索申请与名单<input id="claims-search" type="search" placeholder="姓名、学校、编号或状态"></label><div class="claim-columns"><section><h3>领取申请</h3><div class="claim-scroll">${model.requests.map(r=>`<p data-claim-search="${esc([r.id,r.name,r.school,r.status].join(' ').toLowerCase())}"><button type="button" class="btn secondary small" data-claim-request="${esc(r.id)}">${esc(r.name)} · ${esc(r.school)} · ${esc(({pending:'待审核',approved:'已批准',issued:'已领取',expired:'已过期',rejected:'已拒绝'})[r.status] || r.status)} · 修订 ${Number(r.revision)}</button></p>`).join('') || '<p>暂无申请。</p>'}</div></section><details><summary>私有报名参考记录（${model.people.length} 条）</summary><div class="claim-scroll">${model.people.map(p=>`<details data-claim-search="${esc([p.id,p.name,p.school].join(' ').toLowerCase())}"><summary>${esc(p.name)} · ${esc(p.school)}${p.needsReview?'（待核实）':''}${p.teamId?'（已归队）':''}</summary><p>编号：${esc(p.id)} · 修订 ${Number(p.revision)}${p.teamId?`<br>队伍：${esc(p.teamId)}`:''}</p><pre class="claim-notes">${esc(p.notes)}</pre><button class="btn secondary small" type="button" data-claim-person="${esc(p.id)}">修订此人</button></details>`).join('') || '<p>暂无参考记录，仍可接受并批准新队伍申请。</p>'}</div><button type="button" class="btn secondary small" id="claim-person-add">补充参考记录</button></details></div><div id="claim-review"></div><div id="claim-person-editor"></div><details><summary>导入私有名单</summary><form id="claim-import-form"><label class="field">名单 JSON 文件<input type="file" name="file" accept=".json,application/json" required></label><p class="small-note">格式：people 数组，包含 id、name、school、notes、needsReview；最多 500 人。重复导入不改写已有记录。</p><button class="btn secondary small">导入名单</button><p class="form-error" role="alert"></p></form></details>`;
     const auto=model.autoReview??{revision:0,enabled:false,count:0,eligibleCount:0,ambiguousCount:0,sourceName:''};
     content.insertAdjacentHTML('beforeend',`${model.emailConfigured?'':'<p class="info-banner warning" role="status">邮件服务尚未配置，申请邮件将暂存，配置后在有效期内发送。</p>'}<details><summary>可信自动审核名单（独立来源）</summary><p>状态：${auto.enabled?'已启用':'已停用'} · 修订 ${Number(auto.revision)} · ${Number(auto.count)} 条 · 可匹配 ${Number(auto.eligibleCount)} 条 · 歧义 ${Number(auto.ambiguousCount)} 条</p><p>来源：${esc(auto.sourceName)}<br>SHA-256：<code>${esc(auto.sourceSha256??'')}</code></p><p class="small-note">仅整队姓名与学校唯一匹配且无冲突时自动批准；普通参考记录及公开登记不会获得此资格。替换名单后须重新启用。不会开通 API 服务。</p><form id="claim-auto-toggle"><button class="btn secondary small">${auto.enabled?'停用':'启用'}自动审核</button><p class="form-error" role="alert"></p></form><form id="claim-auto-import"><label class="field">完整可信名单 JSON<input type="file" name="file" accept=".json,application/json" required></label><p class="small-note">autoReview：expectedRevision、sourceName、sourceSha256、entries（id、name、school、eligible、notes），最多 500 条。提交时使用当前显示的修订号，完整替换不会分批生效。</p><button class="btn secondary small">替换可信名单并停用</button><p class="form-error" role="alert"></p></form></details>`);
-    const toggle=document.getElementById('claim-auto-toggle');trackAdminForm(toggle);toggle.onsubmit=event=>{event.preventDefault();mutate(toggle,'admin/claims/auto-review',{expectedRevision:auto.revision,enabled:!auto.enabled});};
+    const toggle=document.getElementById('claim-auto-toggle');trackAdminForm(toggle);toggle.onsubmit=buttonAction(event=>{event.preventDefault();return mutate(toggle,'admin/claims/auto-review',{expectedRevision:auto.revision,enabled:!auto.enabled});});
     const trusted=document.getElementById('claim-auto-import');trackAdminForm(trusted);let importRead=0;
-    trusted.onsubmit=async event=>{
+    trusted.onsubmit=buttonAction(async event=>{
       event.preventDefault();const file=trusted.elements.file.files[0],snapshot=model,readRevision=read,inputRevision=edit,operation=++importRead;
       await importTrustedClaimsFile({form:trusted,file,expectedRevision:auto.revision,
         isCurrent:()=>live() && !busy && model===snapshot && read===readRevision && edit===inputRevision && importRead===operation,
         submit:body=>mutate(trusted,'admin/claims/roster',body),onError:error=>formError(trusted,error)});
-    };
+    });
     document.getElementById('claims-search').oninput=e=>{const q=e.target.value.trim().toLowerCase();for(const item of content.querySelectorAll('[data-claim-search]'))item.hidden=!item.dataset.claimSearch.includes(q);};
     content.querySelectorAll('[data-claim-request]').forEach(button=>button.onclick=()=>selectRequest(button.dataset.claimRequest));
     content.querySelectorAll('[data-claim-person]').forEach(button=>button.onclick=()=>editPerson(model.people.find(p=>p.id===button.dataset.claimPerson)));
     document.getElementById('claim-person-add').onclick=()=>editPerson();
-    const form=document.getElementById('claim-import-form');trackAdminForm(form);form.onsubmit=async event=>{event.preventDefault();const file=form.elements.file.files[0];if(!file)return;if(file.size>2*1024*1024){formError(form,'名单文件超过 2 MB');return;}try{const body=JSON.parse(await file.text());if(live())await mutate(form,'admin/claims/roster',body);}catch(error){if(live())formError(form,error.message);}};
+    const form=document.getElementById('claim-import-form');trackAdminForm(form);form.onsubmit=buttonAction(async event=>{event.preventDefault();const file=form.elements.file.files[0];if(!file)return;if(file.size>2*1024*1024){formError(form,'名单文件超过 2 MB');return;}try{const body=JSON.parse(await file.text());if(live())await mutate(form,'admin/claims/roster',body);}catch(error){if(live())formError(form,error.message);}});
   }
   async function mutate(form,path,body){
     if(!live() || busy)return;busy=true;form.querySelectorAll('button').forEach(button=>button.disabled=true);
@@ -73,7 +73,7 @@ function installClaimsAdmin(version){
   function replaceEditor(panel){if([...panel.querySelectorAll('form')].some(f=>dirtyAdminForms.has(f)) && !confirm('切换会替换未保存输入。请先复制备注。继续？'))return false;for(const f of panel.querySelectorAll('form'))dirtyAdminForms.delete(f);edit++;return true;}
   function editPerson(person){
     if(!live() || busy)return;const panel=document.getElementById('claim-person-editor');if(!replaceEditor(panel))return;panel.innerHTML=claimsPersonForm(person);const form=document.getElementById('claim-person-form');trackAdminForm(form);
-    form.onsubmit=e=>{e.preventDefault();const f=form.elements;mutate(form,'admin/claims/person',{expectedRevision:Number(f.revision.value),person:{id:f.id.value,name:f.name.value,school:f.school.value,notes:f.notes.value,needsReview:f.needsReview.checked}});};
+    form.onsubmit=buttonAction(e=>{e.preventDefault();const f=form.elements;return mutate(form,'admin/claims/person',{expectedRevision:Number(f.revision.value),person:{id:f.id.value,name:f.name.value,school:f.school.value,notes:f.notes.value,needsReview:f.needsReview.checked}});});
   }
   function selectRequest(id){
     if(!live() || busy)return;const panel=document.getElementById('claim-review');if(!replaceEditor(panel))return;const request=model.requests.find(r=>r.id===id);panel.innerHTML=claimsReviewMarkup(request,model);const form=document.getElementById('claim-review-form');if(!form)return;trackAdminForm(form);
@@ -83,15 +83,15 @@ function installClaimsAdmin(version){
       document.getElementById('claim-existing-summary').innerHTML=claimExistingTeamMarkup(team);
     };
     const common=action=>({requestId:id,expectedRevision:request.revision,action,note:form.elements.note.value});
-    form.onsubmit=e=>{
+    form.onsubmit=buttonAction(e=>{
       e.preventDefault();if(!request.declaration)return;const f=form.elements;
       const selectedId=f.teamId?.value??'',selected=(model.teams??[]).find(team=>team.id===selectedId);
       if(selectedId && !selected){formError(form,'所选队伍已变化，请刷新后核对');return;}
-      mutate(form,'admin/claims/approve',{requestId:id,expectedRevision:request.revision,reviewContext:request.reviewContext,
+      return mutate(form,'admin/claims/approve',{requestId:id,expectedRevision:request.revision,reviewContext:request.reviewContext,
         teamName:f.teamName.value,track:f.track.value,note:f.note.value,verificationMethod:'online',applicationReviewed:true,
         ...(selected?{teamId:selected.id,teamContext:selected.teamContext}:{}),resolvedIdentity:f.resolvedIdentity.checked});
-    };
-    document.getElementById('claim-reject').onclick=()=>{if(confirm('确认拒绝此申请？'))mutate(form,'admin/claims/review',common('reject'));};
+    });
+    document.getElementById('claim-reject').onclick=buttonAction(()=>{if(confirm('确认拒绝此申请？'))return mutate(form,'admin/claims/review',common('reject'));});
   }
-  document.getElementById('claims-admin-load').onclick=load;
+  document.getElementById('claims-admin-load').onclick=buttonAction(load);
 }

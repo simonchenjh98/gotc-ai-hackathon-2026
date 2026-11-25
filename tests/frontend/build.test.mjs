@@ -35,13 +35,16 @@ test('hashed output is repeatable, rewrites eager and lazy paths, and updates on
   assert.equal(firstManifest, readFileSync(join(second,'asset-manifest.json'),'utf8'));
   const names = readdirSync(first,{recursive:true});
   const {assets,version} = JSON.parse(firstManifest);
-  assert.equal(version,1);
+  assert.equal(version,2);
   for (const [logical,{path,integrity}] of Object.entries(assets)) {
     const bytes = readFileSync(join(first,path));
     const fingerprint = createHash('sha256').update(bytes).digest('hex').slice(0,16);
-    assert.equal(path,logical.replace(/\.(js|css)$/,'.'+fingerprint+'.$1'));
+    assert.equal(path,logical.replace(/\.(js|css|jpg|webp)$/,'.'+fingerprint+'.$1'));
     assert.equal(integrity,'sha384-'+createHash('sha384').update(bytes).digest('base64'));
-    assert.ok(!names.includes(logical));
+    if (logical.startsWith('assets/')) {
+      assert.deepEqual(readFileSync(join(first,logical)),bytes);
+      assert.ok(readFileSync(join(first,'index.html'),'utf8').includes('"'+path+'"'));
+    } else assert.ok(!names.includes(logical));
     assert.deepEqual(bytes,readFileSync(join(second,path)));
   }
   for (const page of ['index.html','teams.html','platform.html']) {
@@ -100,11 +103,14 @@ test('hashed output is repeatable, rewrites eager and lazy paths, and updates on
   cpSync(source,copy,{recursive:true});
   const leaf='static/platform/claims/application.js';
   writeFileSync(join(copy,leaf),'\n// Synthetic build fixture\n',{flag:'a'});
+  const poster='assets/schedule-20261106.jpg';
+  writeFileSync(join(copy,poster),Buffer.from([0]),{flag:'a'});
   const third=join(tmp,'third');
   build(copy,third);
   const changed=JSON.parse(readFileSync(join(third,'asset-manifest.json'),'utf8')).assets;
   assert.deepEqual(Object.keys(changed).filter(key=>assets[key].path!==changed[key].path).sort(),
-    [leaf,'static/platform/route-assets.js','static/platform/routes.js'].sort());
+    [leaf,poster,'static/platform/route-assets.js','static/platform/routes.js'].sort());
+  assert.ok(readFileSync(join(third,'index.html'),'utf8').includes(changed[poster].path));
   assert.notEqual(readFileSync(join(first,'platform.html'),'utf8'),readFileSync(join(third,'platform.html'),'utf8'));
 });
 
@@ -118,6 +124,8 @@ test('Pages uses the configured HTTPS origin and integrated HTML stays same-orig
     'href="https://stage.example:9443/gotc/platform.html#team"', 'data-platform-base="https://stage.example:9443/gotc/"']) {
     assert.ok(homepage.includes(text));
   }
+  const {assets}=JSON.parse(readFileSync(join(output,'asset-manifest.json'),'utf8'));
+  assert.ok(homepage.includes('property="og:image" content="https://stage.example:9443/gotc/'+assets['assets/hero-city.webp'].path+'"'));
   const local=join(tmp,'integrated');
   build(source,local);
   assert.ok(readFileSync(join(local,'index.html'),'utf8').includes('data-api="api/registration"'));

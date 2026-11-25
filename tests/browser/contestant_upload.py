@@ -73,7 +73,10 @@ def contestant_upload(visit, service, admin):
             bundle.writestr("project/README.md", "Synthetic project\n")
             bundle.writestr("project/main.py", "print('Fixture')\n")
 
-        expect(page.locator("#upload-slides-button")).to_be_disabled()
+        disabled_upload = page.locator("#upload-slides-button")
+        expect(disabled_upload).to_be_disabled()
+        expect(disabled_upload).to_have_css("cursor", "not-allowed")
+        expect(disabled_upload).not_to_have_attribute("aria-busy", "true")
         expect(page.get_by_text("当前作品提交只读", exact=False)).to_be_visible()
         set_window(admin, True)
         page.reload(wait_until="networkidle")

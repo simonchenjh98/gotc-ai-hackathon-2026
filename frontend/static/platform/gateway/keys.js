@@ -30,7 +30,7 @@ function revealPendingTeamKey(view){
   const out=view.out;
   out.innerHTML=`<div class="code-output"><strong>新密钥 · ${esc(result.item.name)}</strong><code>${esc(view.key)}</code><p>仅显示这一次，离开或刷新页面后无法再查看。请立即复制保存。</p><button type="button" class="btn secondary small" id="copy-api-key">复制密钥</button>${setupSnippets(view.data,view.key)}</div>`;
   const copy=document.getElementById('copy-api-key');
-  copy.onclick=async()=>{
+  copy.onclick=buttonAction(async()=>{
     if(!view.valid() || view.copying || !view.key || !copy.isConnected || document.getElementById('copy-api-key')!==copy)return;
     const value=view.key;view.copying=true;copy.disabled=true;
     try{
@@ -40,7 +40,7 @@ function revealPendingTeamKey(view){
       if(view.valid() && view.key===value)toast('密钥已复制。');
     }catch(error){if(view.valid())toast('复制未完成，请核对登录身份后重试。'+error.message);}
     finally{view.copying=false;if(view.valid() && copy.isConnected)copy.disabled=false;}
-  };
+  });
   out.scrollIntoView({block:'center'});
 }
 async function loadTeamKeys(version,context=null){
@@ -52,7 +52,7 @@ async function loadTeamKeys(version,context=null){
   try{data=await view.request('team/keys');}
   catch(error){if(alive()){
     box.innerHTML=`<h2>AI API 密钥</h2><p class="small-note" role="status">${view.pendingKey?'密钥已创建，正在等待身份验证；请保持本页，重试验证不会创建第二把密钥。':''}${esc(error.message)}</p><button type="button" class="btn secondary small" id="retry-team-keys">重试读取 / 验证</button>`;
-    document.getElementById('retry-team-keys').onclick=async()=>{if(!view.valid() || view.busy)return;view.busy=true;try{await loadTeamKeys(version,view);}finally{view.busy=false;if(view.valid())view.updateButtons?.();}};
+    document.getElementById('retry-team-keys').onclick=buttonAction(async()=>{if(!view.valid() || view.busy)return;view.busy=true;try{await loadTeamKeys(version,view);}finally{view.busy=false;if(view.valid())view.updateButtons?.();}});
   }return false;}
   if(!alive())return false;
   if(!data.enabled){view.key='';view.pendingKey=null;view.out.innerHTML='';box.innerHTML='<h2>AI API 密钥</h2><p class="small-note">本队 API 访问权限尚未开通或已停用，请联系组织方。</p>';return false;}
@@ -63,7 +63,7 @@ async function loadTeamKeys(version,context=null){
   const form=document.getElementById('key-form'),submit=form.querySelector('button'),deletes=[...box.querySelectorAll('[data-key-delete]')];
   view.updateButtons=()=>{if(alive()){submit.disabled=full || view.busy;deletes.forEach(button=>button.disabled=view.busy);}};
   view.updateButtons();
-  form.onsubmit=async event=>{
+  form.onsubmit=buttonAction(async event=>{
     event.preventDefault();if(!alive() || view.busy || full || !form.isConnected || document.getElementById('key-form')!==form)return;
     view.busy=true;view.updateButtons();formError(form,'');
     try{
@@ -74,8 +74,8 @@ async function loadTeamKeys(version,context=null){
       await loadTeamKeys(version,view);
     }catch(error){if(alive() && form.isConnected)formError(form,error.message);}
     finally{view.busy=false;if(view.valid())view.updateButtons?.();}
-  };
-  deletes.forEach(button=>button.onclick=async()=>{
+  });
+  deletes.forEach(button=>button.onclick=buttonAction(async()=>{
     if(!alive() || view.busy || !button.isConnected || !confirm('删除后使用该密钥的程序立即无法调用，确认删除？') || !alive())return;
     view.busy=true;view.updateButtons();
     try{
@@ -84,7 +84,7 @@ async function loadTeamKeys(version,context=null){
       view.key='';view.out.innerHTML='';toast('密钥已删除。');await loadTeamKeys(version,view);
     }catch(error){if(alive())formError(form,error.message);}
     finally{view.busy=false;if(view.valid())view.updateButtons?.();}
-  });
+  }));
   const calls=document.getElementById('team-calls');
   view.request('team/keys/logs').then(logs=>{if(alive() && calls.isConnected && document.getElementById('team-calls')===calls)calls.innerHTML=callTable(logs.items,false);})
     .catch(error=>{if(alive() && calls.isConnected && document.getElementById('team-calls')===calls)calls.innerHTML=`<p class="small-note">${esc(error.message)}</p>`;});

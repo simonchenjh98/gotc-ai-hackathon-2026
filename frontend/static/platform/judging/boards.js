@@ -21,27 +21,52 @@ function progressBoardMarkup(data){
   const stage=data.stage?.id || 'exhibition',name=stageName(stage);
   return stageNotice(stage)+metrics([[teams.length,stage==='roadshow'?'本轮路演队伍':'本轮展示队伍'],[teams.reduce((n,t)=>n+Number(t.reviewCount || 0),0),'正式评审记录（未计分）'],['待配置','数值评分规则'],['未实现','排名与成绩发布']])+`<div class="info-banner warning"><strong>${name}进度 · 不是成绩榜</strong><br>当前仅展示正式评审记录数量。分值、汇总、排名与晋级规则待配置，成绩发布尚未实现。${data.window?.canEdit?'本轮评审记录开放中。':'本轮评审记录尚未开放或已截止。'}</div>`+(teams.length?`<div class="table-wrap"><table class="board-table"><thead><tr><th scope="col">队伍 / 作品</th><th scope="col" class="track-col">探索方向</th><th scope="col">正式评审记录</th><th scope="col">成绩 / 排名</th></tr></thead><tbody>${visible.map(t=>`<tr><td><div class="team-name"><span class="team-number">${esc(String(t.number).padStart(2,'0'))}</span>${esc(t.name)}<small>${esc(t.project || '作品名称待完善')}</small></div></td><td class="track-col">${esc(t.track || '—')}</td><td>${Number(t.reviewCount || 0)} <span class="board-pending">份 · 未计分</span></td><td><span class="board-pending">规则待配置 / 未实现</span></td></tr>`).join('')}</tbody></table></div>`:empty(`本轮还没有${stage==='roadshow'?'路演':'展示'}队伍`,'组织方配置本轮工作名单后，评审进度会出现在这里。'))+`<div class="board-foot"><span>${screen?`第 ${page+1} / ${pageCount} 屏 · 每 12 秒轮播 · `:''}草稿与回避不计入正式评审记录数。</span><span>北京时间 ${esc(beijingTime(data.window?.serverTime || Date.now()))}</span></div>`;
 }
-async function loadExhibitionBoard(version,stage=stageForRoute()){
-  const data=await api(`judging/${stage}/board`);if(version!==routeVersion)return;
-  lastBoard=data;document.getElementById('board-content').innerHTML=progressBoardMarkup(data);
-  const status=document.getElementById('live-status');status.classList.remove('offline');status.innerHTML='<span class="live-dot"></span>已连接 · 每 2 秒更新';
+function watchBoard(version,path,markup,unavailableTitle){
+  const status=document.getElementById('live-status'),content=document.getElementById('board-content');
+  const offline=()=>window.navigator?.onLine===false;
+  function connection(message,unavailable){
+    status.classList.toggle('offline',unavailable);
+    status.innerHTML='<span class="live-dot"></span>'+message;
+  }
+  function showOffline(){
+    connection('网络已断开 · 恢复后自动更新',true);
+    if(!lastBoard)content.innerHTML=empty(unavailableTitle,'网络恢复后将自动重新读取。');
+  }
+  if(offline())showOffline();
+  boardPoller=makeLivePoller({
+    read:signal=>api(path,undefined,{signal}),
+    apply(data){lastBoard=data;content.innerHTML=markup(data);},
+    status(result,error){
+      if(result==='updated'){connection('已连接 · 每 2 秒更新',false);return;}
+      const message=result==='auth'?'当前身份无法读取 · 请重新登录':'连接中断 · 正在重试';
+      connection(message,true);
+      if(result==='auth'){lastBoard=null;content.innerHTML=empty(unavailableTitle,message);}
+      else if(!lastBoard)content.innerHTML=empty(unavailableTitle,esc(error.message));
+    },
+    alive:()=>routeVersion===version,
+    isHidden:()=>document.hidden || offline(),
+    subscribe(refresh){
+      function changed(){if(offline())showOffline();refresh();}
+      document.addEventListener('visibilitychange',changed);
+      window.addEventListener('online',changed);
+      window.addEventListener('offline',changed);
+      return ()=>{
+        document.removeEventListener('visibilitychange',changed);
+        window.removeEventListener('online',changed);
+        window.removeEventListener('offline',changed);
+      };
+    }
+  });
+  return boardPoller.refresh();
 }
 async function renderExhibitionBoard(version){
   const stage=stageForRoute(),name=stageName(stage);
-  root.innerHTML=heading(`LIVE / ${name}进度`,`${name}进度`,'查看本轮正式评审记录数量。计分与成绩发布尚未实现。','<span class="live-indicator" id="live-status"><span class="live-dot"></span>连接中…</span><button class="btn secondary small" id="screen-toggle">大屏模式 ↗</button>')+'<div id="board-content"><div class="loading-state">正在读取本轮评审进度…</div></div>';
-  document.getElementById('screen-toggle').onclick=()=>{document.body.classList.toggle('screen-mode');screenStarted=Date.now();if(lastBoard)document.getElementById('board-content').innerHTML=progressBoardMarkup(lastBoard);document.getElementById('screen-toggle').textContent=document.body.classList.contains('screen-mode')?'退出大屏模式':'大屏模式 ↗';};
-  async function tick(){try{await loadExhibitionBoard(version,stage);}catch(e){if(version!==routeVersion)return;const status=document.getElementById('live-status');status.classList.add('offline');status.innerHTML='<span class="live-dot"></span>连接中断 · 正在重试';if(!lastBoard)document.getElementById('board-content').innerHTML=empty('暂时无法读取进度',esc(e.message));}finally{if(version===routeVersion)pollTimer=setTimeout(tick,2000);}}
-  await tick();
-}
-async function loadBoard(version) {
-  const data = await api('board'); if (version !== routeVersion) return;
-  lastBoard = data;
-  document.getElementById('board-content').innerHTML = boardMarkup(data);
-  const status = document.getElementById('live-status'); status.classList.remove('offline'); status.innerHTML = '<span class="live-dot"></span>已连接 · 每 2 秒更新';
+  root.innerHTML=heading(`LIVE / ${name}进度`,`${name}进度`,'查看本轮正式评审记录数量。计分与成绩发布尚未实现。','<span class="live-indicator" id="live-status"><span class="live-dot"></span>连接中…</span><button class="btn secondary small" id="screen-toggle" aria-pressed="false">大屏模式 ↗</button>')+'<div id="board-content"><div class="loading-state">正在读取本轮评审进度…</div></div>';
+  document.getElementById('screen-toggle').onclick=()=>{document.getElementById('screen-toggle').setAttribute('aria-pressed',String(document.body.classList.toggle('screen-mode')));screenStarted=Date.now();if(lastBoard)document.getElementById('board-content').innerHTML=progressBoardMarkup(lastBoard);document.getElementById('screen-toggle').textContent=document.body.classList.contains('screen-mode')?'退出大屏模式':'大屏模式 ↗';};
+  await watchBoard(version,`judging/${stage}/board`,progressBoardMarkup,'暂时无法读取进度');
 }
 async function renderBoard(version) {
-  root.innerHTML = heading('LIVE / GOTC 2026','每一格，都在发生。','百格成城 · 实时成绩看板', '<span class="live-indicator" id="live-status"><span class="live-dot"></span>连接中…</span><button class="btn secondary small" id="screen-toggle">大屏模式 ↗</button>') + '<div id="board-content"><div class="loading-state">正在读取本届活动数据…</div></div>';
-  document.getElementById('screen-toggle').onclick = () => { document.body.classList.toggle('screen-mode'); screenStarted = Date.now(); if(lastBoard)document.getElementById('board-content').innerHTML=boardMarkup(lastBoard); document.getElementById('screen-toggle').textContent = document.body.classList.contains('screen-mode') ? '退出大屏模式' : '大屏模式 ↗'; };
-  async function tick() { try { await loadBoard(version); } catch(e) { if(version !== routeVersion)return; const status=document.getElementById('live-status'); status.classList.add('offline');status.innerHTML='<span class="live-dot"></span>连接中断 · 正在重试';if(!lastBoard)document.getElementById('board-content').innerHTML=empty('暂时无法读取数据',esc(e.message)); } finally { if(version === routeVersion)pollTimer=setTimeout(tick,2000); } }
-  await tick();
+  root.innerHTML = heading('LIVE / GOTC 2026','每一格，都在发生。','百格成城 · 实时成绩看板', '<span class="live-indicator" id="live-status"><span class="live-dot"></span>连接中…</span><button class="btn secondary small" id="screen-toggle" aria-pressed="false">大屏模式 ↗</button>') + '<div id="board-content"><div class="loading-state">正在读取本届活动数据…</div></div>';
+  document.getElementById('screen-toggle').onclick = () => { document.getElementById('screen-toggle').setAttribute('aria-pressed',String(document.body.classList.toggle('screen-mode'))); screenStarted = Date.now(); if(lastBoard)document.getElementById('board-content').innerHTML=boardMarkup(lastBoard); document.getElementById('screen-toggle').textContent = document.body.classList.contains('screen-mode') ? '退出大屏模式' : '大屏模式 ↗'; };
+  await watchBoard(version,'board',boardMarkup,'暂时无法读取数据');
 }

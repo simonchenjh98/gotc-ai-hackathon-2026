@@ -124,7 +124,7 @@ const apiPageRenderers={
       `<strong>${esc(apiAccountName(kind,u))}</strong>`,`<span class="api-platform ${kind}"><b>${esc(apiPlatforms[kind].label)}</b><i>Key</i></span>`,apiBadge('正常','success'),`<code>${esc(u.url)}</code>`,
       `${names.slice(0,3).map(m=>`<span class="api-chip">${esc(m)}</span>`).join('')}${names.length>3?`<small> 等 ${names.length} 个</small>`:''}${Object.keys(u.aliases || {}).length?`<br><small>${Object.keys(u.aliases).length} 条映射</small>`:''}`,pricing(u),
       `<span class="api-row-actions"><button type="button" class="link-button" data-edit="${kind}">编辑</button><button type="button" class="link-button" data-test="${kind}">测试连接</button><button type="button" class="link-button danger" data-delete="${kind}">删除</button></span>`];}),'还没有账号。点击右上角“添加账号”，填写接口地址与 API Key，再同步上游模型即可。')}</section>`;
-    c.actions.querySelector('[data-refresh]').onclick=()=>c.reload();
+    c.actions.querySelector('[data-refresh]').onclick=buttonAction(()=>c.reload());
     c.actions.querySelector('[data-add]').onclick=()=>apiAccountDialog(c,free[0],false);
     c.box.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>apiAccountDialog(c,b.dataset.edit,true));
     c.box.querySelectorAll('[data-test]').forEach(b=>b.onclick=()=>apiTestDialog(c,b.dataset.test));
@@ -138,8 +138,8 @@ const apiPageRenderers={
     c.box.innerHTML='<div class="api-tabs" role="tablist"><button type="button" role="tab" data-tab="stats" aria-selected="true">用量统计</button><button type="button" role="tab" data-tab="logs" aria-selected="false">调用记录</button><button type="button" role="tab" data-tab="errors" aria-selected="false">错误请求</button></div><div id="key-detail" aria-live="polite"></div>';
     const select=c.actions.querySelector('[data-team]');let tab='stats';
     const show=()=>{if(!c.alive())return;const teamId=select.value || null,title=teamId?c.team(teamId):'全部队伍';c.box.querySelectorAll('[data-tab]').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.tab===tab)));
-      (tab==='stats'?showKeyStats({teamId},title,7):showKeyLogs({teamId},title,tab==='errors')).catch(e=>toast(e.message));};
-    select.onchange=show;c.box.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{tab=b.dataset.tab;show();});show();
+      return (tab==='stats'?showKeyStats({teamId},title,7):showKeyLogs({teamId},title,tab==='errors')).catch(e=>toast(e.message));};
+    select.onchange=show;c.box.querySelectorAll('[data-tab]').forEach(b=>b.onclick=buttonAction(()=>{tab=b.dataset.tab;return show();}));show();
   },
   audit(c){
     c.box.innerHTML=`<section class="api-card flush">${apiTable(['时间（北京）','操作','对象','详情'],c.data.changes.map(x=>[esc(beijingTime(x.at)),esc(changeName[x.action] || x.action),esc(x.target?c.team(x.target):'—'),`<small class="api-json">${esc(JSON.stringify(x.metadata)).slice(0,300)}</small>`]),'暂无记录')}</section><p class="small-note">显示最近 50 条 AI API 管理操作。</p>`;
@@ -174,7 +174,7 @@ function apiAccountDialog(c,kind,editing){
     <div class="field"><span>快速填入</span><div class="form-actions">${apiPresets.filter(x=>x[1]===kind).map(([name,,url])=>`<button type="button" class="btn secondary small" data-preset="${esc(url)}" data-preset-name="${esc(name)}">${esc(name)}</button>`).join('')}</div></div>
     <label class="field">Base URL<input name="url" placeholder="${esc(p.official)}" value="${esc(u.url || '')}"><small>留空使用官方 ${esc(p.label)} API。只接受 HTTPS（本机地址除外）。</small></label>
     <label class="field">API Key${editing?'':' *'}<input name="key" type="password" autocomplete="off" placeholder="${editing?esc(u.keyHint?.startsWith('…')?`已保存 ${u.keyHint}`:'已保存'):esc(p.keyHint)}"><small>${editing?'留空以保持当前密钥（更换接口域名时需要重新填写）。':`您的 ${esc(p.label)} API Key，保存后不再显示，队伍看不到。`}</small></label>
-    <div class="field"><span>模型限制</span><div class="api-tabs half"><button type="button" data-mode="whitelist" aria-selected="true">模型白名单</button><button type="button" data-mode="mapping" aria-selected="false">模型映射</button></div>
+    <div class="field"><span>模型限制</span><div class="api-tabs half"><button type="button" data-mode="whitelist" aria-pressed="true">模型白名单</button><button type="button" data-mode="mapping" aria-pressed="false">模型映射</button></div>
       <div data-pane="whitelist"><div class="api-chips" data-chips></div><p class="small-note" data-count></p>
         <div class="form-actions"><button type="button" class="btn secondary small api-sync" data-sync>同步上游支持的模型</button><button type="button" class="btn danger small" data-clear>清除所有模型</button><span class="small-note" data-sync-status role="status" aria-live="polite"></span></div>
         <div class="api-custom"><input data-custom placeholder="输入自定义模型名称" aria-label="自定义模型名称"><button type="button" class="btn secondary small" data-add-custom>填入</button></div><div data-catalog></div></div>
@@ -202,7 +202,7 @@ function apiAccountDialog(c,kind,editing){
     if(t.dataset.aliasDel!==undefined){s.aliases.splice(Number(t.dataset.aliasDel),1);drawAliases();}});
   d.querySelectorAll('[data-platform]').forEach(b=>b.onclick=()=>{if(b.dataset.platform===kind)return;d.close();apiAccountDialog(c,b.dataset.platform,false);});
   d.querySelectorAll('[data-preset]').forEach(b=>b.onclick=()=>{f.url.value=b.dataset.preset;if(!f.name.value)f.name.value=b.dataset.presetName;f.key.focus();});
-  d.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>{d.querySelectorAll('[data-mode]').forEach(x=>x.setAttribute('aria-selected',String(x===b)));d.querySelectorAll('[data-pane]').forEach(x=>x.hidden=x.dataset.pane!==b.dataset.mode);});
+  d.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>{d.querySelectorAll('[data-mode]').forEach(x=>x.setAttribute('aria-pressed',String(x===b)));d.querySelectorAll('[data-pane]').forEach(x=>x.hidden=x.dataset.pane!==b.dataset.mode);});
   q('[data-clear]').onclick=()=>{if(s.models.length && !confirm('清除所有已选模型？'))return;s.models=[];drawChips();};
   q('[data-add-custom]').onclick=()=>{const n=q('[data-custom]').value.trim();if(/\s/.test(n) || n.length>100){toast('模型名不能含空格，最多 100 字。');return;}add([n]);q('[data-custom]').value='';};
   q('[data-alias-add]').onclick=()=>{s.aliases.push(['',s.models[0] || '']);drawAliases();};

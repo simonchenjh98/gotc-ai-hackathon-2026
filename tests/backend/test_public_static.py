@@ -1,6 +1,7 @@
 """Packaged frontend revalidation and private data directory regressions."""
 from contextlib import closing
 import http.client
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -63,6 +64,24 @@ class PackagedServiceTests(unittest.TestCase):
         self.assertNotEqual(headers["ETag"], validator)
         status, headers, _ = self.request(port, "/static/platform/login.css")
         self.assertEqual((status, headers["Content-Type"]), (200, "text/css; charset=utf-8"))
+
+    def test_only_manifest_artwork_has_immutable_cache_headers(self):
+        assets = self.frontend / "assets"
+        assets.mkdir()
+        original = "assets/photo.jpg"
+        versioned = "assets/photo.1234567890abcdef.jpg"
+        unlisted = "assets/photo.0000000000000000.jpg"
+        (self.frontend / "asset-manifest.json").write_text(json.dumps({
+            "version": 2, "assets": {original: {"path": versioned}}
+        }))
+        for name in (original, versioned, unlisted):
+            (self.frontend / name).write_bytes(b"test artwork")
+        port = self.serve()
+        for name, policy in [(versioned, "public, max-age=31536000, immutable"),
+                             (original, "public, no-cache"), (unlisted, "public, no-cache")]:
+            with self.subTest(name=name):
+                status, headers, body = self.request(port, "/" + name)
+                self.assertEqual((status, headers["Cache-Control"], body), (200, policy, b"test artwork"))
 
     def test_private_files_and_directories_are_never_public_assets(self):
         port = self.serve()

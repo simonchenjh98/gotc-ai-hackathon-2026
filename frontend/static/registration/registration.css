@@ -6,7 +6,7 @@
 .registration-panel p{line-height:1.7}.registration-note{font-size:13px;color:#59677b;margin:10px 0}
 .registration-tabs{display:flex;gap:8px;margin:0 0 20px;flex-wrap:wrap}
 .reg-button{appearance:none;border:1px solid #073bcf;background:#073bcf;color:#fff;border-radius:3px;padding:11px 16px;font-family:inherit;font-size:14px;font-weight:700;line-height:1.4;cursor:pointer;min-height:44px;text-decoration:none;display:inline-block}
-.reg-button.secondary{background:white;color:#073bcf}.reg-button:disabled{opacity:.5;cursor:wait}.reg-button:hover:not(:disabled){background:#164fd9;color:white}
+.reg-button.secondary{background:white;color:#073bcf}.reg-button:hover:not(:disabled){background:#164fd9;color:white}
 .reg-button:focus-visible,.registration-panel input:focus-visible,.registration-panel textarea:focus-visible,.registration-panel select:focus-visible{outline:3px solid #ffb454;outline-offset:2px}
 .registration-form fieldset{border:0;padding:0;margin:0;min-width:0}.registration-form legend{font-weight:700;font-size:14px;margin-bottom:10px}
 .registration-fields{display:grid;grid-template-columns:1fr 1fr;gap:14px}.registration-field{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:650;min-width:0;margin-bottom:14px}.registration-fields .registration-field{margin-bottom:0}.registration-field.wide{grid-column:1/-1}

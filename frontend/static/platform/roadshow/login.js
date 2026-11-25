@@ -48,7 +48,7 @@ function makeRoadshowNameLoginController({form,isCurrent,load,login,accept}){
     }catch(failure){if(current()){if(failure.code==='judge_login_not_open'){allowed=false;availability.textContent=failure.message;}error.textContent=failure.name==='AbortError'?'登录请求超时，未确认登录身份。请核对姓名后手动重试，没有自动重发。':failure.message;}}
     finally{if(current()){busy=false;buttons();retryStatus();}}
   }
-  const changed=()=>{edit++;error.textContent='';};name.addEventListener('input',changed);form.onsubmit=submitName;refresh.onclick=reload;buttons();
+  const changed=()=>{edit++;error.textContent='';};name.addEventListener('input',changed);form.onsubmit=buttonAction(submitName);refresh.onclick=buttonAction(reload);buttons();
   return {reload,login:submitName,dispose(){active=false;clearRefresh();for(const controller of requests)controller.abort();name.value='';name.removeEventListener('input',changed);form.onsubmit=null;refresh.onclick=null;}};
 }
 

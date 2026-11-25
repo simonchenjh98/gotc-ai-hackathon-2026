@@ -10,7 +10,7 @@ const stageForRoute=()=>route.endsWith('-roadshow')?'roadshow':'exhibition';
 const stageName=stage=>stage==='roadshow'?'路演评审':'展示评审';
 const stageNotice=stage=>stage==='roadshow'?'<div class="info-banner"><strong>路演与决赛名单</strong><br>路演成绩确认发布时，默认按有效均分从高到低同步最多 12 支队伍，同分按队号排序。组织方另行确认的决赛名单优先。完整汇总仍仅组织方可见。</div>':'';
 let logoutInFlight=null,currentTeamKeys=null,currentIdentityPage=null,currentAdminTeamLifecycle=null;
-let session={role:null}, route='', pollTimer, routeVersion=0, lastBoard, judgeData, selectedTeam, toastTimer;
+let session={role:null}, route='', boardPoller=null, routeVersion=0, lastBoard, judgeData, selectedTeam, toastTimer;
 const roleName = {team:'参赛队伍',judge:'专业评委',audience:'观众',admin:'组织方'};
 function toast(message) { const el = document.getElementById('platform-toast'); el.textContent = message; el.classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('visible'), 4500); }
 const loginOwnerKey=`gotc-login-owner:v1:${encodeURIComponent(base.pathname)}`;
@@ -58,15 +58,15 @@ function profileNavigationState(){return typeof currentTeamProfile!=='undefined'
 function confirmLeave(){const claim=claimNavigationState();if(claim.pendingInitial){toast('申请正在提交，请等待领取凭据保存后再离开。');return false;}return !(claim.dirty || profileNavigationState().dirty || submissionDirty || reviewDirty || scoreDirty || dirtyAdminForms.size) || confirm(submissionDirty?'有尚未保存服务器的作品输入。离开不会自动提交；只有成功保存的本机副本可在重新登录本队后找回，未备份输入可能丢失。确认离开？':'有尚未保存的输入，确认离开并放弃这些输入？');}
 function account(){
   const el=document.getElementById('account');el.innerHTML=session.role?`<span>${session.operator?'管理员代管 · ':''}${esc(session.name || roleName[session.role])}</span>${session.operator?'<button type="button" id="switch-team-workbench">切换队伍</button>':''}<button id="logout">退出</button>`:'';
-  document.getElementById('logout')?.addEventListener('click',logoutAccount);
-  document.getElementById('switch-team-workbench')?.addEventListener('click', async event => {
+  document.getElementById('logout')?.addEventListener('click',buttonAction(logoutAccount));
+  document.getElementById('switch-team-workbench')?.addEventListener('click', buttonAction(async event => {
     const button = event.currentTarget, owner = session, version = routeVersion;
     try { await loadPlatformAssets(['team/delegation.js']); }
     catch (error) { if (button.isConnected) toast(error.message); return; }
     if (session === owner && version === routeVersion && button.isConnected) {
       await returnAdminTeamWorkbench({currentTarget:button});
     }
-  });
+  }));
 }
 async function logoutAccount(event,{preserveClaim=false}={}){
     if(claimNavigationState().pendingInitial){toast('申请正在提交，请等待领取凭据保存后再退出。');return false;}
@@ -113,8 +113,8 @@ function editorHasLogin(form,owner,{notify=false,error}={}){
   return false;
 }
 
-async function withBusy(button, fn) { if (!button || button.disabled) return; button.disabled = true; try { await fn(); } catch(e) { toast(e.message); } finally { if (button.isConnected) button.disabled = false; } }
-function showConnectionError(error) { root.innerHTML = heading('CONNECTION / 连接状态','暂时无法连接平台',esc(error.message)) + empty('连接暂时中断','请检查网络，稍后重试。尚未提交的操作不会显示为成功。','<button class="btn" id="retry">重新连接</button>'); document.getElementById('retry').onclick = error.refreshDocument ? () => location.reload() : renderRoute; }
+async function withBusy(button, fn) { if (!button || button.disabled) return; button.disabled = true; button.setAttribute?.('aria-busy', 'true'); try { await fn(); } catch(e) { toast(e.message); } finally { button.removeAttribute?.('aria-busy'); if (button.isConnected) button.disabled = false; } }
+function showConnectionError(error, retry = renderRoute) { root.innerHTML = heading('CONNECTION / 连接状态','暂时无法连接平台',esc(error.message)) + empty('连接暂时中断','请检查网络，稍后重试。尚未提交的操作不会显示为成功。','<button class="btn" id="retry">重新连接</button>'); document.getElementById('retry').onclick = buttonAction(error.refreshDocument ? () => location.reload() : retry); }
 
 
 function renderLogin(role) {
@@ -162,7 +162,7 @@ function renderLogin(role) {
     });
   }
   form.elements.code.addEventListener('input',()=>{identityField.hidden=true;identity.required=false;identity.innerHTML='<option value="">请选择主办方分配的身份</option>';});
-  form.onsubmit = async event => {
+  form.onsubmit = buttonAction(async event => {
     event.preventDefault();
     const button = form.querySelector('button');
     if (button.disabled || !mounted()) return;
@@ -217,9 +217,9 @@ function renderLogin(role) {
     } finally {
       if (form.isConnected) button.disabled = false;
     }
-  };
+  });
 }
-function renderWrongRole(role) { root.innerHTML = heading('ACCESS / 登录身份','请使用对应的登录凭据',`当前身份为${esc(roleName[session.role] || session.role)}，此入口需要${roleName[role]}身份。`) + empty('切换登录身份','切换后使用此入口的登录凭据登录；独立的队伍申请凭据会保留，可返回申请页领取参赛码。','<button class="btn" id="switch-role">切换身份（保留申请）</button>');document.getElementById('switch-role').onclick=event=>logoutAccount(event,{preserveClaim:true}); }
+function renderWrongRole(role) { root.innerHTML = heading('ACCESS / 登录身份','请使用对应的登录凭据',`当前身份为${esc(roleName[session.role] || session.role)}，此入口需要${roleName[role]}身份。`) + empty('切换登录身份','切换后使用此入口的登录凭据登录；独立的队伍申请凭据会保留，可返回申请页领取参赛码。','<button class="btn" id="switch-role">切换身份（保留申请）</button>');document.getElementById('switch-role').onclick=buttonAction(event=>logoutAccount(event,{preserveClaim:true})); }
 
 function beijingTime(value){return value===null || value===undefined?'—':new Date(value).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false});}
 function beijingInput(value){if(value===null || value===undefined)return '';const parts=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date(value));const part=k=>parts.find(p=>p.type===k).value;return `${part('year')}-${part('month')}-${part('day')}T${part('hour')}:${part('minute')}`;}

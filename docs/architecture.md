@@ -33,6 +33,12 @@ New events default to metadata-only gateway logging. Gateway maintenance expires
 
 The organizer dashboard reads event history from SQLite. For live inflight and queued calls it asks the gateway for a bounded snapshot over its private Unix socket after the authenticated database read completes. If the gateway is unavailable, the dashboard labels those counters unavailable. A combined development instance can obtain them from the same process.
 
+## Browser access on intermittent connections
+
+The platform checks the session before mounting a workspace. On a public route, it can download the route's scripts and styles during that check. A stalled session check expires after 12 seconds. Reconnecting or pressing the retry button checks the session again and opens the route currently selected.
+
+The standalone team directory loads immediately. On the homepage, the browser requests the public list as the directory approaches the viewport. A failed refresh keeps the last list visible, and reconnecting retries the public read. The exhibition progress board pauses when hidden or offline, resumes on return, and backs off after repeated failures. Submissions and other writes retain their own receipt and retry rules.
+
 ## Public credential checks
 
 The platform gives public sign-ins and credential redemption two dedicated workers. Up to 40 requests wait in FIFO order for at most four seconds after their request body arrives. Waiters use the event loop and leave the eight general API workers available. A full or expired queue returns HTTP 429 with `login_busy` and `Retry-After: 1`. Local platform metrics expose current and peak counts for active and waiting password work.

@@ -44,7 +44,7 @@ function installRoadshowWindowControls(form,stage,initialWindow,version){
   const buttons=()=>{start.disabled=busy || blocked || !!currentWindow.open;close.disabled=busy || blocked || !currentWindow.open;};
   const countdown=makeRoadshowCountdown({alive:valid,apply:text=>{form.querySelector('[data-roadshow-window-countdown]').textContent=text;}});
   function applyWindow(window){currentWindow={...window};countdown.update(currentWindow);buttons();}
-  const poller=makeFinalsPoller({read:signal=>api('admin/roadshow/scoring',undefined,{loginId:owner.loginId,signal}),alive:valid,isHidden:()=>document.hidden,
+  const poller=makeLivePoller({read:signal=>api('admin/roadshow/scoring',undefined,{loginId:owner.loginId,signal}),alive:valid,isHidden:()=>document.hidden,
     subscribe:listener=>{document.addEventListener('visibilitychange',listener);return ()=>document.removeEventListener('visibilitychange',listener);},status:kind=>{if(current() && kind==='auth'){blocked=true;buttons();error.textContent='登录已失效，请刷新后重新登录。';}},apply:data=>{
       if(!valid() || busy || Number(data.config.stageRevision)<Number(revision))return;
       if(data.config.runId!==stage.runId || Number(data.config.stageRevision)!==Number(revision)){blocked=true;buttons();error.textContent='路演名单、窗口或轮次已更新。请刷新数据核对后再操作。';return;}
@@ -65,7 +65,7 @@ function installRoadshowWindowControls(form,stage,initialWindow,version){
     }catch(failure){if(valid()){blocked=true;error.textContent=failure.message+' 请刷新数据核对当前窗口后再操作，没有自动重发。';}}
     finally{clearTimeout(deadline);request=null;busy=false;if(valid()){buttons();poller.kick();}}
   }
-  start.onclick=()=>save(true);close.onclick=()=>save(false);form.onsubmit=event=>event.preventDefault();applyWindow(initialWindow);poller.start();return controller;
+  start.onclick=buttonAction(()=>save(true));close.onclick=buttonAction(()=>save(false));form.onsubmit=event=>event.preventDefault();applyWindow(initialWindow);poller.start();return controller;
 }
 
 function roadshowScoreSummaryMarkup(data,publicView=false){
@@ -103,7 +103,7 @@ async function renderRoadshowJudge(version){
   view.data=data;view.config=data.config;view.scores=new Map((data.myScores || []).map(record=>[record.teamId,record]));
   finalsShell(view,'ROADSHOW / 路演评委','路演评分 · 六维100分',`${esc(session.name || '评委')} · 路演成绩独立统计；专项奖提名在决赛进行。`,`<div class="finals-admin-tools"><button class="btn secondary small" type="button" data-roadshow-reload-score>重新读取评分</button><span class="small-note" data-finals-sync role="status">每2秒核对评分状态</span></div><p class="info-banner ${data.config.canEdit?'':'warning'}" data-roadshow-window>${esc(roadshowWindowText(data.config))}</p><p class="small-note">路演进行期间不显示任何队伍的汇总分数或排名。你只能核对自己填写的评分状态；全部实时汇总仅供组织方后台查看。</p><p class="info-banner warning" data-roadshow-changed hidden></p><section class="surface"><label class="field">选择路演队伍<select data-roadshow-team>${data.teams.map(team=>`<option value="${esc(team.id)}" ${team.eligible===false?'disabled':''}>${esc(finalsName(team))} · ${esc(finalsStatus(view.scores.get(team.id)))}</option>`).join('')}</select></label><div data-roadshow-editor></div></section>`);
   const select=view.container.querySelector('[data-roadshow-team]');view.selected=data.teams.find(team=>team.eligible!==false)?.id || '';select.value=view.selected;
-  view.container.querySelector('[data-roadshow-reload-score]').onclick=()=>finalsConfirmReload(view);
+  view.container.querySelector('[data-roadshow-reload-score]').onclick=buttonAction(()=>finalsConfirmReload(view));
   select.onchange=()=>{
     const previous=view.scoreForm;
     if(previous?.finalsBusy){select.value=view.selected;finalsMessage(previous,'评分正在保存，请等待完成后再切换队伍。');return;}
@@ -140,7 +140,7 @@ function roadshowRenderScore(view){
       if(unchanged && record.status==='recused'){for(const dimension of dimensions)form.elements['score-'+dimension.id].value='';preview();}view.poller?.kick();
     });
   }
-  form.onsubmit=event=>{event.preventDefault();return save('submitted');};draft.onclick=()=>save('draft');recuse.onclick=()=>save('recused');form.finalsRefreshButtons();
+  form.onsubmit=buttonAction(event=>{event.preventDefault();return save('submitted');});draft.onclick=buttonAction(()=>save('draft'));recuse.onclick=buttonAction(()=>save('recused'));form.finalsRefreshButtons();
 }
 
 function roadshowTeamRosterMarkup(){
@@ -164,18 +164,18 @@ function installRoadshowTeams(view,onSaved){
     form.finalsRefreshButtons();
   }
   all.onclick=()=>{if(!current() || all.disabled || !latest)return;scoringPatchTeamChoices(choices,latest.availableTeams || [],(latest.availableTeams || []).filter(team=>team.eligible!==false).map(team=>team.id));form.finalsEdit++;dirtyAdminForms.add(form);state.textContent='已勾选全部有效队伍，尚需保存名单。';};
-  refresh.onclick=async()=>{
+  refresh.onclick=buttonAction(async()=>{
     if(!current() || loading || form.finalsBusy)return;loading=true;form.finalsRefreshButtons();
     try{const data=await finalsRequest(view,'admin/roadshow/scoring');if(current()){update(data);onSaved(data);}}
     catch(error){if(current())finalsMessage(form,error.message+' 当前勾选已保留。');}
     finally{loading=false;if(current())form.finalsRefreshButtons();}
-  };
-  form.onsubmit=event=>{
+  });
+  form.onsubmit=buttonAction(event=>{
     event.preventDefault();if(!current() || !editable || loading || runId===null)return;
     return finalsSave(view,form,'admin/roadshow/teams',{runId,expectedRevision:revision,teamIds:scoringCheckedTeams(form)},(result,unchanged)=>{
       runId=result.config.runId;revision=result.config.stageRevision;if(unchanged)dirtyAdminForms.delete(form);update(result,true);onSaved(result);view.poller?.kick();
     });
-  };
+  });
   form.finalsRefreshButtons();return {update,form};
 }
 
@@ -195,8 +195,8 @@ async function mountRoadshowScoringAdmin(version,parent){
     try{const data=await finalsRequest(view,'admin/roadshow/scoring');if(!view.valid())return;view.publishBlocked=false;message.textContent='';update(data);}
     catch(error){if(view.current())message.textContent=error.message+' 当前页面输入已保留，请重新读取。';}
   }
-  view.container.querySelector('[data-roadshow-refresh-score]').onclick=refresh;
-  publish.onclick=async()=>{
+  view.container.querySelector('[data-roadshow-refresh-score]').onclick=buttonAction(refresh);
+  publish.onclick=buttonAction(async()=>{
     if(!view.valid() || view.publishBusy || view.publishBlocked || publish.disabled || !view.latest)return;
     const config=view.latest.config;view.publishBusy=true;publish.disabled=true;message.textContent='';
     try{
@@ -204,6 +204,6 @@ async function mountRoadshowScoringAdmin(version,parent){
       if(!view.valid())return;update(data);const synced=Number(data.config.confirmedFinalistCount)||Math.min(12,(data.summary?.teams||[]).filter(team=>roadshowTeamValid(team,roadshowMinimum(data))).length);message.textContent=data.config.published?`路演成绩已确认；${synced} 支队伍已同步至决赛，选手仍只能查看本队成绩。`:'路演成绩确认已撤回；组织方单独确认的决赛名单保留，请到决赛控制台核对。';
     }catch(error){if(view.current()){view.publishBlocked=true;message.textContent=error.message+' 请重新读取最新成绩核对后，再手动操作；没有自动重发。';}}
     finally{view.publishBusy=false;if(view.valid() && view.latest)update(view.latest);}
-  };
+  });
   await refresh();if(view.valid())finalsStartPolling(view,'admin/roadshow/scoring',update);
 }

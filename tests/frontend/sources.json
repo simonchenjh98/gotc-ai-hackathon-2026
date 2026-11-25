@@ -15,6 +15,7 @@
     "frontend/static/site/styles.css"
   ],
   "app.js": [
+    "frontend/static/site/button-states.js",
     "frontend/static/site/app.js"
   ],
   "site-header.js": [
@@ -44,20 +45,25 @@
     "frontend/static/platform/team/draft-store.js"
   ],
   "platform-admin.js": [
+    "frontend/static/site/button-states.js",
     "frontend/static/platform/admin/directory.js"
   ],
   "platform-api-admin.js": [
+    "frontend/static/site/button-states.js",
     "frontend/static/platform/admin/api.js"
   ],
   "platform-roadshow-scoring.js": [
+    "frontend/static/site/button-states.js",
     "frontend/static/platform/roadshow/scoring.js"
   ],
   "team-registration.js": [
+    "frontend/static/site/button-states.js",
     "frontend/static/registration/directory.js",
     "frontend/static/registration/admin.js",
     "frontend/static/registration/profile.js"
   ],
   "platform-claims.js": [
+    "frontend/static/site/button-states.js",
     "frontend/static/platform/login-retry.js",
     "frontend/static/platform/claims/receipt.js",
     "frontend/static/platform/claims/form.js",
@@ -65,22 +71,27 @@
     "frontend/static/platform/claims/review.js"
   ],
   "platform-finals.js": [
+    "frontend/static/site/button-states.js",
     "frontend/static/platform/login-retry.js",
+    "frontend/static/platform/polling.js",
     "frontend/static/platform/finals/shared.js",
     "frontend/static/platform/finals/judges.js",
     "frontend/static/platform/finals/organizer.js",
     "frontend/static/platform/finals/dashboard.js"
   ],
   "platform-roadshow-access.js": [
+    "frontend/static/site/button-states.js",
     "frontend/static/platform/login-retry.js",
     "frontend/static/platform/roadshow/login.js",
     "frontend/static/platform/roadshow/roster.js"
   ],
   "platform.js": [
+    "frontend/static/site/button-states.js",
     "frontend/static/platform/login-retry.js",
     "frontend/static/platform/shell.js",
     "frontend/static/platform/team/delegation.js",
     "frontend/static/platform/judging/rules.js",
+    "frontend/static/platform/polling.js",
     "frontend/static/platform/judging/boards.js",
     "frontend/static/platform/judging/judges.js",
     "frontend/static/platform/judging/audience.js",

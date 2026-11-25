@@ -12,6 +12,7 @@ from threading import Thread
 from urllib.parse import urlsplit
 
 from playwright.sync_api import sync_playwright
+from button_states import button_states
 from contestant_upload import contestant_upload
 from fixture import participants
 
@@ -159,6 +160,10 @@ def smoke(browser, service):
     def direct_entry(page, selector):
         page.reload(wait_until="networkidle")
         page.locator(selector).first.wait_for()
+
+    with visit() as page:
+        button_states(page, base)
+        passed.append("button resting, hover, press, persistent selection, keyboard focus and pending refresh with reduced motion")
 
     with visit(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True) as page:
         page.goto(base)

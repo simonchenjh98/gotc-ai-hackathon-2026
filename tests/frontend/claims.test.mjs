@@ -109,7 +109,7 @@ test('API and route wiring protects admin reads/writes and logout clears tab cla
   assert.ok(post>=0 && clear>post);
   assert.match(source,/if\(revision!==edit\)/);assert.match(source,/button\.dataset\.stale='true'/);
   const installer=source.slice(source.indexOf('function installClaimsAdmin'));
-  assert.match(installer,/onclick=load/);assert.ok(!/\n\s*load\(\);/.test(installer));
+  assert.match(installer,/onclick=buttonAction\(load\)/);assert.ok(!/\n\s*load\(\);/.test(installer));
 });
 
 test('real admin mutation handler retains selected members, PIN and notes after roster revision conflict',async()=>{
@@ -229,7 +229,8 @@ test('direct staff review shows private duplicate references and posts only revi
   const form={elements:{teamName:{value:'Reviewed Team'},track:{value:''},pin:{value:'123456'},note:{value:'Distinct people verified'},inPersonVerified:{checked:true},resolvedIdentity:{checked:true}}};
   const nodes={'claim-review':{innerHTML:''},'claim-review-form':form,'claim-reject':{}};
   const scope=vm.createContext({model:{requests:[request]},document:{getElementById:id=>nodes[id]},busy:false,live:()=>true,replaceEditor:()=>true,trackAdminForm:()=>{},claimsReviewMarkup:()=>'',mutate:(f,path,body)=>posts.push({path,body})});
-  const handler=source.slice(source.indexOf('  function selectRequest(id){'),source.indexOf("  document.getElementById('claims-admin-load').onclick=load;"));
+  const handler=source.slice(source.indexOf('  function selectRequest(id){'),source.indexOf("  document.getElementById('claims-admin-load').onclick"));
+  scope.buttonAction=context.buttonAction;
   vm.runInContext(handler+'\nselectRequest("declared-fixture");',scope);form.onsubmit({preventDefault(){}});
   assert.equal(posts[0].path,'admin/claims/approve');assert.equal(posts[0].body.reviewContext,'opaque-context');assert.equal(posts[0].body.expectedRevision,3);
   assert.equal(posts[0].body.teamName,'Reviewed Team');assert.equal(posts[0].body.track,'');assert.equal(posts[0].body.resolvedIdentity,true);assert.equal(posts[0].body.verificationMethod,'online');assert.equal(posts[0].body.applicationReviewed,true);assert.ok(!Object.hasOwn(posts[0].body,'pin'));assert.ok(!Object.hasOwn(posts[0].body,'inPersonVerified'));
@@ -376,7 +377,8 @@ test('optional existing team selection displays registration and binds its displ
   const posts=[],form={elements:{teamId:{value:''},teamName:{value:'Reviewed Team'},track:{value:''},pin:{value:'123456'},note:{value:'Verified'},inPersonVerified:{checked:true},resolvedIdentity:{checked:false}}};
   const nodes={'claim-review':{innerHTML:''},'claim-review-form':form,'claim-reject':{},'claim-existing-summary':{innerHTML:''}};
   const scope=vm.createContext({model:{requests:[request],teams:[team]},document:{getElementById:id=>nodes[id]},busy:false,live:()=>true,replaceEditor:()=>true,trackAdminForm:()=>{},claimsReviewMarkup:()=>'',claimExistingTeamMarkup:context.claimExistingTeamMarkup,mutate:(f,path,body)=>posts.push(body),formError:(f,error)=>{f.error=error;}});
-  const handler=source.slice(source.indexOf('  function selectRequest(id){'),source.indexOf("  document.getElementById('claims-admin-load').onclick=load;"));
+  const handler=source.slice(source.indexOf('  function selectRequest(id){'),source.indexOf("  document.getElementById('claims-admin-load').onclick"));
+  scope.buttonAction=context.buttonAction;
   vm.runInContext(handler+'\nselectRequest("select-fixture");',scope);
   form.onsubmit({preventDefault(){}});assert.ok(!Object.hasOwn(posts[0],'teamId'));assert.ok(!Object.hasOwn(posts[0],'teamContext'));
   form.elements.teamId.value=team.id;form.elements.teamId.onchange();assert.match(nodes['claim-existing-summary'].innerHTML,/Old Captain/);

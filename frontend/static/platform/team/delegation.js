@@ -31,7 +31,7 @@ async function renderAdminTeamWorkbench(version){
   const form=document.getElementById('admin-team-workbench');if(!form)return;
   let busy=false;
   const live=()=>valid() && form.isConnected && document.getElementById('admin-team-workbench')===form;
-  form.onsubmit=async event=>{
+  form.onsubmit=buttonAction(async event=>{
     event.preventDefault();if(busy || !live() || !confirmLeave())return;
     const teamId=form.elements.teamId.value;
     if(!data.teams.some(team=>team.id===teamId)){formError(form,'请选择需要进入的队伍。');return;}
@@ -42,7 +42,7 @@ async function renderAdminTeamWorkbench(version){
       await adoptTeamWorkbenchSession(result,owner,{role:'team',teamId},live,page,marker);
     }catch(error){if(form.isConnected && version===routeVersion && (session===owner || !session.role))formError(form,error.message);}
     finally{busy=false;if(form.isConnected)button.disabled=false;}
-  };
+  });
 }
 async function returnAdminTeamWorkbench(event){
   const owner=session,version=routeVersion,page=route,button=event?.currentTarget;

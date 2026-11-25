@@ -66,11 +66,11 @@ PAGES_FILES = manifest({
     'frontend/assets': 'hero-city.webp registration-qr.jpg schedule-20261106.jpg',
     'frontend/downloads': 'gotc-gitee-submission-guide.pdf gotc-hackathon.ics submission-checklist.txt',
     'frontend/static/registration': 'directory.js registration.css',
-    'frontend/static/site': 'app.js header.css header.js styles.css',
+    'frontend/static/site': 'app.js button-states.css button-states.js header.css header.js styles.css',
 })
 FILES = PAGES_FILES | manifest({
     'frontend': 'platform.html teams.html',
-    'frontend/static/platform': 'login-retry.js navigation.js platform.css route-assets.js routes.js shell.js workspaces.css',
+    'frontend/static/platform': 'login-retry.js navigation.js platform.css polling.js route-assets.js routes.js shell.js workspaces.css',
     'frontend/static/platform/admin': 'api.css api.js dashboard.css directory.js event.js settings.js submissions.js',
     'frontend/static/platform/claims': 'application.js form.js receipt.js review.js',
     'frontend/static/platform/finals': 'dashboard.js finals.css judges.js organizer.js shared.js',
@@ -321,7 +321,10 @@ def validate_built_assets(package, entries, manifest):
     source_assets = {name for name in FILES if name.startswith('frontend/') and name.endswith(('.js', '.css'))}
     expected = FILES - source_assets | {'frontend/asset-manifest.json'}
     assets = manifest.get('assets', {})
-    if manifest.get('version') != 1 or set(assets) != {name.removeprefix('frontend/') for name in source_assets}:
+    version = manifest.get('version')
+    if version == 2:
+        source_assets.update(name for name in FILES if name.startswith('frontend/assets/') and name.endswith(('.jpg', '.webp')))
+    if version not in (1, 2) or set(assets) != {name.removeprefix('frontend/') for name in source_assets}:
         raise RuntimeError('Built frontend asset list differs from the public allowlist')
     for source, record in assets.items():
         stem, ext = source.rsplit('.', 1)
@@ -333,6 +336,8 @@ def validate_built_assets(package, entries, manifest):
         integrity = 'sha384-' + base64.b64encode(hashlib.sha384(data).digest()).decode()
         if path != f'{stem}.{hashlib.sha256(data).hexdigest()[:16]}.{ext}' or record['integrity'] != integrity:
             raise RuntimeError('Generated asset integrity mismatch')
+        if source.startswith('assets/') and data != package.extractfile(entries['frontend/' + source]).read():
+            raise RuntimeError('Public artwork alias differs from its fingerprinted file')
         expected.add(name)
     return expected
 
