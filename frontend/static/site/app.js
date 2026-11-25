@@ -33,8 +33,8 @@ checks.forEach(c => c.addEventListener('change', updateChecklist));
 updateChecklist();
 let toastTimer;
 function toast(message) { const el = document.getElementById('toast'); el.textContent = message; el.classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('visible'), 3500); }
-document.getElementById('share-button')?.addEventListener('click', async () => {
+document.getElementById('share-button')?.addEventListener('click', buttonAction(async () => {
   const url = new URL('./', location.href).href;
   try { await navigator.clipboard.writeText(url); toast('官网链接已复制，可以发给队友了。'); }
   catch { toast(`官网链接：${url}`); }
-});
+}));

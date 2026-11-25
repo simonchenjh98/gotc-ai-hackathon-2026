@@ -66,7 +66,7 @@ PAGES_FILES = manifest({
     'frontend/assets': 'hero-city.webp registration-qr.jpg schedule-20261106.jpg',
     'frontend/downloads': 'gotc-gitee-submission-guide.pdf gotc-hackathon.ics submission-checklist.txt',
     'frontend/static/registration': 'directory.js registration.css',
-    'frontend/static/site': 'app.js header.css header.js styles.css',
+    'frontend/static/site': 'app.js button-states.css button-states.js header.css header.js styles.css',
 })
 FILES = PAGES_FILES | manifest({
     'frontend': 'platform.html teams.html',

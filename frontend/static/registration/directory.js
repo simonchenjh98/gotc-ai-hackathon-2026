@@ -16,14 +16,14 @@ const RegistrationUI=(()=>{
       q('[data-reg-list]').innerHTML=rows.length?rows.map(team=>card(team,profileUrl)).join(''):'<p class="registration-empty">没有找到匹配的队伍。可换个关键词，或前往队伍申请入口。</p>';
     }
     async function refresh(){
-      const serial=++generation,button=q('[data-reg-refresh]');button.disabled=true;
+      const serial=++generation,button=q('[data-reg-refresh]');button.disabled=true;button.setAttribute?.('aria-busy','true');
       try{
         const response=await fetch(endpoint,{method:'GET',credentials:'omit',cache:'no-store'}),data=await response.json();
         if(!response.ok)throw new Error(data.error || '名单暂时不可用');
         if(serial!==generation || !host.isConnected)return;
         teams=data.teams;showList();q('[data-reg-list-error]').textContent='';
       }catch(error){if(serial===generation && host.isConnected)q('[data-reg-list-error]').textContent='名单暂时未能更新：'+error.message;}
-      finally{if(serial===generation && host.isConnected)button.disabled=false;}
+      finally{if(serial===generation && host.isConnected){button.disabled=false;button.removeAttribute?.('aria-busy');}}
     }
     q('[data-reg-search]').oninput=showList;q('[data-reg-recruiting]').onchange=showList;q('[data-reg-refresh]').onclick=refresh;
     const legacy=installLegacyRegistration(host,endpoint);
@@ -42,7 +42,7 @@ function installLegacyRegistration(host,endpoint){
     current(capture){return this.active && host.isConnected && host.legacyRegistration===this && this.generation===capture.generation && location.href===capture.href && codeForm.elements.code.value.trim()===capture.code;}
   };
   host.legacyRegistration=state;
-  const controls=()=>{openButton.disabled=!!state.reading;saveButton.disabled=!state.team || state.blocked || !!state.reading || !!state.saving || codeForm.elements.code.value.trim()!==state.code;};
+  const controls=()=>{openButton.setAttribute?.('aria-busy',String(!!state.reading));saveButton.setAttribute?.('aria-busy',String(!!state.saving));openButton.disabled=!!state.reading;saveButton.disabled=!state.team || state.blocked || !!state.reading || !!state.saving || codeForm.elements.code.value.trim()!==state.code;};
   const capture=code=>({code,generation:state.generation,href:location.href,editRevision:state.editRevision});
   function remember(code){try{sessionStorage.setItem(storageKey,code);return true;}catch{return false;}}
   async function request(action,body){
