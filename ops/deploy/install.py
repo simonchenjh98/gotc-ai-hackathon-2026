@@ -70,7 +70,7 @@ PAGES_FILES = manifest({
 })
 FILES = PAGES_FILES | manifest({
     'frontend': 'platform.html teams.html',
-    'frontend/static/platform': 'login-retry.js navigation.js platform.css route-assets.js routes.js shell.js workspaces.css',
+    'frontend/static/platform': 'login-retry.js navigation.js platform.css polling.js route-assets.js routes.js shell.js workspaces.css',
     'frontend/static/platform/admin': 'api.css api.js dashboard.css directory.js event.js settings.js submissions.js',
     'frontend/static/platform/claims': 'application.js form.js receipt.js review.js',
     'frontend/static/platform/finals': 'dashboard.js finals.css judges.js organizer.js shared.js',

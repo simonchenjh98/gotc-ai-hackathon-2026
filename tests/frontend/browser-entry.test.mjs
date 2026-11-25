@@ -10,7 +10,7 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 // Use the HTML entry point and the browser's separate classic-script evaluation
 // model. Only DOM operations and HTTP are simulated; the router, renderer and
 // loader run exactly as shipped.
-async function openPage(hash, {beforeAsset, session = {role:null}, replies = {}, respond, storage = new Map()} = {}) {
+async function openPage(hash, {beforeAsset, session = {role:null}, replies = {}, respond, storage = new Map(), timers = {setTimeout,clearTimeout}} = {}) {
   const location = new URL('https://example.test/gotc/platform.html' + hash);
   const classList = {add() {}, remove() {}, toggle() {}, contains: () => false};
   function node() {
@@ -60,7 +60,7 @@ async function openPage(hash, {beforeAsset, session = {role:null}, replies = {},
     addEventListener() {}, removeEventListener() {}
   };
   const context = vm.createContext({
-    document, location, URL, window, AbortController, Intl, TextEncoder, setTimeout, clearTimeout,
+    document, location, URL, window, AbortController, Intl, TextEncoder, ...timers,
     sessionStorage: {getItem: () => null},
     localStorage: {getItem:key=>storage.get(key) ?? null,setItem:(key,value)=>storage.set(key,value)},
     fetch: async (url, options) => {
@@ -102,6 +102,7 @@ async function openPage(hash, {beforeAsset, session = {role:null}, replies = {},
   await settle();
   return {
     main, nodes, requests, assets, context,
+    online() { for (const notify of [...(listeners.get('online') || [])]) notify(); },
     async go(nextHash) {
       location.hash = nextHash;
       for (const notify of listeners.get('hashchange')) notify();
@@ -244,6 +245,36 @@ test('an asset failure permits an explicit retry that displays the requested pag
   assert.equal(browser.assets.filter(path=>path.endsWith('/claims/application.js')).length,2);
 });
 
+test('public board code loads during the identity check and waits to read event data',async()=>{
+  const identity=deferred();
+  const browser=await openPage('#board-exhibition',{respond:path=>{
+    if(path==='session')return identity.promise;
+    if(path==='judging/exhibition/board')return loginReply(503,{error:'Fixture unavailable'});
+  }});
+  assert.ok(browser.assets.some(path=>path.endsWith('/judging/boards.js')));
+  assert.deepEqual(browser.requests,['/gotc/api/session']);
+  identity.resolve(loginReply(200,{role:null}));
+  await settle();
+  assert.ok(browser.requests.includes('/gotc/api/judging/exhibition/board'));
+  await browser.go('#board-finals');
+});
+
+test('leaving a cold public route does not hold the new login screen behind its download',async()=>{
+  const identity=deferred(),asset=deferred();
+  const browser=await openPage('#claim',{
+    respond:path=>path==='session'?identity.promise:undefined,
+    beforeAsset:path=>path.endsWith('/claims/application.js')?asset.promise:undefined
+  });
+  await browser.go('#team');
+  identity.resolve(loginReply(200,{role:null}));
+  await settle();
+  assert.match(browser.main.innerHTML,/id="login-form"/);
+  asset.reject(new Error('Network offline'));
+  await settle();
+  assert.match(browser.main.innerHTML,/id="login-form"/);
+  assert.deepEqual(browser.requests,['/gotc/api/session']);
+});
+
 test('a delayed script from a previous route cannot repaint the newly selected page',async()=>{
   let release;
   const pending=new Promise(resolve=>{release=resolve;});
@@ -290,6 +321,51 @@ for(const [route,role,replies,markup] of [
   });
 }
 
+test('session timeout presents reconnect and retries only the identity GET before entering the latest route',async()=>{
+  const timers=new Map(), checked=deferred(), methods=[];
+  let calls=0;
+  const browser=await openPage('#admin',{timers:{
+    setTimeout(fn,ms){timers.set(fn,ms);return fn;},clearTimeout(fn){timers.delete(fn);}
+  },respond:(path,options)=>{
+    methods.push(options.method);
+    if(path==='session' && ++calls===1){
+      return new Promise((_,reject)=>options.signal.addEventListener('abort',()=>reject(options.signal.reason)));
+    }
+    if(path==='session')return checked.promise;
+    if(path==='audience')return loginReply(200,noTeams.body);
+  }});
+  assert.equal(timers.size,1);
+  const [[expire,ms]]=timers;
+  assert.equal(ms,12000);
+  expire();await settle();
+  assert.match(browser.main.innerHTML,/连接超时/);
+  assert.doesNotMatch(browser.main.innerHTML,/id="login-form"/);
+  assert.deepEqual(browser.assets,[]);
+  const retry=browser.nodes.retry.onclick;
+  browser.online();
+  const duplicate=retry();
+  await browser.go('#audience');
+  assert.deepEqual(browser.requests,['/gotc/api/session','/gotc/api/session']);
+  checked.resolve(loginReply(200,{role:'audience',loginId:'current-identity'}));
+  await duplicate;await settle();
+  browser.online();
+  assert.deepEqual(browser.requests,['/gotc/api/session','/gotc/api/session','/gotc/api/audience']);
+  assert.deepEqual(methods,['GET','GET','GET']);
+  assert.match(browser.main.innerHTML,/队伍即将出现在这里/);
+  assert.equal(timers.size,0);
+});
+test('server failures permit a manual session retry before offering the sign-in form',async()=>{
+  let calls=0;
+  const browser=await openPage('#team',{respond:path=>{
+    if(path==='session' && ++calls===1)return loginReply(503,{error:'Temporarily unavailable'});
+  }});
+  assert.match(browser.main.innerHTML,/尚未确认登录身份/);
+  assert.doesNotMatch(browser.main.innerHTML,/id="login-form"/);
+  await browser.nodes.retry.onclick();
+  assert.match(browser.main.innerHTML,/id="login-form"/);
+  assert.deepEqual(browser.requests,['/gotc/api/session','/gotc/api/session']);
+});
+
 test('navigation during session bootstrap opens the latest route with the restored identity',async()=>{
   let restore;
   const session=new Promise(resolve=>{restore=resolve;});
@@ -305,9 +381,9 @@ test('navigation during session bootstrap opens the latest route with the restor
 });
 
 function deferred() {
-  let resolve;
-  const promise=new Promise(done=>{resolve=done;});
-  return {promise,resolve};
+  let resolve,reject;
+  const promise=new Promise((done,fail)=>{resolve=done;reject=fail;});
+  return {promise,resolve,reject};
 }
 const ownerKey='gotc-login-owner:v1:'+encodeURIComponent('/gotc/');
 const ok=body=>({ok:true,status:200,json:async()=>body});

@@ -9,25 +9,51 @@ const RegistrationUI=(()=>{
   async function install(host){
     const endpoint=new URL(host.dataset.api,location.href).href,profileUrl=new URL('../platform.html#team-profile',endpoint).href,claimUrl=new URL('../platform.html#claim',endpoint).href;
     host.innerHTML=`<div class="registration-layout"><section class="registration-panel"><h3>本队资料与成员</h3><p>已有本队参赛码？使用同一个账号查看本队资料、成员、提交作品和查分。</p><a class="reg-button" href="${escape(profileUrl)}">进入本队资料与成员 ↗</a><p class="registration-note">还没有参赛码，请先提交队伍申请；申请未完成时，可继续使用原申请回执查询和补充资料。</p><a class="reg-button secondary" href="${escape(claimUrl)}">申请队伍 / 领取参赛码 ↗</a><p class="registration-note">已审核成员变更请联系组织方。下方名单可直接查看；队员学校以实际记录为准，不根据队长学校推断其他成员学校。</p>${legacyRegistrationMarkup()}</section><section class="registration-panel" aria-label="已登记队伍"><div class="registration-directory-top"><div><h3>公开队伍名单</h3><span class="registration-count" data-reg-count>正在读取…</span></div><button class="reg-button secondary" type="button" data-reg-refresh>刷新名单</button></div><label class="registration-field">搜索队名、姓名或学校<input type="search" data-reg-search placeholder="输入队名、姓名或学校"></label><label class="registration-filter"><input type="checkbox" data-reg-recruiting>只看还可组队的队伍</label><p class="registration-error" data-reg-list-error role="status"></p><div class="registration-list" data-reg-list aria-live="polite"></div></section></div>`;
-    const q=selector=>host.querySelector(selector);let teams=[],generation=0;
+    const q=selector=>host.querySelector(selector);let teams=null,generation=0,observer=null;
+    const retryOnline=()=>{if(host.isConnected)refresh();};
     function showList(){
+      if(teams===null)return;
       const rows=teams.filter(team=>matches(team,q('[data-reg-search]').value,q('[data-reg-recruiting]').checked));
       q('[data-reg-count]').textContent=`共 ${teams.length} 支队伍 · 当前显示 ${rows.length} 支`;
       q('[data-reg-list]').innerHTML=rows.length?rows.map(team=>card(team,profileUrl)).join(''):'<p class="registration-empty">没有找到匹配的队伍。可换个关键词，或前往队伍申请入口。</p>';
     }
     async function refresh(){
-      const serial=++generation,button=q('[data-reg-refresh]');button.disabled=true;button.setAttribute?.('aria-busy','true');
+      observer?.disconnect();
+      window.removeEventListener('online',retryOnline);
+      const serial=++generation,button=q('[data-reg-refresh]');
+      const controller=new AbortController();
+      const timeout=setTimeout(()=>controller.abort(),12000);
+      button.disabled=true;
+      button.setAttribute?.('aria-busy','true');
+      if(teams===null)q('[data-reg-count]').textContent='正在读取…';
       try{
-        const response=await fetch(endpoint,{method:'GET',credentials:'omit',cache:'no-store'}),data=await response.json();
+        const response=await fetch(endpoint,{method:'GET',credentials:'omit',cache:'no-store',signal:controller.signal});
+        const data=await response.json();
         if(!response.ok)throw new Error(data.error || '名单暂时不可用');
         if(serial!==generation || !host.isConnected)return;
         teams=data.teams;showList();q('[data-reg-list-error]').textContent='';
-      }catch(error){if(serial===generation && host.isConnected)q('[data-reg-list-error]').textContent='名单暂时未能更新：'+error.message;}
-      finally{if(serial===generation && host.isConnected){button.disabled=false;button.removeAttribute?.('aria-busy');}}
+      }catch(error){
+        if(serial!==generation || !host.isConnected)return;
+        if(teams===null)q('[data-reg-count]').textContent='尚未取得名单';
+        const message=controller.signal.aborted?'连接超时':error.message;
+        q('[data-reg-list-error]').textContent='名单暂时未能更新：'+message+'。可点击刷新名单重试。';
+        window.addEventListener('online',retryOnline,{once:true});
+      }finally{
+        clearTimeout(timeout);
+        if(serial===generation && host.isConnected){button.disabled=false;button.removeAttribute?.('aria-busy');}
+      }
     }
     q('[data-reg-search]').oninput=showList;q('[data-reg-recruiting]').onchange=showList;q('[data-reg-refresh]').onclick=refresh;
     const legacy=installLegacyRegistration(host,endpoint);
-    await Promise.all([refresh(),legacy.ready]);
+    if('deferList' in host.dataset && typeof IntersectionObserver==='function'){
+      observer=new IntersectionObserver(entries=>{
+        if(!generation && entries.some(entry=>entry.isIntersecting))refresh();
+      },{rootMargin:'300px'});
+      observer.observe(host);
+      await legacy.ready;
+    }else{
+      await Promise.all([refresh(),legacy.ready]);
+    }
   }
   return {escape,matches,card,install};
 })();

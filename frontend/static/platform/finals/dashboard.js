@@ -113,7 +113,7 @@ function mountAdminFinalsDashboard(version){
     const notice=panel.querySelector('[data-afd-notice]');if(notice){notice.textContent='';notice.hidden=true;}
     view.lastSync=null;
   };
-  view.poller=makeFinalsPoller({
+  view.poller=makeLivePoller({
     read:async signal=>{
       if(!view.valid() || signal.aborted)throw new Error('当前组织方页面已失效');
       const result=await api('admin/finals',undefined,{signal,loginId});
@@ -136,7 +136,7 @@ function mountAdminFinalsDashboard(version){
       };
     }
   });
-  panel.querySelector('[data-afd-refresh]').onclick=()=>{if(view.valid())view.poller.kick();};
+  panel.querySelector('[data-afd-refresh]').onclick=buttonAction(()=>{if(view.valid())return view.poller.refresh();});
   view.poller.start();view.poller.refresh();
   return view;
 }

@@ -22,9 +22,11 @@ test('original numeric routes and exhibition remain unchanged while roadshow use
 });
 
 test('numeric board reads original aggregate endpoint rather than exhibition progress',async()=>{
-  const requested=[];const content={innerHTML:''},status={classList:{remove(){}},innerHTML:''};
-  const ctx=vm.createContext({document:{getElementById:id=>id==='board-content'?content:id==='live-status'?status:{},body:{classList:{contains:()=>false}}},location:{href:'https://example.test/platform.html#board'},URL,Date,setTimeout,clearTimeout,fetch:async url=>{requested.push(String(url));return {ok:true,json:async()=>({teams:[{number:1,name:'Numeric team',score:82.5,rank:1,judgeCount:5}],config:{minJudges:5,resultsPublished:true}})};}});
-  vm.runInContext(source+'\nrouteVersion=4;',ctx);await vm.runInContext('loadBoard(4)',ctx);
+  const requested=[],content={innerHTML:''},status={classList:{toggle(){}},innerHTML:''};
+  const doc={getElementById:id=>id==='board-content'?content:id==='live-status'?status:{},body:{classList:{contains:()=>false}},addEventListener(){},removeEventListener(){}};
+  const ctx=vm.createContext({document:doc,window:{addEventListener(){},removeEventListener(){}},location:{href:'https://example.test/platform.html#board'},AbortController,URL,Date,setTimeout,clearTimeout,fetch:async url=>{requested.push(String(url));return {ok:true,json:async()=>({teams:[{number:1,name:'Numeric team',score:82.5,rank:1,judgeCount:5}],config:{minJudges:5,resultsPublished:true}})};}});
+  vm.runInContext(source+'\nrouteVersion=4;',ctx);
+  try{await vm.runInContext('renderBoard(4)',ctx);}finally{vm.runInContext('boardPoller?.stop()',ctx);}
   assert.equal(requested[0],'https://example.test/api/board');assert.match(content.innerHTML,/82\.50/);assert.match(content.innerHTML,/专业均分/);
 });
 

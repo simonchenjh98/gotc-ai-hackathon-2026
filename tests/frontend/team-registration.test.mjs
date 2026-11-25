@@ -25,10 +25,10 @@ function legacyNode(selector){
   }
   return node;
 }
-function publicFixture(transport){
+function publicFixture(transport,environment={}){
   const nodes=new Map(),requests=[],removed=[];
   const host={isConnected:true,dataset:{api:'api/registration'},innerHTML:'',querySelector(selector){if(!nodes.has(selector))nodes.set(selector,legacyNode(selector));return nodes.get(selector);}};
-  const scope=vm.createContext({document:{querySelectorAll:()=>[]},URL,location:{href:'https://example.test/gotc/teams.html'},sessionStorage:{removeItem:key=>removed.push(key),getItem:()=>'',setItem(){throw new Error('No absent credential should be persisted');}},fetch:async(url,options)=>{requests.push({url,options});return transport?.(url,options) || {ok:true,json:async()=>({teams:[team]})};}});
+  const scope=vm.createContext({window:new EventTarget(),setTimeout,clearTimeout,AbortController,...environment,document:{querySelectorAll:()=>[]},URL,location:{href:'https://example.test/gotc/teams.html'},sessionStorage:{removeItem:key=>removed.push(key),getItem:()=>'',setItem(){throw new Error('No absent credential should be persisted');}},fetch:async(url,options)=>{requests.push({url,options});return transport?.(url,options) || {ok:true,json:async()=>({teams:[team]})};}});
   scope.host=host;vm.runInContext(source,scope);
   return {scope,host,requests,removed,node:selector=>host.querySelector(selector),install:()=>vm.runInContext('RegistrationUI.install(host)',scope)};
 }
@@ -46,6 +46,38 @@ test('out-of-order public refresh cannot replace a newer directory',async()=>{
   secondResolve({ok:true,json:async()=>({teams:[{...team,name:'NEW DIRECTORY'}]})});await refresh;
   firstResolve({ok:true,json:async()=>({teams:[{...team,name:'OLD DIRECTORY'}]})});await initial;
   assert.match(f.node('[data-reg-list]').innerHTML,/NEW DIRECTORY/);assert(!f.node('[data-reg-list]').innerHTML.includes('OLD DIRECTORY'));
+});
+test('the landing page defers its directory GET until approached and ignores a queued observation after manual refresh',async()=>{
+  let observe;
+  const f=publicFixture(null,{IntersectionObserver:class{
+    constructor(notify){observe=notify;}
+    observe(){} disconnect(){}
+  }});
+  f.host.dataset.deferList='';
+  await f.install();
+  assert.equal(f.requests.length,0);
+  observe([{isIntersecting:false}]);
+  assert.equal(f.requests.length,0);
+  await f.node('[data-reg-refresh]').onclick();
+  observe([{isIntersecting:true}]);
+  assert.equal(f.requests.length,1);
+});
+test('a stalled directory GET releases refresh and reconnect reads the public list once',async()=>{
+  const events=new EventTarget();
+  let expire,calls=0;
+  const f=publicFixture((_url,{signal})=>{
+    if(++calls===1)return new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason)));
+  },{window:events,setTimeout:callback=>{expire=callback;return 1;},clearTimeout(){}});
+  const initial=f.install();
+  expire();await initial;
+  assert.match(f.node('[data-reg-list-error]').textContent,/连接超时/);
+  assert.equal(f.node('[data-reg-refresh]').disabled,false);
+  events.dispatchEvent(new Event('online'));
+  events.dispatchEvent(new Event('online'));
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(calls,2);
+  assert.equal(f.node('[data-reg-list-error]').textContent,'');
+  assert.equal(f.requests[1].options.method,'GET');
 });
 test('public pages expose existing-code profile and pending application links',()=>{
   for(const path of ['index.html','teams.html']){

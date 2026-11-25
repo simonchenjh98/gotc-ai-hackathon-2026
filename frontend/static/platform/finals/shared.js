@@ -19,24 +19,6 @@ function finalsSetAccess(grant){
   try{if(grant)sessionStorage.setItem(finalsAccessStorageKey,JSON.stringify(grant));else sessionStorage.removeItem(finalsAccessStorageKey);}catch{}
 }
 
-function makeFinalsPoller({read,apply,status,alive,isHidden,subscribe,schedule=setTimeout,cancel=clearTimeout}){
-  let timer=null,deadline=null,controller=null,busy=false,stopped=false,pending=false;
-  const clear=()=>{if(timer!==null)cancel(timer);timer=null;};
-  function arm(delay){clear();if(!stopped && alive() && !isHidden())timer=schedule(check,delay);}
-  async function check(){
-    timer=null;if(stopped || busy || !alive() || isHidden())return;
-    busy=true;controller=new AbortController();const request=controller;
-    deadline=schedule(()=>request.abort(),8000);
-    try{const data=await read(request.signal);if(!stopped && alive() && !isHidden()){apply(data);status('updated');}}
-    catch(error){if(!stopped && alive()){if(error.status===401 || error.status===403){stop();status('auth');}else status('error');}}
-    finally{if(deadline!==null)cancel(deadline);deadline=null;controller=null;busy=false;if(!stopped){const delay=pending?0:2000;pending=false;arm(delay);}}
-  }
-  function kick(){if(stopped)return;if(isHidden()){clear();controller?.abort();return;}if(busy){pending=true;return;}arm(0);}
-  function stop(){stopped=true;clear();if(deadline!==null)cancel(deadline);deadline=null;controller?.abort();unsubscribe?.();}
-  const unsubscribe=subscribe(kick);
-  return {start(){arm(2000);},refresh(){clear();return check();},kick,stop};
-}
-
 function disposeFinalsView(){
   const view=activeFinalsView;if(!view)return;
   view.disposed=true;view.poller?.stop();for(const controller of view.controllers)controller.abort();
@@ -152,14 +134,15 @@ function finalsConfirmReload(view){
   if([...forms].some(form=>form.isConnected && (form.finalsBusy || form.roadshowBusy))){toast('正在保存，请等待结果返回后再重新读取。');return;}
   if([...dirtyAdminForms].some(form=>form.isConnected) && !confirm('请先复制要保留的输入。重新载入会替换当前未保存内容，继续？'))return;
   for(const form of view.forms)dirtyAdminForms.delete(form);
-  if(view.role==='seat')renderFinalsJudge(view.version,{id:view.judgeId,name:view.judgeName});else renderRoute();
+  if(view.role==='seat')return renderFinalsJudge(view.version,{id:view.judgeId,name:view.judgeName});
+  return renderRoute();
 }
 function finalsConflict(view,form,message){
   form.finalsBlocked=true;dirtyAdminForms.add(form);
   finalsMessage(form,message+' 当前输入已保留，请先复制，再重新载入最新记录。');
   const box=form.querySelector('[data-finals-recovery]');
   box.innerHTML='<button class="btn secondary small" type="button">复制所需输入后，重新载入</button>';
-  box.querySelector('button').onclick=()=>finalsConfirmReload(view);
+  box.querySelector('button').onclick=buttonAction(()=>finalsConfirmReload(view));
 }
 
 async function finalsSave(view,form,path,payload,onSaved){
@@ -217,9 +200,10 @@ function finalsPatchSummary(view,data,publicView=false){
   }
   if(publicView)return;
   const button=host.querySelector('[data-finals-confirm-awards]');if(!button)return;
+  button.setAttribute?.('aria-busy',String(!!view.awardBusy));
   button.disabled=!!view.awardBusy || !!data.config.open || Number(data.summary?.submittedBallots)!==Number(data.summary?.expectedJudges || 7) || !!data.summary?.awardsConfirmed;
   const message=host.querySelector('[data-finals-awards-message]');message.textContent=view.awardMessage || '';
-  button.onclick=async()=>{
+  button.onclick=buttonAction(async()=>{
     if(!view.valid() || button.disabled || view.awardBusy)return;
     view.awardBusy=true;view.awardMessage='';button.disabled=true;
     const latest=host.finalsData;
@@ -232,7 +216,7 @@ function finalsPatchSummary(view,data,publicView=false){
       view.poller?.kick();
     }catch(error){if(view.current())view.awardMessage=error.name==='AbortError'?'请求超时，确认结果尚未核实。请等待统计更新后核对，没有自动重发。':error.message+' 请核对最新候选名单后再确认。';}
     finally{view.awardBusy=false;if(view.current()){const latestMessage=view.container.querySelector('[data-finals-awards-message]');if(latestMessage)latestMessage.textContent=view.awardMessage;view.poller?.kick();}}
-  };
+  });
 }
 
 function finalsStartPolling(view,path,apply){
@@ -241,6 +225,6 @@ function finalsStartPolling(view,path,apply){
     node.textContent=kind==='updated'?'已同步 · 每2秒更新':kind==='auth'?'同步已停止，请重新登录':'同步暂不可用，正在重试；当前内容和输入已保留';
     node.classList.toggle('warning',kind!=='updated');
   };
-  view.poller=makeFinalsPoller({read:signal=>finalsRequest(view,path,undefined,signal),apply:data=>{if(view.valid())apply(data);},status,alive:()=>view.valid(),isHidden:()=>document.hidden,subscribe:listener=>{document.addEventListener('visibilitychange',listener);return ()=>document.removeEventListener('visibilitychange',listener);}});
+  view.poller=makeLivePoller({read:signal=>finalsRequest(view,path,undefined,signal),apply:data=>{if(view.valid())apply(data);},status,alive:()=>view.valid(),isHidden:()=>document.hidden,subscribe:listener=>{document.addEventListener('visibilitychange',listener);return ()=>document.removeEventListener('visibilitychange',listener);}});
   view.poller.start();
 }

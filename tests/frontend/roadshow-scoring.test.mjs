@@ -149,7 +149,7 @@ test('an expired open flag and other insufficient teams do not block publication
 function windowFixture(api,extra={}){
   const start={},close={},error={},notice={},nodes={'[data-roadshow-start]':start,'[data-roadshow-close]':close,'.form-error':error,'[data-roadshow-window-countdown]':notice};
   const form={isConnected:true,querySelector:selector=>nodes[selector]},ctx=runtime({route:'admin',adminStage:'roadshow',session:{role:'admin',loginId:'admin-a'},api,patchSubmissionStageCards(){},toast(){},stageHasUnsavedInputs:()=>false,loadAdminJudging:async()=>{},...extra});
-  ctx.makeFinalsPoller=()=>({start(){},stop(){},kick(){}});
+  ctx.makeLivePoller=()=>({start(){},stop(){},kick(){}});
   ctx.installRoadshowWindowControls(form,{runId:'run-a',revision:7},{open:false,canEdit:false,deadline:null,serverTime:Date.now()},1);
   return {ctx,start,close,error,notice,form};
 }

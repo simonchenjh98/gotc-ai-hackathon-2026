@@ -73,6 +73,7 @@
   "platform-finals.js": [
     "frontend/static/site/button-states.js",
     "frontend/static/platform/login-retry.js",
+    "frontend/static/platform/polling.js",
     "frontend/static/platform/finals/shared.js",
     "frontend/static/platform/finals/judges.js",
     "frontend/static/platform/finals/organizer.js",
@@ -90,6 +91,7 @@
     "frontend/static/platform/shell.js",
     "frontend/static/platform/team/delegation.js",
     "frontend/static/platform/judging/rules.js",
+    "frontend/static/platform/polling.js",
     "frontend/static/platform/judging/boards.js",
     "frontend/static/platform/judging/judges.js",
     "frontend/static/platform/judging/audience.js",

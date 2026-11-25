@@ -17,7 +17,7 @@ function runtime(extra={}){
     metrics:items=>items.map(([value,label])=>`<span>${esc(value)} ${esc(label)}</span>`).join(''),
     dirtyAdminForms:new Set(),window:{addEventListener(){},removeEventListener(){}},document:{addEventListener(){},removeEventListener(){},hidden:false},
     session:{role:'judge',loginId:'owner-a',name:'Judge A'},route:'judge-finals',routeVersion:1,ownsBrowserLogin:()=>true,...extra});
-  vm.runInContext(source+'\nglobalThis.testHelpers={makeFinalsPoller,finalsSummaryMarkup,finalsSave,finalsTrack,createFinalsView,disposeFinalsView,finalsRequest,finalsRenderScore,finalsRenderNominations,finalsPatchSummary,finalsInstallAdmin,renderFinalsJudge,renderFinalsAccess,finalsHasAccess,finalsSetAccess};',ctx);
+  vm.runInContext(source+'\nglobalThis.testHelpers={makeLivePoller,finalsSummaryMarkup,finalsSave,finalsTrack,createFinalsView,disposeFinalsView,finalsRequest,finalsRenderScore,finalsRenderNominations,finalsPatchSummary,finalsInstallAdmin,renderFinalsJudge,renderFinalsAccess,finalsHasAccess,finalsSetAccess};',ctx);
   return ctx;
 }
 const team=(id,number,name='Team '+number)=>({id,number,name,project:'Synthetic',eligible:true,score:81.25,scoreCount:7,recusedCount:0,complete:true,rank:number,dimensions:[16,12,17,16,12,8.25]});
@@ -58,7 +58,7 @@ test('results escape team text, distinguish missing score from zero and show val
 function pollHarness(overrides={}){
   const ctx=runtime(),tasks=new Map();let seq=0,listener,hidden=false,active=true;
   const calls={reads:0,applied:[],states:[]};
-  const controller=ctx.testHelpers.makeFinalsPoller({
+  const controller=ctx.testHelpers.makeLivePoller({
     read:async()=>{calls.reads++;return {ok:true};},apply:data=>calls.applied.push(data),status:state=>calls.states.push(state),alive:()=>active,isHidden:()=>hidden,
     subscribe:fn=>{listener=fn;return ()=>listener=null;},schedule:(fn,delay)=>{const id=++seq;tasks.set(id,{fn,delay});return id;},cancel:id=>tasks.delete(id),...overrides});
   return {controller,calls,tasks,tick(){const [id,task]=[...tasks].sort((a,b)=>a[1].delay-b[1].delay)[0];tasks.delete(id);return task.fn();},setHidden(value){hidden=value;listener?.();},setActive(value){active=value;}};

@@ -8,13 +8,13 @@ const teamAssets = [
   'submissions/history.js', 'gateway/usage.js', 'gateway/keys.js', 'team/submission.js'
 ];
 const reviewAssets = ['judging/rules.js', 'submissions/materials.js'];
-const finalsAssets = ['finals/finals.css', 'finals/shared.js'];
+const finalsAssets = ['finals/finals.css', 'polling.js', 'finals/shared.js'];
 const roadshowLoginAssets = ['roadshow/access.css', 'roadshow/login.js'];
 const roadshowAssets = [...reviewAssets, ...finalsAssets, ...roadshowLoginAssets, 'roadshow/scoring.js'];
 const organizerAssets = [
   ...reviewAssets, 'submissions/history.js', 'admin/settings.js', 'admin/submissions.js',
   'admin/directory.js', 'claims/form.js', 'claims/review.js', '../registration/admin.js',
-  'finals/shared.js', 'finals/dashboard.js', 'admin/dashboard.css', 'roadshow/scoring.js', 'admin/event.js'
+  'polling.js', 'finals/shared.js', 'finals/dashboard.js', 'admin/dashboard.css', 'roadshow/scoring.js', 'admin/event.js'
 ];
 
 function workspace(title, role, files, render) {
@@ -37,7 +37,7 @@ const platformRoutes = {
   claim: workspace('领取队伍参赛码', null, ['claims/form.js', 'claims/application.js'], version => renderClaim(version)),
   judge: workspace('专业评分（六维100分）', 'judge', [...reviewAssets, 'judging/judges.js'], version => renderJudge(version)),
   'judge-exhibition': workspace('展示评审记录', 'judge', [...reviewAssets, 'judging/judges.js'], version => renderExhibitionJudge(version)),
-  'board-exhibition': workspace('展示评审进度（未计分）', null, ['judging/rules.js', 'judging/boards.js'], version => renderExhibitionBoard(version)),
+  'board-exhibition': workspace('展示评审进度（未计分）', null, ['judging/rules.js', 'polling.js', 'judging/boards.js'], version => renderExhibitionBoard(version)),
   'judge-roadshow': workspace('路演评分（六维100分）', 'judge', roadshowAssets, version => renderRoadshowJudge(version)),
   // Finals use a separate event access token and judge-seat flow.
   'judge-finals': workspace('决赛评分与专项奖提名', null, [...finalsAssets, 'finals/judges.js'], version => renderFinalsJudge(version)),
