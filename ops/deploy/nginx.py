@@ -139,6 +139,7 @@ def locations(frontend: Path = FRONTEND, *, hsts: bool = False) -> str:
     # Regex locations use bounded captures. An ordinary JS/CSS filename never receives immutable caching.
     for prefix, names, immutable in [
         ("static", r"(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.[0-9a-f]{16}\.(?:js|css)", True),
+        ("assets", r"[A-Za-z0-9_-]+\.[0-9a-f]{16}\.(?:jpg|webp)", True),
         ("assets", r"[A-Za-z0-9_-]+\.(?:webp|png|jpg|jpeg|svg|ico|woff2?)", False),
         ("downloads", r"(?:[A-Za-z0-9_-]+\.(?:ics|txt)|gotc-gitee-submission-guide\.pdf)", False),
     ]:

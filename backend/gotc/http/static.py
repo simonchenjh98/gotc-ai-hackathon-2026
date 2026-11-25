@@ -56,7 +56,8 @@ def immutable_assets(root: Path) -> set[str]:
         return set()
     entries = json.loads(manifest.read_text(encoding="utf-8"))["assets"]
     return {entry["path"] for entry in entries.values()
-            if re.fullmatch(r"static/(?:[\w.-]+/)*[\w.-]+\.[0-9a-f]{16}\.(?:css|js)", entry["path"])}
+            if re.fullmatch(r"(?:static/(?:[\w.-]+/)*[\w.-]+\.[0-9a-f]{16}\.(?:css|js)"
+                            r"|assets/[\w-]+\.[0-9a-f]{16}\.(?:jpg|webp))", entry["path"])}
 
 
 def public_response(root: Path, path: str, request_headers, immutable: set[str]) -> Response:

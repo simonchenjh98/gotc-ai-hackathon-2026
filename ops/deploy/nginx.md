@@ -24,7 +24,7 @@ Nginx must be able to traverse the runtime socket directories and connect to the
 
 | Path under `/gotc/` | Handler |
 | --- | --- |
-| Home, teams, platform, manifest and approved static/download extensions | Nginx reads the assembled release's `current/frontend/` directory. HTML, the manifest and other unhashed files return the current bytes when a browser revalidates. Deterministic releases share file timestamps, so the edge suppresses size-and-time ETags and ignores date validators for these URLs. Content-hashed JS and CSS use one-year immutable caching and support conditional requests. Eligible responses use gzip. |
+| Home, teams, platform, manifest and approved static/download extensions | Nginx reads the assembled release's `current/frontend/` directory. HTML, the manifest and other unhashed files return the current bytes when a browser revalidates. Deterministic releases share file timestamps, so the edge suppresses size-and-time ETags and ignores date validators for these URLs. Content-hashed scripts, stylesheets and artwork use one-year immutable caching and support conditional requests. Eligible responses use gzip. |
 | `api/` and `materials/` | Platform Unix socket with bounded bodies. Native material downloads and HTML previews retain the application's authenticated streaming and response-level security headers. |
 | `v1/` | Gateway Unix socket with streaming and WebSocket upgrade support. |
 

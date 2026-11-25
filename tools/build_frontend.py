@@ -17,6 +17,7 @@ MANIFEST_REFERENCE = "const builtRouteManifest = null;"
 MANIFEST_TABLE = "const platformReleaseAssets = {};"
 STATIC_TAG = re.compile(r"<(?:script|link)\b[^>]*>", re.IGNORECASE)
 ASSET_ATTRIBUTE = re.compile(r'\b(src|href)="([^"]+\.(?:js|css))"')
+ART_ATTRIBUTE = re.compile(r'\b(src|href|content)="(assets/[\w-]+\.(?:jpg|webp))"')
 
 
 class AssetInfo(TypedDict):
@@ -87,7 +88,11 @@ def build_frontend(source: Path, destination: Path, files: Iterable[str | Path],
             emit(target, data)
 
         for name, path in sorted(inputs.items()):
-            if name not in (LOADER, ROUTE_ASSET_LIST) and path.suffix in (".js", ".css"):
+            if name.startswith("assets/") and path.suffix in (".jpg", ".webp"):
+                data = path.read_bytes()
+                emit_asset(name, data)
+                emit(name, data)  # Keep public poster and image links from earlier releases.
+            elif name not in (LOADER, ROUTE_ASSET_LIST) and path.suffix in (".js", ".css"):
                 emit_asset(name, path.read_bytes())
 
         if LOADER in inputs:
@@ -123,20 +128,27 @@ def build_frontend(source: Path, destination: Path, files: Iterable[str | Path],
             attr = f'{found[1]}="{asset["path"]}" integrity="{asset["integrity"]}"'
             return tag[:found.start()] + attr + tag[found.end():]
 
+        def rewrite_art(match: re.Match[str]) -> str:
+            attribute, original = match.groups()
+            if original not in assets:
+                raise ValueError(f"Undeclared artwork in HTML: {original}")
+            path = assets[original]["path"]
+            if attribute == "content" and public_origin:
+                path = platform_base(public_origin) + path
+            return f'{attribute}="{path}"'
+
         for name, path in sorted(inputs.items()):
             if name in assets:
                 continue
             data = path.read_bytes()
             if path.suffix == ".html":
                 html = STATIC_TAG.sub(rewrite_tag, data.decode("utf-8"))
-                if name == "index.html" and public_origin:
-                    html = html.replace('property="og:image" content="assets/hero-city.webp"',
-                                        f'property="og:image" content="{platform_base(public_origin)}assets/hero-city.webp"')
+                html = ART_ATTRIBUTE.sub(rewrite_art, html)
                 if name == "index.html" and pages and public_origin:
                     html = pages_landing(html, public_origin)
                 data = html.encode("utf-8")
             emit(name, data)
-        manifest: FrontendManifest = {"version": 1, "assets": assets}
+        manifest: FrontendManifest = {"version": 2, "assets": assets}
         emit("asset-manifest.json", (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode())
         root.rename(destination)
     return manifest
