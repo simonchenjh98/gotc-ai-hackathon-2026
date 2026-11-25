@@ -5,7 +5,7 @@ async function renderExhibitionJudge(version,expectedForm=null,stage=stageForRou
   const stale=()=>version!==routeVersion || stage!==stageForRoute() || (expectedForm && !expectedForm.isConnected) || session!==owner || !ownsBrowserLogin(owner);
   function changedLogin(){if(version!==routeVersion || stage!==stageForRoute() || (expectedForm && !expectedForm.isConnected))return;if(expectedForm)currentIdentityPage?.valid();else root.innerHTML=empty('登录身份已失效或切换','请刷新页面并核对评委身份后继续。');}
   if(stale()){changedLogin();return;}
-  try{data=await api(`judging/${stage}`,undefined,{loginId:owner.loginId});}catch(error){if(stale()){changedLogin();return;}if(error.status===403){root.innerHTML=heading(`JUDGE / ${stageName(stage)}`,'本轮尚未获得评审授权',`请联系组织方，将你的评委身份加入${stageName(stage)}工作名单。`)+stageNotice(stage)+empty('尚未分配本轮队伍','获得授权后，可用当前身份重新读取。','<button class="btn secondary" id="retry-judge">重新读取</button>');document.getElementById('retry-judge').onclick=()=>renderExhibitionJudge(version,null,stage);return;}throw error;}
+  try{data=await api(`judging/${stage}`,undefined,{loginId:owner.loginId});}catch(error){if(stale()){changedLogin();return;}if(error.status===403){root.innerHTML=heading(`JUDGE / ${stageName(stage)}`,'本轮尚未获得评审授权',`请联系组织方，将你的评委身份加入${stageName(stage)}工作名单。`)+stageNotice(stage)+empty('尚未分配本轮队伍','获得授权后，可用当前身份重新读取。','<button class="btn secondary" id="retry-judge">重新读取</button>');document.getElementById('retry-judge').onclick=buttonAction(()=>renderExhibitionJudge(version,null,stage));return;}throw error;}
   if(stale()){changedLogin();return;}
   judgeData=data;
   const submitted=judgeData.myReviews.filter(r=>r.submitted && !r.recused && !r.invalidated).length;
@@ -43,10 +43,10 @@ function renderExhibitionJudgeEditor(){
     if(Array.from(value).length>2000){formError(form,'评审记录最多 2000 字。');return;}
     const fieldset=form.querySelector('fieldset');saving=true;fieldset.disabled=true;
     try{await api(`judging/${stage}/review`,{runId,teamId:team.id,expectedVersion:record?.version || 0,status,feedback:value,scores:null},{loginId:owner.loginId});if(!valid())return;reviewDirty=false;toast(status==='submitted'?'评审记录已正式提交（未计分）。':status==='draft'?'草稿已保存，正式记录保持原版本。':'已回避此队，不计入正式评审记录数。');await renderExhibitionJudge(viewVersion,form,stage);}
-    catch(error){if(!valid())return;formError(form,error.message);if(error.status===409){blocked=true;fieldset.disabled=false;form.elements.feedback.readOnly=true;form.querySelectorAll('button').forEach(b=>b.disabled=true);document.getElementById('review-conflict').innerHTML='<section class="surface"><h2>当前输入已保留</h2><p class="small-note">服务器版本或评审轮次已变化。请先复制需要保留的文字，再读取最新记录重新编辑。</p><button class="btn secondary" id="reload-review" type="button">读取最新记录</button></section>';document.getElementById('reload-review').onclick=()=>{if(!valid() || !confirmLeave())return;reviewDirty=false;renderExhibitionJudge(viewVersion,form,stage);};}else if(error.status===401 || error.status===403 || error.status===428){blocked=true;fieldset.disabled=true;}}
+    catch(error){if(!valid())return;formError(form,error.message);if(error.status===409){blocked=true;fieldset.disabled=false;form.elements.feedback.readOnly=true;form.querySelectorAll('button').forEach(b=>b.disabled=true);document.getElementById('review-conflict').innerHTML='<section class="surface"><h2>当前输入已保留</h2><p class="small-note">服务器版本或评审轮次已变化。请先复制需要保留的文字，再读取最新记录重新编辑。</p><button class="btn secondary" id="reload-review" type="button">读取最新记录</button></section>';document.getElementById('reload-review').onclick=buttonAction(()=>{if(!valid() || !confirmLeave())return;reviewDirty=false;renderExhibitionJudge(viewVersion,form,stage);});}else if(error.status===401 || error.status===403 || error.status===428){blocked=true;fieldset.disabled=true;}}
     finally{saving=false;if(valid() && !blocked)fieldset.disabled=false;}
   }
-  form.onsubmit=e=>{e.preventDefault();return save('submitted');};document.getElementById('save-review-draft').onclick=()=>save('draft');document.getElementById('recuse-review').onclick=()=>{if(confirm('确认回避此队？已有正式记录会保留，但不计入本轮正式评审记录数。'))return save('recused');};
+  form.onsubmit=buttonAction(e=>{e.preventDefault();return save('submitted');});document.getElementById('save-review-draft').onclick=buttonAction(()=>save('draft'));document.getElementById('recuse-review').onclick=buttonAction(()=>{if(confirm('确认回避此队？已有正式记录会保留，但不计入本轮正式评审记录数。'))return save('recused');});
 }
 async function renderJudge(version,expectedForm=null) {
   const owner=session;const data=await api('judge',undefined,{loginId:owner.loginId});if(session!==owner || !ownsBrowserLogin(owner) || version!==routeVersion || route!=='judge' || (expectedForm && !expectedForm.isConnected))return;judgeData=data;
@@ -65,7 +65,7 @@ function updateScoreSummary(data){
     windowChip.textContent=data.scoringOpen?'评分开放中':'评分尚未开放 / 已截止';
   }
 }
-function renderTeamPicker(){document.getElementById('team-picker').innerHTML=judgeData.teams.map(t=>{const score=judgeData.myScores.find(s=>String(s.teamId)===String(t.id));return `<button class="team-pick ${String(t.id)===String(selectedTeam)?'selected':''}" data-team="${esc(t.id)}"><span class="team-number">TEAM ${esc(String(t.number).padStart(2,'0'))}</span><strong>${esc(t.name)}</strong><small class="${score?.status==='submitted'?'saved-status':''}">${score?({submitted:'已正式提交',draft:'草稿已保存',recused:'已回避'}[score.status] || '待评分'):'待评分'}</small></button>`;}).join('');document.querySelectorAll('[data-team]').forEach(b=>b.onclick=()=>{if(String(selectedTeam)===b.dataset.team)return;if(!confirmLeave())return;scoreDirty=false;selectedTeam=b.dataset.team;renderTeamPicker();renderJudgeEditor();});}
+function renderTeamPicker(){document.getElementById('team-picker').innerHTML=judgeData.teams.map(t=>{const score=judgeData.myScores.find(s=>String(s.teamId)===String(t.id));return `<button class="team-pick ${String(t.id)===String(selectedTeam)?'selected':''}" data-team="${esc(t.id)}" aria-pressed="${String(t.id)===String(selectedTeam)}"><span class="team-number">TEAM ${esc(String(t.number).padStart(2,'0'))}</span><strong>${esc(t.name)}</strong><small class="${score?.status==='submitted'?'saved-status':''}">${score?({submitted:'已正式提交',draft:'草稿已保存',recused:'已回避'}[score.status] || '待评分'):'待评分'}</small></button>`;}).join('');document.querySelectorAll('[data-team]').forEach(b=>b.onclick=()=>{if(String(selectedTeam)===b.dataset.team)return;if(!confirmLeave())return;scoreDirty=false;selectedTeam=b.dataset.team;renderTeamPicker();renderJudgeEditor();});}
 function renderJudgeEditor(){
   const data=judgeData,team=data.teams.find(t=>String(t.id)===String(selectedTeam));
   const saved=data.myScores.find(s=>String(s.teamId)===String(selectedTeam)),dimensions=data.dimensions,owner=session,version=routeVersion;
@@ -83,7 +83,7 @@ function renderJudgeEditor(){
   function conflict(message='服务端评分已更新。'){
     blocked=true;scoreDirty=true;const panel=document.getElementById('score-conflict');
     panel.innerHTML='<section class="info-banner warning"><strong>当前输入已保留</strong><p>'+esc(message)+'先查看最新评分并与上方当前输入核对，复制需要保留的内容，再载入最新记录重新填写。</p><button class="btn secondary small" id="preview-score" type="button">查看服务器最新评分</button></section>';
-    document.getElementById('preview-score').onclick=async()=>{
+    document.getElementById('preview-score').onclick=buttonAction(async()=>{
       if(!alive({notify:true}))return;
       const request=++previewRequest;
       try{
@@ -97,7 +97,7 @@ function renderJudgeEditor(){
           data.scoringOpen=latest.scoringOpen;scoreDirty=false;updateScoreSummary(data);renderTeamPicker();renderJudgeEditor();
         };
       }catch(error){if(request===previewRequest && alive({error}))formError(form,error.message);}
-    };
+    });
   }
   async function save(status){
     if(!alive({notify:true}) || saving || blocked || !data.scoringOpen || (status==='draft' && currentStatus==='submitted'))return;
@@ -133,7 +133,7 @@ function renderJudgeEditor(){
       if(error.status===428 || error.status===403)blocked=true;
     }finally{saving=false;if(alive())updateButtons();}
   }
-  form.onsubmit=event=>{event.preventDefault();return save('submitted');};
-  document.getElementById('save-draft').onclick=()=>save('draft');
-  document.getElementById('recuse').onclick=()=>{if(confirm('确定回避此队伍？你对该队的评分将不计入专业均分。评分开放期间可重新评分。'))return save('recused');};
+  form.onsubmit=buttonAction(event=>{event.preventDefault();return save('submitted');});
+  document.getElementById('save-draft').onclick=buttonAction(()=>save('draft'));
+  document.getElementById('recuse').onclick=buttonAction(()=>{if(confirm('确定回避此队伍？你对该队的评分将不计入专业均分。评分开放期间可重新评分。'))return save('recused');});
 }

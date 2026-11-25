@@ -26,5 +26,5 @@ async function renderTeamScore(version) {
   }).join('');
   const stages=stageResults?`<h2>路演 / 决赛成绩</h2>${stageResults}<h2>其他专业评分</h2>`:'<h2>专业评分总分</h2>';
   root.innerHTML=`<section class="surface own-score"><h1>本队查分</h1><p>${esc(teamLabel(data.team))}</p>${stages}${result}<p class="small-note">此页面只读取当前登录队伍，不能查询其他队伍或全队排名。</p><button type="button" id="refresh-team-score" class="btn secondary small">刷新成绩</button></section>`;
-  document.getElementById('refresh-team-score').onclick=()=>renderRoute();
+  document.getElementById('refresh-team-score').onclick=buttonAction(()=>renderRoute());
 }

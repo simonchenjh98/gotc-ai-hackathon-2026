@@ -32,7 +32,7 @@ function installSubmissionUploads(data,form,{isCurrent,canUpload,onChange,onBusy
   for(const [kind,spec] of Object.entries(submissionUploadKinds)){
     const button=element(kind,'button'),input=element(kind,'file'),status=element(kind,'status'),resultBox=element(kind,'result'),field=form.elements[spec.field];if(!button || !input || !field)continue;
     input.addEventListener('change',refresh);
-    button.onclick=async()=>{
+    button.onclick=buttonAction(async()=>{
       if(pending || !live() || !canUpload())return;
       const project=form.elements.projectName.value.trim() || '作品',file=input.files?.[0],problem=submissionUploadProblem(kind,file,project);
       if(problem){status.textContent=problem;(project?input:form.elements.projectName).focus();return;}
@@ -50,7 +50,7 @@ function installSubmissionUploads(data,form,{isCurrent,canUpload,onChange,onBusy
         field.value=result.url;form.elements.confirmed.checked=false;uploads.set(kind,{url:result.url,project});onChange();status.textContent='文件已上传，链接已填入当前草稿；尚未保存草稿或正式提交。';
       }catch(error){if(live()){status.textContent=error.name==='AbortError'?'上传等待超时；原链接和其他输入已保留，请重试。':error.message;if([401,403].includes(error.status))onUnauthorized();}}
       finally{clearTimeout(timer);pending=false;if(live()){controls(false);refresh();}}
-    };
+    });
   }
   refresh();return {busy:()=>pending,refresh};
 }

@@ -41,8 +41,8 @@ async function renderTeamProfile(version){
     if(!model.membersEditable)for(const key of ['captain','school','targetSize','member1','member2','member3','member4'])values[key].disabled=true;
     values.project.disabled=!model.projectEditable;
     form.addEventListener('input',()=>{if(state.valid()){state.dirty=true;state.editRevision++;message('当前修改尚未保存。');}});
-    panel.querySelector('#team-profile-refresh').onclick=()=>{if(form===state.form && form.isConnected)return load(true);};
-    form.onsubmit=event=>{event.preventDefault();if(form===state.form && form.isConnected)return save();};controls();
+    panel.querySelector('#team-profile-refresh').onclick=buttonAction(()=>{if(form===state.form && form.isConnected)return load(true);});
+    form.onsubmit=buttonAction(event=>{event.preventDefault();if(form===state.form && form.isConnected)return save();});controls();
   }
   async function load(explicit=false){
     if(!state.valid() || state.pending)return;

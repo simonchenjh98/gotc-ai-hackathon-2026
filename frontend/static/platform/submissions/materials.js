@@ -119,7 +119,7 @@ function installRepositoryBackup(container,path,version,materials,isCurrent,{tea
   container.dataset.repositoryVersion=String(version);let busy=false;
   const live=()=>session===owner && owner.loginId===loginId && browserLoginOwner()===marker && ownsBrowserLogin(owner) && ['team','admin'].includes(owner.role) && route===page && routeVersion===pageVersion && container.isConnected && document.getElementById(id)===container && container.dataset.repositoryVersion===String(version) && isCurrent();
   if(!button)return;
-  button.onclick=async()=>{
+  button.onclick=buttonAction(async()=>{
     if(busy || !live())return;busy=true;button.disabled=true;
     try{
       const data=await api(path,undefined,{loginId});if(!live())return;
@@ -128,7 +128,7 @@ function installRepositoryBackup(container,path,version,materials,isCurrent,{tea
       target.innerHTML=repositoryBackupMarkup(data.repositoryBackup,materials,teamId,version);message.textContent='已刷新本版备份状态；当前输入保持不变。';
     }catch{if(live())message.textContent='备份状态读取未完成；当前输入已保留，请稍后再试。';}
     finally{busy=false;if(live())button.disabled=false;}
-  };
+  });
 }
 function materialMarkup(materials,seal=null){if(!materials)return '<p class="small-note">暂无材料。</p>';return `<dl class="material-list">${repositoryMaterialsUrl(materials)?`<div><dt>仓库内项目材料</dt><dd><a href="${esc(repositoryMaterialsUrl(materials))}" target="_blank" rel="noopener noreferrer">查看这版仓库文件 ↗</a><p class="small-note">请在此版本查看 README / 运行说明、许可证、第三方来源和已知局限。平台未检查这些文件是否存在及其内容。</p></dd></div>`:''}${materialFields.map(([key,label,,type])=>{const value=materials[key] || '';if(!value)return '';const safe=type==='url'?safeMaterialFieldUrl(key,value):'';return `<div><dt>${esc(label)}</dt><dd>${key==='codeVersion'?commitMarkup(value,materials.codeUrl,seal):safe?`<a href="${esc(safe)}" target="_blank" rel="noopener noreferrer">${esc(value)} ↗</a>`:esc(value)}</dd></div>`;}).join('')}<div><dt>材料自查声明</dt><dd>${materials.confirmed===true?'已确认（队伍自行声明）':'尚未确认'}</dd></div></dl>`;}
 function judgeSubmissionMarkup(record){return `<section class="surface submitted-materials"><h2>最新正式项目材料</h2><p class="small-note">原专业评分入口读取最新正式版；此处不是展示或路演的冻结快照，评分不绑定材料版本。</p>${record?`<p class="small-note">正式版本 ${Number(record.version)} · 北京时间 ${esc(beijingTime(record.submittedAt))}</p>${materialMarkup(record.materials)}`:'<p class="small-note">暂未正式提交材料；仍可根据现场演示评分。</p>'}</section>`;}
